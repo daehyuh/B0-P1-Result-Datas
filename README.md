@@ -7,13 +7,14 @@ This repository publishes the analysis program and the case-level results used i
 - [`analyzer/`](analyzer/): source code and tests for the static relation-information builder. It does not call an LLM or determine whether code is vulnerable.
 - [`results/summary.md`](results/summary.md): dataset-level comparison, scoring rules, and limitations.
 - [`results/`](results/): case-level model submissions and target-match adjudications for Vul4J, VJBench, Vul4J+, and CWE-Bench-Java.
+- [`results/codeql/`](results/codeql/): case-level CodeQL target-match adjudications and the comparison with P1 LLM. The large SARIF and working databases remain local.
 - [`results/vul4j/README.md`](results/vul4j/README.md): explains how the original 75-case ledger and four-case supplement combine into the 79-case Vul4J result.
 - [`prompts/`](prompts/): the B0/P1 and common prompts used by the recorded experiments.
 - [`figures/`](figures/): figures accompanying the summary.
 
 ## Result files
 
-The case-level result tables preserve each model's submitted candidate and its adjudication. Original responses and format-retry responses are kept separate. The VJBench case-039 target correction is documented and linked to its evidence; it was made after reviewing the outputs and must be treated as a post-hoc correction.
+The main summary reports one final score for each case and condition. The VJBench final case table and Vul4J+ final score table are linked from [`results/summary.md`](results/summary.md). Initial responses and separate format-repair executions remain distinct in the audit records; the final score table does not overwrite either source. The VJBench case-039 target correction is documented and linked to its evidence; it was made after reviewing the outputs and must be treated as a post-hoc correction.
 
 The repository does **not** redistribute benchmark source snapshots, generated per-case relation databases, or the large working SQLite database. Dataset source commit/hash information is retained in the result records where available. Obtain benchmark code from its upstream source and follow its license and citation requirements. Rebuild relation data locally with the included analyzer if needed.
 
