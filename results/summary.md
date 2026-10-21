@@ -1,20 +1,11 @@
-# Current results: Flash Max
+# Current Top1 results
 
-| Dataset | Cases | CodeQL | B0 (source only) | P1 (VulRIS) | P1−B0 (cases; pp) |
+| Dataset | Cases | CodeQL | B0 | P1 | P1−B0 (cases; pp) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Vul4J | 79 | 11 (13.92%) | 13 (16.46%) | 13 (16.46%) | +0; +0.00 pp |
 | VJBench | 42 | 4 (9.52%) | 16 (38.10%) | 16 (38.10%) | +0; +0.00 pp |
 | Vul4J+ | 140 | 17 (12.14%) | 39 (27.86%) | 46 (32.86%) | +7; +5.00 pp |
 | CWE-Bench-Java | 213 | 41 (19.25%) | 52 (24.41%) | 51 (23.94%) | -1; -0.47 pp |
 
-The current representative setting is Flash Max (`deepseek-flash`, reasoning effort `max`). B0 reads the prepared source; P1 also queries VulRIS relation records. Vul4J uses the original multi-candidate protocol (at most 10 candidates); VJBench, Vul4J+, and CWE-Bench-Java use at most one candidate per submission.
+All paired LLM submissions use Flash Max (`deepseek-flash`, reasoning effort `max`) and permit at most one candidate. B0 reads prepared source; P1 also queries read-only VulRIS relations. The metric is reference-cause and affected-path matching. CodeQL is the recorded baseline; exact source-version parity with every corrected LLM input has not been established.
 
-The metric is case-level reference-cause and affected-path matching. All 213 CWE-Bench-Java cases have final binary labels, including case-173. Datasets are reported separately because Vul4J and Vul4J+ overlap. The final adopted submissions form a retrospective collection.
-
-P1 and B0 tie on Vul4J and VJBench. P1 identifies seven more Vul4J+ cases (+5.00 pp), and one fewer CWE-Bench-Java case (−0.47 pp). These results show dataset-dependent effects of relation-assisted exploration rather than uniform improvement.
-
-CodeQL counts come from the completed recorded baseline (CLI 2.23.2, Java pack 1.8.1, `java-security-extended.qls`, `build-mode=none`). Exact source-version parity with the corrected LLM inputs has not been established for every case. Report CodeQL values as descriptive baseline results rather than a controlled same-input estimate of the relation index's contribution.
-
-[Case rows, reports, judgments, and hashes](final-flash-max-20261021/).
-
-Other dated result files preserve historical records. They are not the current adjudications or representative model settings.
+Legacy Vul4J multi-candidate responses and their derived comparisons have been removed from the current tree. The separate Vul4J P1 Top1 experiment (79 completed reviews, October 9–10) remains preserved. It has no matching Top1 B0 in the recorded experiment and is not substituted with old multi-candidate B0 results.
