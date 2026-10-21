@@ -1,0 +1,64 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The entry names come from dependency jars on the build classpath: any third-party jar (regular dependency or WebJar, e.g. a compromised/malicious artifact published to Maven Central or bundled by a compromised component) can contain entries with `../` after the expected base path. The build only validates the prefix, not the resolved path.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the prefix filter prevents traversal: it does not, because `../` may appear after the required base path. Checked whether any later normalization/containment validation exists in JarContentsManager or ProductionModeCopyStep: none (no Path.normalize/getCanonicalFile/startsWith check on the resolved destination). Checked whether the excluded-file wildcard filter helps: it only filters entry names, not the resulting relative path. The code path is not guarded by any authentication/role check (it is a build step). Note the source appears consistent with long-standing upstream code, so this may be an unfixed historical defect rather than a reverted security patch.",
+      "id": "zip-slip-jarcontentsmanager",
+      "impact": "Arbitrary file write (subject to the build process's permissions) outside the intended frontend/output directory on the machine running the production build — e.g. overwriting project files, build configuration, scripts or user files, which can be escalated to code execution in the build/CI environment. No source-text path normalization or containment check exists to prevent it.",
+      "locations": [
+        {
+          "end_line": 187,
+          "path": "flow-maven-plugin/src/main/java/com/vaadin/flow/plugin/common/JarContentsManager.java",
+          "start_line": 146
+        },
+        {
+          "end_line": 200,
+          "path": "flow-maven-plugin/src/main/java/com/vaadin/flow/plugin/production/ProductionModeCopyStep.java",
+          "start_line": 189
+        }
+      ],
+      "prerequisites": "A build using the affected flow-maven-plugin production-mode goal with a dependency jar containing crafted entry names; the plugin must run (developer/CI machine) for the write to occur. WebJar handling additionally requires the jar to contain a bower.json/package.json under META-INF/resources/webjars/ so it is treated as a WebJar.",
+      "root_cause": "JarContentsManager.copyJarEntryTrimmingBasePath() derives the destination path directly from the jar entry name. It only checks that the entry name startsWith the configured base path (in the caller), then computes `relativePath = fullPath.substring(indexOf(basePath) + basePath.length())` and writes to `new File(outputDirectory, relativePath)` (line 183) with no normalization and no check that the result stays inside `outputDirectory`. A jar entry such as `META-INF/resources/frontend/../../../../../../tmp/x` passes the `startsWith(basePath)` filter, yields `../../../../../../tmp/x`, and escapes the output directory when `FileUtils.copyInputStreamToFile` creates parent folders and writes. ProductionModeCopyStep.copyWebApplicationFiles() invokes this for every regular dependency jar (base `META-INF/resources/frontend`, lines 198-200) and for each WebJar package directory (line 194).",
+      "title": "Zip Slip: jar entries are extracted without path normalization, allowing arbitrary file write outside the target directory during production builds",
+      "trace": "ProductionModeCopyStep.copyWebApplicationFiles(outputDirectory, ...) -> JarContentsManager.copyFilesFromJarTrimmingBasePath(jar, basePath, outputDirectory, exclusions) [JarContentsManager.java:146-160] -> stream filters `entryName.toLowerCase().startsWith(basePath.toLowerCase())` -> copyJarEntryTrimmingBasePath(jarFile, jarEntry, basePath, outputDirectory) [178-187] -> `relativePath = fullPath.substring(... + basePath.length())` (line 180-181, no `..`/absolute-path handling) -> FileUtils.copyInputStreamToFile(input, new File(outputDirectory, relativePath)) (line 183) -> write outside outputDirectory for crafted entry names. The same class's getPackageName()/caller line 192 also use the WebJar-declared package name (substring after the last '/') as a file name, so a bower.json name ending in `/..` also yields `..` as a directory component.",
+      "unverified": "Not built or executed (no build/run tools permitted); the write primitive and escape were established by reading the source, not by running a crafted jar. I could not verify against the fixed upstream version (no network/git history in this run), so it is unconfirmed whether this exact code was later patched or is the snapshot's intended finding.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / Zip Slip (arbitrary file write)"
+    }
+  ],
+  "coverage_summary": "Snapshot: Vaadin Flow 1.3-SNAPSHOT, 1,352 files (1,073 Java); module POMs reviewed for module layout. Read/traced in detail: flow-server request pipeline (VaadinServlet, VaadinServletService, VaadinService, VaadinSession, StaticFileServer, WebJarServer, BootstrapHandler/BootstrapUtils/InitialPageSettings/InlineTargets, ServerRpcHandler + all rpc/* handlers, UidlRequestHandler/UidlWriter, StreamRequestHandler/StreamReceiverHandler/StreamResourceHandler, PushHandler/PushRequestHandler/JSR356WebsocketInitializer, PwaHandler/PwaRegistry/PwaIcon/PwaConfiguration, HeartbeatHandler, UnsupportedBrowserHandler, ServletHelper, ServletDeployer-related startup classes, router Location/ParameterDeserializer/DefaultRouteResolver), flow-client binding/communication/error code, flow-data DataCommunicator area, flow-theme-integrations, and the flow-maven-plugin (JarContentsManager, ProductionModeCopyStep, FrontendDataProvider, FrontendToolsLocator/Manager, BundleConfigurationReader, ComponentGeneratorPlugin). Relation index coverage is partial (1,050-1,051 parsed files of 1,350, 2 omitted, no semantic resolution/data flow/control flow; 16,689 unresolved call candidates), so index-derived navigation was always verified against source text. Large periphery (generated components, resources/JS bundles, OSGi/tests modules) was sampled rather than read exhaustively.",
+  "limitations": [
+    "No build, test execution, scanners, or runtime verification was allowed; the finding is based on static reading only and is a lead, not a confirmed vulnerability.",
+    "No unit/integration test sources are present in the snapshot (flow-server/src/test and generator tests absent), so intended behavior could not be confirmed from tests.",
+    "No git history, upstream comparison, CVE/advisory lookup, or web access was available, so I could not determine whether the candidate was later patched or whether it is the snapshot's intended vulnerability.",
+    "The P1 relation index is syntactic and partial (no data flow, control flow, or semantic resolution); its security_call/config facts are navigation hints only and were not treated as findings.",
+    "Some areas were sampled rather than fully reviewed (generated component classes, client resources / minified JS, OSGi and test-fixture modules); a vulnerability could exist there undetected."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ElementPropertyMap.deferredUpdateFromClient (flow-server/src/main/java/com/vaadin/flow/internal/nodefeature/ElementPropertyMap.java:78-100) rejects a property update only when `updateFromClientFilter != null && !updateFromClientFilter.test(key)`; otherwise it falls through to `putWithDeferredChangeEvent`, so a forged `mapSync` RPC can write properties that are neither synchronized nor allowed (including the `forbiddenProperties` textContent/classList/className) into the server-side property map of the attacker's own UI.",
+      "reason": "Strong code smell (the code's own warning states the 'for security reasons' policy) but plausibly intentional upstream design for client-side element property defaults, and impact is confined to the attacker's own UI state; I could not confirm it deviates from the fixed upstream code. Reported as an unconfirmed lead, not the candidate."
+    },
+    {
+      "lead": "UidlWriter.getInlineResourceStream (flow-server/src/main/java/com/vaadin/flow/server/communication/UidlWriter.java:262-295) falls back to `new URL(url).openConnection().getInputStream()` for INLINE dependencies whose URL cannot be resolved from the servlet context (potential SSRF / local file read via file: URLs).",
+      "reason": "The URL originates from server-side dependency declarations (@HtmlImport/@JavaScript/@StyleSheet, theme/URL translation), not from a web request, so an unauthenticated remote attacker does not control it; rejected as a remote vulnerability."
+    },
+    {
+      "lead": "WebJarServer.getWebJarPath (flow-server/src/main/java/com/vaadin/flow/server/webjar/WebJarServer.java:141-146) uses `path.replace(prefix, \"/webjars/\")` on the request path and passes the result to ServletContext.getResource, and StaticFileServer passes raw request path info to getStaticResource.",
+      "reason": "Path resolution/normalization is delegated to the servlet container and the request must start with the configured frontend prefix; I found no source-level evidence that `..` survives container normalization, so no concrete traversal is demonstrated. Unconfirmed lead."
+    },
+    {
+      "lead": "FrontendDataProvider.createFragmentFile (flow-maven-plugin/src/main/java/com/vaadin/flow/plugin/common/FrontendDataProvider.java:285-300) resolves the fragment file name (`fragmentName + \".html\"`) directly against the target directory, allowing `../` escapes if a fragment name in the bundle-configuration file or Maven configuration contains traversal sequences.",
+      "reason": "Same class of issue as the candidate but the name comes from the project's own build configuration (self-inflicted), so it is a weaker variant of the same root cause and was not submitted separately."
+    },
+    {
+      "lead": "ServerRpcHandler.getMessage (flow-server/src/main/java/com/vaadin/flow/server/communication/ServerRpcHandler.java:388-402) reads the entire RPC body into memory without an application-level size limit (64 KiB is only the read buffer and the hash truncation length).",
+      "reason": "Typical servlet containers cap POST size by default and the impact is availability-only; no source evidence of a missing framework-level limit relative to intended behavior. Unconfirmed lead."
+    },
+    {
+      "lead": "Client-side DOM sinks such as SystemErrorHandler.setInnerHTML (flow-client/src/main/java/com/vaadin/client/SystemErrorHandler.java:144-174) render server-provided error text as HTML in non-production mode.",
+      "reason": "The content is generated for the same client that triggered the error (self-XSS in debug mode); no cross-user attacker-controlled path could be demonstrated from source. Unconfirmed lead."
+    }
+  ],
+  "summary": "Reviewed the Vaadin Flow 1.3-SNAPSHOT source tree (1,352 files; 1,073 Java). I traced the main untrusted-input paths: servlet/UIDL/RPC handling (ServerRpcHandler, UidlRequestHandler, UidlWriter, MapSyncRpcHandler, PublishedServerEventHandlerRpcHandler), bootstrap-page generation (BootstrapHandler/BootstrapUtils/InitialPageSettings), stream resource and file-upload handling (StreamRequestHandler/StreamReceiverHandler/StreamResourceHandler), push (PushHandler/PushRequestHandler), servlet static/webjar serving, PWA handling, routing/Location, and the client-side Flow bindings. The core request-handling paths are generally hardened (CSRF check on RPC, random UUID security keys, Location `..` rejection, `<` escaping of the initial UIDL, PWA workbox path slash-stripping, quote stripping in PWA cache entries). The single strongest concrete defect I found is an unvalidated path in the production-build copy step: jar-entry names are used to build destination files without any normalization, so entries containing `../` write outside the intended output directory (classic Zip Slip, CWE-22). I report that as one candidate and list other plausible-but-unconfirmed leads separately."
+}

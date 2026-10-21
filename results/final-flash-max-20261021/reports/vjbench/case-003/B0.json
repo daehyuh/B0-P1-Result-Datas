@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any user or process able to influence a build's console output (typically a user with Job/Build, or code/SCM/parameter content echoed to the log) can emit the literal PREAMBLE ESC[8mha:, a length prefix, base64-encoded gzip data containing a serialized object, and the POSTAMBLE (ConsoleNote.PREAMBLE_STR/POSTAMBLE_STR, ConsoleNote.java:259-270). No server secret is needed for this path.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) I could not read hudson.remoting.ObjectInputStreamEx because the remoting artifact is external to the snapshot; if its 2-argument constructor already applies ClassFilter.DEFAULT internally, this would be defense-in-depth rather than a live gap. (2) ConsoleNote.readFrom does validate the ANSI preamble/postamble and wraps failures as IOException, but these are framing checks only, not class filtering. (3) The deserialized result is cast to ConsoleNote, but the object is fully constructed during readObject() beforehand. (4) Alternative hardening exists elsewhere in the tree (CLI Connection, XStream2 BlacklistedTypesConverter), which is consistent with an incomplete hardening sweep rather than proof of exploitability. No dynamic testing was performed.",
+      "id": "console-note-deserialization-missing-classfilter",
+      "impact": "Arbitrary code execution on the Jenkins controller with the privileges of the Jenkins JVM, escalating a build/log-write capability to full master compromise (and all secrets/jobs on it). The same missing-filter pattern in AnnotatedLargeText could allow tampering with annotator state if the AES-CBC (no MAC) blob could be forged, which is not demonstrated here.",
+      "locations": [
+        {
+          "end_line": 238,
+          "path": "core/src/main/java/hudson/console/ConsoleNote.java",
+          "start_line": 209
+        },
+        {
+          "end_line": 124,
+          "path": "core/src/main/java/hudson/console/ConsoleAnnotationOutputStream.java",
+          "start_line": 105
+        },
+        {
+          "end_line": 131,
+          "path": "core/src/main/java/hudson/console/AnnotatedLargeText.java",
+          "start_line": 115
+        },
+        {
+          "end_line": 115,
+          "path": "cli/src/main/java/hudson/cli/Connection.java",
+          "start_line": 111
+        },
+        {
+          "end_line": 464,
+          "path": "core/src/main/java/hudson/util/XStream2.java",
+          "start_line": 440
+        },
+        {
+          "end_line": 492,
+          "path": "core/pom.xml",
+          "start_line": 488
+        }
+      ],
+      "prerequisites": "(1) attacker can get bytes into a build log (build permission or influence over logged content); (2) the log is rendered as HTML, which calls AnnotatedLargeText.writeHtmlTo -> ConsoleAnnotationOutputStream.eol -> ConsoleNote.readFrom (ConsoleAnnotationOutputStream.java:109); (3) a gadget chain is present on the master classpath — core bundles commons-collections 3.2.1 (core/pom.xml:488-492) and deserialization uses pluginManager.uberClassLoader.",
+      "root_cause": "hudson.console.ConsoleNote.readFrom() (core/src/main/java/hudson/console/ConsoleNote.java:209-238) decodes a base64+gzip stream embedded in console output and passes it to a new ObjectInputStreamEx(..., uberClassLoader) using the 2-argument constructor (lines 226-227) with no ClassFilter, unlike the hardened call sites in this same tree (e.g. cli/src/main/java/hudson/cli/Connection.java:111-115 passes ClassFilter.DEFAULT; hudson.util.XStream2.BlacklistedTypesConverter uses ClassFilter.DEFAULT at XStream2.java:440-464). The doc comment at ConsoleNote.java:104-106 ('ConsoleNotes that failed to deserialize will be simply ignored') reflects that side effects of deserialization are not considered, but readObject() executes gadget code before any type check/cast. The same missing-filter pattern exists in AnnotatedLargeText.createAnnotator() (core/src/main/java/hudson/console/AnnotatedLargeText.java:115-131, header X-ConsoleAnnotator), though that blob is AES-encrypted with a server key, so ConsoleNote is the directly attacker-writable path.",
+      "title": "Untrusted Java deserialization of console-note payloads without ClassFilter (console output -> RCE on master)",
+      "trace": "Build writes PREAMBLE + base64(gzip(serialized gadget)) + POSTAMBLE to stdout -> stored in build log file -> user requests console/progressive HTML -> AnnotatedLargeText.writeHtmlTo creates ConsoleAnnotationOutputStream -> eol() finds the preamble and calls ConsoleNote.readFrom() -> ObjectInputStreamEx.readObject() (no filter) -> gadget readObject() executes -> RCE as the Jenkins master process. The attacker can trigger the render themselves, so no victim interaction is required.",
+      "unverified": "The exact semantics of remoting 2.53.4's two-argument ObjectInputStreamEx constructor (whether it defaults to ClassFilter.DEFAULT) could not be verified from this snapshot; the presence of the explicit ClassFilter.DEFAULT argument in Connection.readObject and the BlacklistedTypesConverter in XStream2 indicates the filter is intended to be passed explicitly. Gadget-chain availability is inferred from the bundled commons-collections 3.2.1 dependency, not executed.",
+      "weakness_type": "CWE-502: Deserialization of Untrusted Data"
+    }
+  ],
+  "coverage_summary": "All 8,829 model-visible files were in scope (no excluded paths/symlinks/binaries). I enumerated the tree (core 8,318 files, plus cli, war, plugins, root poms) and read the security-relevant areas: hudson/console (ConsoleNote, AnnotatedLargeText, ConsoleAnnotationOutputStream, ConsoleAnnotator), hudson/cli (CLIAction, CliManagerImpl, CliProtocol2, CLICommand, command-level permission checks), hudson/security (SecurityRealm, HudsonPrivateSecurityRealm, ACL/SidACL/SparseACL, csrf CrumbFilter/DefaultCrumbIssuer, AuthenticationProcessingFilter2, HudsonAuthenticationEntryPoint, TokenBasedRememberMeServices2, BCrypt), hudson/model (DirectoryBrowserSupport, ItemGroupMixIn, User, Views, UpdateSite, DownloadService/JSONSignatureValidator), hudson/util (XStream2, Secret), jenkins/model (Jenkins doLoginEntry/doScript areas, ApiTokenProperty), jenkins/security (ClassFilter usages, ConfidentialKey/CryptoConfidentialKey, s2m), hudson/FilePath archive extraction, plus literal searches for deserialization sinks, redirects, permission checks, and SECURITY-* markers. Test sources are not present in the snapshot.",
+  "limitations": [
+    "The hudson.remoting (2.53.4), stapler, and XStream libraries are external dependencies not included in the snapshot; their exact filtering behavior (especially ObjectInputStreamEx's 2-argument constructor) could not be inspected, which is the main uncertainty for the selected candidate.",
+    "No git history or upstream reference is available, so I could not diff against fixed releases to confirm which specific fix commit this snapshot precedes.",
+    "No code execution, tests, or scanners were run; the finding is static source evidence only and is a lead, not a runtime-confirmed vulnerability.",
+    "Literal text search cannot prove absence of other issues in 8,800+ files; View/Jelly/XSS surfaces and war webapp resources were sampled rather than exhaustively reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Open redirect in jenkins/model/Jenkins.java doLoginEntry (lines 3173-3177): from=//evil.example satisfies the from.startsWith(\"/\") check and sendRedirect2 issues a scheme-relative Location, contradicting the 'make sure the URL falls into this domain' comment.",
+      "reason": "Real but lower impact (phishing/user-interaction) and the method's javadoc says it is used only by LegacySecurityRealm; the codebase already has Util.isSafeToRedirectTo used in the other redirect paths, so this is a plausible second issue but not the strongest."
+    },
+    {
+      "lead": "hudson/util/XStream2.java relies on BlacklistedTypesConverter (a deny-list via ClassFilter.DEFAULT) for XML deserialization used by job/view/node config submission (e.g. ItemGroupMixIn.createProjectFromXML, View.createViewFromXML).",
+      "reason": "Deny-list-only filtering is a hardening gap, but no concrete escaping gadget/class was identified from source, and config submission requires Item.CREATE/CONFIGURE. Speculative without a concrete chain."
+    },
+    {
+      "lead": "FilePath.readFromTar/unzip (core/src/main/java/hudson/FilePath.java:575-608, 2273-2308) extracts archive entries via new File(base, entryName) without an explicit canonical-path containment check.",
+      "reason": "Standard archive-slip shape, but the callers extract trusted artifacts (tool/agent installers, signed plugins) and no attacker-controlled archive path to unzipFrom was identified in this snapshot; not selected."
+    },
+    {
+      "lead": "AnnotatedLargeText X-ConsoleAnnotator header deserialization without ClassFilter.",
+      "reason": "Same root-cause family as the selected candidate, but the blob is AES-encrypted with a server-side key (CryptoConfidentialKey 'AES', CryptoConfidentialKey.java:75) and replay-bounded, so direct attacker control was not established; kept as part of the single candidate's context instead of a separate finding."
+    }
+  ],
+  "summary": "Reviewed the Jenkins core snapshot (version 1.625.4-SNAPSHOT; core + cli + war modules, 8,829 files, no test sources present). Broad tracing of attacker-controlled input to sinks (deserialization, path handling, redirects, permission checks, CSRF, update-center signature checks) yielded one strongest candidate: the console-note rendering path performs Java deserialization of attacker-influenced console output without the ClassFilter used elsewhere in the same codebase. An open redirect in doLoginEntry and the deny-list-only XStream filtering are noted as weaker/rejected leads."
+}

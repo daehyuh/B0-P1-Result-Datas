@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The S3 object key in the request path (path[2] after routing) of GET/HEAD/PUT/DELETE requests, and the source object name in the x-amz-copy-source header (handleCopyBlob/handleCopyPart split that header into container/blob without validation). Any remote client that can reach the handler controls these strings, including the characters %2F and '..' (or literal '../' segments).",
+      "confidence": "medium",
+      "counterevidence_checked": "No normalize()/toRealPath()/startsWith(root)/'..' check exists anywhere in the repository, and no key validation exists in S3ProxyHandler (isValidContainer applies only to path[1]). The only root-prefix comparison is in the directory-listing helper (AbstractNio2BlobStore line 233) and is not applied to blob operations. Quirks.NO_BLOB_ACCESS_CONTROL excludes filesystem-nio2, so anonymous reads are gated by the target file's permission bits (which is why a traversal target such as a world-readable system file passes checkPublicAccess). transient-nio2 uses Jimfs, so the same '..' handling stays inside the in-memory filesystem (no host impact). Container cannot be '..' because isValidContainer rejects names starting/ending with '.', so the traversal must travel through the key. Content-length/decoded-content-length checks in handlePutBlob/handleUploadPart do not affect path construction. I could not execute the server to confirm Jetty's exact getRequestURI() output; the literal '../../' variant does not depend on %2F support at all.",
+      "id": "nio2-filesystem-key-path-traversal",
+      "impact": "Confidentiality: arbitrary file read (and metadata/HEAD disclosure, plus existence probing) for files the S3Proxy process can read, without credentials when the target file is world-readable and authentication is enabled, or unauthenticated for all operations when s3proxy.authorization=none. Integrity/availability: attacker-controlled creation/overwrite of arbitrary files (Files.newOutputStream + Files.move REPLACE_EXISTING) and deletion of arbitrary files reachable by the process, plus chmod through setBlobAccess. Writing files the service account consumes (e.g. its own authorized_keys, shell profiles, unit/scheduled files) can lead to code execution as the S3Proxy user; removeEmptyParentDirectories can also delete empty directories above the basedir. The same unvalidated key is additionally used via the x-amz-copy-source header path.",
+      "locations": [
+        {
+          "end_line": 348,
+          "path": "src/main/java/org/gaul/s3proxy/nio2blob/AbstractNio2BlobStore.java",
+          "start_line": 341
+        },
+        {
+          "end_line": 533,
+          "path": "src/main/java/org/gaul/s3proxy/nio2blob/AbstractNio2BlobStore.java",
+          "start_line": 525
+        },
+        {
+          "end_line": 698,
+          "path": "src/main/java/org/gaul/s3proxy/nio2blob/AbstractNio2BlobStore.java",
+          "start_line": 692
+        },
+        {
+          "end_line": 807,
+          "path": "src/main/java/org/gaul/s3proxy/nio2blob/AbstractNio2BlobStore.java",
+          "start_line": 765
+        },
+        {
+          "end_line": 474,
+          "path": "src/main/java/org/gaul/s3proxy/S3ProxyHandler.java",
+          "start_line": 471
+        },
+        {
+          "end_line": 818,
+          "path": "src/main/java/org/gaul/s3proxy/S3ProxyHandler.java",
+          "start_line": 811
+        },
+        {
+          "end_line": 94,
+          "path": "src/main/java/org/gaul/s3proxy/S3Proxy.java",
+          "start_line": 92
+        }
+      ],
+      "prerequisites": "Deployment uses the filesystem-nio2 provider (jclouds.provider=filesystem-nio2 with jclouds.filesystem.basedir; README lists it as a preview on-disk backend) and at least one container exists (isValidContainer passes and containerExists() is true). Reads: with s3proxy.authorization=none every GET is unauthenticated; with authentication enabled, unauthenticated GET/HEAD still take the doHandleAnonymous path, and because Quirks.NO_BLOB_ACCESS_CONTROL does not contain filesystem-nio2, checkPublicAccess() -> getBlobAccess() evaluates the POSIX OTHERS_READ bit of the *target* file, so world-readable files outside the basedir are disclosed. Writes/deletes/ACL changes require the configured credential (or authorization=none). No runtime execution was performed.",
+      "root_cause": "AbstractNio2BlobStore never normalizes or confines the caller-supplied key. Every operation builds the target path as root.resolve(container).resolve(key) (writes also build a sibling temp path the same way) and then calls Files.newInputStream/Files.newOutputStream/Files.move/Files.delete/Files.get|setPosixFilePermissions on it, so a key containing '..' segments walks out of the basedir. Containers are validated by S3ProxyHandler.isValidContainer (so the container cannot be '..'), but S3ProxyHandler validates no key at all, and it decodes each URI segment after splitting the raw request URI on '/', meaning a key can contain '/' plus '..' (literal '../..' or percent-encoded %2e%2e/%2F; Jetty is deliberately configured with UriCompliance.LEGACY, which accepts ambiguous/encoded path separators and preserves the raw path in getRequestURI()).",
+      "title": "filesystem-nio2 blob store resolves attacker-controlled keys with ../ outside the configured basedir (arbitrary file read/write/delete)",
+      "trace": "S3ProxyHandler.doHandle: uri = request.getRequestURI() (line 293) -> servicePath stripped (296-300) -> path = uri.split(\"/\", 3) then URLDecoder.decode(path[i]) (471-474) -> dispatch passes path[2] to handleGetBlob/handleBlobMetadata/handlePutBlob/handleBlobRemove/handleSetBlobAcl (673-766) or, unauthenticated, to doHandleAnonymous GET (811-818) -> AbstractNio2BlobStore.getBlob builds root.resolve(container).resolve(key) (347) and opens it (413); putBlob builds root.resolve(container).resolve(name) and tmpPath (531/533) and moves over the target (603); removeBlob builds containerPath.resolve(key) and Files.delete()s it (695-697); getBlobAccess/setBlobAccess resolve the same key for POSIX permission read/modification (774/794). Path resolution by the OS follows the '..' components, so the file operated on is outside root.",
+      "unverified": "Not runtime-confirmed. Jetty internals were reasoned from the explicit UriCompliance.LEGACY/HttpCompliance.LEGACY configuration and from the handler's own decode-after-split logic; a front proxy or different embedding that normalizes/rejects '..' and %2F could break the encoded variant (the literal '..' segment variant would still pass through). Whether the maintainers consider basedir escape in scope for the preview filesystem-nio2 backend is unknown; dependency behavior (Jetty, jclouds) is outside this snapshot.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Scope was the 64 readable files reported by get_source_scope: pom/Dockerfile/docs/CI plus all src/main Java sources (no test sources are included). I read S3ProxyHandler, AwsSignature, S3AuthorizationHeader, S3Proxy, Main, all middlewares (Alias, Regex, Sharded, Eventual, Null, ReadOnly, StorageClass, UserMetadataReplacer, EncryptedBlobStore), the crypto package, Quirks, CORS, the full nio2 backend (Abstract/Filesystem/Transient) and the Azure SDK backend, and skimmed the junit helpers. Search passes for '..', normalize, isValidBlob, ProcessBuilder, openConnection, FromUrl, and credential/password/admin literals found no other attacker-controlled sink of comparable strength. Binary files, tests, and dependency internals (Jetty/jclouds) are outside the snapshot.",
+  "limitations": [
+    "No code was executed; all conclusions are static source analysis (no runtime confirmation of Jetty URI handling or filesystem behavior).",
+    "No test sources were in scope, so I could not compare intended key semantics against test expectations.",
+    "Jetty 11 getRequestURI()/URI-compliance behavior is inferred from the configuration in this snapshot (UriCompliance.LEGACY) and the handler's post-split URL decoding, not from the dependency source.",
+    "The filesystem-nio2 provider is a non-default, preview backend; exploitability depends on deployment configuration (basedir, authorization mode, whether a container already exists).",
+    "Other S3 operations (multipart parts, copy part, POST policy) share unvalidated key handling and were folded into the single candidate rather than reported separately."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ChunkedInputStream does not verify per-chunk AWS signatures and allocates new byte[currentLength] from attacker-supplied hex (ChunkedInputStream.java 47-60); parts[1] also indexes without bounds.",
+      "reason": "Impact is limited to integrity of an already-authenticated upload plus memory/CPU DoS, and the code marks it as a known TODO (issue #205 reference); it does not cross an authorization or filesystem boundary like the path traversal does."
+    },
+    {
+      "lead": "Signature verification is skipped for OPTIONS requests (S3ProxyHandler.java 613-617).",
+      "reason": "OPTIONS always dispatches to handleOptionsBlob (CORS preflight) at lines 767-769, so the observable effect is container-existence probing rather than data access; the skip is also required for browser preflight."
+    },
+    {
+      "lead": "handlePostBlob verifies only HMAC(policy) and never enforces the POST policy's conditions/expiry/bucket/key (S3ProxyHandler.java 2049-2184).",
+      "reason": "The signer must already hold the S3Proxy credential, README explicitly lists POST upload policies as unsupported, and the form-based identity still has to resolve through blobStoreLocator; plausible hardening gap but weaker evidence and impact."
+    },
+    {
+      "lead": "Configurable CORS with allow-all origins/headers and allow-credentials (CrossOriginResourceSharing, S3Proxy.java 270-308).",
+      "reason": "Configuration-dependent browser-side behavior, not a server-side source vulnerability; no credential-bearing cross-origin read demonstrated."
+    },
+    {
+      "lead": "EncryptedBlobStore/crypto uses AES/CFB/NoPadding without a MAC and trusts the 64-byte padding trailer to decide whether a blob is encrypted (Decryption.java 57-78).",
+      "reason": "Design limitation of the optional encrypted-blobstore middleware; exploitation requires the ability to modify stored ciphertext, which the traversal candidate already covers more directly."
+    },
+    {
+      "lead": "Anonymous requests with bucket-locator/multiple backends are always served by defaultBlobStore (S3ProxyHandler.java 210-211, 346-355).",
+      "reason": "Looks like the upstream 'TODO: hack to allow per-request anonymous access'; impact depends on specific multi-backend public-bucket configurations and was not resolved to a concrete disclosure chain."
+    }
+  ],
+  "summary": "Reviewed the 64-file s3proxy snapshot (all main sources; no test sources are present in scope). The strongest finding is a path-traversal in the filesystem-nio2 backend: blob keys are turned into filesystem paths with root.resolve(container).resolve(key) and no normalization/containment check, while S3ProxyHandler hands the store URL-decoded keys (it splits the raw request URI on \"/\" and then URL-decodes each segment), so a key can carry \"../\" and escape the configured basedir for get/put/delete/metadata/ACL and copy-source operations. Other reviewed areas (SigV2/V4 verification, anonymous access routing, CORS, middlewares, EncryptedBlobStore, Azure SDK backend) did not yield a comparably strong, source-evidenced issue."
+}

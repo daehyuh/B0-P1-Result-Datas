@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "HTTP cookie names and values are fully attacker-controlled by any direct HTTP client (Cookie request header). CookieInterceptor.intercept iterates request cookies (line 218-224) and, when the configured `cookiesName` set contains `*` (documented configuration, lines 46-48/153-154), passes any cookie name to isAcceptableName. With the weak default pattern, `class.classLoader...`-style names are accepted; cookie values are likewise attacker-controlled and are written via `stack.setValue` when `cookiesValue` is empty (default) or `*`/attacker-known.",
+      "confidence": "high",
+      "counterevidence_checked": "Verified that acceptedPattern really accepts `class.classLoader` (all chars in [a-zA-Z0-9.]), and that ExcludedPatterns.CLASS_ACCESS_PATTERN would reject it (alternation `^` + `class` + `.`). Checked that no other layer compensates: (1) SecurityMemberAccess.isAccessible only enforces static-method rules plus empty accept/exclude sets for the action stack (empty sets -> isExcluded(isAccepted) return false/true respectively, so props are allowed); (2) ParametersInterceptor's hardcoded exclusions (ExcludedPatterns.EXCLUDED_PATTERNS added in initializeHardCodedExcludePatterns, lines 502-507) are applied only to its own new stack; (3) OgnlUtil's eval-expression check only blocks ${}/%{} eval chains, not dotted expressions; (4) defaultStack does not include the cookie interceptor, so the bug is configuration-gated; (5) acceptedPattern does block several OGNL metacharacters (#, @, (, ), *, =, comma), so only property-path expressions, not method calls, are available. The removed check is documented by the in-file `// Patch:` comment and by ExcludedPatterns' Javadoc reference to CookieInterceptor.",
+      "id": "case-028-cand-1",
+      "impact": "Remote, unauthenticated OGNL expression injection restricted to property navigation/setters. Attacker can overwrite properties reachable from the action class's ClassLoader (e.g., servlet-container/access-log/internal objects), which historically leads to remote code execution or at least persistent tampering of classloader/action state; also writes attacker-controlled names/values into the CookiesAware cookies map. This is the same impact class as the fixed class-loader parameter/cookie vulnerabilities (S2-020/S2-022 family).",
+      "locations": [
+        {
+          "end_line": 250,
+          "path": "core/src/main/java/org/apache/struts2/interceptor/CookieInterceptor.java",
+          "start_line": 247
+        },
+        {
+          "end_line": 176,
+          "path": "core/src/main/java/org/apache/struts2/interceptor/CookieInterceptor.java",
+          "start_line": 170
+        },
+        {
+          "end_line": 238,
+          "path": "core/src/main/java/org/apache/struts2/interceptor/CookieInterceptor.java",
+          "start_line": 222
+        },
+        {
+          "end_line": 287,
+          "path": "core/src/main/java/org/apache/struts2/interceptor/CookieInterceptor.java",
+          "start_line": 261
+        },
+        {
+          "end_line": 20,
+          "path": "xwork-core/src/main/java/com/opensymphony/xwork2/ExcludedPatterns.java",
+          "start_line": 4
+        },
+        {
+          "end_line": 178,
+          "path": "xwork-core/src/main/java/com/opensymphony/xwork2/ognl/OgnlValueStack.java",
+          "start_line": 147
+        },
+        {
+          "end_line": 235,
+          "path": "xwork-core/src/main/java/com/opensymphony/xwork2/ognl/OgnlUtil.java",
+          "start_line": 225
+        },
+        {
+          "end_line": 314,
+          "path": "core/src/main/resources/struts-default.xml",
+          "start_line": 288
+        }
+      ],
+      "prerequisites": "Application must include the optional `cookie` interceptor (defined at struts-default.xml:160; it is NOT part of defaultStack at lines 288-314) on a reachable action, with `cookiesName` containing `*` or the crafted name, and cookiesValue empty/`*`/known. For the strongest impact (RCE) the deployment must expose settable classloader members (e.g., servlet-container classloaders such as Tomcat); otherwise the primitive still yields arbitrary OGNL property writes on the value stack/action (and the cookies map for CookiesAware actions).",
+      "root_cause": "In CookieInterceptor.isAcceptableName (core/src/main/java/org/apache/struts2/interceptor/CookieInterceptor.java:247-250) the only check performed is `acceptedPattern.matcher(name).matches()`, whose default pattern is `[a-zA-Z0-9\\.\\]\\[_'\\s]+` (line 170/176). That pattern allows pure letter/dot/bracket/quote names, so names such as `class.classLoader.<property>` or `class['classLoader'].<property>` pass. The line that would reject such names is commented out (`// Patch: return !Pattern.compile(ExcludedPatterns.CLASS_ACCESS_PATTERN).matcher(name).matches();`), and the class no longer imports/uses `ExcludedPatterns` at all, even though ExcludedPatterns.java's own Javadoc (xwork-core/.../ExcludedPatterns.java:4-5) says its patterns are used 'partially in CookInterceptor'. The accepted cookie name is later used directly as an OGNL expression: populateCookieValueIntoStack (lines 261-287) calls `stack.setValue(cookieName, cookieValue)` (lines 274/285).",
+      "title": "CookieInterceptor accepts class-loader OGNL expressions as cookie names (missing CLASS_ACCESS_PATTERN rejection)",
+      "trace": "Request Cookie header -> CookieInterceptor.intercept (line 226 isAcceptableName) -> isAcceptableName returns true for `class.classLoader...` because acceptedPattern `[a-zA-Z0-9\\.\\]\\[_'\\s]+` matches dots/letters (line 249) -> populateCookieValueIntoStack -> stack.setValue(cookieName, cookieValue) (line 274/285) -> OgnlValueStack.setValue (156-158) -> OgnlUtil.setValue -> Ognl.setValue parses the cookie name as an OGNL expression against the CompoundRoot (225-235) -> `class` resolves to the action's Class via Object.getClass, `.classLoader` via Class.getClassLoader, and the remaining dotted path sets properties on container classloader objects (the well-known class-loader manipulation vector). OgnlUtil.setValue at lines 229-233 only blocks `${...}`/`%{...}` eval chains when enableEvalExpression=false; a plain dotted expression such as `class.classLoader...` is unaffected. The action's main value stack used here has empty SecurityMemberAccess exclude/accept property sets and no PropertiesJudge (they are only populated on the throwaway stack created inside ParametersInterceptor, lines 299-328), and ParametersInterceptor's ExcludedPatterns list is never applied to this path.",
+      "unverified": "Runtime behavior not executed or compiled (no tests exist in the snapshot). The exact upstream fixed form (CLASS_ACCESS check alone vs. conjunction with acceptedPattern) cannot be confirmed offline, but either way the class-access rejection is absent from the executable code. Concrete RCE depends on deployment/container (settable classloader members) and on the cookie interceptor being configured as described; only the property-injection primitive itself is source-verified. OGNL library version and its exact member-access behavior at runtime were not audited.",
+      "weakness_type": "Improper input validation / OGNL expression injection (externally controlled input used to select code/class-loader members), CWE-470/CWE-917 class"
+    }
+  ],
+  "coverage_summary": "Source scope: 2,841 files (Apache Struts 2.3.16.2-SNAPSHOT tree: core, xwork-core, apps, plugins, bundles, archetypes, assembly, poms). P1 relation index reports index_status complete, 2,841/2,841 files indexed, 0 missing, 35,035 edges / 17,989 symbols, and no SAST/findings loaded; it is syntactic navigation only. Deep review concentrated on request-to-OGNL paths and security controls: ParametersInterceptor + ExcludedPatterns, SecurityMemberAccess/MemberAccessValueStack, OgnlValueStack/OgnlUtil, CookieInterceptor, DefaultActionMapper/RestActionMapper, FileUploadInterceptor/multipart, DebuggingInterceptor, DefaultStaticContentLoader/PrepareOperations, URL/ServletUrlRenderer helpers, and spot checks of the REST, XSLT-era, and convention plugins. No tests exist in the snapshot; no build, test, or scanner was executed.",
+  "limitations": [
+    "Static review only: no compilation, execution, dependency resolution, or runtime verification; no exploit was attempted.",
+    "The P1 index is syntactic and does not prove data flow, reachability, or exploitability; every cited edge was verified against source text instead.",
+    "No upstream Git history or fixed revision is available in the snapshot, so the removed-vs-original nature of the CookieInterceptor check was inferred from the in-file '// Patch:' comment, the ExcludedPatterns Javadoc reference, and regex analysis rather than a diff.",
+    "Only ~2,800 files were visible; plugins (~1,197 files) and app/archetype code were spot-checked rather than exhaustively reviewed, and external dependencies (OGNL, XStream, servlet container classes) were not audited.",
+    "Exploitability of the cookie-name OGNL injection depends on deployment configuration (cookie interceptor present with cookiesName='*' or matching name) and on settable classloader/container members; those runtime conditions were not confirmed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "REST plugin XStreamHandler.toObject deserializes request bodies with an unrestricted `new XStream()` (plugins/rest/src/main/java/org/apache/struts2/rest/handler/XStreamHandler.java:43-50).",
+      "reason": "Genuine design weakness of the era, but it is the plugin's normal upstream implementation rather than an anomalous/removed check, exploitability depends on the external XStream version and available gadgets, and it is not the strongest source-evidenced defect found. Left unconfirmed; requires the REST plugin plus an XML content type."
+    },
+    {
+      "lead": "DebuggingInterceptor 'command' mode evaluates attacker-supplied OGNL (`stack.findValue(cmd)`) with output to the response (core/src/main/java/org/apache/struts2/interceptor/debugging/DebuggingInterceptor.java:189-210).",
+      "reason": "Requires devMode (struts.devMode=true) and the debug parameter path; this is documented debug functionality in this version rather than an obvious injected control removal. Not selected."
+    },
+    {
+      "lead": "FileUploadInterceptor.hasAllowedExtension uses filename.toLowerCase().endsWith(extension) without a dot boundary (core/.../FileUploadInterceptor.java:391-404).",
+      "reason": "Weakness depends on operator-supplied allowed-extension configuration and is upstream behavior; no anomalous change or direct attacker-controlled bypass of a default control was identified."
+    },
+    {
+      "lead": "DefaultStaticContentLoader static resource serving and DefaultActionMapper action-name cleaning.",
+      "reason": "Inspected; the resource-path ending check (DefaultStaticContentLoader.java:181-200) and allowedActionNames cleanup (DefaultActionMapper.java:383-400) are present and consistent with the hardened design. No bypass identified."
+    },
+    {
+      "lead": "ParametersInterceptor / ExcludedPatterns hardcoded exclusions.",
+      "reason": "The S2-020/021-style hardening is intact (constructor initializes ExcludedPatterns.EXCLUDED_PATTERNS; setExcludeParams adds rather than replaces, lines 502-521); no defect found in this path."
+    }
+  ],
+  "summary": "Reviewed the Apache Struts 2.3.16.2-SNAPSHOT source tree (2,841 files; P1 index reports complete coverage of all 2,841 files). Focus was on framework trust boundaries where request-controlled data reaches OGNL/value-stack evaluation: ParametersInterceptor/ExcludedPatterns, SecurityMemberAccess/OgnlValueStack/OgnlUtil, CookieInterceptor, action mappers, multipart/static-content handling, and selected plugins. The strongest source-evidenced defect is in CookieInterceptor: the cookie-name guard `isAcceptableName` was reduced to the permissive `acceptedPattern` check, and the class-access rejection (`ExcludedPatterns.CLASS_ACCESS_PATTERN`) that the surrounding code/Javadoc show should also apply is present only as a \"// Patch:\" comment. Because the default pattern permits dotted letter names, an attacker-controlled cookie name such as `class.classLoader...` is accepted and then passed to `ValueStack.setValue`, i.e., evaluated as an OGNL expression on the action's value stack, enabling classloader/property manipulation (the historical class-loader OGNL-injection impact, including container-dependent RCE). The finding requires the application to include the (non-default) cookie interceptor with `cookiesName` containing `*` (or the crafted name). One candidate submitted; other leads listed as rejected/unconfirmed."
+}

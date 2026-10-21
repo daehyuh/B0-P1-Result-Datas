@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any SSH client that completes authentication with the server controls all forwarding requests: it chooses the global `tcpip-forward` requests (client `-R`) and `direct-tcpip` channel-open requests (client `-L`), including bind addresses, ports and connection targets.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified `TcpForwardingFilter.canListen` is documented as 'the session may listen for inbound connections' and `canConnect` as 'the session may create an outbound connection' (TcpForwardingFilter.java lines 52-68 and 136-153); verified the only caller tying `tcpip-forward` to the filter is `DefaultForwarder.localPortForwardingRequested` -> `canListen` and the only caller tying `direct-tcpip` to the filter is `TcpipServerChannel.doInit` -> `canConnect(Direct, ...)`, with no local/remote swap elsewhere; verified `AllowTcpForwardingValue` is the sole `TcpForwardingFilter` implementation and is only reached from server config parsing; verified `ALL`/`NONE` are correct and that `docs/technical/tcpip-forwarding.md` defines local forwarding as client `-L` and remote forwarding as client `-R`. Counter-hypothesis that MINA intentionally defines these values from the client's perspective was considered: that would make the values correct for a client-side filter but they are placed in and used by server-side `sshd_config` parsing (`org.apache.sshd.server.config`), contradicting the cited OpenSSH semantics.",
+      "id": "allow-tcp-forwarding-value-direction-inversion",
+      "impact": "Authorization-policy bypass: with the restrictive `AllowTcpForwarding local` setting, any authenticated user can still compel the SSH server to bind TCP listening sockets (potentially on wildcard/all interfaces, subject to OS permissions) and tunnel inbound connections back to the client, enabling firewall/NAT traversal and exposure of services in the server network. With `AllowTcpForwarding remote`, the server will instead open outbound connections to arbitrary hosts chosen by the client, providing a pivot into networks reachable only from the server. In both cases the capability the operator believed disabled remains enabled, while the capability the operator expected to allow is broken.",
+      "locations": [
+        {
+          "end_line": 79,
+          "path": "sshd-core/src/main/java/org/apache/sshd/server/config/AllowTcpForwardingValue.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 68,
+          "path": "sshd-core/src/main/java/org/apache/sshd/server/forward/TcpForwardingFilter.java",
+          "start_line": 52
+        },
+        {
+          "end_line": 153,
+          "path": "sshd-core/src/main/java/org/apache/sshd/server/forward/TcpForwardingFilter.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 73,
+          "path": "sshd-core/src/main/java/org/apache/sshd/server/global/TcpipForwardHandler.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 190,
+          "path": "sshd-core/src/main/java/org/apache/sshd/server/forward/TcpipServerChannel.java",
+          "start_line": 155
+        },
+        {
+          "end_line": 134,
+          "path": "sshd-core/src/main/java/org/apache/sshd/server/config/SshServerConfigFileReader.java",
+          "start_line": 129
+        }
+      ],
+      "prerequisites": "The server is configured with the granular policy `AllowTcpForwarding local` or `AllowTcpForwarding remote` (e.g. `-o AllowTcpForwarding=local` or via `SshServerConfigFileReader.resolveTcpForwardingFilter`) and the client is authenticated. `yes`/`all` and `no`/`none` are unaffected.",
+      "root_cause": "In `AllowTcpForwardingValue`, `LOCAL` returns `canListen = true` (server accepts client `tcpip-forward` requests and binds listening sockets) and `canConnect = false` (server rejects client `direct-tcpip` channel opens, i.e. client local forwarding), while `REMOTE` returns the exact mirror image (`canListen = false`, `canConnect = true`). Per `sshd_config(5)` (the man page the file itself cites) and per the `TcpForwardingFilter` javadoc in the same snapshot, `local` must allow only `direct-tcpip` (server connects out) and `remote` must allow only `tcpip-forward`/listeners. The granular values are therefore inverted; only `yes`/`all` and `no`/`none` behave as documented.",
+      "title": "AllowTcpForwarding 'local'/'remote' policies are mapped to the opposite forwarding directions",
+      "trace": "1) `AllowTcpForwarding=<value>` is parsed by `SshServerConfigFileReader.resolveTcpForwardingFilter` (lines 129-134) into `AllowTcpForwardingValue`. 2) For a client `-R` (remote forwarding) the server's `TcpipForwardHandler.process` (lines 61-73) builds an `SshdSocketAddress` and calls `forwarder.localPortForwardingRequested(...)`, which in `DefaultForwarder` (lines 658-670) consults `filter.canListen(...)` and, if true, binds a listening socket (`doBind`, line 682). With `AllowTcpForwarding local` the inverted mapping returns `canListen=true`, so the server binds and accepts inbound connections that the administrator intended to forbid. 3) For a client `-L` (local forwarding) the server receives a `direct-tcpip` channel open; `TcpipServerChannel.doInit` (lines 155-190) consults `filter.canConnect(Type.Direct, ...)` and denies the channel when false. With `AllowTcpForwarding local` the inverted mapping returns `canConnect=false`, so the operation the administrator intended to permit is refused. `AllowTcpForwarding remote` produces the mirror-image behavior (outbound connections permitted, listeners denied).",
+      "unverified": "No runtime/configuration test was executed, so the end-to-end behavior was not observed; the upstream history could not be inspected to determine whether this mapping is the original upstream code or a local regression, and if MINA deliberately defines `local`/`remote` from the client's perspective the practical impact would be a functional mismatch rather than a policy bypass. Only the enumeration constant bodies were traced; deployment code that swaps the values before installing the filter was not found but cannot be fully excluded.",
+      "weakness_type": "CWE-863 Incorrect Authorization (server-side forwarding policy bypass)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 1110 model-visible source files, no over-size/sensitive-name/symlink exclusions and binary NUL-byte filtering only. I reviewed the whole-file inventory and read/traced security-relevant code across sshd-common (host-key provider, key/certificate parsing, Buffer/Signature/KeyUtils, RootedFileSystemProvider, IO helpers), sshd-core (session/KEX handling, user authentication, public-key/certificate paths, forwarding filters, TCP/IP forward handlers, SFTP-in-core helpers), sshd-scp (ScpCommand, ScpHelper, resolvers/opener), sshd-sftp (server subsystem helper and SftpSubsystem, file accessor), sshd-cli, sshd-git, sshd-contrib, sshd-ldap and sshd-spring-sftp. Test sources are not present in the snapshot, so behavior could not be cross-checked against unit tests.",
+  "limitations": [
+    "Read-only review with no execution: no build, unit test, or runtime forwarding negotiation was performed, so the finding is not runtime-confirmed.",
+    "Not every one of the 1110 files was read line-by-line; coverage prioritized authentication, key exchange, forwarding policy, filesystem confinement, SCP/SFTP file operations and configuration parsing.",
+    "Upstream repository history, tags and later fixes were not available, so it was not possible to determine whether the inverted mapping is original upstream code or a snapshot-local regression, nor to compare against the fixed version.",
+    "Tests are excluded from the visible snapshot, removing a useful source of intended-behavior evidence for AllowTcpForwarding semantics.",
+    "Synthetic or generated code variations cannot be ruled out; only textual/structural evidence in this snapshot was used."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Legacy host-key Java deserialization (GH-229 / CVE-2022-45047)",
+      "reason": "`SimpleGeneratorHostKeyProvider` already wraps `ObjectInputStream` in a `ValidatingObjectInputStream` that only resolves an allow-list of classes (`resolveClass` at lines 145-155) and writes keys in OpenSSH format, so the known deserialization vector appears mitigated in this snapshot."
+    },
+    {
+      "lead": "Missing OpenSSH strict-KEX support (CVE-2023-48795 / Terrapin)",
+      "reason": "No `kex-strict-c/s-v00@openssh.com` handling exists anywhere in the tree, so sessions are theoretically open to prefix truncation when using affected ciphers/MACs. This is a protocol-capability absence spread across KEX proposal/session handling rather than a localized source defect, and packet-sequence handling was not verifiable without runtime negotiation; weaker and less localizable than the chosen candidate."
+    },
+    {
+      "lead": "SCP receive path lacks explicit containment checks for peer-supplied file names",
+      "reason": "`LocalFileScpTargetStreamResolver.resolveTargetStream` (lines 71-89) and `ScpFileOpener.resolveIncomingFilePath` (lines 72-118) join the peer-supplied `name` onto the target directory without an explicit `normalize()/startsWith(root)` guard, so names containing `..` or absolute paths are a plausible traversal vector. No corroborating TODO/known-fix marker exists and the code matches the project's long-standing behavior, so it stayed a rejected lead."
+    },
+    {
+      "lead": "Certificate CA/trusted-user-CA verification",
+      "reason": "`UserAuthPublicKey.doAuth` (lines 95-116) contains a TODO stating that the certificate CA key is not validated against authorized_keys/TrustedUserCAKeys. This is explicitly documented incomplete functionality in the snapshot, and the certificate signature is verified for host certificates (`DHGClient.verifyCertificate`); exploiting it requires a trusted-key-setup assumption, so it was not selected."
+    },
+    {
+      "lead": "Dependency-level weaknesses (e.g. logback 1.2.11, spring 5.3.20, jgit 5.13.0)",
+      "reason": "Version pinning was noted in pom.xml, but dependency CVEs are outside the repository's own source logic and could not be validated from the snapshot."
+    }
+  ],
+  "summary": "Repository is Apache MINA sshd at a ~2.9.2/2.10.0-development snapshot (pom version 2.9.2; CHANGES.md \"Planned for next version\" ends at SSHD-1307/GH-266). I reviewed the security-relevant paths around KEX/host-key handling, server authentication, forwarding filters, virtual/rooted filesystems, SCP receive paths, SFTP server path handling and key/certificate parsing. The strongest source-level finding is an authorization-policy inversion in AllowTcpForwardingValue: the `local`/`remote` values map to the opposite forwarding directions from the OpenSSH `sshd_config(5)` semantics that the class itself references, so a restrictive `AllowTcpForwarding local`/`remote` policy still leaves the opposite (explicitly denied) forwarding capability enabled. The known legacy host-key Java-deserialization issue (GH-229/CVE-2022-45047) is already mitigated in this tree, and the strict-KEX (Terrapin) mitigation is absent but that is a protocol-wide property with weak local source evidence, so neither was chosen."
+}

@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "No application input is needed: an attacker with a network MITM/DNS/rogue-proxy position (or a mis-issued/other-host certificate from a CA in the client trust store, e.g. a corporate CA) can terminate TLS toward the CXF client. The code path is reachable whenever an application configures a CXF endpoint/client using the Netty transport with TLSClientParameters for an https:// target address.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether HNV is enabled elsewhere: `setEndpointIdentificationAlgorithm` appears only in SSLUtils.java:307 (it *disables* the algorithm for the wrapper that performs its own manual verification) and in a Jetty *server* comment (JettyHTTPServerEngine.java:955); no call sets \"HTTPS\". Checked SSLUtils.getSSLContext(TLSParameterBase, boolean addHNV): the hostname-checking X509TrustManagerWrapper is only added when addHNV=true; createClientSSLEngine never passes true. Checked whether a hidden class could add the check: NettyHttpConduit.java (and all other *Conduit.java files) is absent from the snapshot, and it only supplies TLSClientParameters to the pipeline factory (NettyHttpClientPipelineFactory.java:81-105, 86-97); the SslHandler is created and installed inside the factory, so the conduit has no reference through which to configure it — but I cannot formally exclude a hidden change. Also noted the HTTP/2 SslContextBuilder path has the same omission.",
+      "id": "cxf-netty-client-missing-hostname-verification",
+      "impact": "Man-in-the-middle/impersonation of HTTPS services contacted by CXF clients using the Netty transport: confidentiality and integrity of SOAP/REST traffic is lost whenever the attacker presents any certificate signed by a CA the client trusts for another name; credentials sent over the channel (Basic/Digest/OAuth tokens) can be captured or responses modified. Fails to meet the hostname-verification requirement of RFC 6125 / Java's default HttpsURLConnection behavior.",
+      "locations": [
+        {
+          "end_line": 267,
+          "path": "rt/transports/http-netty/netty-client/src/main/java/org/apache/cxf/transport/http/netty/client/NettyHttpClientPipelineFactory.java",
+          "start_line": 198
+        },
+        {
+          "end_line": 117,
+          "path": "rt/transports/http-netty/netty-client/src/main/java/org/apache/cxf/transport/http/netty/client/NettyHttpClientPipelineFactory.java",
+          "start_line": 107
+        },
+        {
+          "end_line": 175,
+          "path": "rt/transports/http/src/main/java/org/apache/cxf/transport/https/SSLUtils.java",
+          "start_line": 170
+        },
+        {
+          "end_line": 309,
+          "path": "rt/transports/http/src/main/java/org/apache/cxf/transport/https/SSLUtils.java",
+          "start_line": 304
+        }
+      ],
+      "prerequisites": "Application uses the Netty HTTP client transport (cxf-rt-transports-http-netty / `netty://` URI prefix, or the NettyHttpConduit) for HTTPS calls, and the attacker is on the network path (MITM) or can cause the client to trust a certificate for a different name (any trusted CA).",
+      "root_cause": "For HTTPS calls made through the Netty transport, the client SSLEngine is built by SSLUtils.createClientSSLEngine(...), which calls SSLUtils.getSSLContext(parameters) (i.e. addHNV=false) and then SSLContext.createSSLEngine() with no peer host; the resulting engine is wrapped in `new SslHandler(sslEngine)` by NettyHttpClientPipelineFactory.configureClientSSLOnDemand(...) without setting `endpointIdentificationAlgorithm = \"HTTPS\"` (the only occurrences of EndpointIdentificationAlgorithm in the tree are the deliberate disable in SSLUtils and a Jetty server comment). Netty does not perform hostname verification itself, so a certificate issued by any trusted CA for a different hostname is accepted for the target host. The HTTP/2 branch builds the engine via SslContextBuilder.forClient()...newEngine(channel.alloc()) with the same omission.",
+      "title": "Netty HTTP client validates TLS certificate chain but not the server hostname (CWE-295)",
+      "trace": "NettyHttpTransportFactory.getConduit() -> NettyHttpConduitFactory.getConduit() -> new NettyHttpConduit(bus, localInfo, target, this) [class absent from snapshot] -> NettyHttpClientPipelineFactory.initChannel() (line 111) -> configureClientSSLOnDemand(channel) (line 198) -> HTTP/1.1: SSLUtils.createClientSSLEngine(tlsClientParameters) (line 261) -> SSLUtils.getSSLContext(parameters) [addHNV=false] (SSLUtils.java:105-137) -> sslContext.createSSLEngine() (SSLUtils.java:172) -> new SslHandler(sslEngine) (line 264) -> pipeline.addLast(\"ssl\", sslHandler) (line 116). No host, no SNI and no `setEndpointIdentificationAlgorithm(\"HTTPS\")` is ever applied; the X509TrustManagerWrapper in SSLUtils that performs manual hostname checks (lines 122-129, 259-285) is only installed when callers pass addHNV=true, which the Netty path does not do.",
+      "unverified": "Not runtime-tested (no build/run allowed). The excluded `*Conduit.java` files could not be inspected, so a compensating check in NettyHttpConduit (or a recent fix already present) cannot be fully ruled out; reachability depends on deployments actually using the Netty client transport for HTTPS.",
+      "weakness_type": "CWE-295 Improper Certificate Validation (missing TLS hostname verification / MITM)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned Apache CXF 4.1.1-SNAPSHOT tree (5,022 visible files; 4,063 Java, 4,978 indexed/2,616 parsed by the relation index). Inspected/queried: HTTP transport core (AbstractHTTPDestination, HTTPTransportFactory, Headers, MessageTrustDecider, auth suppliers, CXFAuthenticator/ReferencingAuthenticator, HttpsURLConnectionFactory, SSLUtils, Netty/HC/HC5 client factories, servlet service-list writers), attachments/MTOM (AttachmentDeserializer/AttachmentUtil, Aegis MTOM), JAX-RS frontend (JAXRSUtils, XSLTJaxbProvider, RequestDispatcherProvider), JOSE/JWT/JWE, OAuth2/OIDC/SAML SSO, WS-Security/STS, WS-Addressing, JAX-RS search extension, Swagger/OpenAPI description modules, and build/config files. Trust boundaries traced from request/URL/header inputs to URL-opening, XML parsing, template/XSLT, SQL/LDAP and logging sinks. No build, tests, scanners or exploit execution were performed; relation-index facts are name-based navigation hints only.",
+  "limitations": [
+    "Major file filter: every `*Conduit.java` source file is absent from the snapshot (verified via list_files/read_file/search_code): core Conduit.java and AbstractConduit.java, rt/transports/http HTTPConduit.java and URLConnectionHTTPConduit.java, http-hc AsyncHTTPConduit/URLConnectionAsyncHTTPConduit, http-hc5 HttpClientHTTPConduit, netty NettyHttpConduit, websocket AhcWebSocketConduit, JMSConduit, LocalConduit, UDPConduit, CorbaConduit. These are exactly the classes most likely to contain the case's target behavior (HTTP redirects, credential handling, TLS setup, address validation), so a conduit-level ground truth could not be verified against source; this is a coverage gap, not a finding.",
+    "All `**/src/test/**` files, `.xsd`/`.wsdl`/`.xsl`/`.bnd` and other non-allowlisted file types (and test resources/keystores) are absent, so generated configuration types (e.g. HTTPClientPolicy XSD) and the fix's tests could not be consulted.",
+    "The relation index is partial and syntactic only: 2,616 of 4,063 Java files parsed, no data flow/control flow/semantic resolution, 104,099 unresolved calls; index labels and edges were treated as navigation hints and every used edge was verified in source text where possible.",
+    "No code execution, build, dependency resolution or runtime observation: exploitability, default configuration exposure and reachability of the netty transport in real deployments remain assumptions.",
+    "Only the strongest candidate is reported (one-candidate cap); the alternate conduit-adjacent leads above were left unconfirmed rather than reported."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CXFAuthenticator returns HTTP conduit credentials (Authorization/ProxyAuthorization) to any authentication challenge received while a CXF message is current, without comparing getRequestingHost()/getRequestingSite() to the conduit target (rt/transports/http/src/main/java/org/apache/cxf/transport/http/CXFAuthenticator.java:143-176).",
+      "reason": "Real design weakness (potential credential disclosure on redirect/other-host challenge), but Basic/Digest schemes are explicitly skipped (lines 161-163), the JDK Authenticator is only consulted for other schemes, and the classes that decide when/whether auth is requested (HTTPConduit/URLConnectionHTTPConduit) are excluded from the snapshot, so the full data flow cannot be verified. Kept as secondary lead."
+    },
+    {
+      "lead": "WS-Addressing decoupled responses are sent to a client-supplied ReplyTo address with only an isNoneAddress() check (rt/ws/addr/src/main/java/org/apache/cxf/ws/addressing/impl/InternalContextUtils.java:80-133, rt/ws/addr/src/main/java/org/apache/cxf/ws/addressing/impl/MAPAggregatorImpl.java:936-993).",
+      "reason": "Potentially an SSRF vector, but the behavior is largely as specified by WS-Addressing (responses are delivered to ReplyTo) and only applies to decoupled/async deployments with MAPAggregator active; no evidence of attacker-controlled response body in the visible flow. Unconfirmed."
+    },
+    {
+      "lead": "SwaggerUiResourceLocator.locate concatenates the request path into the UI root URL (rt/rs/description-swagger-ui/src/main/java/org/apache/cxf/jaxrs/swagger/ui/SwaggerUiResourceLocator.java:45-61; used from SwaggerUiService.java:78-152 via @Path(\"{resource:.*}\")).",
+      "reason": "Path traversal requires a non-default file/dir swaggerUiRoot override; the standard root is a `jar:` URL whose JarURLConnection entry lookup does not normalize `..`, so no concrete traversal was demonstrated."
+    },
+    {
+      "lead": "Debug System.out.println(\"cst1\"/\"cst2\") statements left in the TLS trust-manager wrapper (rt/transports/http/src/main/java/org/apache/cxf/transport/https/SSLUtils.java:228,235).",
+      "reason": "Information hygiene/noise only; it does not change the trust decision and is not a vulnerability by itself."
+    },
+    {
+      "lead": "Search extension SQL/LDAP query visitors (SQLPrinterVisitor.java:102-112; LdapQueryVisitor.java:50-67) building query strings from FIQL property names/values.",
+      "reason": "Library-level APIs; LDAP values are RFC2254-escaped and SQL values single-quote-escaped, and property-name injection only materializes if an application wires untrusted FIQL directly into these visitors without a field map/validator."
+    },
+    {
+      "lead": "Service-list title written unescaped into HTML (rt/transports/http/src/main/java/org/apache/cxf/transport/servlet/servicelist/FormattedServiceListWriter.java:71).",
+      "reason": "The title comes from the servlet init parameter (deployer-controlled), not from request input; endpoint addresses are HTML-escaped at lines 124/175."
+    }
+  ],
+  "summary": "Snapshot is Apache CXF 4.1.1-SNAPSHOT (main branch, ~Jan/Feb 2025, per pom dependency versions and release notes). Review scope was the whole visible source tree (5,022 files), with the notable filter that all test sources, schema/wsdl/xsd resources, and — critically — every source file named `*Conduit.java` (the whole Conduit class family, including HTTPConduit.java, URLConnectionHTTPConduit.java, AsyncHTTPConduit.java, HttpClientHTTPConduit.java, NettyHttpConduit.java, JMSConduit.java, LocalConduit.java, UDPConduit.java, CorbaConduit.java, AhcWebSocketConduit.java, and the core Conduit/AbstractConduit classes) are absent from the assigned snapshot even though remaining code references them; they cannot be read or searched. The strongest evidence-supported issue that remains fully visible is a TLS certificate/hostname-verification gap in the Netty HTTP client path: client SSLEngines are created with no peer host and no endpoint-identification algorithm and are installed in an SslHandler without any hostname verification, so the server certificate chain is validated but never matched to the requested hostname (CWE-295 MITM)."
+}

@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Full control of the bytes of any archive handed to a job as an InputFile with FilePreProcessor.ARCHIVE_UNZIP, including the central-directory member names (e.g. '../../<existing-dir>/x', or '/abs/path/y'). Applications that accept user-supplied case bundles (.zip) and execute them through the local computation manager pass exactly this content into preProcess().",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked InputFile.checkName (outer name forbids File.separator and requires .zip) — it does not constrain archive members. Checked the sibling FILE_GUNZIP branch — its output name derives from the validated outer name and cannot traverse. Checked SafeZipInputStream — it only caps entry count/bytes for CGMES reads and performs no name sanitization; it is not used on this path and would not prevent traversal. Checked readers of the same archives elsewhere (ZipArchiveDataSource, CimAnonymizer, CgmgesOnDataSource/CgmesImport) — they read entries in-memory via ZipFile.getInputStream and do not write them to the filesystem. Confirmed no in-repo caller currently sets ARCHIVE_UNZIP, so exploitability is conditional on the consuming application, which lowers severity confidence but not the code-level evidence.",
+      "id": "case-149-zipp slip-localcomputationmanager",
+      "impact": "Arbitrary file creation/overwrite outside the computation working directory, including absolute paths on Unix-like systems and drive/backslash paths on Windows; REPLACE_EXISTING means existing files reachable by relative or absolute traversal can be clobbered. This breaks the working-directory sandbox for locally executed commands: configuration, scripts, result files or other operator data can be overwritten, with a plausible follow-on code-execution/denial-of-service impact if the overwritten artifact is later consumed or executed by the host application. It also defeats any per-job isolation assumption in hosted/CI usage of the local computation manager.",
+      "locations": [
+        {
+          "end_line": 239,
+          "path": "computation-local/src/main/java/com/powsybl/computation/local/LocalComputationManager.java",
+          "start_line": 231
+        },
+        {
+          "end_line": 221,
+          "path": "computation-local/src/main/java/com/powsybl/computation/local/LocalComputationManager.java",
+          "start_line": 216
+        }
+      ],
+      "prerequisites": "An embedding application that (1) uses LocalComputationManager / the default local computation manager and (2) submits a Command whose InputFile carries FilePreProcessor.ARCHIVE_UNZIP over an archive whose content is attacker-influenced. The process must be able to write to the target path: existing parent directory and file permissions, or an existing regular file to overwrite (copy fails if the parent directory is missing). No in-repo call site currently constructs such an InputFile, so this is a library/API-level exposure rather than a self-contained exploit path.",
+      "root_cause": "In preProcess(), when an InputFile declares FilePreProcessor.ARCHIVE_UNZIP, every entry of the provided zip is copied to workingDir.resolve(ze.getName()) with StandardCopyOption.REPLACE_EXISTING. ZipArchiveEntry.getName() is taken verbatim from the archive's central directory; it is never normalized, and there is no containment check that the resolved path stays under workingDir. Path.resolve() returns the entry name unchanged when it is absolute, and preserves '../' segments, so both absolute member names and relative traversal members escape the working directory. The feature's only name validation (InputFile.checkName, which rejects File.separator and requires '.zip') applies to the outer input file name only and is bypassed by the archive's internal names. Note the contrast with the FILE_GUNZIP branch, whose target is derived from the already-validated outer file name.",
+      "title": "Zip Slip: archive member names extracted outside the job working directory in LocalComputationManager (ARCHIVE_UNZIP)",
+      "trace": "ComputationManager.execute(...) -> execute(workingDir, ...) -> performSingleExecution() (line 190) -> preProcess(workingDir, command, idx) (line 216) -> InputFile.getPreProcessor()==ARCHIVE_UNZIP (line 231) -> Collections.list(zipFile.getEntries()) (line 236) -> Files.copy(zipFile.getInputStream(...), workingDir.resolve(ze.getName()), REPLACE_EXISTING) (line 237). checkInputFileExistsInWorkingAndCommons (lines 315-327) resolves/validates only the outer fileName, not ze.getName().",
+      "unverified": "No runtime execution or exploit payload was attempted. Whether any real powsybl-based deployment feeds attacker-controlled zip binaries into a Command with ARCHIVE_UNZIP is unverified. Whether Files.copy target directories commonly exist in such deployments is environment-dependent. The same review could not rule out that the benchmark's intended issue lies elsewhere in the 2923-file tree.",
+      "weakness_type": "CWE-22 Path Traversal (Zip Slip) — improper limitation of a pathname to a restricted directory"
+    }
+  ],
+  "coverage_summary": "Filters: get_source_scope reported 2923 model-visible files, 0 excluded for size (>5 MiB), sensitive name/path, or symlinks; binary-like files are refused/skipped by the tools. I searched and read across action-api/action-ial, ampl-converter/executor, cgmes (conversion/model/completion/gl), cim-anonymiser, commons (datasource, compress, config, xml, json, report, binary, io, parameters), computation and computation-local, config-classic, contingency/contingency-dsl, dynamic-simulation/-security-analysis, iidm (api, impl, serde, modification, criteria, geodata, scripting), itools-packager, loadflow (api/validation/results-completion), math (matrix/graph/solver), matpower, powerfactory, psse, scripting/dsl, security-analysis-api (including distributed execution), sensitivity/shortcircuit APIs, time-series, tools, triple-store (api/rdf4j), and the format importers UCTE/IEEE. I did not read all 2923 files line-by-line; coverage was driven by keyword searches for the main sink/trap categories (process execution, object/XML/YAML/JSON/CSV parsing, reflection/class loading, path resolution and archive/zip handling) plus targeted reading of the files those searches surfaced.",
+  "limitations": [
+    "No execution, tests, scanners or exploit payloads were run; all conclusions are static and unconfirmed at runtime.",
+    "No git history or upstream diff is available in this run, so I cannot distinguish upstream code from a deliberately injected mutation or confirm which issues correspond to a published fix.",
+    "The candidate's exploitability depends on an embedding application: no in-repo caller currently uses FilePreProcessor.ARCHIVE_UNZIP, so end-to-end reachability was not demonstrated.",
+    "Only files visible to the read/search tools were reviewed; excluded/binary files, resources and generated artifacts were not inspected.",
+    "Dependency-level vulnerabilities (e.g. pinned library versions in pom.xml) were not assessed and were out of scope of the source review.",
+    "Sibling configuration/target/ground-truth data, previous experiment outputs and external advisories were intentionally not consulted per the task constraints."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal in cgmes-completion CreateMissingContainersPreProcessor: fixesFile = fixesFolder.resolve(basename + \".zip\") where basename comes from new URI(cgmes.getBasename()).getAuthority(), falling back to the attacker-controlled md:FullModel rdf:about (nameFor(), lines 101-107); Files.deleteIfExists/createFile then write a zip at that path (lines 109-127).",
+      "reason": "Plausible but weaker: requires two non-default configuration settings simultaneously (the createMissingContainers pre-processor parameter and iidm.import.cgmes.fixes-for-missing-containers-folder); the write is limited to a '.zip' suffix; and it depends on URI authority decoding and RDF4J IRI resolution details that could not be verified offline. Not selected over the unconditional entry-name traversal in LocalComputationManager."
+    },
+    {
+      "lead": "Unsafe Java deserialization in SparseMatrix.read(InputStream)/read(Path) using new ObjectInputStream(...).readObject() with no ObjectInputFilter (math/src/main/java/com/powsybl/math/matrix/SparseMatrix.java lines 487-514).",
+      "reason": "The sink is real (CWE-502) but no in-repository caller or tool path reads a SparseMatrix from an externally supplied stream/file, so source-level attacker control and reachability are not demonstrated. The existing Z0Edge class shows the project is aware of native-deserialization risk elsewhere."
+    },
+    {
+      "lead": "WindowsLocalCommandExecutor builds a 'cmd /c setlocal & set ... & program \"arg\"' string from program, args and environment values (computation-local .../WindowsLocalCommandExecutor.java lines 43-65).",
+      "reason": "A shell-metacharacter/quoting injection would require an embedding application to place attacker-controlled strings into command arguments or environment variables; in-repo commands derive these from trusted command definitions, and the Unix executor uses ProcessBuilder with a list (no shell). No attacker-controlled source found in the snapshot."
+    },
+    {
+      "lead": "SnakeYAML parsing in commons (new Yaml() in YamlModuleConfigRepository line 32; explicit Constructor with root type in BaseVoltagesConfig line 79/136-168).",
+      "reason": "Inputs are operator-controlled platform configuration files rather than remote/untrusted data, and snakeyaml 2.4 defaults/tag restrictions were not verified offline; no untrusted source reaching these parsers was found."
+    },
+    {
+      "lead": "Path composition from externally supplied datasource base names / file names (DirectoryDataSource.getPath -> directory.resolve(fileName), AbstractPowsyblTripleStore.fileNameFromContextName, CgmesExport.getBaseName using network.getNameOrId()).",
+      "reason": "Several call sites pass names derived from caller-controlled output parameters, and one site explicitly strips path components; no concrete attacker-controlled source flowing to a filesystem write was traced, so this remains a hardening observation rather than an evidenced vulnerability."
+    },
+    {
+      "lead": "CSV/formula injection and log injection in result/validation writers (e.g. CsvTableFormatter, validation CSV outputs, CGMES alias naming CSV).",
+      "reason": "Values written can contain attacker-controlled grid IDs, but impact is limited to consumers opening exported CSV in spreadsheet software; no in-repo sanitization exists and severity/reachability were not established. Not competitive with the file-write candidate."
+    },
+    {
+      "lead": "XXE / XML entity expansion in importers.",
+      "reason": "Counterevidence found: XmlUtil centrally sets SUPPORT_DTD=false, IS_SUPPORTING_EXTERNAL_ENTITIES=false, disallow-doctype-decl=true, XInclude=false for StAX/DOM, and NetworkSerDe's SchemaFactory uses ACCESS_EXTERNAL_SCHEMA/DTD=\"\". No unhardened XML factory was found in the searched files."
+    }
+  ],
+  "summary": "Review of powsybl-core 6.8.0-SNAPSHOT (2923 readable files; no binary/symlink/sensitive-name exclusions reported by get_source_scope). I traced input-handling and file/deserialization sinks across commons, computation/computation-local, iidm-serde, cgmes, triple-store, security-analysis, math, tools and the format importers. XML parsing is centrally hardened (XmlUtil disables DTDs/external entities/XInclude, SchemaFactory uses ACCESS_EXTERNAL_*=\"\"), Jackson polymorphic typing is registration-based, no shell-out or network sinks exist, and the recently added SafeZipInputStream caps zip decompression for CGMES reads. The strongest concrete issue found is a Zip Slip in LocalComputationManager: archive entry names are resolved directly against the job working directory when ARCHIVE_UNZIP preprocessing is used, allowing attacker-controlled zip members (\"../...\", absolute paths) to write outside the sandbox with REPLACE_EXISTING. A second, more conditional path traversal (CGMES missing-containers preprocessor) and an unsafe Java-deserialization API were checked but have weaker evidence/reachability and are listed as rejected leads."
+}

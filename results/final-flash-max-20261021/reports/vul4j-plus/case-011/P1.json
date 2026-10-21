@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The multipart boundary is taken verbatim from the request Content-Type header: FileUploadBase.getBoundary(String) (src/main/java/org/apache/commons/fileupload/FileUploadBase.java:419-436) parses the 'boundary' parameter and converts it to ISO-8859-1 bytes with no length limit. FileItemIteratorImpl (lines 944, 988-995) passes those bytes to the package-private MultipartStream constructor (lines 358-361), which fixes the buffer at MultipartStream.DEFAULT_BUFSIZE = 4096 (line 184). The request body itself need not contain a valid multipart structure; the boundary length is sufficient.",
+      "confidence": "high",
+      "counterevidence_checked": "Verified the codebase is not simply the pre-1.3.1 release: the other 1.3.1 fix (DiskFileItem.readObject repository validation, disk/DiskFileItem.java:656-679) is present, so only the MultipartStream fix appears to have been removed. Grep of all Java files for 'IllegalArgumentException', 'too small' and 'boundary may not be null' returned no matches, confirming no equivalent guard exists elsewhere. Checked FileUploadBase for any boundary length cap before construction (lines 988-995) - none. Checked that sizeMax/fileSizeMax (FileUploadBase:963-981, 770-797) cannot stop the spin: the loop stops consuming input entirely (len-0 reads) rather than hitting the limit. Checked Streams.copy (util/Streams.java:100-111): it loops on res == 0 without progress, so the caller does not break the loop. Checked that the same root cause is not better explained as CVE-2016-3092-style quadratic matching: that concern is separate and undocumented here, while the buffer/boundary invariant is exactly what changes.xml says was fixed.",
+      "id": "fileupload-multipartstream-unvalidated-buffer-boundary-dos",
+      "impact": "Remote, unauthenticated denial of service. Each crafted request permanently pins a request-processing thread in a busy loop at ~100% CPU; a small number of concurrent requests exhaust the servlet container thread pool and CPU, degrading or halting the application with no attacker-controlled payload size beyond a ~4 KB header and no recovery without restarting the JVM/thread. This is precisely the impact the repository's own 1.3.1 release notes say the missing buffer-size check was meant to prevent.",
+      "locations": [
+        {
+          "end_line": 344,
+          "path": "src/main/java/org/apache/commons/fileupload/MultipartStream.java",
+          "start_line": 323
+        },
+        {
+          "end_line": 1017,
+          "path": "src/main/java/org/apache/commons/fileupload/MultipartStream.java",
+          "start_line": 983
+        },
+        {
+          "end_line": 718,
+          "path": "src/main/java/org/apache/commons/fileupload/MultipartStream.java",
+          "start_line": 697
+        },
+        {
+          "end_line": 851,
+          "path": "src/main/java/org/apache/commons/fileupload/MultipartStream.java",
+          "start_line": 845
+        },
+        {
+          "end_line": 995,
+          "path": "src/main/java/org/apache/commons/fileupload/FileUploadBase.java",
+          "start_line": 988
+        },
+        {
+          "end_line": 60,
+          "path": "src/changes/changes.xml",
+          "start_line": 54
+        }
+      ],
+      "prerequisites": "Target application parses untrusted multipart requests with commons-fileupload (e.g., ServletFileUpload.parseRequest / getItemIterator, or FileUpload.parseRequest), i.e., the normal streaming API. Attacker must be able to send a Content-Type header carrying a boundary of roughly >= 4092 bytes (boundaryLength >= 4096) and some request body; the container/proxy must permit a header of that size (Tomcat's default maxHttpHeaderSize of 8192 bytes allows it). No authentication, no special configuration, and no size-limit disabling is required; sizeMax/fileSizeMax do not prevent it.",
+      "root_cause": "The public MultipartStream constructor (src/main/java/org/apache/commons/fileupload/MultipartStream.java:323-344) stores the caller-supplied bufSize and allocates the buffer without ever checking that it can hold the boundary: boundaryLength = boundary.length + 4 and keepRegion = boundaryLength, buffer length = bufSize, with no requirement bufSize >= boundaryLength + 1. When boundaryLength >= bufSize, findSeparator() (lines 697-718) always computes maxpos = tail - boundaryLength < 0 and returns -1; ItemInputStream.findSeparator() (817-826) then sets pad = tail - head (because tail-head <= keepRegion), so available() (845-851) returns 0, and makeAvailable() (983-1017) repeatedly calls input.read(buffer, tail, bufSize - tail) which returns 0 once tail == bufSize, never reaching -1 or finding a separator. The for(;;) loop therefore never terminates and never progresses. The snapshot's own changes.xml (lines 54-60) documents the intended fix: 'Fix CVE-2014-0050 ... enforce the requirements for buffer size by throwing an IllegalArgumentException if the requested buffer size is too small.' That code does not exist (no IllegalArgumentException, and no 'too small' message, anywhere in the tree).",
+      "title": "Missing MultipartStream buffer-size validation allows remote DoS via oversized multipart boundary (CVE-2014-0050 class)",
+      "trace": "1) HttpServletRequest Content-Type -> ServletRequestContext.getContentType (servlet/ServletRequestContext.java:73) -> FileUploadBase.FileItemIteratorImpl line 944. 2) getBoundary(contentType) (FileUploadBase.java:419-436) extracts the attacker boundary bytes (no cap). 3) FileUploadBase.java:994 new MultipartStream(input, boundary, notifier) -> MultipartStream.java:358-361 uses DEFAULT_BUFSIZE 4096 -> constructor lines 323-344 sets boundaryLength = boundary.length+4 > 4096, keepRegion = boundaryLength, buffer = new byte[4096], with no validation. 4) skipPreamble() (624-644) or readBoundary() leads to discardBodyData()/readBodyData() (586-614) -> util/Streams.copy (util/Streams.java:100-111) repeatedly calls ItemInputStream.read. 5) ItemInputStream.read(byte[],int,int) (891-911) sees available()==0 -> makeAvailable() (983-1017): findSeparator() (697-718) can never match because maxpos = tail - boundaryLength < 0, ItemInputStream.findSeparator (817-826) sets pad = tail-head since tail-head <= keepRegion, available() (845-851) returns 0, and input.read(buffer, tail, bufSize-tail) returns 0 once tail == bufSize. bytesRead = 0 is not -1, so the infinite for(;;) loop keeps spinning (zero-byte reads) without consuming input or throwing. 6) The request-handling thread never returns.",
+      "unverified": "No code was built, run, or fuzzed, so the infinite loop is not runtime-confirmed. The trigger threshold (boundary length >= bufSize - 4, i.e. >= 4092 bytes with the default 4096 buffer) and the resulting zero-length-read spin are derived analytically from the source. Exact behavior depends on the container's InputStream for a zero-length read (the java.io.InputStream contract says return 0; an implementation that instead blocked or threw would change the symptom to a hang/exception, still a DoS but not a spin) and on the deployed header-size limit/proxy: a limit below ~4.1 KB would prevent reachability. Also unverified whether any deployment-specific wrapper or non-default constructor call site could be used to enlarge bufSize, though the built-in servlet/portlet paths always use DEFAULT_BUFSIZE.",
+      "weakness_type": "CWE-400 Uncontrolled Resource Consumption (infinite loop / CPU exhaustion); CWE-835 Loop with Unreachable Exit Condition"
+    }
+  ],
+  "coverage_summary": "Relation index reports complete coverage: 63/63 source files indexed, 0 missing, 0 hash mismatches, 445 symbols / 686 edges, but with no capabilities, no SAST or findings data, and navigation-only edges; build/tests were not run. I reviewed in depth the untrusted multipart data path: MultipartStream.java (all 1030 lines), FileUploadBase.java (all 1474 lines), disk/DiskFileItem.java (all 711 lines), disk/DiskFileItemFactory.java, ParameterParser.java, util/Streams.java, util/LimitedInputStream.java, util/mime/Base64Decoder.java, util/mime/QuotedPrintableDecoder.java, util/mime/MimeUtility.java (partial), servlet/ServletFileUpload.java, servlet/ServletRequestContext.java, FileUpload.java, DefaultFileItemFactory.java, and the 1.3.1 section of src/changes/changes.xml. Verified the key call edge FileUploadBase:994 -> MultipartStream constructor in source text rather than relying on the index. Not reviewed in depth: build files (build.xml, pom.xml beyond version, build.properties, gump.xml), src/site and src/checkstyle content, deprecated DefaultFileItem/DiskFileUpload, portlet package, servlet/FileCleanerCleanup, util/FileItemHeadersImpl, interface/exception files, and changes.xml entries before 1.3.1; these are less likely to affect the identified parser-level DoS.",
+  "limitations": [
+    "Static, read-only review: no compilation, tests, fuzzing, or runtime execution was performed, so the candidate is a lead, not a confirmed vulnerability.",
+    "The P1 relation index provides syntactic navigation only (calls/containment hints, no control/data-flow, reachability, or exploitability proof); every claim above was verified against source text, but no dynamic evidence exists.",
+    "Exploitability of the DoS depends on environment: the servlet container/proxy must allow a Content-Type header of about 4 KB, and the container's zero-length InputStream read behavior determines whether the symptom is a CPU spin or a hang; neither could be executed here.",
+    "Only Java sources under src/main/java plus changes.xml/build metadata were in scope (63 visible files); dependencies (servlet API, commons-io) and container behavior were not available for inspection.",
+    "No comparison against upstream commits/patches, CVE records, or test suites was possible in this run; the changes.xml text is the internal evidence that the documented buffer-size guard is missing."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Quadratic partial-boundary matching cost in MultipartStream.findSeparator (the CVE-2016-3092 class of long-boundary CPU DoS)",
+      "reason": "The naive match loop (MultipartStream.java:697-718) is present, but the snapshot's release metadata documents no corresponding fix, and demonstrating unbounded cumulative CPU work would require further analysis of Worst-case input; it is not clearly demonstrated with source evidence alone and is dominated by the missing buffer-size invariant documented in the same class."
+    },
+    {
+      "lead": "Predictable temp-file names / TOCTOU in DiskFileItem.getTempFile and DiskFileItemFactory (CVE-2013-0248/CVE-2013-2186 family)",
+      "reason": "DiskFileItemFactory's javadoc (lines 42-52) documents this as requiring a private repository and local untrusted users; it is a deployment-hardening requirement, and the deserialization variant is already mitigated in DiskFileItem.readObject (lines 666-679). Not remotely exploitable from the source as-is."
+    },
+    {
+      "lead": "DiskFileItem.write(File) trusts the destination path supplied by the application",
+      "reason": "The destination is chosen by trusted calling code, not by the HTTP request; that is the API contract. No attacker-controlled path reaches it inside the library."
+    },
+    {
+      "lead": "ServletFileUpload.isMultipartContent accepts only POST (servlet/ServletFileUpload.java:66-72)",
+      "reason": "Functional API behavior matching upstream (restriction deliberately lives in ServletFileUpload while FileUploadBase.isMultipartContent is method-agnostic); no security impact found."
+    },
+    {
+      "lead": "Base64Decoder/QuotedPrintableDecoder malformed-input handling",
+      "reason": "Bounds/padding checks are present (Base64Decoder.java:105-149, QuotedPrintableDecoder.java:49-93); decoded values only feed header/file-name strings, exceptions are caught and treated as non-encoded text, and no memory-safety issue exists in Java."
+    },
+    {
+      "lead": "DiskFileItem.get() ignores partial reads (single fis.read(fileData), lines 303-330)",
+      "reason": "Could return truncated data in exotic streams, but the source is a local temp file and the behavior matches upstream; no attacker-controlled security impact identified."
+    }
+  ],
+  "summary": "Snapshot is Apache Commons FileUpload trunk at the 1.3.1 development state (pom 1.4-SNAPSHOT, changes.xml \"1.3.1 TBD\"). The strongest source-evidenced issue is that the documented CVE-2014-0050 fix is absent: MultipartStream's constructor accepts any buffer size and never validates it against the attacker-supplied boundary length, so a multipart request whose boundary is at least as long as the parse buffer (default 4096) drives ItemInputStream.makeAvailable() into a non-progressing read loop (infinite CPU spin), a remote unauthenticated DoS. Evidence is unusually strong because the repository's own changes.xml (lines 54-60) states the fix (throw IllegalArgumentException when the buffer is too small) while no such check exists anywhere in the code, and the sibling 1.3.1 DiskFileItem deserialization fix is present (only the MultipartStream fix is missing)."
+}

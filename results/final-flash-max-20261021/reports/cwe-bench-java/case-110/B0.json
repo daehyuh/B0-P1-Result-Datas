@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The path/remote-destination strings passed to PodResource.file(String), dir(String), copy(Path), read() and upload(Path) — for example a value bound from a UI/API field in features that let end users download or upload files to/from pods (the kubectl-cp-equivalent API). If an application forwards untrusted path input to these APIs, shell metacharacters (';', '|', '&&', '$()', backticks) are interpreted by the container shell.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified no shell-quoting/escaping exists for these values (searched quote/escape; PodUpload URL-encodes the whole command but that does not neutralize shell metacharacters). Checked that PodOperationsImpl.readFile/copyDir are guarded only by optional-dependency wrapping, not input validation. Checked the alternative path-traversal hypothesis: copyDir uses FilenameUtils.normalize(entry.getName()) and rejects null (PodOperationsImpl.java:562-568), and Java's File(parent, child) resolves absolute child names under the destination on Unix, so CVE-2021-20218 appears mitigated in this snapshot. Checked whether the path is attacker-controlled by the remote pod: it is not — the remote side cannot inject into these strings; attacker control requires the calling application to pass untrusted path input, which is not guaranteed by the library contract, so this remains a lead rather than a confirmed vulnerability.",
+      "id": "case-110-c1",
+      "impact": "Arbitrary command execution in the target pod's container under the credentials used for the exec websocket. For an application that only intends to expose file download/upload, this lets an attacker controlling the path run commands in the container (read secrets/config, alter or delete container data, pivot within the pod/namespace), i.e., privilege escalation beyond the intended file-transfer operation. No local-client impact is demonstrated by this flow alone.",
+      "locations": [
+        {
+          "end_line": 454,
+          "path": "kubernetes-client/src/main/java/io/fabric8/kubernetes/client/dsl/internal/core/v1/PodOperationsImpl.java",
+          "start_line": 415
+        },
+        {
+          "end_line": 544,
+          "path": "kubernetes-client/src/main/java/io/fabric8/kubernetes/client/dsl/internal/core/v1/PodOperationsImpl.java",
+          "start_line": 503
+        },
+        {
+          "end_line": 399,
+          "path": "kubernetes-client/src/main/java/io/fabric8/kubernetes/client/dsl/internal/core/v1/PodOperationsImpl.java",
+          "start_line": 363
+        },
+        {
+          "end_line": 133,
+          "path": "kubernetes-client/src/main/java/io/fabric8/kubernetes/client/dsl/internal/uploadable/PodUpload.java",
+          "start_line": 71
+        }
+      ],
+      "prerequisites": "1) An application uses this library's pod copy/read/upload API with a path derived from untrusted input (the shared precondition for command injection); 2) the client principal has pods/exec permission (inherent to these APIs); 3) a reachable pod/container to run the resulting command (target container may be attacker-chosen only if the caller also controls pod selection).",
+      "root_cause": "The pod file-transfer implementation builds shell command strings by direct concatenation/String.format of context-supplied path values and runs them via exec(\"sh\", \"-c\", ...) with no quoting or escaping. Sinks: PodOperationsImpl.readFile -> \"cat \" + source + \"|base64\" (line 444); PodOperationsImpl.readTar -> \"tar -cf - \" + source + \"|\" + \"base64\" (line 532); PodUpload.uploadFile -> String.format(\"mkdir -p %s && base64 -d - > %s\", directory, file) (lines 75-78); PodUpload.uploadDirectory -> String.format(\"mkdir -p %1$s && base64 -d - | tar -C %1$s -xzf -\", context.getDir()) (lines 96-97). Sources: PodOperationsImpl.file(String)/dir(String) (lines 363-371) capture the path into PodOperationContext; read() (401-413), copy(Path) (373-387) and upload(Path) (389-399) forward it to the sinks. No escaping helper exists anywhere in the repository (searches for quote/escape returned nothing relevant); the only encoding applied is URL-encoding of the whole command in PodUpload.buildCommandUrl (lines 169-184), which does not neutralize shell metacharacters.",
+      "title": "Unescaped pod path arguments interpolated into `sh -c` exec commands (command injection) in pod read/copy/upload",
+      "trace": "PodResource.file(String) (PodOperationsImpl.java:363-366) / dir(String) (368-371) store the caller path in PodOperationContext. read() (401-413) routes it to readFile(source) (415-454) or readTar(source) (503-544); copy(Path) (373-387) routes it through copyFile/copyDir, which call readFile/readTar; upload(Path) (389-399) hands the context to PodUpload.upload(podUpload.uploadFile at 71-90 and uploadDirectory at 92-133). readFile concatenates the value into `\"cat \" + source + \"|base64\"` and calls `.exec(\"sh\", \"-c\", ...)` (line 444); readTar concatenates into `\"tar -cf - \" + source + \"|\" + \"base64\"` (line 532); PodUpload.uploadFile builds `mkdir -p <dir> && base64 -d - > <file>` (77-78) and uploadDirectory builds `mkdir -p <dir> && base64 -d - | tar -C <dir> -xzf -` (96-97), both URL-encoded as a whole but not shell-escaped before `sh -c` execution. Shell metacharacters in the path therefore execute arbitrary commands inside the target container with the exec session's privileges.",
+      "unverified": "Not executed or dynamically confirmed. The attacker-control precondition (application routes untrusted path input into file()/dir()/copy()/upload()) is application-dependent and not visible in this repository; the library also exposes exec(String...) directly, which some maintainers may treat as making the shell path by-design. Windows-specific container/shell behavior not assessed. No tests are present in the assigned scope to demonstrate intent or regression coverage.",
+      "weakness_type": "CWE-78 OS Command Injection (shell metacharacters allowed through a path/argument API)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 933-file snapshot (no test sources present). Deep-read the kubernetes-client core: Config/ConfigBuilder usage, KubeConfigUtils, CertUtils, SSLUtils, HttpClientUtils, Utils, URLUtils, Serialization/SerializationUtils, KubeConfig/exec plugin, PodOperationsImpl (read/copy/upload/exec/port-forward/log paths), PodUpload(+WebSocketListener), PortForwarderWebsocket, ExecWebSocketListener, Watcher/Watch managers, RawCustomResourceOperationsImpl (URL building), NamespaceVisit* list/im-pl apply/delete/wait flows, CreateOrReplace/DeleteAndCreate helpers, KubernetesResourceUtil, IOHelpers, OpenIDConnectionUtils, TokenRefreshInterceptor, BackwardsCompatibilityInterceptor, ImpersonatorInterceptor, informers/cache, extended leaderelection/run, and the hand-written kubernetes-model-core classes (KubernetesDeserializer, HasMetadata, Quantity, Duration, IntOrString); skimmed openshift-client (OAuth interceptor, OpenShiftConfig, operations), the extension clients (knative/tekton/service-catalog/chaosmesh/volumesnapshot incl. duplicated ApiVersionUtil), kubernetes-server-mock, build files (.github workflows, poms), and examples/docs. Coverage is broad but not exhaustive: ~one third of files were read line-by-line; the remainder were inventoried or skimmed, and generated/schema JSON files were not exhaustively inspected.",
+  "limitations": [
+    "No code was compiled, executed, or dynamically tested; findings are source-evidence-based only and no candidate is runtime-confirmed.",
+    "No test sources are present in the assigned scope, so intended API contracts/regression expectations could not be checked.",
+    "Upstream/diff verification was not possible (no VCS history, no web access), so I could not prove whether the wildcard port-forward bind or the unescaped shell concatenation match or diverge from upstream at this tag.",
+    "Attacker control for the reported candidate depends on application usage outside this repository (how callers populate file()/dir()/copy()/upload() paths), which cannot be established from the snapshot alone.",
+    "Dependency-version exposure (snakeyaml 1.26, commons-compress 1.20, jackson 2.11.2, okhttp 3.12.12) was noted only where used by source; dependency CVEs were not exhaustively enumerated or verified against advisories (external lookup not permitted).",
+    "Windows-specific path/shell semantics and multi-tenant cluster scenarios were reasoned about but not verified.",
+    "Generated model/schema JSON files (many hundreds of KiB) and about two thirds of Java files were skimmed rather than fully line-reviewed; an injected or subtle logic flaw in an unread DSL/context class cannot be fully excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unsafe YAML deserialization: Serialization.unmarshalYaml uses SnakeYAML `new Yaml()` + `yaml.load(is)` on arbitrary InputStreams (kubernetes-client/.../utils/Serialization.java:298-302) with snakeyaml 1.26 pinned in pom.xml:116; the default Constructor supports global tags (CVE-2022-1471 class of issue), reachable from client.load(InputStream)/resource(InputStream) via NamespaceVisitFromServerGetWatchDeleteRecreateWaitApplicableListImpl:267 and from non-JSON API response bodies in OperationSupport.handleResponse (line 477).",
+      "reason": "Real hardening/deserialization concern, but as the single candidate it is weaker on source evidence: the danger depends on SnakeYAML version semantics (dependency, not visible sink behavior here) and on the application parsing untrusted manifests with this API; no fabric8-side validation is expected by its own contract for trusted manifests. Kept as an unconfirmed lead rather than the candidate."
+    },
+    {
+      "lead": "PortForwarderWebsocket binds the local listener to the wildcard address when localHost == null: `ServerSocketChannel.open().bind(new InetSocketAddress(localPort))` (PortForwarderWebsocket.java:79-84), while the internal comment says 'Start listening on localhost' (line 156) and the README/examples present it as the `kubectl port-forward` equivalent.",
+      "reason": "Exposure/insecure-default issue with no attacker-controlled input flow, and the public PortForwardable API offers no bind-address parameter in this snapshot, so I could not establish whether this is intended upstream behavior; classified as a hardening opportunity rather than the strongest vulnerability."
+    },
+    {
+      "lead": "Trust-all X509TrustManager when config.isTrustCerts() (SSLUtils.java:100-113) combined with hostname verifier always returning true when trustCerts/disableHostnameVerification (HttpClientUtils.java:116-118).",
+      "reason": "Gated behind explicit opt-in configuration flags that mirror kubeconfig insecure-skip-tls-verify semantics; not exploitable by default and therefore not reported as a vulnerability."
+    },
+    {
+      "lead": "Cleartext fallback: Config.ensureHttps/SSLUtils.isHttpsAvailable probe HTTPS and silently fall back to `http://` (SSLUtils.java:58-81; Config.java:282-288), potentially sending bearer tokens/basic auth over cleartext when a scheme-less master URL is configured.",
+      "reason": "Only triggers for scheme-less master URLs and is long-standing documented behavior; conditional configuration weakness, not clearly the strongest source-evidenced issue."
+    },
+    {
+      "lead": "Kubeconfig exec credential plugin: Config.getExecCredentialFromExecConfig builds `sh -c`/`cmd /c` command lines by joining exec.command and unquoted exec.args (Config.java:635-679).",
+      "reason": "The kubeconfig is a trusted local artifact, and the `command` field itself is arbitrary by design, so argument quoting adds no privilege; not a vulnerability."
+    },
+    {
+      "lead": "Miscellaneous minor items: KubernetesResourceUtil.isValidName uses `name.length() < 63` instead of <= (off-by-one); Utils.randomString uses java.util.Random for template names; getProxyUrl noProxy matching uses `host.contains(noProxy)`; BackwardsCompatibilityInterceptor rewrites URLs on 404/400.",
+      "reason": "No concrete attacker-controlled security impact demonstrated; noted for completeness only."
+    }
+  ],
+  "summary": "This snapshot is fabric8 kubernetes-client 5.0.2 (933 non-test source/doc/build files). The CVE-2021-20218 tar path-traversal fix is present (PodOperationsImpl.copyDir normalizes tar entry names through FilenameUtils.normalize before writing). The strongest remaining source-evidenced issue is an OS command injection: caller-supplied pod paths are interpolated unquoted into `sh -c` commands that are executed inside the target container via the Kubernetes exec websocket (used by the file/dir read, copy and upload APIs). A suspicious but weaker alternative is the unsafe SnakeYAML default constructor used on untrusted YAML, and the port-forward wildcard bind, both listed as rejected/unconfirmed leads. Candidate is a lead, not a runtime-confirmed vulnerability."
+}

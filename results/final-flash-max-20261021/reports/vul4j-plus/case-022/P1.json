@@ -1,0 +1,99 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remote, unauthenticated HTTP request header `Cookie: rememberMe=<base64>` (the value is only Base64-decoded by Shiro, so arbitrary bytes are accepted). For the shipped sample configuration the cipher key (`kPH+bIxk5D2deZiIxcaaaA==`) is public, so an attacker can compute valid ciphertexts; for library deployments the key is attacker-controllable only if the application configures a known/weak key (as Shiro's own documentation and samples demonstrate) or disables the cipher/uses XmlSerializer.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) The default constructor now generates a random key (`setCipherKey(cipherService.generateNewKey().getEncoded())`, AbstractRememberMeManager 95-100), and the rememberMe cookie is HttpOnly by default (SimpleCookie line 86; CookieRememberMeManager line 89) — so the plain out-of-the-box configuration is not attacker-forgeable, and I have not claimed default-config exploitation. (2) `getRememberedPrincipals` catches RuntimeException and `onRememberedPrincipalFailure` forgets the identity (380-393, 441-454), which prevents some error-based abuse but does not prevent successful deserialization of a correctly-encrypted payload. (3) Decryption errors and deserialization errors are both funnelled through the same failure handling, so I make no padding-oracle claim here (see rejected leads). (4) The library never accepts serialized data without the cipher key when configured as documented; exploitation therefore depends on the documented key-configuration practice, which the repo's own guice sample instantiates with a public constant.",
+      "id": "shiro-rememberme-cookie-deserialization",
+      "impact": "Remote code execution (gadget-chain deserialization) and/or authentication bypass by forging a valid rememberMe principal (e.g., impersonating an administrator) in deployments where the cipher key is known or weak — exactly the exposure exercised in the wild against Shiro's default/sample key. Impact is critical where the precondition holds; the random-key default keeps untouched configurations from being trivially exploitable.",
+      "locations": [
+        {
+          "end_line": 224,
+          "path": "web/src/main/java/org/apache/shiro/web/mgt/CookieRememberMeManager.java",
+          "start_line": 185
+        },
+        {
+          "end_line": 422,
+          "path": "core/src/main/java/org/apache/shiro/mgt/AbstractRememberMeManager.java",
+          "start_line": 417
+        },
+        {
+          "end_line": 486,
+          "path": "core/src/main/java/org/apache/shiro/mgt/AbstractRememberMeManager.java",
+          "start_line": 478
+        },
+        {
+          "end_line": 508,
+          "path": "core/src/main/java/org/apache/shiro/mgt/AbstractRememberMeManager.java",
+          "start_line": 506
+        },
+        {
+          "end_line": 84,
+          "path": "core/src/main/java/org/apache/shiro/io/DefaultSerializer.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 57,
+          "path": "core/src/main/java/org/apache/shiro/io/ClassResolvingObjectInputStream.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 78,
+          "path": "core/src/main/java/org/apache/shiro/io/XmlSerializer.java",
+          "start_line": 69
+        },
+        {
+          "end_line": 29,
+          "path": "samples/guice/src/main/webapp/WEB-INF/shiro.ini",
+          "start_line": 27
+        },
+        {
+          "end_line": 79,
+          "path": "samples/guice/src/main/java/org/apache/shiro/samples/guice/SampleShiroServletModule.java",
+          "start_line": 72
+        }
+      ],
+      "prerequisites": "A web application using Shiro's rememberMe support (`DefaultWebSecurityManager` installs a `CookieRememberMeManager` by default, web/.../DefaultWebSecurityManager.java line 75) with (a) a configured/known/weak symmetric cipher key (the public sample key is the canonical example), or (b) a custom `Serializer` such as `XmlSerializer`, or (c) `cipherService` set to null. With the untouched default (random 128-bit key generated per JVM) the attacker cannot produce decryptable ciphertext, so forgery/gadget execution is not possible in that specific default configuration.",
+      "root_cause": "Identity data for the rememberMe feature is read from an HTTP cookie fully controlled by the requester. `CookieRememberMeManager.getRememberedSerializedIdentity` only Base64-decodes the value; `AbstractRememberMeManager.convertBytesToPrincipals` then decrypts it with the configured symmetric key and passes the resulting plaintext directly to the configured `Serializer` — by default `DefaultSerializer`, which wraps it in `ClassResolvingObjectInputStream` and calls `readObject()` with no class allow-list and no integrity verification (no MAC/AEAD). Security therefore rests entirely on the secrecy of the symmetric key: the library generates a random key only when the application does not configure one, and it documents/ships configuration that uses a fixed, well-known key (`samples/guice/.../shiro.ini` line 29 sets `kPH+bIxk5D2deZiIxcaaaA==`, which `SampleShiroServletModule` (lines 74-79) reads and installs with `rememberMeManager.setCipherKey(Base64.decode(cipherKey))`). With a known/weak key (or a custom serializer such as `XmlSerializer`, whose `XMLDecoder.readObject()` is also an unsafe deserialization sink), an unauthenticated attacker can forge a remembered principal or submit a gadget chain that executes on deserialization. Note the file/line of the classic CVE-2016-4437 remedy (`setCipherKey(cipherService.generateNewKey().getEncoded())`, AbstractRememberMeManager lines 95-100) is present, which limits the plain default-config exposure.",
+      "title": "Attacker-controlled rememberMe cookie is decrypted and Java-deserialized without integrity or class protection (and the repo ships a public cipher key in a sample)",
+      "trace": "GET request containing `rememberMe=<attacker bytes>` → CookieRememberMeManager.getRememberedSerializedIdentity (lines 185-224; `getCookie().readValue` at 205, `Base64.decode(base64)` at 215) → AbstractRememberMeManager.getRememberedPrincipals (lines 380-393) → convertBytesToPrincipals (417-422): `decrypt(bytes)` at 419, `deserialize(bytes)` at 421 → decrypt (478-486): `cipherService.decrypt(encrypted, getDecryptionCipherKey())` (482) → deserialize (506-508) → DefaultSerializer.deserialize (67-84): `new ClassResolvingObjectInputStream(bis)` (75), `ois.readObject()` (77) → ClassResolvingObjectInputStream.resolveClass (51-57) loads arbitrary classes via ClassUtils.forName, so standard Java deserialization gadget chains execute. If XmlSerializer is configured instead, XmlSerializer.deserialize (69-78) passes the same bytes to `XMLDecoder.readObject()` (75).",
+      "unverified": "No runtime verification: I did not build or deploy Shiro, generate cookies, or test gadget chains (and must not). I could not verify which applications in the wild configure weak keys, nor inspect deployed configurations; the public-key exposure is asserted only for the in-repo guice sample and for deployments that copy such configuration. The claim that attacker-supplied ciphertext actually reaches `readObject()` in a given deployment depends on the app enabling rememberMe and on the key in use.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (with CWE-345/CWE-347 insufficient authenticity verification; CWE-321 hard-coded key in a shipped sample)"
+    }
+  ],
+  "coverage_summary": "Scope: the assigned 582-file plain-text snapshot (indexed_files 582, missing_from_index 0; tests and binary files are absent/not readable by the filters, and binary-like files are skipped). I reviewed core authc/authz (credentials matchers, realms, ModularRealmAuthorizer/Authenticator, Subject DAO/session persistence), core crypto (AesCipherService, JcaCipherService, DefaultBlockCipherService, hashing/password services), core session management (SimpleSession serialization, session managers/DAOs, session validation), core config/io (ReflectionBuilder, Ini, DefaultSerializer, ClassResolvingObjectInputStream, XmlSerializer), web (WebUtils, filters and filter-chain management, AbstractShiroFilter, ShiroHttpServletRequest/Response, SimpleCookie, DefaultWebSessionManager, CookieRememberMeManager, DefaultWebSecurityManager), and support/spring|guice|cas|quartz|ehcache|hazelcast plus samples. I used the P1 relation index (get_relation_scope: complete, 4682 symbols/8940 edges, no SAST oracle loaded) for navigation (symbols/calls/containment around rememberMe, deserialization, WebUtils, filters) and verified every cited location in source text. I did not exhaustively line-review every one of the 582 files; lower-risk areas (event bus, some cache providers, i18n/config plumbing, most sample controllers, eclipse metadata) were scanned or sampled rather than fully audited.",
+  "limitations": [
+    "No build, test, scanner, container, or exploit execution was performed (prohibited by the task and environment); all findings are source-reading only.",
+    "The P1 index is navigational: its edges/facts are syntactic candidates and do not prove reachability, data flow, or exploitability; index labels were not treated as verdicts.",
+    "The default configuration of the chosen candidate is mitigated by a per-JVM random cipher key; exploitation requires a configured/known/weak key (or custom serializer). I could not verify deployed configurations or which key any real deployment uses.",
+    "Whether an actual container/Spring routing mismatch (path-bypass lead) is exploitable cannot be validated without running the stack; it remains an unconfirmed rejected lead.",
+    "The case's hidden ground-truth vulnerability/identifier is not accessible in this run; the ranking is my own evidence-based judgment. No runtime confirmation is claimed for any finding."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path-normalization authorization bypass: `WebUtils.getRequestUri` URL-decodes the raw request URI and `decodeAndCleanUriString` truncates everything after the first ';' (web/.../util/WebUtils.java lines 135-141, 231-235), and that derived path is used for filter-chain selection by `PathMatchingFilterChainResolver.getChain` (lines 93-116) and `PathMatchingFilter.pathsMatch` (121-142). This is the documented root-cause area of the Shiro 1.5.2+/1.6.0 auth-bypass CVEs (e.g., a URI such as `/x/..;/admin` that Spring resolves to `/admin` while Shiro truncates at ';' and believes it is `/`).",
+      "reason": "Plausible and unmitigated in this snapshot, but proving a concrete bypass requires container/Spring request-routing semantics (Tomcat `;`/`..` handling and Spring `UrlPathHelper` semicolon removal) that are outside this source snapshot and cannot be verified with read-only local tools; every matched pattern still fails closed in many configurations. Reported as an unconfirmed rejected lead rather than the candidate because the attacker-controlled-input-to-impact chain is not fully demonstrable from source alone."
+    },
+    {
+      "lead": "Unauthenticated block cipher (AES-CBC + PKCS5 padding, no MAC) used for the rememberMe cookie (`DefaultBlockCipherService` lines 164-174; `JcaCipherService.encrypt/decrypt` lines 303-392) — CVE-2019-12422 padding-oracle class.",
+      "reason": "The unauthenticated CBC/PKCS5 usage is real in this snapshot, but Shiro funnels decryption failures and subsequent deserialization failures through the same `AbstractRememberMeManager.onRememberedPrincipalFailure` handling, so I could not establish a distinguishable decryption oracle observable to a remote attacker from the code alone; confidence below the chosen candidate."
+    },
+    {
+      "lead": "`DefaultWebSessionManager` accepts a session ID from a request parameter/lowercase parameter and from `;jsessionid=` path segments while `sessionIdUrlRewritingEnabled` defaults to true (web/.../session/mgt/DefaultWebSessionManager.java lines 56-158), combined with no session-ID rotation at login — a session-fixation/URL-exposed-session-ID concern.",
+      "reason": "Attacker cannot invent a valid session ID (the store is checked and unknown IDs are rejected), and the impact requires additional victim-interaction/login-flow assumptions; amounts to a hardening/design issue here."
+    },
+    {
+      "lead": "`DefaultLdapRealm.getUserDn` substitutes the submitted principal into the configured DN template without escaping (core/.../realm/ldap/DefaultLdapRealm.java lines 227-251), enabling LDAP DN-template injection.",
+      "reason": "Real unescaped interpolation, but exploitability (DN spoofing/authentication impact) depends on directory schemas and template configuration and is not demonstrable from this snapshot; lower impact/evidence than the chosen candidate."
+    },
+    {
+      "lead": "`XmlSerializer` uses `java.beans.XMLDecoder.readObject()` on a byte array (core/.../io/XmlSerializer.java lines 69-78), an unsafe-deserialization sink if selected as rememberMe/session serializer.",
+      "reason": "Dangerous sink is present and is reachable through the same rememberMe chain, but it is not the default serializer (DefaultSerializer is), so it is folded into the chosen candidate as an aggravating configuration rather than treated as a separate root cause."
+    },
+    {
+      "lead": "`PrincipalTag` prints principal values unescaped into the JSP output (web/.../tags/PrincipalTag.java lines 143-149) and resolves the `type` attribute via `Class.forName` (155-167).",
+      "reason": "Tag attributes and principal content are application-controlled; no attacker-controlled path identified in this snapshot."
+    }
+  ],
+  "summary": "Case-022 (P1): reviewed the Apache Shiro 1.3.2-SNAPSHOT tree (582 indexed plain-text files; core, web, support/spring|guice|cas|ehcache|quartz|hazelcast|aspectj, samples, tools). The strongest single source-supported candidate is the rememberMe identity path: an attacker-controlled `rememberMe` cookie value is Base64-decoded, symmetrically decrypted with the configured key, and then passed directly to Java serialization (`ObjectInputStream.readObject`) with no integrity check (no MAC/AEAD) and no class allow-list, and the repository itself ships a publicly-known cipher key in a sample configuration. The default JVM-random key mitigates cookie forgery in untouched default configs, so this is a conditional but high-impact lead (CVE-2016-4437 family). Other plausible but weaker/unconfirmed leads (path-normalization auth bypass in WebUtils/filter-chain matching; unauthenticated CBC/PKCS5 padding oracle) are listed as rejected leads."
+}

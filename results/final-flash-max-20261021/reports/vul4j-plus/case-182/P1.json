@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The HTTP request body and the effective content type are both attacker-controlled. `Request.getBody()` unconditionally returns the raw request body (Request.java:409-427) and even allows a form POST to smuggle an arbitrary body/type pair via the `_content` and `_content_type` parameters, while `Request.getContentType()` selects the engine from the raw Content-Type header (or the Accept header / URI suffix, Request.java:318-322, 386-400). Sending `application/x-yaml` (or `_content_type=application/x-yaml` on a form POST, or a missing Content-Type plus an `application/x-yaml` accept type) routes the attacker's text straight into SnakeYamlEngine.fromString, where the YAML parser honours attacker-chosen global tags.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked (a) whether the module is required: `pippo/pom.xml` bundles only pippo-core, pippo-jetty, pippo-freemarker and pippo-gson, so the finding is scoped to applications that opt into pippo-snakeyaml; (b) whether the fix exists elsewhere: XStream (XstreamEngine.java:42-56) and Java serialization of session data (SerializationSessionDataTranscoder.java:48-56 with WhitelistObjectInputStream) were explicitly hardened in this same unreleased cycle (CHANGELOG.md:8-9, issues #454/#458), while the SnakeYAML engine has no such restriction, and FastJSON was bumped to 1.2.51 — the asymmetry indicates body deserialization is treated as untrusted elsewhere; (c) whether an engine registered earlier could shadow it: possible only if another engine claims `application/x-yaml` first, which requires the optional jackson-dataformat-yaml dependency or custom registration; (d) whether the exception handling in Request.createEntityFromBody mitigates it: no, instantiation happens before the cast/exception; (e) the serialization direction (`toString`/`dump`, line 43) is not the issue.",
+      "id": "case-182-cand-1",
+      "impact": "Deserialization of untrusted data with arbitrary class instantiation in the application's JVM, under the application's privileges: at minimum memory/state manipulation and denial of service, and — with commonly available gadget classes or remote class loading — remote code execution. An internet-facing application that includes pippo-snakeyaml and parses request bodies is exposed with no authentication beyond whatever the endpoint itself enforces.",
+      "locations": [
+        {
+          "end_line": 49,
+          "path": "pippo-content-type-parent/pippo-snakeyaml/src/main/java/ro/pippo/snakeyaml/SnakeYamlEngine.java",
+          "start_line": 46
+        },
+        {
+          "end_line": 33,
+          "path": "pippo-content-type-parent/pippo-snakeyaml/pom.xml",
+          "start_line": 17
+        },
+        {
+          "end_line": 31,
+          "path": "pippo-content-type-parent/pippo-snakeyaml/src/main/java/ro/pippo/snakeyaml/SnakeYamlInitializer.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 337,
+          "path": "pippo-core/src/main/java/ro/pippo/core/Request.java",
+          "start_line": 309
+        },
+        {
+          "end_line": 427,
+          "path": "pippo-core/src/main/java/ro/pippo/core/Request.java",
+          "start_line": 386
+        },
+        {
+          "end_line": 48,
+          "path": "pippo-controller-parent/pippo-controller/src/main/java/ro/pippo/controller/extractor/BodyExtractor.java",
+          "start_line": 38
+        },
+        {
+          "end_line": 56,
+          "path": "pippo-content-type-parent/pippo-xstream/src/main/java/ro/pippo/xstream/XstreamEngine.java",
+          "start_line": 42
+        }
+      ],
+      "prerequisites": "1) The application has the optional `pippo-snakeyaml` artifact on its classpath (so SnakeYamlInitializer registers SnakeYamlEngine for `application/x-yaml`; it is not part of the default `pippo` aggregate bundle). 2) No other YAML engine was registered first for that content type — e.g. Jackson's YAML engine requires the optional `jackson-dataformat-yaml` dependency, and `ContentTypeEngines.registerContentTypeEngine` silently ignores a later duplicate (ContentTypeEngines.java:98-105). 3) At least one endpoint deserializes the request body, e.g. a controller method parameter annotated `@Body` (BodyExtractor.java:38-48) or application code calling `routeContext.createEntityFromBody(...)` / `Request.createEntityFromBody(...)`. 4) Exploitation depth depends on which gadget-compatible classes/URL-loading capabilities exist in the application's runtime classpath.",
+      "root_cause": "SnakeYamlEngine.fromString parses attacker-supplied request-body text with SnakeYAML's default (non-restricted) API: `return (T) new Yaml().load(content);` (SnakeYamlEngine.java:46-49). The default `Yaml()`/`Constructor` path of the pinned SnakeYAML 1.17 (pippo-snakeyaml/pom.xml:17-33, `<snakeyaml.version>1.17</snakeyaml.version>`) resolves and instantiates arbitrary Java classes named by global YAML type tags instead of being limited to plain data types (no `SafeConstructor`, no `LoaderOptions`/type restrictions, and no result-type filter on `classOfT`). The engine is auto-registered for `application/x-yaml` (and suffix `yaml`) by SnakeYamlInitializer.init (SnakeYamlInitializer.java:28-31) through the `@MetaInfServices`/ServiceLoader mechanism consumed in Application.init (Application.java:99-109), so any application that has this optional module on the classpath exposes an unsafe deserializer through the framework's normal body-parsing API.",
+      "title": "Unsafe YAML deserialization in SnakeYamlEngine (request-body parsing with unrestricted SnakeYAML `new Yaml().load`)",
+      "trace": "Attacker request -> PippoFilter/PippoServlet dispatch -> RouteDispatcher -> RouteContext/Request -> endpoint calls createEntityFromBody (DefaultRouteContext.java:193-196 -> Request.java:309) -> getBody()/getContentType() choose the raw body and the engine (Request.java:386-427 -> ContentTypeEngines.getContentTypeEngine, ContentTypeEngines.java:119-134) -> SnakeYamlInitializer-registered SnakeYamlEngine -> SnakeYamlEngine.fromString -> `new Yaml().load(content)` (SnakeYamlEngine.java:47-48) -> SnakeYAML 1.17 default Constructor resolves attacker-supplied YAML type tags and constructs the named classes / runs their side effects before the result is cast to the endpoint's entity type. Because object construction occurs inside `load`, the subsequent ClassCastException/PippoRuntimeException wrapping in Request.java:337-344 (or a 500 error page) does not undo the side effects already triggered by parsing.",
+      "unverified": "Not runtime-confirmed and no exploit payload was executed or provided. The unsafe semantics of SnakeYAML's default `Yaml()`/`Constructor` for version 1.17 are asserted from library knowledge plus the pinned version in pippo-snakeyaml/pom.xml; the snakeyaml jar itself is not present in the snapshot, so the exact set of available gadget chains for a given application classpath was not verified. Whether a particular deployment reaches the sink depends on the optional module being present and on an endpoint using `@Body`/`createEntityFromBody`, neither of which can be confirmed from the library snapshot alone.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (unsafe object construction via YAML type tags; potential RCE)"
+    }
+  ],
+  "coverage_summary": "Scope: 387 model-visible source files, all under the assigned root; per get_source_scope there were 0 files excluded by size, sensitive-name, or symlink filters, and per get_relation_scope the P1 index covers 387/387 files (5574 edges, 2976 symbols, 142 facts) with no file hash mismatches; the index itself is syntactic/navigational only and was used solely to navigate, with every cited edge verified in source text. Files inspected include pippo-core (Request, Response, Application, Pippo, PippoFilter/PippoServlet, PippoSettings, Messages/Languages, DefaultErrorHandler, route/* including DefaultRouter, DefaultUriMatcher, resource/Directory/File/Classpath/Webjars handlers, CSRF/CORS/Language/TrailingSlash handlers, gzip/*, util/*, websocket/*), all content-type engines (snakeyaml, xstream, fastjson, gson, jackson, jaxb, csv), the session modules (base, cookie, jdbc, ehcache, xmemcached, etc.), pippo-controller, pippo-metrics, pippo-css, pippo-pac4j, representative template engines, server modules (jetty/tomcat/undertow/tjws settings and websocket filters), the archetype files, and the root/module POMs and CHANGELOG. The snapshot contains no test sources (0 files under any src/test path), so no repository tests were available to corroborate or refute any lead. Coverage is not line-exhaustive: PippoSettings (~1082 lines), the larger server/template engine classes, the remaining session-cache backends, and the metrics reporters were skimmed rather than read end-to-end, and no code was compiled, executed, or scanned.",
+  "limitations": [
+    "Static review only: no build, tests, scanners, or exploit payloads were run; the submitted candidate is a lead, not a confirmed vulnerability.",
+    "The SnakeYAML dependency jar is not vendored in the snapshot, so the library's default-constructor behaviour and the concrete gadget availability for a given application classpath were not verified from source in this run.",
+    "Reachability of the YAML sink depends on deployment choices (presence of the optional pippo-snakeyaml artifact, engine registration order, and an endpoint that deserializes request bodies) that cannot be settled from the library snapshot alone.",
+    "Runtime behaviour of the gzip response wrapper (whether bodies written via getWriter()/resource()/file() are actually dropped, and how containers treat duplicate Content-Length headers) could not be confirmed and remains an unverified secondary lead.",
+    "No coverage of external deployment artifacts (web.xml, container configuration, application code outside this repository) was possible, so end-to-end prerequisites for any candidate remain partial."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Default-on gzip response wrapping: Application.createRequestResponseFactory now returns GZipRequestResponseFactory (Application.java:281-284), which wraps any response when the client sends `Accept-Encoding: gzip` or even `*`, and GZipFilter/GZipRequestResponseFactory only use a substring check so `gzip;q=0` still gets compressed (GZipRequestResponseFactory.java:54-60). Bodies written through getWriter()/getOutputStream()/resource()/file() appear never to be flushed by GZipResponseWrapper.finish(), which is only invoked from Response.commit(CharSequence) (Response.java:1085-1108, 1135-1140), and GZipResponseStream.close() appends a second Content-Length/Content-Encoding via addHeader (GZipResponseStream.java:50-60).",
+      "reason": "Plausible correctness/robustness defect (broken or empty responses for resource/file writer paths, spec-violating gzip selection, possible duplicate Content-Length) rather than a demonstrable attacker-controlled security impact; could not be confirmed without executing the container/response stack, so it was not submitted as the single candidate."
+    },
+    {
+      "lead": "SettingsHandler password masking uses a case-sensitive check: `name.contains(settingNamePasswordToken)` with the default token \"password\" (SettingsHandler.java:41-54, 80-90), so settings spelled with capitals are not masked — including the framework's own names `server.keystorePassword`/`server.truststorePassword` (PippoConstants.java:70-76); additionally settingNamePasswordToken stays null for the `SettingsHandler(boolean)` constructors, which would NPE on use.",
+      "reason": "Real weakness (secret disclosure to whoever can reach the settings route, plus an admin-route NPE), but it requires the application to expose SettingsHandler and to name secrets with a case variant of the token; impact and evidence are weaker than the deserialization candidate, and it was not confirmed that the casing nuance is a regression rather than an upstream design limitation."
+    },
+    {
+      "lead": "Unbounded array allocation from indexed request parameter names in Request.initParameters: an attacker-supplied parameter name matching `name[<int>]` causes `new String[maxIndex + 1]` (Request.java:142-193), e.g. a very large index allocates a multi-gigabyte array or, at Integer.MAX_VALUE, a NegativeArraySizeException.",
+      "reason": "Reachable in default configurations and a genuine memory-amplification/denial-of-service pattern (the code's own try/catch only covers NumberFormatException for out-of-int-range indexes), but impact is limited to OOM/500-level availability effects and it was not confirmed to be the intended target; kept as a secondary lead only."
+    },
+    {
+      "lead": "Dev-mode error page reflects the request URI into HTML without encoding (DefaultErrorHandler.renderDirectly, DefaultErrorHandler.java:215-255; bindings at 264-295, including unescaped `message`/`requestUri` passed to templates).",
+      "reason": "Only active when the runtime mode is not PROD (dev/test), and exploitation also depends on browser encoding of `<`/`>` in the path and/or app error templates printing the values unescaped; treated as a hardening gap rather than the strongest candidate."
+    },
+    {
+      "lead": "Path traversal in static-resource handlers (FileResourceHandler.java:49-70, DirectoryHandler.java:150-186, ClasspathResourceHandler.isValidResourcePath / WebjarsResourceHandler.java:57-88).",
+      "reason": "Checked in detail: all three use normalize() plus element-wise Path.startsWith() containment (so `/opt/data-evil` does not pass for base `/opt/data`), ClasspathResourceHandler blocks `..` escapes, and DirectoryHandler only logs the rejected path. No traversal bypass was found, so no candidate was raised (this codebase did fix a ClasspathResourceHandler traversal previously, CHANGELOG.md:177)."
+    },
+    {
+      "lead": "CookieSessionDataStorage stores session state in a client cookie using the plain SerializationSessionDataTranscoder by default (CookieSessionDataStorage.java:41-71), and BaseEncryptor uses bare \"AES\" (ECB) with a caller-supplied key (BaseEncryptor.java:27-55).",
+      "reason": "Client-readable/tamperable session state and unauthenticated-ciphertext design weakness, but the deserialization whitelist (whitelist-serialization.txt via WhitelistObjectInputStream) blocks classical gadget RCE, tampering is largely self-directed, and the encrypted variant is the documented opt-in; judged lower-impact and largely a design/configuration issue."
+    }
+  ],
+  "summary": "Reviewed the Pippo 1.12.0-SNAPSHOT multi-module source tree as a defensive source assessment (387 model-visible files; P1 index reports 387/387 indexed, index is navigation-only). I traced attacker-controlled request input into the ContentTypeEngine framework, the session/cookie machinery, static-resource handlers, CSRF/CORS handlers, the controller module, template/CSS modules, server modules, and build/config files. The single strongest candidate is the unrestricted SnakeYAML deserialization primitive exposed by the optional pippo-snakeyaml content-type engine: request bodies can be parsed with `new Yaml().load(...)` (SnakeYAML 1.17, no SafeConstructor / type restriction), which allows attacker-named YAML global tags to instantiate arbitrary classes and trigger side effects during parsing (classic CWE-502 unsafe deserialization, up to remote code execution). Neighbouring engines in the same codebase were explicitly hardened in this same dev cycle (XStream type whitelist for issue #454; Java serialization whitelist for issue #458; FastJSON bumped to 1.2.51), which makes the unguarded SnakeYAML engine the standout remaining unsafe deserializer. Rejected/unconfirmed leads (gzip response wrapping now on by default, SettingsHandler password-masking gaps, indexed-parameter array allocation DoS, dev-mode error-page URI reflection, and several path-traversal candidates) are listed below; no candidate was runtime-confirmed and no code was executed."
+}

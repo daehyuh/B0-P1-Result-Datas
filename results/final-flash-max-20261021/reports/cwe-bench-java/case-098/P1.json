@@ -1,0 +1,120 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Instance name (argument of instance:create/destroy/rename) and the `--location` option value (CreateCommand lines 58-59, 93-94, 122-125) are plain shell arguments supplied by the remote user; no canonicalization/containment check is applied before they become filesystem paths. Example shapes: a default-location create with a traversal name (e.g. `instance:create ../../outside` -> `${karaf.home}/instances/../../outside`), or `instance:create x --location /absolute/path` followed by `instance:destroy x`.",
+      "confidence": "medium",
+      "counterevidence_checked": "The JMX twin of this API (InstancesMBeanImpl create/destroy) is protected by the generic `jmx.acl` config (`* = admin`, feature.xml lines 998/1067-1071), and the webconsole instance plugin is gated by `org.apache.karaf.webconsole role=admin` (feature.xml lines 941-965) plus the standard `sshRole = ssh` login gate; so the exposed path is the shell command path with a non-admin role. The `--location` option is documented/intended (admins legitimately choose instance locations), so the defect is the combination of unvalidated input and missing authorization, not the option itself. `mkdir`/copy failures abort creation, so deletion is limited to trees writable by the Karaf user. Allowing commands whose scope has no ACL is documented Karaf behavior, which is exactly why the absent `org.apache.karaf.command.acl.instance` policy is the operative gap; I also checked that the `scope_bundle` map and service-ACL transformer generate no instance rules, and that `SecuredSessionFactoryImpl` never falls back to a deny for a scope without config.",
+      "id": "karaf-instance-path-traversal-missing-acl",
+      "impact": "Any authenticated console user (for example a user holding only viewer/manager roles) can create directories/files and recursively delete directory trees with the privileges of the Karaf process, outside the intended ${karaf.home}/instances tree: e.g. point an instance at `${karaf.base}`, `${karaf.base}/data`, `/opt/app/...` or `/tmp/...` and destroy it. This breaks the RBAC role model (filesystem-destructive operations remain in the admin domain), and can destroy the Karaf installation/data or other applications' data (integrity/availability). No confidentiality impact demonstrated.",
+      "locations": [
+        {
+          "end_line": 126,
+          "path": "instance/src/main/java/org/apache/karaf/instance/command/CreateCommand.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 52,
+          "path": "instance/src/main/java/org/apache/karaf/instance/command/DestroyCommand.java",
+          "start_line": 32
+        },
+        {
+          "end_line": 306,
+          "path": "instance/src/main/java/org/apache/karaf/instance/core/internal/InstanceServiceImpl.java",
+          "start_line": 289
+        },
+        {
+          "end_line": 328,
+          "path": "instance/src/main/java/org/apache/karaf/instance/core/internal/InstanceServiceImpl.java",
+          "start_line": 323
+        },
+        {
+          "end_line": 703,
+          "path": "instance/src/main/java/org/apache/karaf/instance/core/internal/InstanceServiceImpl.java",
+          "start_line": 689
+        },
+        {
+          "end_line": 732,
+          "path": "instance/src/main/java/org/apache/karaf/instance/core/internal/InstanceServiceImpl.java",
+          "start_line": 706
+        },
+        {
+          "end_line": 1074,
+          "path": "instance/src/main/java/org/apache/karaf/instance/core/internal/InstanceServiceImpl.java",
+          "start_line": 1050
+        },
+        {
+          "end_line": 241,
+          "path": "shell/core/src/main/java/org/apache/karaf/shell/impl/console/osgi/secured/SecuredSessionFactoryImpl.java",
+          "start_line": 206
+        },
+        {
+          "end_line": 129,
+          "path": "assemblies/features/base/src/main/resources/resources/etc/system.properties",
+          "start_line": 118
+        },
+        {
+          "end_line": 1072,
+          "path": "assemblies/features/standard/src/main/feature/feature.xml",
+          "start_line": 998
+        },
+        {
+          "end_line": 281,
+          "path": "assemblies/features/standard/src/main/feature/feature.xml",
+          "start_line": 281
+        },
+        {
+          "end_line": 179,
+          "path": "assemblies/apache-karaf/pom.xml",
+          "start_line": 160
+        }
+      ],
+      "prerequisites": "Default 4.3.5 distribution with the `instance` feature booted (present in assemblies/apache-karaf/pom.xml bootFeatures, line 173); a configured non-admin JAAS user able to log into the console (SSH login only needs the `ssh` role, default `sshRole = ssh`, and role check is any RolePrincipal; roles need not include admin); `karaf.secured.command.compulsory.roles` left unset (default) and no instance command ACL; the target directory must be writable by the Karaf process for the create step (and its files deletable for the delete step).",
+      "root_cause": "InstanceServiceImpl derives filesystem paths directly from user input with no normalization or containment check: `String loc = settings.getLocation() != null ? settings.getLocation() : name; File karafBase = new File(loc); if (!karafBase.isAbsolute()) karafBase = new File(storageLocation, loc);` (line 302-306) and then creates/copies a Karaf skeleton into that path; destroyInstance later calls `deleteFile(new File(instance.loc))` (line 699) which is a full recursive delete (lines 1050-1074); renameInstance builds `new File(basedir, newName)` and calls `renameTo` (lines 730-732). At the same time, the shipped RBAC policy contains no `org.apache.karaf.command.acl.instance` configuration (the standard feature defines ACLs only for the feature/shell/bundle/config/jaas/system/kar/maven scopes) and `karaf.secured.command.compulsory.roles` is commented out in etc/system.properties, so SecuredSessionFactoryImpl.checkSecurity treats scope `instance` as unrestricted for every logged-in user (`config == null` -> compulsory roles empty -> `passCheck = true`).",
+      "title": "Unvalidated instance name/--location plus missing RBAC for the `instance` command scope allows any authenticated shell user to create and recursively delete arbitrary directories",
+      "trace": "Remote shell command instance:create/instance:destroy -> SecuredCommand.execute -> SecuredSessionFactoryImpl.checkSecurity(\"instance\", name, args) -> getScopeConfig(\"instance\") returns null (no org.apache.karaf.command.acl.instance) -> ACLConfigurationParser.getCompulsoryRoles returns empty (system property unset) -> passCheck = true, no SecurityException -> CreateCommand.doExecute -> new InstanceSettings(..., location, ...) -> InstanceServiceImpl.createInstance: loc = location or name; new File(storageLocation, loc); mkdir/copy of the Karaf skeleton into the attacker-chosen path; state records it -> InstanceImpl.destroy() -> InstanceServiceImpl.destroyInstance -> deleteFile(new File(instance.loc)) recursively deletes the chosen tree. The rename path uses new File(basedir, newName) + renameTo with the same unvalidated input.",
+      "unverified": "No code/tests/containers were executed and no runtime confirmation was obtained; the RBAC behavior was derived by reading SecuredSessionFactoryImpl/ACLConfigurationParser and the shipped configs. I could not confirm the upstream policy intent (whether the eventual hardening was an added ACL config, name/location validation, or both), and no CVE/patch/history metadata was consulted. Whether a specific deployment grants the `ssh` role to a non-admin user is environment-dependent.",
+      "weakness_type": "CWE-22 Path Traversal combined with CWE-862 Missing Authorization (non-admin console user reaches filesystem write/delete operations as the Karaf OS user)"
+    }
+  ],
+  "coverage_summary": "Scope: 1851 model-visible source files under the assigned root; per get_source_scope, binary-like files are unreadable and no path/sensitive-name exclusions were applied, but test trees are absent from the snapshot (e.g. itests/pom.xml declares an `itests/test` module that does not exist), so no tests were reviewable. Per get_relation_scope the P1 index covers 1784 files (67 source files missing), 1284 parsed Java files, 4 parse errors, and explicitly has no control-flow, data-flow, semantic resolution, or reachability proof, so index facts were used only for navigation and every claim here was re-checked in source text. Files/paths inspected included: management (KarafMBeanServerGuard, MBeanInvocationHandler, ConnectorServerFactory, PlainSaslServer, JaasAuthenticator, Activator), jaas boot/config/modules/command (properties, digest, JDBC, LDAP/LDAPCache, publickey, syncope, encryption, audit), shell core/console/commands/ssh (RBAC wrappers, ACL parser, GuardProxyCatalog, SourceAction/ExecuteAction, SSH authenticators/key provider/agent), kar and obr archive handling, features core/command and deployers (JaxbUtil, FeatureConfigInstaller, FeatureDeploymentListener, transformer/deployer classes), config, bundle, system, log, audit, util (XmlUtils, JsonReader/Writer, maven Parser, StreamUtils), profile (Profiles/ProfileServiceImpl/assembly), instance (commands + service + MBean + webconsole plugin), webconsole (JaasSecurityProvider, KarafOsgiManager, Gogo plugin, instance plugin), http proxy, client, main, docker, jdbc, jms, jndi, scheduler, scr, subsystem, services, event, package, tooling/karaf-maven-plugin, assemblies/default configs and etc/*.cfg ACLs, and the P1 relation index (symbols/facts) for navigation. I did not read every one of the 1851 files line-by-line; priority was given to authentication, authorization, path/archive handling, and remote-input-processing code.",
+  "limitations": [
+    "No execution: no build, tests, scanners, containers, or exploit payloads were run; all conclusions are static and source-level only, and the candidate is a lead, not a confirmed vulnerability.",
+    "No repository history, patch, CVE/CWE, or ground-truth data was available or consulted, so I cannot assert that this is the issue a specific fix addressed.",
+    "The P1 relation index is syntactic and partial (67 source files missing, 4 parse errors, no data/control flow or reachability), so coverage of cross-file data flow is limited and unreported areas cannot be assumed clean.",
+    "Test sources are absent from the snapshot (harness filtering), which removes the tests that would normally document the intended behavior of the instance/RBAC paths.",
+    "RBAC conclusions depend on shipped defaults (no org.apache.karaf.command.acl.instance, `karaf.secured.command.compulsory.roles` commented out, `sshRole = ssh`, instance in bootFeatures); deployments that uncomment compulsory roles or add ACLs would not be affected.",
+    "The instance create step must succeed for a later recursive delete, so the impact is bounded by filesystem permissions of the Karaf process; deleteFile ignores partial failures.",
+    "Uninspected/unverified: 4 unparsed Java files and ~67 files not present in the index; optional-feature code paths (obr, profile, webconsole, jdbc/jms/jndi/docker) were reviewed only at a high level."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "profile/src/main/java/org/apache/karaf/profile/impl/Profiles.java writeProfile/deleteProfile resolve `profile.getId().replace(\"-\", separator)` directly under the profiles root, so ids containing dot-dot segments traverse outside the store (arbitrary mkdir and recursive delete), and `profile:*` commands have no ACL.",
+      "reason": "Real traversal pattern, but the impact is bounded (every derived path always ends in `.profile`; profile file content is not attacker-controlled through the available commands) and the `profile` feature is not in the default bootFeatures, unlike `instance`."
+    },
+    {
+      "lead": "features/core FeatureConfigInstaller.installConfigurationFile/uninstallFeatureConfigs use the feature's `<configfile finalname>` without the `..` guard that the config module uses, allowing arbitrary file write/delete.",
+      "reason": "Reaching it requires feature installation (feature:install is restricted to admin by the shipped feature ACL), and installing a feature already means arbitrary bundle code execution, so no privilege boundary is crossed."
+    },
+    {
+      "lead": "management MBeanInvocationHandler only guards invoke/get[Attribute|s]/set[Attribute|s]; remote JMX users with any role can call createMBean/unregisterMBean/addNotificationListener.",
+      "reason": "ObjectName-based ACLs default-deny (generic jmx.acl `* = admin`), I could not establish a concrete privileged operation reachable through these ungated lifecycle operations, and descriptor/filter deserialization impact would be speculation."
+    },
+    {
+      "lead": "bundle:update accepts an arbitrary location URL while the shipped bundle ACL allows `update` for the manager role (unlike `install = admin`), effectively letting a manager replace bundle code; the optional obr feature exposes obr:addUrl/obr:deploy without any ACLs.",
+      "reason": "The ACL comment in the shipped config states that non-forced operations are intentionally allowed to managers, so this is a policy choice rather than a clearly verifiable vulnerability; obr is not booted by default."
+    },
+    {
+      "lead": "webconsole/console JaasSecurityProvider skips password verification when the HTTP session already carries a Subject, and its authorize() always returns true.",
+      "reason": "The short-circuit only applies to sessions that already authenticated successfully; no path was found for an attacker to obtain such a session or to escalate, and the webconsole requires the admin role by default."
+    },
+    {
+      "lead": "shell/ssh OpenSSHKeyPairProvider legacy KeyPair deserialization guard only validates the first class in the stream; SSH client host-key verification is trust-on-first-use and auto-accepts unknown keys when quiet.",
+      "reason": "The deserialization path needs write access to the local private-key file; the TOFU behavior is by design for a CLI client."
+    },
+    {
+      "lead": "EncryptionSupport/DigestPasswordLoginModule password handling (empty prefix/suffix makes encrypt() a no-op; digest path pre-digests the stored password) and client ClientConfig `${env:}`/`${prop:}` substitution slicing look incorrect.",
+      "reason": "No exploitable authentication bypass or information disclosure could be demonstrated from these code paths in the available time."
+    }
+  ],
+  "summary": "Reviewed the Apache Karaf 4.3.5 source snapshot (1851 model-visible files; the harness has removed test sources, e.g. itests/test is referenced by itests/pom.xml but absent, so only main sources were reviewable). I traced the security-relevant paths: JMX management (KarafMBeanServerGuard, MBeanInvocationHandler, ConnectorServerFactory, PlainSaslServer, JaasAuthenticator), JAAS modules (properties/JDBC/LDAP/publickey/digest login modules and encryption support), shell RBAC (SecuredSessionFactoryImpl/SecuredCommand/ACLConfigurationParser/GuardProxyCatalog and the shipped command ACL configs), shell/ssh (authenticators, key provider, command handling), archive/derived-path handling (kar, obr, profile, tooling RunMojo, drop-in deployers), features (JaxbUtil/FeatureConfigInstaller/downloads), instance commands, webconsole (JaasSecurityProvider, Gogo plugin, instance plugin), log/audit/util XML and JSON helpers, client/main bootstrap and config/ACL defaults. Strongest source-backed issue: the `instance` command family (booted by default) uses the user-supplied instance name / `--location` directly as a filesystem path for directory creation and for a recursive delete, and the shipped RBAC policy deliberately restricts only listed commands, with no `org.apache.karaf.command.acl.instance` policy and `karaf.secured.command.compulsory.roles` commented out, so any authenticated shell user (e.g. viewer/manager with the `ssh` role) can create and recursively delete directories outside the intended `${karaf.home}/instances` tree as the Karaf OS user. Other suspicious-but-weaker leads are listed as rejected leads. No code was executed; findings are source-level only."
+}

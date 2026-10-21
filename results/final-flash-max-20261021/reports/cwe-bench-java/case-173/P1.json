@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A user holding a deploy permission (standard Deployer role) fully controls the content of uploaded archives, including the WAR's WEB-INF/jboss-web.xml <context-root> element of a WAR nested inside an EAR. WildFly exposes that descriptor value as subsystem/undertow/context-root in the runtime deployment model, and HAL reads it into the preview without a validation/escaping step between the server response and the HTML sink. The victim only needs to open the Deployments column and select the crafted deployment.",
+      "confidence": "medium",
+      "counterevidence_checked": "- The direct (non-nested) branch of the same method renders the same value with span().textContent(...), showing escaping is the intended handling; no equivalent escape exists in the nested branch.\n- The sibling value in the nested branch (subdeployment name) is escaped via SafeHtmlBuilder.appendEscaped, so only the context root is mishandled.\n- Other model-name rendering paths that initially looked vulnerable are neutralized: ListenerPreview's fromTrustedString argument contains the web server name that has passed through Ids.asId/Ids.build (Ids.java:1068-1108) which strips HTML metacharacters, so that path is not exploitable.\n- GWT i18n SafeHtml messages do escape String parameters (corroborated by the in-repo comment in BrowseContentElement.java:536-537), so the numerous messages(...) usages are not sinks per se.\n- No runtime test was possible: DMR recursive-depth semantics, Undertow context-root validation, and the actual DOM rendering were inferred statically.",
+      "id": "deployment-context-root-xss",
+      "impact": "Stored cross-site scripting in the management console's origin. JavaScript supplied indirectly by a low-privileged deployer executes in the browser of an administrator who inspects the deployment. Because the console is served from the management interface origin and the Dispatcher issues same-origin requests with credentials (dmr/src/main/java/org/jboss/hal/dmr/dispatch/Dispatcher.java, requestInit sets credentials 'include'), the injected script can perform arbitrary management operations with the administrator's session (read/modify the model, exfiltrate data) - i.e., privilege escalation from deploy permissions to effective administrative control of the console session.",
+      "locations": [
+        {
+          "end_line": 178,
+          "path": "app/src/main/java/org/jboss/hal/client/deployment/DeploymentPreview.java",
+          "start_line": 163
+        },
+        {
+          "end_line": 70,
+          "path": "app/src/main/java/org/jboss/hal/client/deployment/StandaloneDeploymentPreview.java",
+          "start_line": 69
+        },
+        {
+          "end_line": 100,
+          "path": "app/src/main/java/org/jboss/hal/client/deployment/StandaloneDeploymentColumn.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 40,
+          "path": "core/src/main/java/org/jboss/hal/core/deployment/Subdeployment.java",
+          "start_line": 31
+        }
+      ],
+      "prerequisites": "- Standalone (or any read path whose recursive-depth includes the subdeployment's subsystem child; StandaloneDeploymentColumn uses read-children-resources(child-type=deployment, include-runtime=true, recursive-depth=2)).\n- The deployment is an archive with nested subdeployments (e.g., EAR containing a WAR) that has the undertow subsystem and a defined context-root.\n- Undertow stores the descriptor value without stripping/neutralizing HTML metacharacters (unverified).\n- An administrator views the deployment in HAL (the preview is built eagerly when the column row is selected).",
+      "root_cause": "In the nested-subdeployment branch of DeploymentPreview.contextRoot(), the value of the management-model attribute subsystem/undertow/context-root is concatenated into a string that is declared trusted with SafeHtmlUtils.fromTrustedString(...) and then inserted into the DOM with li().innerHtml(safeHtml). SafeHtmlUtils.fromTrustedString explicitly bypasses HTML escaping (unlike appendEscaped/fromString used in the adjacent code), so any markup in the model value is parsed as HTML in the management-console origin. The same method's non-nested branch correctly renders the identical value with span().textContent(...), demonstrating the inconsistency.",
+      "title": "Stored XSS in standalone deployment preview via unescaped Undertow context root",
+      "trace": "StandaloneDeploymentColumn.itemsProvider (lines 89-100) reads /deployment=* with recursive-depth=2 -> Deployment/Subdeployment constructors parse the subdeployment model, including subsystem/undertow/context-root (Deployment.java:62-68, Subdeployment.java:31-40) -> StandaloneDeploymentPreview calls contextRoot(attributes, deployment) (line 70) -> DeploymentPreview.contextRoot() nested branch (lines 165-175) evaluates failSafeGet(subdeployment, \"subsystem/undertow/context-root\") and builds SafeHtmlUtils.fromTrustedString(\" <span data-link>\" + contextRoot.asString() + \"</span>\") -> value appended to a SafeHtmlBuilder and rendered by li().innerHtml(safeHtml) -> PreviewAttribute is added to the finder preview, so the attacker-controlled markup is parsed and, e.g., an image error handler executes JavaScript in the HAL origin (the management interface origin).",
+      "unverified": "The exploit chain was not executed or observed. It depends on (a) the server accepting and returning a context-root containing HTML metacharacters without normalization, (b) the recursive read actually containing subdeployment subsystem children so the nested branch is reached, and (c) HAL's preview being rendered on selection as read in source. The sink itself (fromTrustedString + innerHtml) and the data source (context-root) are verified in code.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') - stored/DOM XSS"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot root (1,821 files; modules app, core, dmr, config, meta, ballroom, resources, spi, js, standalone, themes, testsuite, wildfly, build/CI files). Focus areas: all DOM/HTML sinks reachable from management-model data - InnerHtml/innerHTML assignments, SafeHtmlBuilder usage, SafeHtmlUtils.fromTrustedString/fromSafeConstant, GWT i18n Message SafeHtml vs String semantics, finder/table/alert/list/preview rendering, autocomplete renderers, form labels/help text, wizard and notification rendering, macro/config-change displays; plus bootstrap/endpoint handling (EndpointManager, EndpointDialog, EndpointStorage, KeycloakSingleton), Dispatcher request construction/credentials, download/window.open URL construction, and the standalone Quarkus route. P1 relation index: 1,806 of 1,821 source files indexed (15 omitted), 17,106 symbols/63,323 call sites with 44,043 unresolved calls; it provides no control-flow/data-flow and no semantic resolution, so it was used only for navigation/verification and no unreported area is claimed as reviewed. Not reviewed in depth: vendored JS bundles under app/src/web (ACE, DataTables, PatternFly, PouchDB, tagmanager.js), generated/theme assets, package-lock files, and every one of the 1,821 files line by line. Builds/tests/scanners were not run.",
+  "limitations": [
+    "Static, read-only review: no build, test, browser rendering or runtime confirmation of any finding.",
+    "The selected candidate depends on server-side behavior that could not be verified from source: Undertow context-root validation/normalization and DMR recursive-depth semantics for read-children-resources; if either differs from the inference, the nested branch may not be reached or the payload may be rejected.",
+    "GWT i18n escaping rules (String parameters escaped for SafeHtml-returning @Messages methods) and Elemento innerHtml semantics were inferred from library conventions and corroborated only by an in-repo comment (BrowseContentElement.java:536-537), not by running generated code.",
+    "Index coverage is partial and syntactic only (no data/control flow, 44k unresolved calls, 15 files missing); absence of an index edge is not evidence of absence of a code path.",
+    "Browser-side behaviors relevant to the rejected Keycloak/connect lead (CORS with credentials, javascript: URL handling, presentAndValid() outcome) were not empirically verified.",
+    "The vulnerability-relevant code is client-side GWT Java; its behavior in the compiled JavaScript output cannot be fully guaranteed from the Java source alone.",
+    "Only one candidate could be submitted; several plausible but less-evidenced escaping lapses are listed as rejected leads rather than exhaustively resolved."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ballroom/src/main/java/org/jboss/hal/ballroom/autocomplete/ReadChildrenRenderer.java lines 35-50: child resource name from read-children-resources is concatenated raw into appendHtmlConstant (data-val attribute and highlighted label), while the twin StringRenderer.java escapes via SafeHtmlUtils.fromString.",
+      "reason": "Same XSS class and clearly missing escaping, but exploitation requires an attacker who can create/naming resources in the relevant subsystem configuration (socket bindings, undertow servers/listeners, messaging/JGroups/JCA resources) and a victim who triggers the affected autocomplete form; no low-privilege (deployer) path found, so it is weaker than the selected candidate and was not verified end-to-end."
+    },
+    {
+      "lead": "config/src/main/java/org/jboss/hal/config/keycloak/KeycloakSingleton.java lines 47-84 with app/src/main/java/org/jboss/hal/client/bootstrap/endpoint/EndpointManager.java lines 73-118: the unvalidated ?connect= URL is used as base URL, the OIDC JSON is fetched from it and document.createElement('script').src is set to the auth-server-url from that JSON, which would execute attacker JavaScript in the console origin.",
+      "reason": "Plausible DOM-based XSS requiring only a crafted link, but the code intentionally trusts the user-selected management endpoint's OIDC configuration (a legitimate IdP is a different origin), so it is arguably endpoint-trust-by-design; it also depends on unverified runtime behavior (CORS, presentAndValid()) and was not chosen as the strongest evidence."
+    },
+    {
+      "lead": "ballroom/src/main/java/org/jboss/hal/ballroom/HelpTextBuilder.java line 96, core/src/main/java/org/jboss/hal/core/modelbrowser/ResourcePanel.java line 103, core/src/main/java/org/jboss/hal/core/finder/ResourceDescriptionPreview.java line 39: read-resource-description 'description' values are declared safe HTML with SafeHtmlUtils.fromSafeConstant and injected via innerHTML.",
+      "reason": "Descriptions are server-subsystem metadata; influencing them requires a malicious/compromised management endpoint or a custom subsystem, i.e., attacker control is much weaker than a deployer-controlled descriptor value."
+    },
+    {
+      "lead": "ballroom/src/main/java/org/jboss/hal/ballroom/form/AbstractAppearance.java lines 114-119: markAsRequired()/clearRequired() assign the form-item label to labelElement.innerHTML without escaping; a JAX-RS path parameter name (deployment-controlled) becomes a TextBoxItem label in RestResourcePreview.specifyParameters (app/.../jaxrs/RestResourcePreview.java lines 275-293).",
+      "reason": "Attractive deployer-controlled label source, but it depends on the JAX-RS implementation accepting an arbitrary {..} template parameter name at deployment time and on the GET link being clicked; not verifiable statically here, so it remains unconfirmed."
+    },
+    {
+      "lead": "app/src/main/java/org/jboss/hal/client/runtime/configurationchanges/ConfigurationChangeDisplay.java lines 100-116: operation name, resource address (contains resource names) and property names are concatenated into SafeHtmlUtils.fromTrustedString / appendHtmlConstant and rendered via ListItem.innerHTML.",
+      "reason": "Optional configuration-changes service must be enabled and populated with attacker-named changes; the address/op values are server-generated and property names are usually model-defined, so prerequisites are weaker/less certain."
+    },
+    {
+      "lead": "app/src/main/java/org/jboss/hal/client/deployment/ServerGroupDeploymentPreview.java lines 57-79 with ballroom/Alert.java line 99: a String message containing the reference server name is inserted via additionalDescription.innerHTML.",
+      "reason": "Requires write access to host/server configuration names (higher privilege than a deployer) and only affects the domain-mode server-group deployment preview."
+    },
+    {
+      "lead": "app/src/main/java/org/jboss/hal/client/bootstrap/BootstrapFailed.java line 123: endpoints.dmr() (built from the attacker-supplied connect URL) is assigned to an anchor href; a javascript: URL can pass the naive connect.contains(\"://\") check (e.g. with a trailing // comment) and execute when the error-page link is clicked.",
+      "reason": "Requires bootstrap failure plus an explicit user click on the displayed link, and relies on browser javascript: handling; secondary to the script-loading path in the same connect feature."
+    }
+  ],
+  "summary": "HAL (WildFly/EAP management console) source review focused on how management-model data reaches DOM/HTML sinks across the GWT modules (app, core, ballroom, dmr, config, meta, resources, standalone). The strongest source-evidenced issue found is a stored/DOM cross-site scripting path in the standalone deployment preview: the Undertow context root of a nested (sub)deployment is taken verbatim from the server's runtime deployment model, marked as trusted HTML with SafeHtmlUtils.fromTrustedString, and injected via HTMLElement.innerHtml(). A user with deploy permissions controls the application descriptor that feeds this value (e.g., jboss-web.xml context-root inside a WAR in an EAR), so a crafted deployment can execute JavaScript in an administrator's console origin. Other escaping lapses were identified but each is either weaker on attacker control, neutralized by model-ID sanitization, or dependent on optional features; they are recorded as rejected leads. No code was executed; findings are static leads only."
+}

@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The search expression is taken from the HTTP request. SearchContextImpl.getSearchExpression() reads the decoded `_search`/`_s` query parameter (or all query parameters when search.use.plain.queries is enabled) and hands it to the parser; FiqlParser.parseComparison() takes everything after the comparator as the raw value, and parseType() only URL-decodes it (search.decode.values). No character filtering is applied to values, so an unauthenticated caller controls the string that reaches the SQL visitor.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified no default sanitizer blocks the payload: AbstractSearchConditionVisitor.validatePropertyValue is a no-op unless a PropertyValidator is installed; SearchUtils.toSqlWildcardString only rewrites `\\`, `_`, `%`, `*`; FiqlParser does not reject or strip quotes in values (only `,`, `;`, `(`, `)` are structural). Considered that the SQL text is generated for the application to execute rather than executed by CXF itself (app integration is the prerequisite), and that the same helper is also used by JPALanguageVisitor. I could not compare against upstream/fix commits or CVEs (no network, no git history), so the CVE mapping and whether this exact condition is the benchmarked fix remain unverified.",
+      "id": "cxf-search-sql-injection",
+      "impact": "SQL/JPQL injection in applications that use the documented CXF search feature: authentication-free attackers can alter WHERE semantics (e.g. dump or bypass filters), and depending on statement composition/database privileges potentially read or modify other data. It is server-side and deterministic, unlike the client-side reflection lead.",
+      "locations": [
+        {
+          "end_line": 128,
+          "path": "rt/rs/extensions/search/src/main/java/org/apache/cxf/jaxrs/ext/search/SearchUtils.java",
+          "start_line": 123
+        },
+        {
+          "end_line": 112,
+          "path": "rt/rs/extensions/search/src/main/java/org/apache/cxf/jaxrs/ext/search/sql/SQLPrinterVisitor.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 40,
+          "path": "rt/rs/extensions/search/src/main/java/org/apache/cxf/jaxrs/ext/search/jpa/JPALanguageVisitor.java",
+          "start_line": 27
+        },
+        {
+          "end_line": 279,
+          "path": "rt/rs/extensions/search/src/main/java/org/apache/cxf/jaxrs/ext/search/fiql/FiqlParser.java",
+          "start_line": 249
+        },
+        {
+          "end_line": 137,
+          "path": "rt/rs/extensions/search/src/main/java/org/apache/cxf/jaxrs/ext/search/SearchContextImpl.java",
+          "start_line": 113
+        }
+      ],
+      "prerequisites": "The deployed application must use the CXF JAX-RS Search extension (e.g. `@Context SearchContext`, default FiqlParser) and must build a query with SQLPrinterVisitor / SearchUtils.toSQL / JPALanguageVisitor and execute the produced string against a JDBC or JPA backend. No attacker authentication is required beyond access to that resource; the default parser and default visitor settings are sufficient.",
+      "root_cause": "SearchUtils.duplicateSingleQuoteIfNeeded() only escapes apostrophes when the value contains a single quote and does NOT contain the character pair \"''\": `if (value.indexOf('\\'') != -1 && value.indexOf(\"''\") == -1)`. An attacker value that contains both a lone `'` and the sequence `''` skips escaping entirely. SQLPrinterVisitor.visit() then embeds the returned value directly between single quotes into the WHERE clause it builds (sb.append(name)...append(\"'\" ).append(value).append(\"'\")), so the value can terminate the string literal and inject SQL.",
+      "title": "SQL injection in JAX-RS Search: bypassable single-quote escaping in SearchUtils.duplicateSingleQuoteIfNeeded",
+      "trace": "GET /resource?_search=name==x' OR ''=' → SearchContextImpl.getSearchExpression() (lines 113-133) → FiqlParser.parse → parseComparison/parseType stores value `x' OR ''='` (lines 249-279) → application visitor: SQLPrinterVisitor.visit() (lines 99-112) → SearchUtils.toSqlWildcardString leaves quotes untouched, then SearchUtils.duplicateSingleQuoteIfNeeded (lines 123-128) sees `'` present but also `''` present, so it returns the value unchanged → the value is concatenated between quotes, yielding `WHERE name = 'x' OR ''=''`, a tautology that changes the query's semantics (the same value is used by JPALanguageVisitor for JPQL). An injected `--` comment requires only normal SQL rules; no special characters are blocked by CXF.",
+      "unverified": "Not runtime-tested and not executed; the app-side use of SQLPrinterVisitor/toSQL is required for the sink. The exact affected/fixed CXF releases and CVE identifier could not be verified from the snapshot; the bypass logic itself is demonstrable from the quoted source lines.",
+      "weakness_type": "CWE-89 SQL Injection (improper neutralization of special elements; conditional escaping bypass)"
+    }
+  ],
+  "coverage_summary": "All 4,922 model-visible files were in scope (no size/sensitive/symlink exclusions; binary-like files are skipped/refused by policy). I read/search-inspected the core Stax/DOM helpers, the JAX-RS search extension (parser, visitors, context, SQL/JPA/LDAP/Lucene visitors), OAuth2/OIDC/JOSE components, the servlet and HTTP transports (service list generation, CXFNonSpringServlet, ServletController), rt/ws/security helpers, and tooling/benchmark code. No src/test trees exist in the snapshot, so fix-verification tests could not be used.",
+  "limitations": [
+    "Read-only, source-level review: no build, execution, or exploit payloads, so no runtime confirmation of the injection or of container-specific XSS behavior.",
+    "No network, git history, patches, or CVE data were available, so the exact fix commit/CVE mapping for this snapshot (and whether the odd escaping condition is the benchmarked change) is unverified.",
+    "Coverage is bounded by text search/reading; large generated/XML/binary-like artifacts were not parsed, and some modules (CORBA, JMS, OSGi, Maven plugins, samples) were only spot-checked.",
+    "The SQL injection requires the host application to use the documented search visitor and execute the generated query; CXF itself only builds the string."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected content on the servlet services listing page: ServiceListGeneratorServlet builds styleSheetPath from request.getContextPath()/getServletPath()/getPathInfo() (lines 107-131) and FormattedServiceListWriter writes it unescaped into href=\\\"...\\\" (line 65); base path/endpoint addresses derived from the request are likewise written unescaped (FormattedServiceListWriter lines 122-128, UnformattedServiceListWriter lines 60-62).",
+      "reason": "Plausible reflected XSS (same class as CXF-2019-17573), but exploitability depends on servlet-container acceptance of quote/path characters and Host-header handling and the impact is client-side, so it is weaker than the deterministic in-tree SQL injection taint path; noted only as an unconfirmed secondary lead."
+    },
+    {
+      "lead": "JWS/JWT verification could be bypassed via alg=none or missing verifier.",
+      "reason": "JwsUtils.loadSignatureVerifier throws JwsException(NO_VERIFIER) when no verifier is available and only uses NoneJwsSignatureVerifier when the configured algorithm is explicitly NONE and the header matches; JoseJwtConsumer and JwsContainerRequestFilter abort on verifySignatureWith()==false. No source evidence of a bypass."
+    },
+    {
+      "lead": "XXE in XML parsing paths.",
+      "reason": "StaxUtils.createXMLInputFactory sets SUPPORT_DTD=false, IS_SUPPORTING_EXTERNAL_ENTITIES=false and installs a rejecting XMLResolver; DOMUtils disallows DOCTYPE. No unprotected request-parsing factory found in the main paths."
+    },
+    {
+      "lead": "Command execution in bin/DoMerges.java and common/util/Compiler.java.",
+      "reason": "Fixed argument arrays/build tooling, not reachable from service request data."
+    },
+    {
+      "lead": "SQL construction in RMTxStore / LdapQueryVisitor / LuceneQueryVisitor.",
+      "reason": "RMTxStore uses fixed statements/MessageFormat with schema name that is validated in setSchemaName; LDAP visitor applies RFC2254 encoding; Lucene query building is not SQL. No attacker-controlled flow found."
+    }
+  ],
+  "summary": "Assigned snapshot is Apache CXF 3.2.11 (root pom version/tag cxf-3.2.11); 4,922 model-visible text files, no binary/exclusion filters applied, and notably no src/test sources at all, so security-fix regression tests are absent. I inspected core, the JAX-RS front end and search extension, rt/rs/security (OAuth2/OIDC/JOSE/SAML/CORS), rt/ws/security, and the servlet/HTTP transports, using text search over dangerous sinks (XML factories, TrustManager/hostname verification, Runtime.exec, sendRedirect, SQL construction, request-URI/path reflection, ObjectInputStream, XPath, ScriptEngine). The single strongest issue I found is a SQL-injection flaw in the JAX-RS Search extension: `SearchUtils.duplicateSingleQuoteIfNeeded` escapes `'` only when the value contains a quote AND does not already contain the two-character sequence `''`. A request-supplied FiQL search value containing both a lone `'` and `''` is therefore passed through unescaped and concatenated verbatim between single quotes by `SQLPrinterVisitor` (and its JPA subclass), letting an attacker close the literal and inject SQL. Other candidate areas (JWS/JWT signature checking, StaxUtils XXE hardening) looked correctly implemented; the services-listing-page reflection is a real but weaker/secondary lead."
+}

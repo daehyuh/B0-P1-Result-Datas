@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any authenticated user controls the `userId` (target account) and `name` path parameters, and the optional `token_ttl` body. They do not need the target's username: the built-in admin has the fixed, well-known id `local:admin` (`UserImpl.LocalAdminUser.LOCAL_ADMIN_ID`), resolved by `UserServiceImpl.loadById` (lines 115-120), or any target user id observed elsewhere in API responses (e.g. `creator_user_id` fields).",
+      "confidence": "high",
+      "counterevidence_checked": "Checked that the class only has `@RequiresAuthentication` and the method has no `@RequiresPermissions`/`RestrictToLeader` annotation, so the in-body check is the only guard. Checked that `RestResource.isPermitted(permission, instanceId)` calls `subject.isPermitted(permission + \":\" + instanceId)` with the caller's name, and that `getCurrentUser()` resolves the authenticated subject, not the target. Checked that the returned `Token` object includes the plaintext token and that `AccessTokenAuthToken`/`AccessTokenAuthenticator` accept it as the authenticating credential. Compared with `listTokens`, `revokeToken`, `changePassword`, `changeUser`, and `getbyId`, which all scope the permission to the target username, confirming the intended semantics and that this method is an outlier. Verified the admin id constant and root-user special cases that make a target easy to specify.",
+      "id": "users-token-create-authz-target-confusion",
+      "impact": "Privilege escalation / full account takeover: a low-privileged authenticated user can obtain a valid API token for any user, including the built-in admin, then read/modify all data, change configuration, create further tokens/users, and execute administrative actions. Audit events record `USER_ACCESS_TOKEN_CREATE` for the victim username, but the issue is authorization, not detectability.",
+      "locations": [
+        {
+          "end_line": 743,
+          "path": "graylog2-server/src/main/java/org/graylog2/rest/resources/users/UsersResource.java",
+          "start_line": 728
+        },
+        {
+          "end_line": 80,
+          "path": "graylog2-server/src/main/java/org/graylog2/shared/security/Permissions.java",
+          "start_line": 70
+        },
+        {
+          "end_line": 240,
+          "path": "graylog2-server/src/main/java/org/graylog2/users/UserImpl.java",
+          "start_line": 236
+        }
+      ],
+      "prerequisites": "Authenticated user holding `users:tokencreate:<their own username>`. That scoped self permission is automatically granted to non-service users whenever `restrict_access_token_to_admins=false` (`Permissions.userSelfEditPermissions` + `Permissions.isAllowedToCreateTokens`), which is the default for installations upgraded from before 6.2 (`V20250206105400_TokenManagementConfiguration` writes `DEFAULT_VALUES_FOR_UPGRADE`, `restrictAccessTokenToAdmins=false`) and for deployments that relax the fresh-install default. The root/built-in admin must remain enabled (default).",
+      "root_cause": "In `UsersResource.generateNewToken` the target user is loaded into `futureOwner` (line 728) but the permission check on line 734 is performed against `currentUser.getName()` (`users:tokencreate:<caller>`) instead of `futureOwner.getName()`. The token is then created for the target (`accessTokenService.create(futureOwner.getName(), ...)`, line 741) and the plaintext value is returned in the response (line 743). The scoped user-scoped permission exists for self-service management: `Permissions.userSelfEditPermissions` (lines 70-80) adds `users:tokencreate:<own username>` to every non-service user when token creation is not restricted to admins, and `UserImpl.getPermissions` (line 240) applies it. Sibling endpoints consistently check the target instead: `listTokens` uses the loaded user's name (line 702), `revokeToken` uses the target (line 755), `changePassword` uses the target (line 622), `changeUser`/`getbyId` use the target (lines 423, 222).",
+      "title": "Access token creation authorizes the caller instead of the target user, allowing token minting for arbitrary accounts (incl. admin)",
+      "trace": "1) Authenticated attacker POSTs `/api/users/local:admin/tokens/pwn`. 2) `loadUserById(\"local:admin\")` returns the built-in admin (`UserServiceImpl.loadById` special case). 3) `isPermitted(USERS_TOKENCREATE, currentUser.getName())` expands to `users:tokencreate:<attacker>` and passes because the attacker may create their own tokens; no check is made for `users:tokencreate:admin`. 4) `accessTokenService.create(\"admin\"|<root_username>, ...)` persists and returns a token owned by the admin username. 5) Response body `{\"id\":...,\"name\":\"pwn\",\"token\":\"<plaintext>\"}` leaks the token. 6) `AccessTokenAuthenticator` loads the token and authenticates as `userService.load(<root_username>)` = the local admin (permissions `*`), giving full control of the Graylog instance.",
+      "unverified": "Not runtime-confirmed (no code execution/test run). The effective reachability depends on the deployment's `restrict_access_token_to_admins` value: default stricter on brand-new 6.2 installs, but relaxed (self token creation allowed) for upgrades via the token-management migration and for explicitly relaxed installs. Whether the upstream code at this commit had `futureOwner` in the check and this snapshot reverted it cannot be verified without git history; the source as given is defective regardless.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-269 Privilege Escalation (account takeover via access token issuance)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 6,242 model-visible files via list/search/read (no execution). Main Java sources were inspected broadly: `org.graylog2.rest.resources.*` (users/roles/sessions/tokens, system, lookup, content packs, streams, datanodes, search, tools), `org.graylog2.shared.security` and `org.graylog2.security` (Shiro filters/realms, sessions, access tokens, password algorithms), `org.graylog.security.*` (auth services, entity/grants, certificates), `org.graylog.events.*` (definitions, notifications, processors), pipeline processor/rule builder, views search/permissions, inputs/transports/codecs, storage ES7/OS2 modules, and Data Node REST/config. Web interface and build/changelog files were spot-checked. Java test sources are absent from the snapshot, so behavior could not be validated against tests.",
+  "limitations": [
+    "No git history or patch data: could not diff against upstream or confirm which change introduced the flaw.",
+    "No execution, test run, or runtime verification; all findings are static source observations.",
+    "Java test directories are not present in the snapshot, so expected/negative behavior could not be compared with tests.",
+    "The exploitability of the token-creation flaw depends on deployment configuration (`restrict_access_token_to_admins`); fresh 6.2 installs are stricter by default, upgrades are relaxed.",
+    "Web frontend and some plugin/enterprise-only areas were only spot-checked, not exhaustively reviewed.",
+    "No source-relation index (B0); searches were ordinary text matches over the readable snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Rule-builder fragment generation in `ParserUtil.generateForFragment` wraps string parameters in quotes without `StringEscapeUtils.escapeJava` (unlike `addFunctionParameter`), so user-supplied condition/action parameter values could inject pipeline rule source that is then parsed and executed (stream-destination filters execute a generated rule).",
+      "reason": "Real asymmetry, but exploitability is constrained: generated source is re-parsed and type-checked (`ValidatorService.parseRule`), the pipeline `when` clause takes a single Boolean expression, and the rule-builder create path already requires pipeline-rule write permissions. Could not establish a concrete high-impact payload; kept as a secondary lead only."
+    },
+    {
+      "lead": "Event-definition aggregation with `streamCategories` is executed with `streamId -> true` (`AggregationEventProcessor.getStreams`, `PivotAggregationSearch`) while `requiredPermissions()` only checks explicit `streams()`, so a user could make an event search streams they cannot read (explicit TODO comments acknowledge this).",
+      "reason": "Long-standing, comment-acknowledged design gap; requires `eventdefinitions:create` plus a way to consume restricted results, and the code intent (system-executed search) is ambiguous. Not selected as the single strongest source-evidenced flaw."
+    },
+    {
+      "lead": "Expired API tokens keep authenticating until the 5-minute `ExpiredTokenCleaner` periodical deletes them; `AccessTokenAuthenticator` never compares `expiresAt` to now.",
+      "reason": "Genuine code-level gap, but the exposure window is small and cleanup-based expiry appears intentional; impact uncertain."
+    },
+    {
+      "lead": "`HTTPHeaderAuthenticationRealm` denies trusted-header authentication only when `!matchedResources.contains(SessionsResource.class) && matchedResources.size() == 1`, so multi-matched requests bypass the session-only restriction.",
+      "reason": "Could not demonstrate a request that yields multiple matched resources; speculative and old code."
+    },
+    {
+      "lead": "Data Node API proxy endpoints (`DataNodeApiProxyResource`, `DataNodeRestApiProxyResource`) proxy arbitrary paths/methods with a path allowlist.",
+      "reason": "Target host comes from the Data Node registry, not from user input, and the endpoints require admin-level `datanode:*proxy` permissions; no host-level SSRF found in the reviewed code."
+    },
+    {
+      "lead": "`HTMLSanitizerConverter` is applied via `@JsonSerialize` only to selected DTO fields (`remediationSteps`, event-procedure descriptions); related fields such as `EventDefinitionDto.description` are unsanitized.",
+      "reason": "No reachable HTML-rendering sink for the unsanitized fields was found in this snapshot's web interface; speculative."
+    }
+  ],
+  "summary": "Defensive source review of the Graylog snapshot (6.2.4-SNAPSHOT, 6,242 model-visible files; Java test sources are not present in the snapshot). I read/traced REST resources, authentication/session/token handling, authorization helpers, events, lookup tables, content packs, inputs/transports, the rule builder, views search, storage modules, Data Node REST endpoints, and spot-checked the web interface and build/config files. The single strongest issue is in access-token creation: `POST /users/{userId}/tokens/{name}` authorizes against the caller's own username instead of the target user's username, so a user who is only allowed to mint tokens for their own account can mint a working API token for any other account (including the built-in admin, whose fixed id is `local:admin`) and receives the plaintext token in the response. This is a clear broken-access-control/privilege-escalation flaw, inconsistent with every sibling user-scoped endpoint."
+}

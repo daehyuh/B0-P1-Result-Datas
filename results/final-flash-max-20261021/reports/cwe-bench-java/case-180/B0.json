@@ -1,0 +1,51 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The path value is supplied by library code that calls resource(...). An actor who can contribute/modify a library step (library content fetched by ScmLibraryProvider/PluginLibraryProvider) can pass arbitrary traversal strings; the same gap is exposed whenever untrusted configuration or parameters flow into a step that forwards a value to resource(). The docs promise this cannot read outside the library's resources directory and cannot cross into another library's resources, but neither guarantee is enforced.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether library steps are themselves treated as untrusted: StepWrapperFactory.prepareScript() obtains exec.getTrustedShell() (lines 140-158) and StepWrapper.getValue()/parseClass compile step code without the sandbox transformer, so a malicious library author may already be able to execute arbitrary code and read files directly, which reduces the incremental escalation for that specific actor. Also checked that the path is not restricted elsewhere: no 'contains(\"..\")', canonicalization, or isDescendant-style check exists anywhere in the snapshot (repo-wide searches for '..', isDescendant, normalize returned no source checks), and FileSystemWrapper path reads are SCM-relative, not local filesystem reads. The method and its documentation do, however, state an explicit containment guarantee that the code does not implement, so the gap is a real validation defect even if its severity depends on who can influence the path argument.",
+      "id": "jte-resource-path-traversal",
+      "impact": "Disclosure of files readable by the Jenkins process outside the intended library resources directory, including other libraries' resources and other files reachable from the run root. This defeats the documented library isolation property (cross-library resource fetching/arbitrary file read) and can expose build metadata, credentials files, scripts or configuration stored on the agent/controller filesystem. The impact is bounded by the filesystem permissions of the account executing the step.",
+      "locations": [
+        {
+          "end_line": 209,
+          "path": "src/main/java/org/boozallen/plugins/jte/init/primitives/injectors/StepWrapperScript.java",
+          "start_line": 193
+        },
+        {
+          "end_line": 33,
+          "path": "docs/concepts/library-development/library-resources.md",
+          "start_line": 30
+        }
+      ],
+      "prerequisites": "A JTE job that loads a library containing (or influenced by) a step calling resource() with a crafted relative path, and the target file being readable by the agent/controller process running the step. The known library set is resolved from governance-tier-configured Library Sources, so this is most directly reachable by an actor able to introduce or modify library step code, or by untrusted data reaching a resource() call.",
+      "root_cause": "StepWrapperScript.resource(String path) only rejects paths starting with '/'. It does not reject or normalize '..' segments and does not verify that the resolved path is a descendant of the library's resources base directory before reading the file. FilePath.child(path) resolves the supplied relative path directly, so sequences such as '../../...' can traverse above `resourcesBaseDir` (and above the run/JTE directory), and the file contents are returned via readToString().",
+      "title": "Library step resource() allows path traversal outside the library resources directory",
+      "trace": "LibraryStepInjector.injectPrimitives() copies library files (ScmLibraryProvider.loadLibrary / PluginLibraryProvider.loadLibrary) into the run directory under jte/<lib>/, then StepWrapperFactory.prepareScript() compiles each step and sets resourcesPath = 'jte/<lib>/resources' (lines 178-183). At runtime StepWrapperScript.resource(path) builds resourcesBaseDir = runRoot.child(resourcesPath) and resourceFile = resourcesBaseDir.child(path); the only validation is path.startsWith('/'), after which resourceFile.readToString() returns the content. Passing '../../<target>' therefore yields a path that normalizes above the library resources directory (e.g., other libraries' resources or other files under the build/agent root).",
+      "unverified": "I could not run Jenkins/Groovy or confirm at runtime how hudson.FilePath.child() normalizes '..' on each supported version, nor verify a concrete deployment in which the path argument is attacker-influenced without the caller already having library code control; no exploit was attempted.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory (Path Traversal)"
+    }
+  ],
+  "coverage_summary": "Covered all 266 files exposed by get_source_scope at least by inventory; read all of src/main/groovy, src/main/java and src/main/resources (including the Java StepWrapperScript, Groovy step/namespace/whitelist classes, config DSL, governance tiers, SCM/plugin library providers, FileSystemWrapper, job/flow definitions, hooks, and util classes). Docs were searched for security-relevant guarantees (sandbox, trust, library resource restrictions, allow_scm_jenkinsfile, governance merging) and key pages read. No src/test tree exists in this snapshot, so upstream unit/integration tests that might confirm intended behavior were unavailable. Build files/CI, codenarc config, help HTML and JS/CSS assets were inventoried and given limited review as they contain no repository-backend logic.",
+  "limitations": [
+    "No src/test directory and no dependency sources (workflow-cps, script-security, Jenkins core, SCM API) are present, so runtime semantics of CpsFlowExecution.getTrustedShell, SecureGroovyScript sandboxing, and hudson.FilePath.child('..') normalization could not be verified locally.",
+    "No execution, tests, or scanners were run per the review constraints; findings are source-evidence based only and are leads, not runtime-confirmed vulnerabilities.",
+    "Git history/fix commits, advisories and issue trackers were intentionally not consulted, so I could not confirm whether the resource() containment gap or the sandbox whitelist over-permission corresponds to a known/patched vulnerability.",
+    "Trust-model judgment (which actors may supply library step code vs. pipeline configuration) is inferred from the governance-tier/library-source design and docs and may differ per deployment."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SandboxWhitelist permits every method on instances of JTE types, including PipelineConfigurationBuilder (a groovy.lang.Script subclass) and TemplatePrimitive/namespace/DslEnvVar receivers (src/main/groovy/org/boozallen/plugins/jte/util/SandboxWhitelist.groovy lines 37-80). This could in principle expose inherited Script/GroovyObject entry points (e.g. evaluate/invokeMethod) while parsing a repo-supplied pipeline_config.groovy, which is documented as sandboxed (docs/developer/pipeline-initialization/aggregate-configs.md lines 63-67).",
+      "reason": "Rejected as the selected candidate because the escape claim depends on external script-security/Groovy behavior that is not verifiable inside this snapshot (whether Script.evaluate on the config builder's classloader really compiles and executes without a SandboxTransformer, and whether any hard-coded sandbox restriction applies). The receiver-based whitelist also appears intentional and functionally required for the config DSL (setProperty/getProperty/methodMissing), so I could not separate a deliberate over-permission from a design choice with local evidence."
+    },
+    {
+      "lead": "Library steps and library src classes are compiled through the execution's trusted shell / forTrusted() shells (StepWrapperFactory.prepareScript lines 140-158, TemplatePrimitiveInjector.parseClass lines 58-78), so library code runs without the CPS sandbox.",
+      "reason": "Counterevidence dominates: libraries are fetched only from governance-tier-configured Library Sources (ScmLibraryProvider/PluginLibraryProvider) that are configured by Jenkins/folder administrators, and the trusted-shell handling appears to be the framework's intended trust model for libraries rather than an injected check removal; also no in-snapshot statement promises sandboxing of library code."
+    },
+    {
+      "lead": "Pipeline configuration merging strings (PipelineConfigurationDsl.serialize lines 104-143) rebuild DSL text from parsed values, including unquoted Map/List/Pattern interpolation and default-case value interpolation.",
+      "reason": "The serialized text is re-parsed with sandbox=true, and the actor supplying values is the same actor who supplies the original configuration text, so no privilege boundary is crossed and no concrete injection impact could be established."
+    }
+  ],
+  "summary": "Reviewed the assigned jenkinsci/templating-engine-plugin snapshot (version 2.5.3, 266 readable files: ~75 Groovy/Java main sources plus docs/config). I traced attacker-controlled inputs through pipeline-configuration parsing (SecureGroovyScript sandbox), governance-tier merging, library resolution/loading, step compilation/execution, sandbox whitelisting, and library resource reads. The strongest concrete, source-evidenced issue is an incomplete path restriction in the library-step `resource(String path)` method: it rejects only absolute paths and never normalizes or checks `..`, so a path can escape the requesting library's `resources` directory (and its run directory), contradicting the documented guarantee that the path \"must be a relative path within the resources directory\" and that no cross-library resource fetching is allowed. I also examined the broad Script Security whitelist and the trusted-shell compilation of library steps, but those have substantial counterevidence/uncertainty and are recorded as rejected leads rather than additional candidates."
+}

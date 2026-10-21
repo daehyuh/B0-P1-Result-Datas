@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any client able to publish to an exchange/queue that a Camel rabbitmq consumer reads (or to reply on an RPC reply-queue) controls the raw AMQP BasicProperties.headers, including CamelSerialize=true, and the message body bytes. Those raw AMQP properties are exactly what hasSerializeHeader() inspects (RabbitMQMessageConverter.java lines 323-333), and the RabbitMQHeaderFilterStrategy only filters 'rabbitmq.*' patterns, so the marker header is not filtered. No Camel route configuration or endpoint option needs to be enabled.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked whether the marker header is neutralized: RabbitMQMessagePublisher.resolveMessageFrom removes a pre-existing CamelSerialize header from the Camel message before sending (lines 64-71), but external AMQP publishers set the AMQP property header directly, bypassing that removal, and the converter tests the raw AMQP properties, not the filtered Camel headers. Checked the header filter strategy: RabbitMQHeaderFilterStrategy filters only 'rabbitmq.*' (lines 28-30), so CamelSerialize is neither blocked nor required to be produced by Camel. Checked for gates: no allowMessageBodySerialization/allowJavaSerializedObject/trusted-packages/class-resolver check exists anywhere in camel-rabbitmq Java sources (searched entire component tree; only the generated catalog match remains). Checked transferException and useMessageIDAsCorrelationID options; they do not gate body deserialization. Checked that the generated option text is inconsistent with source, which is best explained by a security fix whose source changes are absent from this snapshot rather than by a documentation-only artifact (these catalog files are generated from the @UriParam annotations in the same module). Did not execute code or a broker, so gadget availability is not runtime-confirmed.",
+      "id": "CAND-170-rabbitmq-java-deserialization",
+      "impact": "Remote code execution in the Camel JVM through Java deserialization of a malicious gadget payload embedded in an AMQP message body (integrity/confidentiality/availability loss, full host compromise). A weaker producer-side effect is unsafe automatic serialization of arbitrary Serializable message bodies. Because current code ignores the documented default-false gate, the unsafe behavior is active on every default rabbitmq consumer, not only when a user explicitly opts in.",
+      "locations": [
+        {
+          "end_line": 321,
+          "path": "components/camel-rabbitmq/src/main/java/org/apache/camel/component/rabbitmq/RabbitMQMessageConverter.java",
+          "start_line": 298
+        },
+        {
+          "end_line": 105,
+          "path": "components/camel-rabbitmq/src/main/java/org/apache/camel/component/rabbitmq/RabbitMQMessagePublisher.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 175,
+          "path": "components/camel-rabbitmq/src/main/java/org/apache/camel/component/rabbitmq/RabbitMQEndpoint.java",
+          "start_line": 168
+        },
+        {
+          "end_line": 136,
+          "path": "components/camel-rabbitmq/src/generated/resources/org/apache/camel/component/rabbitmq/rabbitmq.json",
+          "start_line": 136
+        }
+      ],
+      "prerequisites": "A Camel route consuming from a rabbitmq endpoint (default consumer configuration); attacker publish access to the relevant broker exchange/queue or reply queue; a Java deserialization gadget chain reachable on the application classpath (commonly present in Camel/Spring/commons applications). Producer-side risk additionally exists when Camel publishes Serializable objects that no type converter handles.",
+      "root_cause": "RabbitMQMessageConverter.populateMessageBody()/deserializeBody() uses an unrestricted ObjectInputStream.readObject() on the AMQP message body based solely on the CamelSerialize header from raw AMQP BasicProperties (hasSerializeHeader/isSerializeHeaderEnabled), with no endpoint option or class allowlist. The producer side (RabbitMQMessagePublisher.publish) likewise unconditionally Java-serializes any Serializable body when no type converter is available and marks it with CamelSerialize. The checked-in generated catalog proves the intended mitigation existed: rabbitmq.json line 136 lists an allowMessageBodySerialization option (default false) that gates exactly this producer serialization and consumer deserialization ('the message will be deserialized if this value is true and the message contains a CamelSerialize header ... may introduce a security vulnerability ... could result in a RCE'), but no allowMessageBodySerialization field/check exists in RabbitMQEndpoint, RabbitMQComponent, RabbitMQMessageConverter or RabbitMQMessagePublisher in this snapshot.",
+      "title": "camel-rabbitmq: attacker-triggered Java deserialization of AMQP message bodies (missing allowMessageBodySerialization gate)",
+      "trace": "RabbitConsumer.doHandleDelivery (RabbitConsumer.java lines 94-96) -> RabbitMQEndpoint.createRabbitExchange (RabbitMQEndpoint.java lines 203-207) -> RabbitMQMessageConverter.populateRabbitExchange (line 247) -> populateMessageBody (lines 298-305) -> hasSerializeHeader/isSerializeHeaderEnabled reads attacker-controlled CamelSerialize from AMQP properties (lines 323-333) -> deserializeBody -> new ObjectInputStream(...).readObject() (lines 307-313) with no allowMessageBodySerialization/allowlist check. Producer path: RabbitMQMessagePublisher.publish lines 99-105 chooses serialization for any Serializable body and serializeBodyFrom lines 170-178 writes it via ObjectOutputStream; RabbitMQComponent.java lines 271-273 copies allowNullHeaders/allowCustomHeaders to the converter but there is no equivalent for the missing allowMessageBodySerialization option.",
+      "unverified": "The exact CVE/Jira identifier and the harness's ground-truth annotation are not visible in the source; the intended patch shape (adding allowMessageBodySerialization default false to RabbitMQEndpoint/RabbitMQComponent and checking it in RabbitMQMessageConverter/RabbitMQMessagePublisher) is inferred from the leftover generated catalog entry. Runtime exploitability depends on broker ACLs and on a usable gadget chain on the classpath; neither was executed or verified at runtime.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (with CWE-20 insufficient validation/trust boundary)"
+    }
+  ],
+  "coverage_summary": "Coverage: all 10,171 model-visible files from get_source_scope (6 files excluded by the harness for sensitive name/path reasons; no other filters reported; binaries skipped). I inspected the version anchors (parent/pom.xml 3.2.0-SNAPSHOT, Netty 4.1.47, Spring Boot 2.2.5, Undertow 2.0.30), the HTTP stack (camel-http-common, camel-netty-http, camel-undertow, camel-spark-rest, camel-jetty/servlet, camel-platform-http), messaging/deserialization surfaces (camel-rabbitmq, camel-netty, camel-mina, camel-sql, camel-cassandraql, camel-consul, camel-shiro, camel-ahc), XML parsing/XXE surfaces (camel-xml-jaxp XmlConverter/XmlLineNumberParser/StaxConverter, camel-xml-io, camel-stax, camel-spring), data formats (snakeyaml, xstream, csv, zipfile), and utility hardening (StringHelper.removeCRLF usage). The rabbitmq finding was traced from AMQP delivery entry point to the ObjectInputStream sink and cross-checked against the generated catalog; other plausible leads were checked and rejected as above. Not inspected line-by-line: the remaining ~6,800 component files (most unrelated to external-input deserialization/HTTP/templating), test sources beyond targeted searches, and generated DSL/configurer files beyond the rabbitmq catalog. No build, tests, scanners or runtime checks were executed.",
+  "limitations": [
+    "No git history/diff baseline is available, so the absence of the allowMessageBodySerialization code is established by searching the whole camel-rabbitmq tree and by the checked-in generated catalog inconsistency, not by a direct fix-commit diff.",
+    "I could not confirm the associated CVE/Jira identifier or the benchmark ground-truth location from the source snapshot; the fix shape is inferred from the option description in rabbitmq.json line 136.",
+    "Runtime exploitability (broker ACLs, presence of a deserialization gadget chain, whether the vulnerable RabbitMQMessageConverter path is reached in a given deployment) was not executed or dynamically verified.",
+    "No web/CVE database access was used; CVE mapping statements are hypotheses based on the snapshot version window and code evidence.",
+    "Coverage of generated/catalog files and of the ~6,800 component files unrelated to the analyzed trust boundaries was targeted rather than exhaustive."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HTTP response header injection / response splitting: DefaultNettyHttpBinding.toNettyResponse (components/camel-netty-http/.../DefaultNettyHttpBinding.java lines 486-499) and DefaultUndertowHttpBinding.toHttpResponse (components/camel-undertow/.../DefaultUndertowHttpBinding.java lines 333-346) copy Camel message headers into HTTP responses with no CRLF neutralization although StringHelper.removeCRLF exists and is used by camel-mail (MailBinding.java lines 399-428).",
+      "reason": "Genuine missing-hardening pattern, but exploitation is conditional on route-level echoing of attacker header values and on whether the Netty/Undertow server implementation rejects CR/LF in header values; no in-repo artifact (e.g., a generated option or stale resource) ties this snapshot to that fix, so it is a weaker lead than the rabbitmq finding."
+    },
+    {
+      "lead": "camel-netty TCP default codec formerly enabled Java object serialization; ObjectDecoder/ObjectEncoder helpers remain in components/camel-netty/src/main/java/org/apache/camel/component/netty/codec/.",
+      "reason": "In this snapshot NettyConfiguration.parseURI already falls back to String encoder/decoder only (lines 227-231) and no object encoder/decoder factories are used by default, so the netty default-deserialization hardening appears already present."
+    },
+    {
+      "lead": "camel-mina uses ObjectSerializationCodecFactory by default for non-textline TCP (MinaConsumer.java lines 257-261, MinaProducer.java lines 341+), i.e., network Java deserialization by default.",
+      "reason": "Long-standing documented MINA behavior ('if not specified ... Object Serialization is assumed over TCP') with no sign in this snapshot that it is the reverted fix; weaker and less specific than the rabbitmq evidence."
+    },
+    {
+      "lead": "UndertowHeaderFilterStrategy only sets an out-filter pattern and not an in-filter pattern, so request headers/query params named Camel* are copied into Camel message headers (components/camel-undertow/.../UndertowHeaderFilterStrategy.java lines 43-48).",
+      "reason": "The same omission exists in several other components (spark-rest, platform-http, cxf, mail), so it looks like a broader design gap rather than the single reverted fix targeted by this snapshot."
+    },
+    {
+      "lead": "Deserialization in camel-consul ConsulRegistry.lookupByName (ConsulRegistry.java lines 80-83) and in the JDBC/Cassandra aggregation repositories (JdbcCamelCodec.java lines 91-102, CassandraCamelCodec.java).",
+      "reason": "Requires attacker write access to the Consul KV store or the aggregation database, which is a much higher trust assumption than AMQP publish access; no generated-catalog inconsistency points at these components."
+    }
+  ],
+  "summary": "Reviewed the Apache Camel 3.2.0-SNAPSHOT snapshot (10,171 visible files). The strongest finding is untrusted Java deserialization in camel-rabbitmq: RabbitMQMessageConverter deserializes the AMQP body with an unrestricted ObjectInputStream whenever the message carries the attacker-settable CamelSerialize header, and RabbitMQMessagePublisher unconditionally Java-serializes Serializable bodies; there is no endpoint option gating this. Decisive corroboration: the checked-in generated catalog components/camel-rabbitmq/src/generated/resources/org/apache/camel/component/rabbitmq/rabbitmq.json line 136 still advertises an \"allowMessageBodySerialization\" option (default false) whose description states the consumer must only deserialize \"if this value is true and the message contains a CamelSerialize header\" and warns it may allow gadget deserialization/RCE — yet that option/check is absent from all rabbitmq Java sources, indicating the hardening was removed/reverted while its generated artifact remained. This is one root cause (missing opt-in gate around Java object serialization); I report it as a single candidate."
+}

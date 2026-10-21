@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any unauthenticated HTTP client controls the Content-Type request header. A value that satisfies Dispatcher.wrapRequest()'s 'contains(multipart/form-data)' check (the literal can simply be included inside the expression, e.g. as a string constant) is routed into JakartaMultiPartRequest.parse(); commons-fileupload then rejects the malformed header and puts the full raw header value into the exception message. The attacker therefore controls the exact text later evaluated as OGNL. No session, credentials, special action mapping, or non-default configuration (struts.multipart.parser defaults to 'jakarta') is required.",
+      "confidence": "high",
+      "counterevidence_checked": "struts-default.xml (lines 41-63) sets struts.excludedClasses (Runtime, System, Class, ClassLoader, ProcessBuilder, OgnlContext, etc.) and struts.excludedPackageNames (java.lang., ognl, javax), and default.properties sets struts.ognl.allowStaticMethodAccess=false; SecurityMemberAccess enforces these for OGNL property/method/static access. This reduces the payload surface but does not stop the evaluation of attacker-controlled text itself, and the value-stack context exposes framework objects (ActionContext container / OGNL utilities) that the published exploitation of this same code path uses to neutralize the exclusion lists. I did not run any exploit to confirm the bypass in this snapshot; this is the main residual uncertainty. Also checked that ParametersInterceptor excludes getClass/class-style parameter names (not relevant here, since evaluation happens on the header value, not a request parameter), and that the multipart detection is 'contains' rather than 'startsWith', which is what makes the payload-reachable header possible.",
+      "id": "case-026-1",
+      "impact": "Remote, unauthenticated code/expression execution in the JVM hosting the Struts application (worst case full server compromise); at minimum arbitrary OGNL evaluation against the ActionContext with access to the servlet request/response and framework container references. Because the vulnerable parsing happens before action mapping/authorization, it is reachable on any URI through the Struts filter, making it a pre-auth default-configuration risk.",
+      "locations": [
+        {
+          "end_line": 119,
+          "path": "core/src/main/java/org/apache/struts2/dispatcher/multipart/JakartaMultiPartRequest.java",
+          "start_line": 100
+        },
+        {
+          "end_line": 798,
+          "path": "core/src/main/java/org/apache/struts2/dispatcher/Dispatcher.java",
+          "start_line": 789
+        },
+        {
+          "end_line": 737,
+          "path": "core/src/main/java/com/opensymphony/xwork2/util/LocalizedTextUtil.java",
+          "start_line": 714
+        },
+        {
+          "end_line": 169,
+          "path": "core/src/main/java/com/opensymphony/xwork2/util/TextParseUtil.java",
+          "start_line": 154
+        },
+        {
+          "end_line": 109,
+          "path": "core/src/main/java/org/apache/struts2/dispatcher/multipart/MultiPartRequestWrapper.java",
+          "start_line": 84
+        },
+        {
+          "end_line": 247,
+          "path": "core/src/main/java/org/apache/struts2/dispatcher/multipart/JakartaStreamMultiPartRequest.java",
+          "start_line": 236
+        },
+        {
+          "end_line": 36,
+          "path": "core/src/main/resources/org/apache/struts2/struts-messages.properties",
+          "start_line": 34
+        },
+        {
+          "end_line": 715,
+          "path": "pom.xml",
+          "start_line": 711
+        }
+      ],
+      "prerequisites": "Application uses the default Struts filter stack (StrutsPrepareAndExecuteFilter) and the default multipart parser 'jakarta' (default.properties line 69), with commons-fileupload 1.3.1 on the classpath (pom.xml lines 711-715). The request must reach the filter before the action/authorization mapping is resolved; Dispatcher.wrapRequest() runs right after createActionContext(), before any action-level authentication interceptor, so even excluded/unmapped URIs pass through the multipart parse. struts.devMode may be false (default).",
+      "root_cause": "The Jakarta multipart parser embeds the raw request Content-Type value in the error message produced by commons-fileupload 1.3.1 and then feeds that attacker-controlled exception message into the localization machinery as the *default message*: JakartaMultiPartRequest.buildErrorMessage() calls LocalizedTextUtil.findText(..., e.getMessage(), ...). Because no bundle key named 'struts.messages.upload.error.InvalidContentTypeException' exists anywhere in the project (only SizeLimitExceededException and IOException keys are defined in struts-messages*.properties), findDefaultText() returns null and the attacker string becomes the message; LocalizedTextUtil.getDefaultMessage() then calls TextParseUtil.translateVariables(message, valueStack), which parses ${...}/%{...} and evaluates them via ValueStack.findValue() using the request's OGNL context/member access. Dispatcher.wrapRequest() gates the multipart path with contentType.contains(\"multipart/form-data\"), so a header that merely *contains* that literal (e.g. inside the injected expression) is routed into the vulnerable parser.",
+      "title": "Unauthenticated OGNL expression injection via multipart Content-Type error message (multipart parse error path evaluates attacker-controlled text)",
+      "trace": "StrutsPrepareAndExecuteFilter.doFilter -> PrepareOperations.createActionContext -> PrepareOperations.wrapRequest -> Dispatcher.wrapRequest (content_type.contains(\"multipart/form-data\") at line 792) -> new MultiPartRequestWrapper -> JakartaMultiPartRequest.parse -> processUpload -> commons-fileupload throws InvalidContentTypeException/FileUploadException whose message contains the raw Content-Type -> catch (lines 86-106) -> buildErrorMessage (lines 115-118) -> LocalizedTextUtil.findText(Bundle-miss because no key exists) -> getDefaultMessage (line 714) -> fallback message = defaultMessage = e.getMessage() (lines 720-725) -> buildMessageFormat(TextParseUtil.translateVariables(message, valueStack), locale) at line 729 -> TextParseUtil.translateVariables -> TextParser.evaluate -> stack.findValue(var) OGNL evaluation at TextParseUtil lines 156-164. Resulting object may be rendered/used in the request processing context, enabling expression execution (ultimately RCE in the application/framework process, with the request/response and container accessible from the value-stack context).",
+      "unverified": "Runtime exploitability/impact of the excluded-class bypass was not executed or confirmed; the exact payload string and any target-specific gadget/utility availability are unverified; the snapshot has no tests and no VCS metadata, so I could not diff against upstream or map this to a specific advisory/commit from source alone.",
+      "weakness_type": "CWE-917 Expression Language Injection / CWE-94 Code Injection (OGNL, leading to RCE)"
+    }
+  ],
+  "coverage_summary": "Scoped to the assigned snapshot (2643 readable files; binaries/NUL files skipped by tooling; no test sources present). Read/traced in detail: multipart handling (JakartaMultiPartRequest, JakartaStreamMultiPartRequest, MultiPartRequestWrapper, Dispatcher.wrapRequest), filters/prepare operations, OGNL plumbing (OgnlUtil, OgnlValueStack, SecurityMemberAccess, TextParseUtil, OgnlTextParser, LocalizedTextUtil, OgnlValueStackFactory), interceptors (Parameters, FileUpload, Cookie, Roles, Debugging), security pattern checkers (DefaultExcluded/AcceptedPatternsChecker), action mapping/proxy (DefaultActionMapper, DefaultActionProxy, DefaultActionInvocation, ActionConfig/AllowedMethods), default configuration (default.properties, struts-default.xml, struts-messages.properties), URL/rendering helpers (DefaultUrlHelper, ServletUrlRenderer), REST plugin (RestActionMapper, ContentTypeInterceptor, handlers, DefaultContentTypeHandlerManager), JSON plugin names/annotations, and dependency versions in poms. Repo-wide literal searches were run for command execution, deserialization, SQL, scripting, reflection, getParameter uses, CVE/WW markers, TODO/HACK markers, and exception-message localization keys. Not every one of the 2643 files was read line-by-line; apps/archetypes and most plugin internals were sampled, and no injected-code diff against upstream was possible.",
+  "limitations": [
+    "No build, execution, or dynamic testing was performed; all conclusions are source-level.",
+    "The snapshot contains no tests and no VCS history/metadata, so I could not diff against upstream Struts or identify the exact commit/advisory.",
+    "The excluded-class/package hardening in struts-default.xml means a working RCE payload must also neutralize member-access restrictions; I did not verify such a payload compiles/evaluates in this exact snapshot (published exploitation of this code path exists, but I cannot confirm it at runtime here).",
+    "commons-fileupload 1.3.1 behavior (exception message containing the raw Content-Type) was inferred from the dependency version and the presence of the InvalidContentTypeException handling path, not from running the library.",
+    "Only one candidate is allowed, so the other real-but-lower-reach weaknesses noted as rejected leads were not submitted as candidates."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XStreamHandler deserializes attacker XML with XStream 1.4.8 (plugins/rest/src/main/java/org/apache/struts2/rest/handler/XStreamHandler.java lines 43-50; pom.xml line 893-896)",
+      "reason": "Real dangerous sink, but it requires the REST plugin deployed, the XStream handler selected via application/xml content type, and a vulnerable XStream version; core-path multipart issue has wider reach and fewer prerequisites, so this is a secondary lead."
+    },
+    {
+      "lead": "DebuggingInterceptor evaluates request parameters as OGNL expressions (core/src/main/java/org/apache/struts2/interceptor/debugging/DebuggingInterceptor.java lines 147-218)",
+      "reason": "Only active when struts.devMode is true (default false) and the debug interceptor is configured; not a default-configuration vulnerability."
+    },
+    {
+      "lead": "REST plugin dynamic method invocation / 'id/method' parsing (plugins/rest/src/main/java/org/apache/struts2/rest/RestActionMapper.java lines 200-328)",
+      "reason": "The !method handling is gated by allowDynamicMethodCalls and cleanupActionName(); the remaining path feeds DefaultActionProxy.prepare()/ActionConfig.isAllowedMethod and OgnlUtil.callMethod checkSimpleMethod, so I could not establish a concrete bypass in this snapshot."
+    },
+    {
+      "lead": "DefaultUrlHelper applies an ECMAScript escape only when the built URL contains the literal '<script' (core/src/main/java/org/apache/struts2/views/util/DefaultUrlHelper.java lines 183-187)",
+      "reason": "Heuristic looking and weak, but I found no attacker-controlled sink in this snapshot that clearly allows markup injection past it; unconfirmed XSS lead."
+    },
+    {
+      "lead": "Static-content path handling in DefaultStaticContentLoader (core/src/main/java/org/apache/struts2/dispatcher/DefaultStaticContentLoader.java lines 182-208)",
+      "reason": "Path is cleaned and the resolved resource must end with the requested path segment; no traversal showing attacker control was demonstrated."
+    }
+  ],
+  "summary": "Reviewed the Apache Struts 2.5.1-SNAPSHOT tree (2643 model-visible files: core framework, plugins, apps, archetypes). The strongest, fully source-traceable issue is an unauthenticated OGNL/expression injection in the multipart error-handling path: an attacker-controlled Content-Type header value is incorporated into a commons-fileupload exception message, passed as the i18n default message into LocalizedTextUtil, and then evaluated by TextParseUtil.translateVariables against the ActionContext value stack (the same root cause as the well-known Struts Content-Type RCE family, e.g. S2-045). No hardening removes the evaluation itself; the excluded-class/package lists in struts-default.xml constrain some payload forms but do not prevent expression evaluation of attacker text in the value-stack context. Other reviewed candidates (REST/XStream deserialization, devMode debugging OGNL, URL-tag escaping) are weaker or require non-default configuration and are listed as rejected leads. Nothing was executed; findings are source-review leads, not runtime confirmations."
+}

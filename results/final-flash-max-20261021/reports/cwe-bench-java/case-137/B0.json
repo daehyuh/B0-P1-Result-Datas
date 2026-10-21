@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote HTTP client fully controls the request method (PUT), the request path (mapped to the default servlet), the Content-Range header (start, end and complete length values), and the request body bytes. No authentication is performed by the servlet itself; any constraint depends on the application's own web.xml.",
+      "confidence": "low",
+      "counterevidence_checked": "Counterevidence: (1) DefaultServlet defaults to `readonly = true` (line 209), so out of the box PUT returns 405 - this is a non-default configuration issue. (2) The platform's own documentation (webapps/docs/default-servlet.xml, conf/web.xml) describes partial PUT as intended functionality, so write-enabled PUT is a deliberate feature. (3) A plain (non-partial) PUT can also create files when write is enabled, so partial PUT is not necessarily the unique root cause. (4) This snapshot is Tomcat 10.1.43-dev, i.e. after the upstream fix for CVE-2025-24813 (10.1.35, Feb 2025); I inspected doPut/executePartialPut/parseContentRange/StandardRoot.write/DirResourceSet.write and could not find an explicit post-fix guard (such as refusing partial PUT for non-existent resources, or disabling partial PUT by default) in this snapshot, but I cannot rule out that the real upstream fix is expressed differently or is present in code I did not compare. (5) No runtime testing was performed.",
+      "id": "tomcat-default-servlet-partial-put-file-write",
+      "impact": "Arbitrary file creation/overwrite inside the web application resource tree once write is enabled: content injection/defacement, corruption of existing resources, and - where the written location is later consumed by Tomcat or the application (session persistence with deserialization, resource/class loading, JSP/static serving) - a path to remote code execution or session hijacking. Partial PUT also lets the attacker choose the resulting file length and offset, which can be used to craft binary file formats (e.g. serialized objects) precisely. Under the default read-only configuration the servlet returns 405 and the path is not reachable.",
+      "locations": [
+        {
+          "end_line": 710,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 643
+        },
+        {
+          "end_line": 783,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 725
+        },
+        {
+          "end_line": 1547,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 1519
+        },
+        {
+          "end_line": 290,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 288
+        },
+        {
+          "end_line": 310,
+          "path": "java/org/apache/catalina/webresources/DirResourceSet.java",
+          "start_line": 256
+        },
+        {
+          "end_line": 189,
+          "path": "java/org/apache/catalina/webresources/StandardRoot.java",
+          "start_line": 173
+        },
+        {
+          "end_line": 163,
+          "path": "java/org/apache/catalina/webresources/AbstractFileResourceSet.java",
+          "start_line": 73
+        }
+      ],
+      "prerequisites": "The default servlet must be write-enabled (DefaultServlet `readonly` init parameter = false, or the WebResourceRoot/Resources readOnly flag false with a writable resource set), and partial PUT must not be disabled (`allowPartialPut` defaults to true). For code execution or other severe impact, an independent consumer of the created file is needed (e.g. a session persistence mechanism that deserializes files stored inside the webapp, a servlet/container that reads or serves the created path, or class/JSP resources that Tomcat later loads). Without such a consumer the impact is file creation/overwrite/corruption (defacement, config tampering). This is not a default-configuration exposure.",
+      "root_cause": "DefaultServlet.doPut() delegates a request carrying a Content-Range header to executePartialPut(), which builds a temporary file whose length is set from the attacker-supplied range length, seeks to the attacker-supplied start offset, copies the request body into it, and then hands it to resources.write(path, stream, true) (overwrite=true). parseContentRange() only validates header syntax/ordering (ContentRange.isValid(): start >= 0, end >= start, length > end); neither parseContentRange() nor executePartialPut() nor doPut() checks that the target resource already exists, that the request is not being used to plant a new file, or that the written path is anything other than 'under the (writable) web application mount'. allowPartialPut defaults to true and DirResourceSet.write()/StandardRoot.write() only check isPathMounted() and read-only state. As a result, when the default servlet is write-enabled (default is read-only, but `readonly=false` is a documented configuration, e.g. for WebDAV/PUT use), a remote client can create arbitrary webapp files, including zero-filled files of attacker-chosen length with attacker-chosen prefix content.",
+      "title": "Write-enabled DefaultServlet accepts partial PUT (Content-Range) to create/overwrite webapp files with attacker-controlled content",
+      "trace": "HTTP PUT with `Content-Range: bytes <start>-<end>/<length>` -> CoyoteAdapter -> StandardContextValve -> DefaultServlet.doPut (line 644) -> parseContentRange (line 1519) returns a ContentRange with only syntax validation -> executePartialPut (line 725): File.createTempFile in the webapp temp dir, copy existing content if resource is a file, `randAccessContentFile.setLength(range.getLength())` (line 751), `seek(range.getStart())` (line 754), copy request body with only length-consistency checks (lines 760-772) -> resources.write(path, resourceInputStream, true) (line 682) -> StandardRoot.write (line 174) -> DirResourceSet.write (line 256) -> `Files.copy(is, dest.toPath(), REPLACE_EXISTING)` (line 298) creates/overwrites the file under the webapp root. Because the target did not have to exist, the attacker can pre-place files (e.g. a serialized session file at a path derived from a session id) with fully controlled bytes.",
+      "unverified": "I could not diff against the upstream 10.1.35/10.1.43 sources (no VCS metadata or reference copy in the snapshot), so I cannot confirm whether this is an unfixed/reverted fix or intended post-fix behavior. The concrete sink behavior (creation/overwrite of the target path) is established from source, but exploitability for RCE depends on external deployment configuration (writable default servlet plus a deserializer/consumer of the written file) that I could not verify, and the candidate was not runtime-confirmed.",
+      "weakness_type": "CWE-434 Unrestricted Upload of File with Dangerous Type / CWE-73 External Control of File Name or Path"
+    }
+  ],
+  "coverage_summary": "Source scope reported 3,031 readable files (binary-like files skipped; no excluded sensitive paths or symlinks). The snapshot is Apache Tomcat main at about the 10.1.43 development point (webapps/docs/changelog.xml shows \"Tomcat 10.1.43 (schultz) in development\" with July-2025-era entries); the test tree and build.properties.default are absent. I read or searched the connector/Coyote request pipeline (CoyoteAdapter, Http11Processor/InputBuffer, Http2Parser/UpgradeHandler, UDecoder, HttpParser, Request/Parameters), authentication (AuthenticatorBase/JASPIC, Digest/Form), web resources (StandardRoot, DirResourceSet, AbstractFileResourceSet), default/WebDAV servlets, manager JSPs/servlets, filters (CSRF/CORS), realms (JNDI/LockOut/UserDatabase), session stores, rewrite valve, and the EL/JSP support APIs. Coverage is sampling-based, not exhaustive: I did not audit the JSP compiler/parser in depth, WebSocket protocol internals, TLS/JSSE/OpenSSL stack, clustering/Tribes, the embedded JDBC/DBCP pools, or every one of the ~1,000 LocalStrings messages for key/code mismatches.",
+  "limitations": [
+    "No reference copy or VCS metadata is available, so I could not diff the snapshot against upstream Tomcat or against the fix commits for known CVEs; all fix-presence judgments are based on recall and code inspection.",
+    "No code was executed, built, or tested; exploitability and configuration-dependent impact are reasoned from source only and are not runtime-confirmed.",
+    "The absence of the test directory and build.properties.default prevents cross-checking intended behavior and the exact source revision/commit date.",
+    "Only one candidate could be submitted; several plausible but unverified leads were rejected and are listed above.",
+    "The strongest candidate depends on a non-default, documented configuration (write-enabled default servlet) and on an external consumer of the written file, so its status as an unfixed vulnerability rather than intended behavior is uncertain."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Http2UpgradeHandler.init uses `for (int i = 0; i < settings.length % 6; i++)` (java/org/apache/coyote/http2/Http2UpgradeHandler.java:227) so the client HTTP2-Settings values from an HTTP/1.1 upgrade are validated but never applied, while Http2Parser uses `payloadSize / 6` (Http2Parser.java:337).",
+      "reason": "This looks like a long-standing upstream correctness oddity rather than an injected issue; the loop is effectively dead code, but the security impact is at most HTTP/2 interop/flow-control failure on the attacker's own connection (the server keeps its stricter defaults), so it does not meet the evidence/impact threshold."
+    },
+    {
+      "lead": "Path handling for PreResources/PostResources and RequestDispatcher paths (AbstractResourceSet.setWebAppMount/isPathMounted, ApplicationContext.getRequestDispatcher).",
+      "reason": "The CVE-2025-49125 fix and the 10.1.35 RequestDispatcher refactor appear present (normalization, isPathMounted checks, encoded-solidus handling); no bypass found."
+    },
+    {
+      "lead": "Case-insensitive filesystem TOCTOU class of issues (CVE-2024-56337 / CVE-2024-50379) in web resource handling.",
+      "reason": "DirResourceSet.initInternal still contains the read-only/canonical-cache detection and blocks startup when the JVM cannot be protected; checks appear intact."
+    },
+    {
+      "lead": "JASPIC authentication bypass in AuthenticatorBase.authenticateJaspic.",
+      "reason": "The requirePrincipal parameter and the principal-null handling are present (AuthenticatorBase.java:796-859), matching the CVE-2024-52316 fix."
+    },
+    {
+      "lead": "XSS/CSRF in the shipped manager/host-manager JSPs and default credentials in conf/tomcat-users.xml.",
+      "reason": "Manager JSP outputs are escaped (Escape.htmlElementContent / JspHelper.escapeXml), manager context.xml applies a RemoteAddrValve, and tomcat-users.xml contains only commented-out placeholder users; no hardcoded active credentials found."
+    },
+    {
+      "lead": "Potential command execution / deserialization sinks searched broadly (Runtime.exec, ObjectInputStream, ScriptEngine, JNDI lookup, XML parsers).",
+      "reason": "All hits are expected Tomcat uses (session/cluster stores with class filtering, Digester with LocalResolver/blockExternal, JMX code); no attacker-reachable unsafe sink with missing validation was identified."
+    }
+  ],
+  "summary": "Reviewed the Apache Tomcat 10.1.43-dev source snapshot (3,031 files; the snapshot contains no test directory and no build.properties.default). I traced attacker-controlled request data through the connector/processor, mapper, authenticator, class loader, resource sets, session stores, filters, rewrite valve, HTTP/2 parser, and the default/WebDAV servlets. Most known pre-June-2025 security fixes are present in the tree (e.g., CVE-2024-56337 canonical-cache/case checks in DirResourceSet, CVE-2025-49125 isPathMounted/WebAppMount checks, CVE-2024-52316 requirePrincipal in JASPIC, the 10.1.35 WebDAV WEB-INF/META-INF checks, the 10.1.43-dev HTTP/2 padding+content-length fix). The single strongest attacker-controlled, security-relevant code path I could evidence is the partial-PUT/unrestricted-file-write path in DefaultServlet when the servlet is write-enabled: an HTTP client can create/overwrite files inside the web application root with attacker-chosen content and length, with no existence/authorization check in the partial-PUT path. This is the CVE-2025-24813 attack surface; because this snapshot is newer than that fix (10.1.43-dev), I could not conclusively determine whether the upstream fix is present elsewhere or has been removed, so the candidate is submitted as a lead with low confidence, not a confirmed vulnerability."
+}

@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the XML document that the application feeds to XmlMapper/ObjectMapper deserialization (e.g. an XML request body in a REST endpoint, a message queue payload, or an uploaded/imported XML file). A classic payload inserts a DOCTYPE defining an external entity pointing at a local file or internal URL and references that entity in element text that maps to a String-valued property (or a property whose value appears in the resulting object or error output); the DOCTYPE is part of the untrusted document and needs no application cooperation.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) The library deliberately allows callers to supply their own XMLInputFactory (constructors XmlFactory.java:90-102, setters 340-342; XmlMapper.java:55-64), so applications can harden the parser - the gap is only in the default path. (2) Entity resolution is performed by the StAX provider, not by code in this repository; the JDK provider is permissive by default while Woodstox (README line 43, test-scope dependency in pom.xml) is commonly believed to refuse external entities by default, so exploitability is deployment-dependent and unproven here. (3) The project has historically taken the position that XML parser security configuration is the caller's responsibility; nothing in this snapshot documents or enforces a secure default. (4) I checked whether Jackson itself re-emits raw entity text on the serialization side (which would be a different bug): ToXmlGenerator.writeRaw only writes constant whitespace (lines 666-712), and all values go through Stax escaping (writeCharacters/writeCData/writeAttribute/writeLeafElement), so no serialization-side XML injection was found. (5) An internal web search of the index/source found no alternate hardened configuration path or feature flag that would invalidate the finding.",
+      "id": "case-046-xxe-default-stax-factory",
+      "impact": "Confidentiality: disclosure of local files (file:///...) or of internal HTTP resources (SSRF) whose contents are expanded into the entity reference and then surfaced through deserialized string properties or error messages. Availability: entity-expansion DoS (e.g. nested/large entities, external entity fetching with slow URLs). Scope is per application using the library with default settings; the library itself exposes no memory-safety issue. Exact severity depends on the active StAX provider's defaults, which is why this is submitted as a medium-confidence lead rather than a confirmed exploit.",
+      "locations": [
+        {
+          "end_line": 121,
+          "path": "src/main/java/com/fasterxml/jackson/dataformat/xml/XmlFactory.java",
+          "start_line": 104
+        },
+        {
+          "end_line": 142,
+          "path": "src/main/java/com/fasterxml/jackson/dataformat/xml/XmlFactory.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 604,
+          "path": "src/main/java/com/fasterxml/jackson/dataformat/xml/XmlFactory.java",
+          "start_line": 531
+        },
+        {
+          "end_line": 50,
+          "path": "src/main/java/com/fasterxml/jackson/dataformat/xml/XmlMapper.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 65,
+          "path": "src/main/java/com/fasterxml/jackson/dataformat/xml/deser/FromXmlParser.java",
+          "start_line": 35
+        },
+        {
+          "end_line": 566,
+          "path": "src/main/java/com/fasterxml/jackson/dataformat/xml/deser/FromXmlParser.java",
+          "start_line": 542
+        }
+      ],
+      "prerequisites": "(1) Application uses the default XmlMapper/XmlFactory configuration (new XmlMapper(), as documented in README lines 61-108) rather than passing a pre-hardened XMLInputFactory via the available constructors/setters (XmlFactory.java:90-96, 340-342) or disabling DTDs itself; (2) the JAXP-discovered StAX provider resolves external entities / DTDs by default for the given deployment (the JDK's built-in implementation does; Woodstox, which the README recommends, is commonly reported to reject external entities by default for security reasons, though that behavior is provider- and version-dependent and is not configured or documented in this repository); (3) the application actually parses XML from an untrusted source, which is this library's primary purpose.",
+      "root_cause": "XmlFactory, which is what the default XmlMapper constructor uses, creates the platform StAX parser with XMLInputFactory.newInstance() and then applies only one configuration setting, IS_COALESCING=true (XmlFactory.java:112-118, 136-142). It never disables DTD processing (XMLInputFactory.SUPPORT_DTD) or external general/parameter entity resolution (XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES), and it exposes no XML-specific read feature that could do so (FromXmlParser.Feature is empty, FromXmlParser.java:35-65). Parsing therefore inherits the defaults of whatever provider JAXP discovers; for the JDK's built-in StAX implementation those defaults permit DOCTYPE declarations and external entity resolution, so a DOCTYPE/entity in the document is expanded by the provider before Jackson converts events into tokens. A repo-wide search finds no occurrence of SUPPORT_DTD, exterior-entity properties, or any DTD/entity handling, so this is a missing secure-default rather than a code path that can be reached via configuration of the library itself.",
+      "title": "Default XmlMapper/XmlFactory parses XML with an unhardened XMLInputFactory: DTD and external-entity processing are left enabled (XXE / entity-expansion)",
+      "trace": "XmlMapper() -> new XmlFactory() (XmlMapper.java:48-50) -> protected XmlFactory(...) constructor -> xmlIn == null so xmlIn = XMLInputFactory.newInstance() (XmlFactory.java:112-114) -> _initFactories(xmlIn, xmlOut) sets only XMLInputFactory.IS_COALESCING (XmlFactory.java:118, 136-142). Later XmlMapper.readValue(...) calls XmlFactory._createParser(InputStream), which invokes _xmlInputFactory.createXMLStreamReader(in) (XmlFactory.java:531-547; same pattern at 549-604 for Reader/char[]/byte[]) with that unhardened factory. XmlTokenStream/FromXmlParser consume the resulting events (XmlTokenStream.java:350-372 collects CHARACTERS/CDATA with _xmlReader.getText(); FromXmlParser.java:545-566 exposes them as VALUE_STRING), so any value produced by entity expansion performed by the StAX provider is returned as parsed text to the data binder and to the caller.",
+      "unverified": "Not verified at runtime: no build, test, or parser execution was performed, and provider behavior (whether XMLInputFactory.newInstance() in the deployment resolves to a permissive implementation) is inferred from knowledge of JAXP/JDK defaults, not measured in this environment. The snapshot contains no tests or example applications, so no in-repo proof that untrusted XML is deserialized with default settings was available; this is a source-level secure-defaults gap plus a plausible attack path, not a demonstrated exploit.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (with CWE-776 entity-expansion DoS as secondary effect)"
+    }
+  ],
+  "coverage_summary": "Source scope reports 39 visible files (0 excluded by size/symlink/sensitive filters; the same filters apply to B0 and P1). The P1 relation index reports complete coverage of the same 39 files (631 symbols, 1225 call rows, 1129 edges, 2 navigation facts) and explicitly does not provide proof of runtime behavior, complete data flow, or exploitability; no source file is missing from the index. I read all main Java sources fully (annotation, deser, ser, util, jaxb, and top-level packages) plus pom.xml, README.md, .travis.yml and .gitignore. The snapshot contains no test sources, so usage/test evidence could not be inspected. Parsing path (XmlFactory -> XMLInputFactory -> XmlTokenStream -> FromXmlParser -> databind) and serialization path (ToXmlGenerator -> XmlPrettyPrinter/XmlBeanSerializerBase -> XMLStreamWriter) were both traced in source and cross-checked with the index's syntactic edges (e.g. constructor -> _initFactories at XmlFactory.java:118->136, createParser -> _createParser).",
+  "limitations": [
+    "Static review only: no code was compiled or executed, no tests/scanners were run, and no runtime behavior (entity resolution, provider selection) was observed.",
+    "The behavior of XMLInputFactory.newInstance() depends on the classpath/SPI in each deployment; the claim that the JDK-default provider resolves external entities and supports DTDs by default is general JAXP knowledge and is not verifiable from this snapshot (Woodstox, which the README recommends, may already be safe by default).",
+    "No test sources, CI logs, or documentation of intended secure defaults are present in the snapshot, so the maintainers' intended threat model cannot be confirmed from repository data.",
+    "Relationship index edges are syntactic navigation candidates only; I verified the ones used (constructor/containment/call sites) against source text, but I did not and cannot verify runtime reachability or data flow for entity expansion.",
+    "The snapshot is the 2.7.4-SNAPSHOT main-source tree only; other components (jackson-core/databind versions, StAX provider versions) are external dependencies and were not inspected."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ToXmlGenerator.writeNumber(BigDecimal) appears to invert the WRITE_BIGDECIMAL_AS_PLAIN logic: with usePlain=true it calls _xmlWriter.writeDecimal(dec) and with usePlain=false it calls writeCharacters(dec.toPlainString()) (ToXmlGenerator.java:956-985), while the other branches of the same method apply the flag in the opposite sense.",
+      "reason": "Functional/data-fidelity inconsistency (numbers may be written with/without scientific notation contrary to the flag), not a security boundary violation: output still goes through Stax escaping and no attacker-controlled code/format string is involved. Mentioned only as an observation."
+    },
+    {
+      "lead": "XmlFactory.readResolve() instantiates XMLInputFactory/XMLOutputFactory classes whose names come from the Java serialization stream (Class.forName(_jdkXmlInFactory).newInstance(), XmlFactory.java:182-202).",
+      "reason": "Requires an attacker already able to feed arbitrary serialized objects into Java deserialization (a pre-existing dangerous operation) and matches long-standing upstream design; no evidence in this snapshot that XmlFactory instances are deserialized from untrusted data. Weak and unconfirmed."
+    },
+    {
+      "lead": "Generic availability/DoS surface on untrusted XML: no nesting-depth limit in the parser path, repeated String concatenation while accumulating character data (XmlTokenStream.java:350-372), uncapped base64 decoding (FromXmlParser.java:827-854).",
+      "reason": "Same untrusted-XML/entity theme as the submitted candidate but much weaker and generic; not split into a second candidate, and no concrete bounded impact could be attributed to these alone from source."
+    },
+    {
+      "lead": "Serialization-side XML injection via raw output.",
+      "reason": "Checked and rejected: all writeRaw calls pass only whitespace constants (ToXmlGenerator.java:666-712, DefaultXmlPrettyPrinter.java:418-528); attribute/element values are written through Stax escaping APIs. No evidence of an injection sink."
+    }
+  ],
+  "summary": "Repository: jackson-dataformat-xml (com.fasterxml.jackson.dataformat:jackson-dataformat-xml 2.7.4-SNAPSHOT per pom.xml), the XML back-end for Jackson (XmlFactory/FromXmlParser/ToXmlGenerator + XmlMapper). I read all 39 files exposed by the source scope (all main Java sources plus pom.xml, README, .travis.yml, .gitignore); the snapshot contains no test sources. I traced the deserialization pipeline end-to-end (XmlMapper -> XmlFactory._createParser -> javax.xml.stream.XMLStreamFactory -> FromXmlParser/XmlTokenStream) and the serialization side (ToXmlGenerator/DefaultXmlPrettyPrinter/XmlBeanSerializerBase), and confirmed via text search that no DTD/external-entity hardening exists anywhere in the codebase. One candidate is submitted (secure-default gap allowing XXE/entity-expansion when untrusted XML is parsed with the default configuration); the serialization path was checked for raw/unescaped value output and no attacker-controlled injection point was found there."
+}

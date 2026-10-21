@@ -1,0 +1,60 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any untrusted string reachable from an application using Commons IO filename utilities, e.g. an upload/download filename, archive entry name, request parameter, or path read from a remote resource, that is passed to FilenameUtils.normalize(), normalizeNoEndSeparator(), concat(), getFullPath(), or their overloads.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the library adds hardening elsewhere: NUL bytes are rejected by failIfNullBytePresent (lines 985-991) and single-separator traversal is correctly handled - '/../foo' and '//../../foo' hit the guard at lines 409-411 and return null, as does '//server/../bar' matching the javadoc; the defect is specific to '..' inside the computed UNC prefix. Confirmed the affected methods have no other validation layer and that Common-IO itself performs no file I/O here, so exploitation requires a caller that trusts normalize for sanitization. Also noted this tree is the 2.6 release, i.e. before the 2.7 security fix. The upstream fix patch/advisory text was not available offline, so the CVE mapping is from prior knowledge, not verified in-repo.",
+      "id": "commons-io-normalize-unc-dotdot",
+      "impact": "Sanitization bypass and path traversal: a value that the documented normalize contract implies should have been resolved or rejected remains attacker-influenced and contains a parent-directory element together with a UNC/absolute-looking prefix. Depending on the caller, this can cause file reads, writes, or deletions outside the intended base directory (the public advisory describes access one level above the intended directory).",
+      "locations": [
+        {
+          "end_line": 442,
+          "path": "src/main/java/org/apache/commons/io/FilenameUtils.java",
+          "start_line": 348
+        },
+        {
+          "end_line": 687,
+          "path": "src/main/java/org/apache/commons/io/FilenameUtils.java",
+          "start_line": 633
+        },
+        {
+          "end_line": 506,
+          "path": "src/main/java/org/apache/commons/io/FilenameUtils.java",
+          "start_line": 485
+        }
+      ],
+      "prerequisites": "The application uses one of these FilenameUtils methods as (part of) its path-sanitization logic and subsequently resolves the returned value under a base directory, e.g. new File(baseDir, normalized) or Paths.get(baseDir).resolve(normalized). For the most concrete escape the application runs on Windows, where normalize converts the leading double separator to backslashes and the result keeps the UNC-style '\\\\..\\foo' shape; on Unix the returned value still begins with '//' and still contains the '..'.",
+      "root_cause": "getPrefixLength() treats '..' after a leading double separator as the UNC server name and returns the prefix including that segment (for '//../foo' or '\\..\\foo', indexOf(separator,2)==4 so prefix==5). doNormalize() then performs separator collapsing and dot/double-dot removal only from prefix+1 (adjoining slashes line 383, dot-slash line 392) and prefix+2 (double-dot line 406), so the '..' that lies inside the computed prefix is never inspected, 'canceled', or rejected. The method's documented contract (double dot removes the preceding segment, or null is returned if there is no parent segment; cf. javadoc '/../ --> null', '//server/../bar --> null') is violated and the untrusted string is effectively returned unchanged.",
+      "title": "FilenameUtils.normalize() leaves a '..' segment unresolved in UNC-style paths (//../foo), bypassing path sanitization",
+      "trace": "Input '//../foo' -> doNormalize (line 348) -> getPrefixLength (line 633) enters the isSeparator(ch0)&&isSeparator(ch1) branch (line 674), posUnix=4, posWin=-1, returns min(4,4)+1=5, so the '..' at indices 2-3 is classified as the UNC server name. In doNormalize the trailing separator is appended and then the adjoining-slash loop (i=prefix+1, line 383), dot-slash loop (line 392) and double-dot loop (line 406) all start at index >=6, so nothing matches; execution reaches line 441 and returns new String(array,0,size-1), i.e. '//../foo' unchanged. normalize() (line 195), normalizeNoEndSeparator() (line 289), concat() (line 491, prefix>0 branch) and getFullPath() (line 886) all funnel into this code, so all return the unresolved value.",
+      "unverified": "The behavior was traced manually through the source, not executed (no code execution permitted). The precise Windows resolution of the returned UNC-style path was not tested. The claim that this corresponds to CVE-2021-29425 relies on the product version/behavior rather than a local advisory or patch, which were not available.",
+      "weakness_type": "Path Traversal / Improper Input Validation (CWE-22, CWE-20)"
+    }
+  ],
+  "coverage_summary": "Covered all 164 model-visible files of the assigned tree (pom/build and site files skimmed; src/main/java reviewed via targeted reading and searches). Deep inspection focused on path/name handling (FilenameUtils, FileUtils, FileFilterUtils), stream wrappers (BoundedInputStream, BOMInputStream, XmlStreamReader, ByteArrayOutputStream, DeferredFileOutputStream), serialization allowlist code, process execution (FileSystemUtils), and file deletion/locking (FileDeleteStrategy, FileCleaningTracker, LockableFileWriter). No tests or build outputs are present in the snapshot, so behavior could not be exercised, and no upstream diff was available.",
+  "limitations": [
+    "No code execution or unit tests: behavior of normalize('//../foo') was derived by manual trace, not runtime confirmation.",
+    "No network access and no upstream patch/advisory in the snapshot, so the CVE-2021-29425 mapping and the exact fixed semantics are based on prior knowledge, not verified against a patch.",
+    "The snapshot appears to be the 2.6 release tag; if the harness's target is a later reported issue in this same tree (e.g. an XmlStreamReader resource-consumption report), that alternative was considered but had weaker, caller-dependent source evidence.",
+    "Large files (FileUtils ~3100 lines, IOUtils ~3800 lines) were reviewed through targeted searches and key methods rather than exhaustively line-by-line, so an injected/edge-case defect in an uninspected method cannot be fully excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ValidatingObjectInputStream (serialization package) validates class names only in resolveClass and does not override resolveProxyClass, so dynamic proxy classes are not run through validateClassName.",
+      "reason": "Real gap but a design limitation of the 2.6-era class: the proxy's serialized handler field is still resolved through resolveClass, so a bypass needs an additional accepted gadget class and no in-repo caller demonstrates exploitability; weaker and less concrete than the normalize defect."
+    },
+    {
+      "lead": "XmlStreamReader.getXmlProlog (lines 704-750) loops while reading the prolog and could spin if an arbitrary InputStream.read(byte[],int,int) returns 0 without EOF.",
+      "reason": "The stream is wrapped in BufferedInputStream/BOMInputStream inside this class, whose compliant read implementations return >=1 byte or -1, and the loop is bounded by BUFFER_SIZE and the offset<BUFFER_SIZE condition, so no reachable unbounded consumption is demonstrable from the source alone."
+    },
+    {
+      "lead": "FileSystemUtils.freeSpaceWindows/freeSpaceKb passes a caller-supplied path to an OS command.",
+      "reason": "Uses Runtime.getRuntime().exec(String[]) directly (line 573) and not a shell, so the path is a single argv element (e.g. df/dir argument) and is not exposed to shell metacharacter injection; no injection primitive found."
+    },
+    {
+      "lead": "FileCleaningTracker/FileCleaner background deletion and DeferredFileOutputStream temp-file creation.",
+      "reason": "DeferredFileOutputStream uses File.createTempFile for generated names and FileCleaningTracker deletes paths explicitly registered by the calling application; both match expected 2.6 behavior and no attacker-controlled trust boundary or missing validation is evident in the source."
+    }
+  ],
+  "summary": "The snapshot is Apache Commons IO 2.6 (pom.xml version 2.6; changes.xml/RELEASE-NOTES top out at the 2.6 release). Broad reading of the main sources, plus targeted searching of trust-boundary code (path handling, deserialization allowlists, process execution, XML/encoding sniffing, temp/lock files), found one issue with strong source-level evidence: FilenameUtils.doNormalize fails to resolve a parent-directory (\"..\") segment when it occupies the UNC/server portion of a path that begins with a double separator (e.g. \"//../foo\" or \"\\\\..\\foo\"). getPrefixLength treats \"..\" as the server name (prefix length 5 for \"//../foo\"), and all dot/double-dot removal loops start after the prefix (prefix+1 / prefix+2), so the input is returned essentially unchanged instead of being rejected as an escaping path. This is precisely the behavior of the known path-traversal defect in Commons IO before 2.7 (CVE-2021-29425). Callers that use normalize/normalizeNoEndSeparator/concat/getFullPath to sanitize untrusted filenames before resolving them under a base directory can therefore be given a value that still contains \"..\" and (on Windows) a UNC-style prefix, allowing access outside the intended directory by one level. All other leads examined were either upstream design limitations without demonstrated impact or had counterevidence."
+}

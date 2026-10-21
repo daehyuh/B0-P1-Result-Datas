@@ -1,0 +1,103 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker supplies the complete HTTP request: method/path (POST /geode-mgmt/v1/mbean/query, or any other @RequestBody endpoint using a Serializable parameter type), Content-Type: application/octet-stream, and an arbitrary serialized Java byte stream as the body (SerializableObjectHttpMessageConverter supports APPLICATION_OCTET_STREAM and MediaType.ALL). The declared parameter type (QueryParameterSource, which implements Serializable) only has to be Serializable for the converter to be selected; the payload's classes are resolved via Class.forName with the caller-influenced class loader, and gadget side effects occur during readObject() regardless of the later cast.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked and rejected: (a) the converter is used intentionally by gfsh's internal HTTP protocol and the Java serialization transport is 'by design' — but the body is not authenticated or integrity-protected, so accepting attacker-chosen serialized classes remains unsafe input handling, and no code path validates the payload's classes; (b) the HTTP service may be localhost-only — the default DistributionConfig value for http-service-bind-address is an empty string and JettyHelper only restricts the host when it is non-blank, so the default bind is all interfaces; (c) an operator can set http-service-port=0 to disable the service (documented mitigation, not an in-code check); (d) integrated security reduces the attacker set to authenticated users — but only login is enforced at this endpoint, and body deserialization precedes any permission check in the handler; (e) the project's serialization filter exists — but InternalDataSerializer.initialize only wraps DataSerializer-based streams, and ObjectInputStreamFilterWrapper.setFilterOn is never called from the web converter/IOUtils path; (f) the serialization-jar class list and Spring CommonsMultipartFile behavior were checked for related leads (see rejected leads). No runtime confirmation was possible in this read-only review, and the presence of a working gadget chain on the deployed classpath is an inference from the dependency list, not verified.",
+      "id": "case-174-cand-1",
+      "impact": "Code execution as the operating-system user running the manager/locator (typically a service account), i.e., full compromise of the cluster's management host; at minimum denial of service/crash of the manager. In a security-enabled cluster this is a privilege escalation from any authenticated account (for example an application account intended for DATA-only access) to host-level code execution; in the default no-SecurityManager configuration the endpoint is reachable without credentials. It also defeats the documented serializable-object-filter/validate-serializable-objects hardening because that filter is only installed on InternalDataSerializer streams.",
+      "locations": [
+        {
+          "end_line": 75,
+          "path": "geode-core/src/main/java/org/apache/geode/management/internal/web/http/converter/SerializableObjectHttpMessageConverter.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 174,
+          "path": "geode-core/src/main/java/org/apache/geode/internal/util/IOUtils.java",
+          "start_line": 163
+        },
+        {
+          "end_line": 357,
+          "path": "geode-core/src/main/java/org/apache/geode/internal/util/IOUtils.java",
+          "start_line": 332
+        },
+        {
+          "end_line": 163,
+          "path": "geode-core/src/main/java/org/apache/geode/management/internal/web/controllers/ShellCommandsController.java",
+          "start_line": 156
+        },
+        {
+          "end_line": 57,
+          "path": "geode-web/src/main/webapp/WEB-INF/geode-mgmt-servlet.xml",
+          "start_line": 43
+        },
+        {
+          "end_line": 108,
+          "path": "geode-core/src/main/java/org/apache/geode/management/internal/web/controllers/support/LoginHandlerInterceptor.java",
+          "start_line": 80
+        },
+        {
+          "end_line": 257,
+          "path": "geode-core/src/main/java/org/apache/geode/management/internal/ManagementAgent.java",
+          "start_line": 198
+        },
+        {
+          "end_line": 160,
+          "path": "geode-core/src/main/java/org/apache/geode/management/internal/JettyHelper.java",
+          "start_line": 147
+        },
+        {
+          "end_line": 346,
+          "path": "geode-core/src/main/java/org/apache/geode/internal/InternalDataSerializer.java",
+          "start_line": 327
+        }
+      ],
+      "prerequisites": "Network reachability to the manager's HTTP service and a running geode-mgmt web application. The HTTP service starts whenever http-service-port != 0 (default 7070 on a JMX manager/locator, ManagementAgent:198-206) and the war is found under tools/Extensions or the classpath (AgentUtil.findWarLocation). JettyHelper.initJetty only calls connector.setHost(bindAddress) when http-service-bind-address is non-blank (JettyHelper:149-151), and DistributionConfig.DEFAULT_HTTP_SERVICE_BIND_ADDRESS is \"\", so the default is all local interfaces; CliStrings.CONNECT__DEFAULT_BASE_URL shows the expected http://localhost:7070/geode-mgmt/v1 base URL. If integrated security is enabled, any valid account (no CLUSTER/DATA permission needed) suffices because the endpoint performs only login, not authorization; if no SecurityManager is configured (default), no credentials are required. Exploitation additionally requires a usable deserialization gadget on the manager's classpath (the distribution carries many third-party libraries, e.g., Spring 4.3.18, Jackson 2.9.6, commons-digester/commons-beanutils and JDK internal Xalan templates; gadget availability was not verified in this run).",
+      "root_cause": "The management web application registers SerializableObjectHttpMessageConverter (geode-mgmt-servlet.xml:51). Its readInternal() deserializes the raw HTTP body for any Serializable-typed @RequestBody parameter using IOUtils.deserializeObject(bytes, classLoader) (SerializableObjectHttpMessageConverter:63-75). IOUtils.deserializeObject wraps the attacker bytes in ClassLoaderObjectInputStream, a subclass of java.io.ObjectInputStream that calls readObject() without ever installing an ObjectInputFilter or class allow-list (IOUtils:163-174, 332-357). The project's hardening hook (InternalDataSerializer.initialize / ObjectInputStreamFilterWrapper, driven by validate-serializable-objects + serializable-object-filter) is applied only to Geode DataSerializer streams and is never invoked here, so even a hardened cluster remains exposed. No controller-level authorization exists on the reachable endpoint: ShellCommandsController.queryNames is annotated only with @RequestMapping (no @PreAuthorize like geode-web-api), and the servlet's only interceptor, LoginHandlerInterceptor.preHandle, authenticates (securityService.login) but never authorizes. Because argument resolution (body deserialization) happens after preHandle but before the handler method executes, the gadget's readObject() runs before any Geode permission check, and an account with no cluster permissions is sufficient when integrated security is enabled; when no SecurityManager is configured (the default) no credentials are needed at all.",
+      "title": "Unfiltered Java deserialization of management HTTP request bodies allows RCE on the manager/locator (legacy gfsh HTTP API)",
+      "trace": "1) gfsh and other clients use the legacy management channel: JmxOperationInvoker/HttpOperationInvoker target the manager's MemberMXBean and the /geode-mgmt/v1 HTTP context (CliStrings.CONNECT__DEFAULT_BASE_URL, HttpOperationInvoker.COMMANDS_URI). 2) The war registers SerializableObjectHttpMessageConverter as a Spring message converter (geode-mgmt-servlet.xml:51) and maps /mbean/query to ShellCommandsController.queryNames(@RequestBody QueryParameterSource) (ShellCommandsController:156-163). 3) Spring invokes the converter for an octet-stream body because no earlier converter supports QueryParameterSource; readInternal() calls IOUtils.deserializeObject(IOUtils.toByteArray(inputMessage.getBody()), classLoader) (SerializableObjectHttpMessageConverter:63-75). 4) IOUtils.deserializeObject constructs ClassLoaderObjectInputStream and calls ObjectInputStream.readObject() with no ObjectInputFilter (IOUtils:163-174, 332-357), so attacker-chosen readObject methods (gadget chain) execute in the manager JVM before the MBean query is ever performed. 5) The only request interceptor performs login with any supplied security headers and returns true (LoginHandlerInterceptor:80-108; no authorize call, unlike geode-web-api's @PreAuthorize methods), so authorization requirements of the underlying command/MBean layer never gate the deserialization step.",
+      "unverified": "The exact gadget chain available in a deployed locator JVM (e.g., a commons-beanutils/BeanComparator or other chain) was not verified, and no exploit was built or executed. Whether every distribution deploys the geode-web war under tools/Extensions/classpath and the actual runtime bind address/security configuration of the tested deployment are unverified. The claim that the converter is selected for @RequestBody on a POST to /v1/mbean/query is based on Spring 4.3 message-converter selection semantics and the explicit converter registration, not on a run.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (unsafe Java serialization on network input)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 6,009-file snapshot using the read-only tools. Focus areas: geode-core management web/CLI/JMX layers (controllers, message converter, IOUtils, LoginHandlerInterceptor, MBeans, command authorization), file/archive handling (ZipUtils, FileUploader, ExportLogs/ImportClusterConfiguration), Geode deserialization machinery (InternalDataSerializer, ObjectInputStreamFilterWrapper, CacheServerHelper/Part), geode-web/geode-web-api REST security, configuration/XML parsing, client-server protocol auth hooks (Handshake, GMSAuthenticator), Redis adapter auth, protobuf handshake state, Pulse controllers, and the sessions extensions' deserialization points. The P1 relation index reported complete indexing of all 6,009 files with no missing files and no SAST/oracle findings loaded; I treated its rows only as navigation hints and verified every cited candidate against source text. No build, test, or scanner was run; binary files are refused/skipped by the tools.",
+  "limitations": [
+    "No runtime, build, or test execution was performed; all conclusions are static source analysis. Gadget-chain availability, effective HTTP bind address, and the deployed security configuration of any real cluster were not verified.",
+    "Spring Framework 4.3.18 and commons-fileupload 1.3.3 source is not present in the snapshot, so the CommonsMultipartFile path-stripping behavior used to reject the multipart traversal lead relies on knowledge of those libraries rather than on in-tree evidence.",
+    "The distribution layout (tools/Extensions war placement) and whether the geode-mgmt webapp is always deployed were inferred from build files (geode-assembly/build.gradle:127, 471-477; AgentUtil.findWarLocation) rather than from an assembled distribution.",
+    "Only a subset of the ~6,000 files was read line-by-line; large areas (e.g., Geode internals outside the management/security/file paths, geode-lucene, geode-wan, geode-cq, geode-rebalancer, Pulse JavaScript) were surveyed only with targeted searches, so an overlooked vulnerability elsewhere cannot be excluded.",
+    "Because the case's expected vulnerability is unknown, the selected candidate is a lead based on severity and source traceability; the Zip Slip and JMX file-write leads remain plausible alternatives that were not disproven."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Zip Slip / path traversal in ZipUtils.unzip (geode-core/.../configuration/utils/ZipUtils.java:68-104): outputDirectoryPath + File.separator + zipEntry.getName() is passed directly to forceMkdir/createNewFile/FileOutputStream with no normalization or containment check; callers are ExportLogsCommand:179-184 (zip received from cluster members) and ImportClusterConfigurationCommand:128-133 (zip uploaded and unzipped on the locator).",
+      "reason": "Real code defect, but the attacker model is weaker and was not confirmed: import requires CLUSTER:MANAGE, and the export path needs a malicious/compromised member to return a crafted zip; entryDestination.createNewFile() also prevents overwriting existing files, limiting the impact to creation of new files/directories. Kept out of the candidate list per the single-candidate rule, not disproven."
+    },
+    {
+      "lead": "Path traversal via staged file names in the JMX upload path: FileUploader.uploadFile (geode-core/.../beans/FileUploader.java:66-89) writes new File(tempDir, filename) from a JMX client-supplied name, and the deprecated MemberMXBean.processCommand(String, Map, Byte[][]) (MemberMXBean.java:237-239) is annotated with a bare @ResourceOperation() (resource/operation = NULL) so MBeanServerWrapper/IntegratedSecurityService authorize() returns immediately, then CliUtil.bytesToFiles (CliUtil.java:361-387) writes client-supplied names under java.io.tmpdir. FileUploaderMBean requires CLUSTER:MANAGE:DEPLOY; the deprecated processCommand path requires only authentication.",
+      "reason": "Plausible second issue but not selected: the FileUploader sink is gated by a strong permission (deploy already implies loading code into Geode), and the deprecated processCommand(Byte[][]) path is explicitly marked 'only used in a test'/deprecated since 1.4, making real-world reachability and benchmark relevance uncertain. Not runtime-verified."
+    },
+    {
+      "lead": "Multipart upload filename traversal in AbstractCommandsController.processCommand (geode-core/.../web/controllers/AbstractCommandsController.java:240-252): new File(tempDir.toFile(), multipartFile.getOriginalFilename()) plus transferTo(), before command-level authorization, for gfsh HTTP file uploads (ShellCommandsController.command 'resources' parameter).",
+      "reason": "Rejected with counterevidence: this webapp uses Spring's CommonsMultipartResolver (geode-mgmt-servlet.xml:38), and Spring's CommonsMultipartFile.getOriginalFilename() strips both '/' and '\\\\' path prefixes before returning the name, which removes the classic ../ traversal; this behavior could not be re-verified from source in this offline run, so the lead is recorded as unconfirmed rather than claimed."
+    },
+    {
+      "lead": "XXE in XmlUtils.getDocumentBuilder (geode-core/.../configuration/utils/XmlUtils.java:106-113): DocumentBuilderFactory is used without disabling external entities, and CacheXml.resolveEntity returns null (via resolveEntityByEntityResolvers) for unknown SYSTEM/PUBLIC ids (CacheXml.java:777-843, 869-884), which lets the parser fall back to resolving the attacker URL.",
+      "reason": "Parsing of attacker-supplied XML (e.g., Configuration.setCacheXmlFile during import cluster-configuration) is already gated by CLUSTER:MANAGE, and the main cache.xml/config parsing path uses a parser configured with disallow-doctype (CacheXmlParser:211-229). Lower impact/privilege model than the selected candidate; unconfirmed."
+    },
+    {
+      "lead": "Authorization annotation gaps/oddities in gfsh commands: ExecuteFunctionCommand.executeFunction (geode-core/.../cli/commands/ExecuteFunctionCommand.java:41-44) has no @ResourceOperation while OnlineCommandProcessor (cli/remote/OnlineCommandProcessor.java:107-114) skips authorization entirely when the annotation is absent; UserFunctionExecution (cli/functions/UserFunctionExecution.java:96-120) instantiates a caller-supplied resultCollector class name before checking function permissions.",
+      "reason": "Function execution is still gated by Function.getRequiredPermissions defaults (Function.java:148-150 returns DATA_WRITE) enforced inside UserFunctionExecution, and AlterRegion/ExportData-style commands that lack the annotation perform explicit authorize() calls in their bodies. The pre-check class instantiation is a real oddity but no concrete RCE chain was established from source; not selected."
+    },
+    {
+      "lead": "Raw ObjectInputStream in CacheServerHelper.unzip (geode-core/.../tier/sockets/CacheServerHelper.java:89-99), reachable via Part.getObject(boolean unzip).",
+      "reason": "Rejected: no caller in the snapshot passes unzip=true (Part.getObject() delegates with false; no getObject(true) call sites found in any module), so the path appears unreachable."
+    },
+    {
+      "lead": "ExportLogsCommand accepts an arbitrary --dir on the manager (geode-core/.../cli/commands/ExportLogsCommand.java:186-196) under CLUSTER:READ, writing exportedLogs_<timestamp>.zip into a user-chosen directory.",
+      "reason": "Create-only file write of data the CLUSTER:READ user may already read, with a fixed filename pattern; insufficient impact/uncertainty about locator-side execution to be the top candidate."
+    }
+  ],
+  "summary": "Apache Geode 1.9.0-SNAPSHOT source review (6,009 readable files; P1 index reports full file coverage). I traced the management HTTP interface end-to-end and selected one candidate: the legacy gfsh-over-HTTP management web application (`geode-web`, context `/geode-mgmt`, deployed by `ManagementAgent`) parses request bodies with a Java-serialization message converter whose `ObjectInputStream` has no `ObjectInputFilter`/allow-list, giving any client that can reach the service (and either no security, or any authenticated account of any privilege when integrated security is on) a deserialization surface for gadget-chain code execution on the manager/locator JVM. The endpoint `/v1/mbean/query` (`ShellCommandsController.queryNames`, `@RequestBody QueryParameterSource`) is mapped with no `@PreAuthorize`-style check; the webapp's interceptor only performs `securityService.login(...)`, and Geode's configurable `serializable-object-filter` is wired only into `InternalDataSerializer` (not this path). I also inspected the data path for Zip Slip, JMX file staging, XXE, OQL/CLIENT protocol auth, command authorization annotations, Redis adapter auth, protobuf handshake state and Pulse controllers; those are recorded as rejected/unconfirmed leads. Findings are source-level leads only — nothing was executed or runtime-confirmed."
+}

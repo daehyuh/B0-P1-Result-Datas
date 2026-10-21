@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The request-target path (e.g. `GET //evil.example/ HTTP/1.1`). Containers (Tomcat/Jetty/Reactor Netty) pass double-slash paths through to `getRequestURI()` / `getRawPath()`; `AbstractTrailingSlashHandler.supports()` only requires that the last PathContainer element is '/' and that a configured PathPattern matches, which a catch-all pattern such as `/**` does.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether `UriComponentsBuilder`/container behavior neutralizes the value: the servlet path sets the header directly rather than calling HttpServletResponse.sendRedirect (which in most containers would turn '/'-prefixed values into same-host absolute URLs), and the reactive version writes the raw path. UriComponentsBuilder.fromUriString does not treat `//host` as an authority when no scheme is present, so it provides no implicit protection here. Also verified that a guard for this exact network-path-reference pattern exists in ForwardedHeaderFilter (lines 493-497) but not in either UrlHandlerFilter. Static resource traversal defenses (ResourceHandlerUtils.isInvalidPath / isInvalidEncodedPath / isInvalidEncodedResourcePath, encodeOrDecodeIfNecessary, createRelativeResource) were traced and no bypass was found for the known encoded-'..' variants; therefore this candidate is proposed over a traversal finding.",
+      "id": "urlhandlerfilter-protocol-relative-redirect",
+      "impact": "Open redirect served from the application's trusted origin: enables phishing, credential-harvesting chains and, depending on the application's redirect/OAuth flows, leakage of tokens or referrer information to an attacker-controlled site.",
+      "locations": [
+        {
+          "end_line": 324,
+          "path": "spring-web/src/main/java/org/springframework/web/filter/UrlHandlerFilter.java",
+          "start_line": 316
+        },
+        {
+          "end_line": 300,
+          "path": "spring-web/src/main/java/org/springframework/web/filter/UrlHandlerFilter.java",
+          "start_line": 297
+        },
+        {
+          "end_line": 298,
+          "path": "spring-web/src/main/java/org/springframework/web/filter/reactive/UrlHandlerFilter.java",
+          "start_line": 292
+        },
+        {
+          "end_line": 274,
+          "path": "spring-web/src/main/java/org/springframework/web/filter/reactive/UrlHandlerFilter.java",
+          "start_line": 270
+        }
+      ],
+      "prerequisites": "Application registers `UrlHandlerFilter.trailingSlashHandler(pattern).redirect(status)` (the new 6.2 API) with a pattern that matches a path beginning with `//` (e.g. `/**`), and relies on the standard container/config behavior for keeping `//` in the request URI. No special privileges are needed; the victim only has to follow a crafted link.",
+      "root_cause": "In both UrlHandlerFilter implementations the trailing-slash redirect handler derives the Location header directly from the request path after stripping the last '/', using HttpServletRequest.getRequestURI() (servlet) and ServerHttpRequest.getURI().getRawPath() (reactive), without validating that the resulting value is an absolute path for the current origin (i.e. that it starts with a single '/'). A path beginning with '//' is a valid network-path reference (RFC 3986 4.2), so `Location: //evil.example` is interpreted by browsers as `https://evil.example`, redirecting the user off-site from the trusted origin.",
+      "title": "UrlHandlerFilter builds redirect Location from raw request path, allowing protocol-relative (open) redirect",
+      "trace": "UrlHandlerFilter.filter/doFilterInternal matches the request to a RedirectTrailingSlashHandler -> AbstractTrailingSlashHandler.supports() sees last element '/' -> handleInternal() sets `HttpHeaders.LOCATION` to `trimTrailingSlash(request.getRequestURI())` (servlet) / `trimTrailingSlash(exchange.getRequest())` reading `getURI().getRawPath()` (reactive) -> for path `//evil.example/` the value is `//evil.example` -> browser resolves the network-path reference against the current scheme and navigates to the attacker's host. Spring guards the same `//` network-path pattern elsewhere (ForwardedHeaderFilter.sendRedirect, lines 493-497) and collapses duplicate slashes in UrlPathHelper.getSanitizedPath and UriComponentsBuilder.getSanitizedPath, but UrlHandlerFilter contains no equivalent guard.",
+      "unverified": "Not runtime-confirmed. I could not observe the actual container behavior (whether a double-slash path survives into getRequestURI()/getRawPath() in the target deployment) or the application's pattern configuration; exploitation depends on a pattern that matches `//...` paths (e.g. `/**`) and on the filter being enabled with redirect(). It is also uncertain whether this particular flaw is the issue the benchmark snapshot was selected for; the snapshot contains no test sources or vulnerability metadata to confirm.",
+      "weakness_type": "CWE-601 URL Redirection to Untrusted Site ('Open Redirect')"
+    }
+  ],
+  "coverage_summary": "All 5,156 model-visible files under the assigned source root were eligible; no binary/symlink/sensitive-path exclusions were reported by get_source_scope. The snapshot contains main sources, build files and docs but no src/test trees, so fix-related tests could not be used as an oracle. I read or searched across spring-core, spring-beans, spring-context, spring-expression, spring-web, spring-webmvc, spring-webflux, spring-messaging, spring-jdbc, spring-r2dbc, spring-oxm, spring-websocket and .github; deep-dived spring-web/spring-webmvc/spring-webflux request path handling and filters. Files not individually read include large peripheral areas (spring-orm, spring-jms internals, AOT/codegen, docs samples, most of spring-core), which were only sampled.",
+  "limitations": [
+    "Candidate is a source-level lead, not runtime-confirmed; no code execution, tests or containers were run.",
+    "The snapshot has no test sources and no vulnerability metadata, so I could not confirm which upstream fix/commit this snapshot precedes.",
+    "Whether a request path beginning with '//' reaches the filter intact depends on the servlet/reactive container and proxy configuration, which are outside the snapshot.",
+    "The open redirect requires an application to enable UrlHandlerFilter with redirect() and a pattern that matches such paths (e.g., '/**'); with narrow prefix patterns such as '/blog/**' the double-slash path will not match.",
+    "Static-analysis reasoning about multi-encoded path traversal is manual; I did not exhaustively enumerate every resolver/transformer combination (e.g., third-party ResourceResolvers) in the resource chain."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Static resource path traversal via encoded '..' in spring-webmvc/spring-webflux resource handling (ResourceHandlerUtils, PathResourceResolver, PathResourceLookupFunction)",
+      "reason": "The known CVE-2024-38816/CVE-2024-38819 defenses are present and layered: normalizeInputPath + shouldIgnoreInputPath (two URL-decode rounds, backslash normalization, WEB-INF/META-INF and ':/' rejection), encodeOrDecodeIfNecessary / createRelativeResource decoding, ResourceUtils.toRelativeURL cleanPath, and isResourceUnderLocation's location-prefix plus isInvalidEncodedResourcePath check. I traced multi-encoded '..' and encoded-backslash variants and found the decode budget (validation up to 2 decodes vs. at most 1 further decode before file access, and a resource-path re-check) closes them; no concrete bypass found."
+    },
+    {
+      "lead": "DataBinder case-insensitive disallowed-field bypass (CVE-2025-22233 class)",
+      "reason": "Already fixed in the snapshot: DataBinder.isAllowed uses PatternMatchUtils.simpleMatchIgnoreCase for disallowed fields and the javadoc documents the case-insensitive contract; simpleMatchIgnoreCase exists since 6.1.20."
+    },
+    {
+      "lead": "SpEL denial of service via unbounded expression length / auto-growth",
+      "reason": "Limits are present: SpelParserConfiguration.DEFAULT_MAX_EXPRESSION_LENGTH = 10_000 and StandardBeanExpressionResolver reads spring.expression.max-expression-length."
+    },
+    {
+      "lead": "XXE in XML message converters (SourceHttpMessageConverter, Jaxb2 converters, AbstractMarshaller)",
+      "reason": "External-entity and DTD features are disabled by default (disallow-doctype-decl, external-general-entities, NO_OP entity resolvers) in the reviewed code paths."
+    },
+    {
+      "lead": "Jackson2 / Java deserialization of untrusted data",
+      "reason": "No attacker-reachable polymorphic typing configuration or untrusted readObject path found; SerializationUtils.deserialize is deprecated with an explicit RCE warning and is not reachable from HTTP handling in this snapshot."
+    },
+    {
+      "lead": "CI/CD script injection in .github workflows/actions",
+      "reason": "Untrusted event data is passed via env vars (backport-bot) and inputs are workflow-author controlled; no untrusted github.event interpolation inside run: blocks was found. Note .github/actions/build/action.yml referenced by several workflows is absent from the snapshot, but its absence is a build/config inconsistency, not a source vulnerability."
+    }
+  ],
+  "summary": "Spring Framework 6.2.8-SNAPSHOT (spring-projects/spring-framework), main sources only. I reviewed the highest-risk request-handling surfaces: static resource handling (ResourceHttpRequestHandler / ResourceWebHandler / PathResourceResolver / ResourceHandlerUtils / PathResourceLookupFunction), path/URL utilities (UrlPathHelper, UriUtils, UriComponentsBuilder, ResourceUtils, RequestPath/ServletRequestPathUtils), filters (ForwardedHeaderFilter, UrlHandlerFilter servlet+reactive), CORS and cookie handling, DataBinder / BeanWrapperImpl mass-assignment protections, SpEL length limits, XML converters/XXE, ETag handling, and CI workflow YAML. The strongest concrete, source-visible issue is that both variants of `UrlHandlerFilter` build the redirect `Location` header by stripping the trailing slash from the raw, attacker-controlled request path with no check that the result is an absolute path for the current origin. A request whose path starts with `//` (e.g. `//evil.example/`) that matches a configured trailing-slash pattern produces `Location: //evil.example`, which browsers resolve as a protocol-relative URL to an external host (CWE-601). Static-resource path traversal defenses appear complete for the known CVE-2024-38816/38819 bypass patterns, and CVE-2025-22233 (DataBinder) is already fixed; those and other leads are listed as rejected/unconfirmed."
+}

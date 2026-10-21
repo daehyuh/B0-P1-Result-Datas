@@ -1,0 +1,67 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The string passed to ZipEncoding.encode is the ZIP entry name. Names can originate from an archive the application reads and re-writes (attacker-chosen file names), or from caller-supplied file names; the charset is chosen via ZipEncodingHelper/getZipEncoding and defaults to the platform default, which is non-UTF-8 on many deployments. The value that decides whether the vulnerable escaping branch is taken is the name's characters (unmappable/malformed input).",
+      "confidence": "medium",
+      "counterevidence_checked": "UTF-8 is safe because ZipEncodingHelper sets useReplacement=true, configuring CodingErrorAction.REPLACE, so unmappable/malformed results are not produced (lines 62-63, 161-172). Standard JRE single-byte/EBCDIC charsets generally map the ASCII escape alphabet, and the outer loop normally advances when the encoder consumes input; the failure therefore depends on the charset/coder-result combination. I did not find an explicit comment, test, or guard in this snapshot documenting or preventing the non-progress path, and no contradictory validation exists in the two relevant classes (both read in full). The snapshot predates the 1.19 release that fixed the 'file name encoding ... infinite loop' advisory, but I could not inspect the upstream fix commit to confirm this is the exact patched code.",
+      "id": "cand-1",
+      "impact": "Denial of service: a thread entering this path never returns, consuming CPU indefinitely (hang) while processing attacker-influenced file names. No memory corruption or data exposure is claimed.",
+      "locations": [
+        {
+          "end_line": 124,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/NioZipEncoding.java",
+          "start_line": 78
+        },
+        {
+          "end_line": 146,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/NioZipEncoding.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 172,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/NioZipEncoding.java",
+          "start_line": 148
+        },
+        {
+          "end_line": 64,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipEncodingHelper.java",
+          "start_line": 54
+        }
+      ],
+      "prerequisites": "A non-UTF-8 ZIP encoding context (platform default charset not UTF-8, or a caller-specified charset), and a name/input that makes the CharsetEncoder return an unmappable/malformed result (or a non-consuming result) such that the escape path is entered and encodeFully cannot complete the '%UXXXX' escape in that charset. The exact charset that fails to encode the ASCII escape alphabet was not reproduced in this review.",
+      "root_cause": "NioZipEncoding.encode (src/main/java/org/apache/commons/compress/archivers/zip/NioZipEncoding.java:85-116) loops while the character buffer has remaining input, but only reacts to CoderResult.isUnmappable()/isMalformed() and isOverflow(). There is no branch for a non-consuming UNDERFLOW result (or any other non-error, non-overflow result), so if CharsetEncoder.encode(cb, out, false) returns without consuming input the loop spins forever. In the unmappable/malformed branch, each offending character is re-encoded through encodeFully (lines 136-146), which also only handles isOverflow(): it grows the buffer and retries, but never consumes/aborts on unmappable or malformed results. encodeSurrogate (lines 148-159) builds the escape from the ASCII characters '%', 'U', '0'-'9', 'A'-'F'; if the target charset's encoder reports such characters as unmappable (or otherwise returns a non-consuming result), encodeFully never advances and never grows, producing an unbounded loop. ZipEncodingHelper.getZipEncoding (src/main/java/org/apache/commons/compress/archivers/zip/ZipEncodingHelper.java:54-64) enables escape-based encoding (useReplacement=false, i.e., REPORT error actions) for every charset except UTF-8, so non-UTF-8/default-charset environments take the vulnerable branch.",
+      "title": "Infinite loop in ZIP file-name encoding (NioZipEncoding.encode / encodeFully) for non-UTF-8 charsets",
+      "trace": "ZIP writing path: ZipArchiveOutputStream entry handling obtains a ZipEncoding via ZipEncodingHelper.getZipEncoding; the entry name is passed to ZipEncoding.encode; NioZipEncoding.encode loops over the name, and on unmappable/malformed input calls encodeFully(enc, encodeSurrogate(tmp, cb.get()), out). encodeFully loops while cb.hasRemaining() and only reacts to isOverflow(); a non-consuming coder result leaves both the outer and inner loops iterating indefinitely with no input consumption and no buffer growth. Reading path: an archive whose names are re-encoded by the application (e.g., re-compression/renaming flows) reaches the same method. Loop structure and missing result handling were verified directly in the snapshot source; runtime behavior was not executed.",
+      "unverified": "No runtime execution/reproduction; the specific charset and crafted name that reliably yield a non-consuming encodeFully result were not determined. ZipArchiveOutputStream call sites that pass entry names into encode() were not read line-by-line in this run, so the exact public API flow is inferred from the class contracts. Whether a non-consuming UNDERFLOW (as opposed to unhandled unmappable/malformed) is the practical trigger is unresolved. The candidate is a lead, not a confirmed vulnerability.",
+      "weakness_type": "CWE-835 Infinite Loop; uncontrolled resource consumption (DoS)"
+    }
+  ],
+  "coverage_summary": "Assigned scope: 270 repository files under src/main plus top-level build/docs (tests excluded by the snapshot), all 270 present in the P1 index (index_status complete; 0 missing; no SAST/oracle loaded). I read NioZipEncoding.java and ZipEncodingHelper.java in full, read the version/change history (pom.xml, changes.xml, RELEASE-NOTES.txt), searched the tree for loop constructs and encoding-related code, and used find_symbols/relation facts for navigation. Most compressor and archiver packages (bzip2, xz, lzma, lz4, sevenz internals, tar, cpio, dump, arj, zip read/write implementations) were only spot-checked via searches, not read in depth. No code was executed and no runtime behavior was verified.",
+  "limitations": [
+    "Static source review only: no builds, tests, scanners, or payload execution; nothing is runtime-confirmed.",
+    "The P1 index supplies syntactic/navigation candidates only and explicitly does not prove reachability, data flow, or exploitability; I verified the cited loops in source text but not their runtime triggers.",
+    "Tests and test resources are not in the assigned snapshot, so regression tests that might clarify the intended trigger/charset could not be inspected.",
+    "I could not inspect the upstream fix commit (no web/network access), so the link between this code and the 1.19 CVE-2019-12402 advisory is inferred from snapshot date/version and the advisory's description, not confirmed.",
+    "ZipArchiveOutputStream call sites that invoke ZipEncoding.encode were not read line-by-line; the public-API trace is inferred from class contracts.",
+    "Whether the practical trigger is an unhandled non-consuming CharsetEncoder result or a charset that cannot encode the '%UXXXX' escape alphabet remains unresolved."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SevenZFile while(true)/readPackedStreams loops (src/main/java/org/apache/commons/compress/archivers/sevenz/SevenZFile.java:873 and surrounding parsing loops) as a crafted-7z DoS",
+      "reason": "Loops were located only by text search; I did not trace the loop exit conditions and read accounting inside SevenZFile, Archive/Folder parsing in this run. Related 2021 CVEs were fixed after this snapshot, so the code may be affected, but source evidence was not verified strongly enough to prefer it over the name-encoding loop."
+    },
+    {
+      "lead": "ZipArchiveInputStream stored-entry/data-descriptor handling loops (ZipArchiveInputStream.java:588) as a crafted-ZIP hang",
+      "reason": "This area was recently changed (COMPRESS-482/483/463 already present in changes.xml), and I did not verify a non-progress condition against source; no concrete unguarded loop was demonstrated."
+    },
+    {
+      "lead": "Expander/Archiver example path traversal (src/main/java/org/apache/commons/compress/archivers/examples/Expander.java)",
+      "reason": "The 1.18 release notes in this snapshot state the sibling-directory prefix path-traversal was already fixed; no corresponding vulnerable logic was re-verified, and the examples are sample code rather than the core library surface."
+    },
+    {
+      "lead": "Resource-leak and OOM issues in ParallelScatterZipCreator/ZipFile entry preallocation",
+      "reason": "Static navigation hints only; no specific unbounded allocation or leak was traced to a reachable attacker-controlled length in the time available."
+    }
+  ],
+  "summary": "Review of Apache Commons Compress 1.19-SNAPSHOT (270 source files, src/main only; tests are outside the assigned snapshot). The snapshot's changes.xml ends at COMPRESS-478 (2019-08-20), immediately before the 1.19 release that fixed the ZIP name-encoding infinite loop (CVE-2019-12402 family). I focused on the ZIP file-name encoding path and found a concrete, source-visible non-terminating loop: NioZipEncoding.encode only advances for unmappable/malformed/overflow coder results and has no handling for non-consuming UNDERFLOW, and its helper encodeFully only grows the output buffer on OVERFLOW. Since ZipEncodingHelper uses the escaping encoder (useReplacement=false) for every charset except UTF-8, any charset whose encoder cannot consume/report progress on the '%UXXXX' escape characters used for unmappable names makes encodeFully spin forever without consuming input. This is a denial-of-service (hang) lead, not a runtime-confirmed exploit."
+}

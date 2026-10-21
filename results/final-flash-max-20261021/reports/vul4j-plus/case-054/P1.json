@@ -1,0 +1,62 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The tar stream contents are fully attacker-controlled (entry names such as `../../<path>` or link targets such as `/etc` / `$JENKINS_HOME`). Archives reaching `untar`/`untarFrom` come from build inputs or file uploads consumed by archive-extraction build steps/plugins.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether a later check exists in readFromTar (none in lines 2273-2308); checked untar/untarFrom and the surrounding archive helper classes for validation (none found); verified that the tar path is a distinct implementation from the zip path (hudson/util/io/ZipArchiver.java) and that the surrounding methods do not canonicalize or compare prefixes. I did not find core code invoking untar with untrusted data, so exploitability is contingent on a calling build step/plugin, and I could not verify plugin sources because they are not in this snapshot.",
+      "id": "filepath-tar-traversal",
+      "impact": "Arbitrary file write/overwrite with the privileges of the Jenkins process (files outside the extraction root), plus symlink creation. Depending on deployment this can overwrite configuration, scripts or credential files and can lead to code execution or denial of service. Because the traversal escapes the workspace, it is not limited by the intended extraction directory.",
+      "locations": [
+        {
+          "end_line": 2308,
+          "path": "core/src/main/java/hudson/FilePath.java",
+          "start_line": 2273
+        },
+        {
+          "end_line": 730,
+          "path": "core/src/main/java/hudson/FilePath.java",
+          "start_line": 716
+        },
+        {
+          "end_line": 535,
+          "path": "core/src/main/java/hudson/FilePath.java",
+          "start_line": 517
+        }
+      ],
+      "prerequisites": "A caller must extract an untrusted tar into a directory using FilePath.untar/untarFrom (typical for archive-extraction / artifact-processing build steps). No core caller of untar with untrusted input was found inside the reviewed core sources, so the archive source is expected to come from a plugin/build step. Extraction runs with the Jenkins master or agent OS account.",
+      "root_cause": "readFromTar() builds the destination path as `new File(baseDir, te.getName())` and immediately mkdirs/writes it, never verifying that the resolved/canonical target stays inside baseDir and never rejecting `..` segments or absolute entry names. Symlink entries are additionally materialized via `new FilePath(f).symlinkTo(te.getLinkName(), ...)`, so a link entry pointing outside the base directory can be created first and then written through in a second step. The public entry points `FilePath.untar(FilePath, TarCompression)` (line 517) and `FilePath.untarFrom(InputStream, TarCompression)` (line 716) feed the attacker-supplied archive straight into this method.",
+      "title": "Tar extraction in hudson.FilePath (untar/untarFrom) writes attacker-controlled entry names without path validation (zip-slip / arbitrary file write)",
+      "trace": "untar/untarFrom (FilePath.java:517, 716) -> FileCallable/RemoteInputStream -> readFromTar(name, baseDir, in) (FilePath.java:2273) -> `TarArchiveEntry te` -> `File f = new File(baseDir, te.getName())` (line 2280) -> mkdirs(f)/writing(f)/IOUtils.copy(t,f) with no containment check -> file created outside baseDir; `te.isSymbolicLink()` branch (line 2288) creates an arbitrary symlink that a subsequent entry can write through.",
+      "unverified": "No runtime reproduction was attempted (none is permitted). I could not confirm that a deployed plugin/build step in a default configuration actually passes attacker-controlled archives to these APIs; the traversal-to-write behavior itself is evident from the source but requires such a caller. Symlink handling adds an additional escape vector whose success depends on the extraction account's filesystem permissions and OS. The archive paths available in core (e.g., zip extraction utilities) were not exhaustively audited.",
+      "weakness_type": "CWE-22 Path Traversal (tar entry name / symlink escape)"
+    }
+  ],
+  "coverage_summary": "Coverage: the P1 index reports all 8,789 visible files indexed with 0 hash mismatches and no missing or unsupported-file records; source tooling counted 8,789 files with no binary/symlink/size exclusions. I reviewed the Jenkins core (core/src/main/java), especially hudson/model (DirectoryBrowserSupport, ItemGroupMixIn, Job/AbstractItem/Run/Computer/User/ParametersAction/BuildAuthorizationToken), hudson/security (realms, remember-me, crumb issuer), hudson/cli command implementations, hudson/FilePath, hudson/util (Secret, SecretRewriter, XStream2, Digester2), jenkins/model/Jenkins, PluginManager and UpdateCenter, plus the cli module. The snapshot contains no test sources (core/src/test and the top-level test module are absent), so behavior could only be assessed from main sources; the external remoting artifact and all plugins are outside the snapshot. Version strings (poms at 1.625.4-SNAPSHOT) are inconsistent with some contained code (e.g. SECURITY-376/SECURITY-406-era fixes), so I did not rely on version-to-CVE mapping and treated the tree as untrusted evidence.",
+  "limitations": [
+    "No code was executed, no build/tests/scanners were run, and no external services were contacted; findings are source-level only and unconfirmed at runtime.",
+    "Test sources and test fixtures are missing from the snapshot, removing behavioral evidence of expected security invariants.",
+    "The remoting library (hudson.remoting.ClassFilter/ObjectInputStreamEx/Channel) and all Jenkins plugins are external to the snapshot; CLI/channel deserialization and JNLP agent paths could not be verified.",
+    "Only a subset of Jelly views, localization resources, and non-core modules (war, plugins) was inspected, so stored/reflected XSS and view-layer authorization issues may exist uninspected.",
+    "The tar-extraction finding requires a calling plugin/build step that extracts an attacker-controlled archive; I could not confirm such a caller exists in a default deployment.",
+    "Archive extraction in other code paths (e.g. zip utilities, plugin-provided extraction) was not exhaustively audited."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Blacklist-based Java/XStream deserialization defenses (hudson/util/XStream2.java BlacklistedTypesConverter, 'SECURITY-247 defense', plus the reflectively extended remoting ClassFilter blacklist in jenkins/model/Jenkins.java:818-845) could be bypassed by a gadget not on the blacklist, e.g. via CLI/agent channels or /createItem XML.",
+      "reason": "The actual class blacklist lives in the external remoting artifact (2.53.5), which is not part of the snapshot, so no bypass gadget can be verified against source. The known SECURITY-247/SignedObject defenses are present and deserialization is gated by Item/CREATE or CONFIGURE in the item paths I traced (updateByXml checks CONFIGURE before unmarshalling). Left as an unverified architectural concern, not a finding."
+    },
+    {
+      "lead": "CLIAction (core/src/main/java/hudson/cli/CLIAction.java:102-134) explicitly establishes an unauthenticated full-duplex remoting channel ('do not require any permission to establish a CLI connection'), which could be a pre-authentication deserialization surface (CVE-2016-9299/CVE-2017-1000353 class).",
+      "reason": "Whether unauthenticated requests can actually reach dangerous deserialization depends on the external remoting library's class filtering and protocol version, which are not in this snapshot; the endpoint itself sets up the channel via FullDuplexHttpChannel with post-connection authentication in CLICommand. Not verifiable from in-repo source with the required evidence."
+    },
+    {
+      "lead": "DirectoryBrowserSupport.serveFile (core/src/main/java/hudson/model/DirectoryBrowserSupport.java:168-215) rejects only paths containing '/../', so a request whose rest-of-path is '/..' is not matched and would resolve to the parent directory via VirtualFile.child.",
+      "reason": "Servlet containers normally normalize or reject '..' path segments before Stapler computes getRestOfPath(), and I could not confirm an encoding/container combination that delivers a literal '/..' remainder; the upstream-style check is present. Speculative rather than evidenced."
+    },
+    {
+      "lead": "ListJobsCommand (core/src/main/java/hudson/cli/ListJobsCommand.java:52-89) enumerates Jenkins.getInstance().getItems()/view items without filtering by Item.READ, exposing job names to users holding only Overall/Read.",
+      "reason": "Information disclosure is limited to job names/paths, permission behavior is arguable by design in this generation of Jenkins, and I found no in-source proof of a violated documented guarantee; impact too low relative to the selected candidate."
+    }
+  ],
+  "summary": "Review of the assigned snapshot (8,789 source files; Jenkins core + CLI module, roughly a 1.625-era code base into which several later security fixes appear cherry-picked: SECURITY-49/105/144/166/195/200/247/376/406, SECURITY-170 parameter filtering, etc.). I focused on the web/CLI trust boundaries, deserialization, authorization checks, file-serving and archive-extraction code. The strongest source-verifiable issue is a tar extraction path-traversal (zip-slip) in hudson.FilePath: entry names from an untrusted tar stream are used directly as filesystem paths with no containment validation, and symlink entries are honored, allowing writes outside the intended base directory. Other leads (CLI/XStream blacklist-based deserialization, workspace directory listing with non-normalized paths) were examined but could not be confirmed from this snapshot alone."
+}

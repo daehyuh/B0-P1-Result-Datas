@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Fully attacker-controlled file bytes. A BMP with the \"BM\" magic, a 40-byte BITMAPINFOHEADER, compression = 3 (BI_BITFIELDS) and any of the three mask DWORDs immediately following the header set to 0 is sufficient; the masks are read verbatim (BmpImageParser lines 151-157) and no range/non-zero check exists anywhere in the read path (BmpHeaderInfo is a plain holder). The same values flow in from ICO files: IcoImageParser.readBitmapIconData reads red/green/blue masks from the embedded BITMAPINFOHEADER when compression == 3 (lines 401-405), copies them into a synthesised BMP header (lines 452-455) and hands that buffer to BmpImageParser.getBufferedImage (line 461).",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified in source that (a) the loop condition depends only on `mask`, so the `trailingZeroes++` counter overflowing cannot terminate it; (b) there is no validation of red/green/blue masks in BmpImageParser.readBmpHeaderInfo, BmpHeaderInfo, PixelParserBitFields or FormatCompliance (FormatCompliance.getDefault() is created with failOnError=false and only records comparisons, and no mask comparison exists in the BMP path); (c) the guard asymmetry is real - alphaMask is protected at line 54 while the other three are not; (d) the reachability chain from a public API was read end-to-end. Considered and rejected as lower-impact or less-specific: same-file paths that merely decode legitimate masks (non-zero masks terminate the loop), and callers that only read the header (getImageSize) or only write images. Not runtime-confirmed: no code was executed, compiled or fuzzed, and I could not consult any upstream fix history.",
+      "id": "case-013-bmp-bitfields-mask-infinite-loop",
+      "impact": "Availability loss (denial of service). The calling thread spins forever at 100% of a CPU core with no I/O, no allocation and no interruption point, so it cannot be timed out or cancelled from another thread; no exception is ever propagated to the caller, so the application cannot detect or recover from the malformed input. A single small crafted image wedges an image-processing thread of a service that uses Commons Imaging for metadata or pixel reads (one such file per concurrent worker/thread). Because the constructor runs during metadata extraction, even callers that never decode pixels can be hung.",
+      "locations": [
+        {
+          "end_line": 73,
+          "path": "src/main/java/org/apache/commons/imaging/formats/bmp/PixelParserBitFields.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 157,
+          "path": "src/main/java/org/apache/commons/imaging/formats/bmp/BmpImageParser.java",
+          "start_line": 151
+        },
+        {
+          "end_line": 478,
+          "path": "src/main/java/org/apache/commons/imaging/formats/bmp/BmpImageParser.java",
+          "start_line": 459
+        },
+        {
+          "end_line": 461,
+          "path": "src/main/java/org/apache/commons/imaging/formats/ico/IcoImageParser.java",
+          "start_line": 400
+        }
+      ],
+      "prerequisites": "The application must pass an untrusted BMP (or ICO) to any Commons Imaging read API that constructs the BMP pixel parser: Imaging.getImageInfo(File)/getBufferedImage (format is auto-detected from the \"BM\" magic, so no extension is needed), BmpImageParser.getImageInfo / getBufferedImage / getFormatCompliance, or IcoImageParser.getBufferedImage. The crafted file must be long enough to reach the pixel-parser construction (BmpImageParser reads the image data at line 451 before selecting the parser), i.e. a header plus a small image-data block. Header-only APIs such as BmpImageParser.getImageSize are not affected.",
+      "root_cause": "PixelParserBitFields.getMaskShift(int mask) computes the shift for a bitfield mask with `while ((0x1 & mask) == 0) { mask = 0x7fffffff & (mask >> 1); trailingZeroes++; }`. For mask == 0 the loop body leaves mask at 0 and the exit condition can never become true, so the method never returns. The constructor calls getMaskShift unconditionally for the file-derived red, green and blue masks (lines 51-53) but guards only the alpha mask (`alphaMask != 0 ? getMaskShift(alphaMask) : 0`, line 54), and nothing validates that the masks read from the BMP header are non-zero. The masks come straight from untrusted file bytes: in BmpImageParser.readBmpHeaderInfo they are read with read4Bytes when `bitmapHeaderSize >= 52 || compression == BI_BITFIELDS` (lines 151-157) and are stored unvalidated in BmpHeaderInfo; the pixel parser is then constructed unconditionally for compression == BI_BITFIELDS (lines 461-471).",
+      "title": "Non-terminating loop in BMP BI_BITFIELDS mask handling on a zero colour mask (uninterruptible 100% CPU hang)",
+      "trace": "Imaging.getImageInfo(File) (Imaging.java:694) -> getImageParser (Imaging.java:704, BMP recognised by MAGIC_NUMBERS_BMP at Imaging.java:278-279) -> BmpImageParser.getImageInfo (BmpImageParser.java:546) -> readImageContents(is, FormatCompliance.getDefault()) (line 558) -> mask DWORDs read unvalidated (lines 151-157) -> parser selection at line 469-471 `new PixelParserBitFields(bhi, colorTable, imageData)` -> constructor (PixelParserBitFields.java:43-55) -> getMaskShift(redMask/greenMask/blueMask) (lines 51-53) -> non-terminating `while ((0x1 & mask) == 0)` at lines 60-63. Note that PixelParserBitFields is constructed inside readImageContents even for metadata-only calls, so the hang occurs before any pixels are decoded. Index navigation (trace_relations on getMaskShift) confirms only the constructor calls this private method (4 call edges, lines 51-54); the guard asymmetry visible at line 54 was verified in source text.",
+      "unverified": "Not runtime-confirmed: I did not build or execute anything, so the hang is established by code reading only. Uncertain whether the sample/ground-truth fix for this snapshot targets this same defect (no patch, CVE or issue data is available in this run). Also unverified: whether downstream callers of Commons Imaging in scoped deployments wrap parsing in separately killable processes or enforce external timeouts, which would reduce but not remove the impact.",
+      "weakness_type": "CWE-835 Loop with Unreachable Exit Condition ('Infinite Loop') / CWE-20 Improper Input Validation (missing validation of attacker-supplied colour masks)"
+    }
+  ],
+  "coverage_summary": "Scope: 375 model-visible files under the assigned source root, all under src/main/java plus src/main/resources, src/conf, src/site and build metadata (pom.xml, assembly/site descriptors, checkstyle/PMD/FindBugs configs). get_source_scope reports no excluded files (0 excluded for size/symlink/sensitivity) and the same filters for every condition; get_relation_scope reports 375/375 files indexed with 0 hash mismatches, but explicitly only syntactic navigation candidates (4629 symbols, 10345 edges) with no data-flow, reachability or exploitability proof, and build/tests not run. I read the core binary I/O helpers (BinaryFunctions, ByteSource*, BinaryOutputStream, ByteStreams), the API layer (Imaging, ImageParser, FormatCompliance, ImageBuilder), and the parsers for PNG, GIF, BMP, JPEG (segments + decoder + IPTC), TIFF (TiffReader/datapath readers/filters), PSD, ICNS, ICO, PCX/DCX, PNM, XBM, XPM, WBMP, and the ITU-T4/LZW codecs; TGA is entirely commented out in this snapshot. Review was static only: no code was compiled or executed and no tools beyond the provided read-only source/relation tools were used.",
+  "limitations": [
+    "Static review only: nothing was compiled, executed, fuzzed or instrumented, so no finding is runtime-confirmed; reachability statements are based on reading the call chain in source.",
+    "The snapshot has no test sources or reproducible build outputs (no src/test), so I could not check test expectations or a fix-derived regression test; the ground-truth defect for this case is unknown to me.",
+    "The P1 relation index is syntactic only (no data-flow/reachability semantics) and reports no SAST findings; index coverage does not mean an unlisted code area was reviewed.",
+    "Not every line in the 375 files was read in full: TIFF/JPEG writing paths (TiffImageWriter*, ExifRewriter, JpegXmpRewriter), the JPEG IPTC/APP13 helpers, the palette quantisers, the PNG writer and the site/config XML files received only targeted inspection, so additional issues there cannot be excluded.",
+    "Impact assessment is bounded by the JVM: array-index/parse faults in this codebase manifest as runtime exceptions (DoS) rather than memory corruption, so severity is expressed in availability terms."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "PNG chunk length is used without validation: PngImageParser.readChunks (PngImageParser.java:153-168) passes the signed 4-byte chunk length to BinaryFunctions.readBytes (BinaryFunctions.java:89-104), which does `new byte[length]` (line 91), so a crafted PNG whose first chunk type is in the \"keep\" set (e.g. IHDR) with length 0x80000000 yields NegativeArraySizeException and a large positive length (e.g. 0x7FFFFFFF) forces an attempt at a ~2 GiB allocation (OutOfMemoryError) from a tiny file, reachable via Imaging.getImageInfo/getBufferedImage.",
+      "reason": "Genuine unvalidated-length/DoS issue with clear attacker control, but it is a generic 'missing length bound' pattern replicated across several parsers in this snapshot (e.g. PsdImageParser.readImageResourceBlocks lines 207-213 uses file-supplied dataSize the same way), and the failure is a JVM-level Error/exception rather than an unrecoverable loop. I judged it weaker than the deterministically non-terminating BMP loop, and per the one-candidate cap I did not submit it separately."
+    },
+    {
+      "lead": "PNG zTXt/iTXt/iCCP keyword parsing reads past the chunk end: PngChunkZtxt.java:40-56, PngChunkItxt.java, PngChunkIccp.java:52-64 compute the keyword NUL offset with findNull and then dereference bytes[index+1] (and offset by index+2) without checking that a compression-method byte and profile data actually follow, so a chunk whose data ends with the NUL terminator produces an ArrayIndexOutOfBoundsException while reading metadata (ImageInfo/Metadata/XmpXml paths).",
+      "reason": "Real out-of-bounds read (Java exception, not memory corruption) and reachable, but impact is limited to an uncaught RuntimeException/DoS; rejected in favour of the stronger, uninterruptible hang."
+    },
+    {
+      "lead": "GIF LZW minimum code size is taken verbatim from the file and never validated before MyLzwDecompressor is constructed (GifImageParser.java:388-397 -> MyLzwDecompressor.java:55-74): values >= 11 make `intialEntriesCount = 1 << (codeSize + 2)` exceed the fixed `new byte[MAX_TABLE_SIZE][]` (4096) table, producing an ArrayIndexOutOfBoundsException, and other values (e.g. >= 30 / signed shifts) desynchronise the code table and later index arithmetic.",
+      "reason": "Plausible CWE-129 instance, but the observable outcome in Java is an array-bounds exception (DoS by exception) rather than a hang or corruption; not selected given the one-candidate limit."
+    },
+    {
+      "lead": "JPEG decoder index arithmetic: JpegDecoder.decode (JpegDecoder.java:422-434) advances the Huffman-table index without an upper bound and readMCU (lines 332-360) can advance the zig-zag index k past 63 and index null/unset Huffman/quantisation tables.",
+      "reason": "visitSOS wraps the whole decode in `catch (RuntimeException)` (JpegDecoder.java:164-172) and converts such faults into ImageReadException, so impact is an ordinary parse failure - explicitly checked and rejected as not meeting the evidence threshold."
+    },
+    {
+      "lead": "ICNS RLE/1bpp/8bpp decoding (Rle24Compression.java:44-64, IcnsDecoder.decode8BPPImage/apply8BPPMask, decode1BPPImage) reads imageData/maskData at positions derived from the file without validating the buffer against the required size, and T4AndT6Compression.fillRange (T4AndT6Compression.java:700-706) writes referenceLine[i] for a0 that can go negative / past width during TIFF G3/G4 decoding.",
+      "reason": "Same out-of-bounds-by-exception class, with output-buffer bounds that are hard to reach outside full TIFF G3/G4 decode paths; unconfirmed and lower impact than the selected candidate."
+    }
+  ],
+  "summary": "Snapshot reviewed: Apache Commons Imaging 1.0-SNAPSHOT (src/main only: 375 files; no test/build sources in scope). This is a Java image-parsing library, so the realistic impact ceiling for parsing bugs is availability (unbounded CPU / unbounded memory / uncaught runtime exceptions propagating to the caller). After tracing the strongest untrusted-input paths, the single best candidate is an unbounded busy-loop in the BMP BI_BITFIELDS colour-mask handling (`getMaskShift`), reached whenever a zero red/green/blue mask is supplied in a crafted BMP (or ICO) and any read API is invoked."
+}

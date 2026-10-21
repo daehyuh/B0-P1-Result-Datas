@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The pipeline configuration text is repository content: ScmPipelineConfigurationProvider.getConfig, MultibranchTemplateFlowDefinition, and ScmAdHocTemplateFlowDefinitionConfiguration.getConfig fetch pipeline_config.groovy from SCM and hand it to PipelineConfigurationDsl.parse. A user able to push to a branch (or configure a job/SCM source that delivers that file) controls arbitrary Groovy statements in that file, including calls on `this` (the PipelineConfigurationBuilder subclass running sandboxed).",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified in source that library steps are intentionally parsed with the trusted shell (StepWrapperFactory.prepareScript uses exec.getTrustedShell; TemplatePrimitiveInjector.parseClass uses forTrusted), while templates are created sandboxed (`new CpsFlowExecution(template, true, ...)` in TemplateFlowDefinition) and the config DSL is sandboxed (SecureGroovyScript(..., true)); this confirms the whitelist is the mechanism that relaxes checks for sandboxed JTE content. Checked whether other code paths narrow receiver exposure: library steps are trusted by design, and for multibranch PRs the config is fetched via scmSource.getTrustedRevision (FileSystemWrapperFactory.fromMultiBranchProject), which limits PR-head exposure but not ordinary branch pushes. Reviewer did not find any method-name restriction or deny-list in SandboxWhitelist itself, nor any caller-side validation of config DSL method calls. The script-security implementation (a dependency not present in this snapshot) was not inspected, so it is unverified whether the sandbox core hard-rejects Script.evaluate before consulting extension whitelists, and whether nested compilation is definitely un-instrumented.",
+      "id": "jte-sandbox-whitelist-overbroad",
+      "impact": "Potential sandbox escape leading to arbitrary code execution on the Jenkins controller (full compromise of the Jenkins JVM, access to credentials/agents/master files) by a user who can influence repository pipeline configuration content that JTE parses through its sandboxed config DSL. If reachable, this defeats the intended containment of untrusted SCM content, which is JTE's core governance boundary.",
+      "locations": [
+        {
+          "end_line": 79,
+          "path": "src/main/groovy/org/boozallen/plugins/jte/util/SandboxWhitelist.groovy",
+          "start_line": 35
+        },
+        {
+          "end_line": 73,
+          "path": "src/main/groovy/org/boozallen/plugins/jte/util/SandboxWhitelist.groovy",
+          "start_line": 52
+        },
+        {
+          "end_line": 95,
+          "path": "src/main/groovy/org/boozallen/plugins/jte/init/governance/config/dsl/PipelineConfigurationDsl.groovy",
+          "start_line": 75
+        },
+        {
+          "end_line": 102,
+          "path": "src/main/groovy/org/boozallen/plugins/jte/init/governance/config/dsl/PipelineConfigurationBuilder.groovy",
+          "start_line": 30
+        },
+        {
+          "end_line": 75,
+          "path": "src/main/groovy/org/boozallen/plugins/jte/init/governance/config/ScmPipelineConfigurationProvider.groovy",
+          "start_line": 58
+        },
+        {
+          "end_line": 70,
+          "path": "src/main/groovy/org/boozallen/plugins/jte/job/ScmAdHocTemplateFlowDefinitionConfiguration.groovy",
+          "start_line": 54
+        }
+      ],
+      "prerequisites": "JTE pipeline whose pipeline configuration originates from repository/SCM content (e.g., multibranch TemplateBranchProjectFactory or a job configured with ScmAdHocTemplateFlowDefinitionConfiguration) so the config DSL parses attacker-influenced text; JTE's sandbox whitelist is a global @Extension, so it is consulted for that sandboxed evaluation. Attacker needs the ability to place/push the config file (or otherwise control the SCM content used), not Jenkins admin rights.",
+      "root_cause": "SandboxWhitelist.permitsMethod ignores the Method argument and returns true for every method whose receiver is an instance of TemplatePrimitive, TemplatePrimitiveCollector.JTEVar, TemplatePrimitiveNamespace, LibraryNamespace, HooksWrapper, PipelineConfigurationBuilder or DslEnvVar (SandboxWhitelist.groovy:37-57). permitsStaticMethod additionally permits any static method whose first argument is one of those types, regardless of declaring class (lines 59-73). One permitted receiver, PipelineConfigurationBuilder, is a groovy.lang.Script subclass, so inherited unsafe methods (Script.evaluate(String/File/Reader), GroovyObject.invokeMethod, getBinding/setBinding, etc.) become sandbox-permitted even though script-security normally rejects them. The config DSL intentionally runs untrusted repository content sandboxed: PipelineConfigurationDsl.parse wraps repo text in SecureGroovyScript(..., true) with @BaseScript PipelineConfigurationBuilder and evaluates it under the script-security sandbox (PipelineConfigurationDsl.groovy:84-92), so this receiver type is directly reachable by attacker-influenced content.",
+      "title": "Over-broad sandbox whitelist permits arbitrary methods (incl. Script.evaluate / reflective invocation) on PipelineConfigurationBuilder and other JTE receivers, enabling sandbox escape from repo-provided pipeline_config.groovy",
+      "trace": "1) Repository pipeline_config.groovy is fetched (ScmPipelineConfigurationProvider.getConfig / ScmAdHocTemplateFlowDefinitionConfiguration.getConfig) and passed to PipelineConfigurationDsl.parse (lines 62/67/71). 2) parse builds SecureGroovyScript(<text>, true) with an @BaseScript PipelineConfigurationBuilder prologue and evaluates it sandboxed (PipelineConfigurationDsl.groovy:87-92). 3) At runtime the script object is an instance of a generated subclass of PipelineConfigurationBuilder. 4) A statement such as a call to `evaluate(...)` (or reflective invocation of a method on the builder, e.g. via a static Groovy runtime helper whose first argument is the builder instance) triggers script-security sandbox checks; SandboxWhitelist.permitsMethod returns true solely because the receiver is an instance of PipelineConfigurationBuilder (or permitsStaticMethod returns true because args[0] is), so the normally-rejected unsafe call is allowed. 5) Methods such as Script.evaluate compile and execute additional Groovy without the sandbox compilation transformer, giving unsandboxed execution (i.e., the caller-supplied code runs with Jenkins controller privileges). No exploit payload or runtime validation was performed in this review.",
+      "unverified": "No execution or PoC was performed (prohibited). The exact runtime behavior of script-security's SandboxInterceptor/whitelist composition, whether Script.evaluate/invokeMethod are hard-denied regardless of custom whitelists, and whether a permitted static helper plus permitted receiver can reach unsandboxed compilation or reflection were not runtime-verified. Reachability for a specific deployment depends on whether the pipeline configuration is repository-provided (SCM) rather than console-provided.",
+      "weakness_type": "Sandbox escape / CWE-265 (privilege boundary violation), unsafe reflection whitelisting"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 266-file snapshot (Jenkins Templating Engine plugin), focusing on src/main Groovy/Java and resources: SandboxWhitelist, PipelineConfigurationDsl/Builder/Object, PipelineConfigurationAggregator, GovernanceTier and config/library providers (Console/Scm/Plugin), PipelineTemplateCompiler/Resolver, TemplateFlowDefinition and job classes (AdHoc/Scm/Console/Multibranch/Branch/MultiBranch factories), injectors (Library, Stage, TemplateMethod, Default, Keyword, ApplicationEnvironment, JteBlock, GlobalCollision), StepWrapper/Factory/CPS/Script, TemplatePrimitive/Collector/Namespace, hooks, ConfigValidator, FileSystemWrapper(Factory), TemplateLogger, JteGroovySourceFileAllowList and key resources. The P1 relation index is only a partial navigational artifact: it reports 174/266 files indexed (92 missing), only 1 parsed Java file, 38 symbols, 33 call facts and 46 edges, with no control/data-flow, no semantic resolution, and no Spring/annotation enforcement verification; Groovy symbols are largely unparsed, so relation queries were used only for orientation and every claim above rests on source text. No tests exist in the snapshot (src/test absent), dependencies (script-security, workflow-cps, groovy-sandbox) are not included, and no code was executed.",
+  "limitations": [
+    "No runtime execution, tests, dependency inspection, or PoC was performed (prohibited), so sandbox-escape behavior is inferred from source and Jenkins/script-security design knowledge, not confirmed.",
+    "script-security, workflow-cps, and groovy-sandbox sources are not in the snapshot; the exact whitelist-composition and hard-deny semantics for Script.evaluate/invokeMethod could not be verified.",
+    "P1 relation index omits 92 files, parsed only one Java file, and has no data-flow or semantic resolution; unreported Groovy areas were reviewed only by direct reading, and some files may not have been inspected.",
+    "Whether repository-provided pipeline_config.groovy (versus console-provided) is used depends on job/folder configuration not fully enumerated; the candidate is conditional on that deployment shape.",
+    "No upstream/history/CVE comparison was allowed or performed, so it is unknown whether this whitelist behavior is a known/patched or intentionally accepted risk."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Governance merge allows lower-trust config to override higher-trust config (PipelineConfigurationObject.plus)",
+      "reason": "Source shows the accumulated higher-governance config wins on top-level keys (`child.config + this.config` where `this` is the higher-precedence config) and lower configs can only override/merge keys explicitly marked via the higher config's `override`/`merge` sets (PipelineConfigurationObject.groovy:46-113). No unilateral override path was found; treat as intended design, not a finding."
+    },
+    {
+      "lead": "Path traversal / glob injection via library names or baseDir into SCMFile/FilePath children (ScmLibraryProvider, LibraryStepInjector, ScmPipelineConfigurationProvider)",
+      "reason": "Library names must resolve through admin-configured library sources (ScmLibraryProvider.hasLibrary / PluginLibraryProvider.hasLibrary) before paths are built; traversal would only reach content in the same attacker-controlled SCM/workspace. No cross-trust-boundary read/write was established from source alone."
+    },
+    {
+      "lead": "ScmPipelineConfigurationProvider / ScmAdHocTemplateFlowDefinitionConfiguration fetch config/templates from SCM using credentials configured on the tier/job",
+      "reason": "Configuration of these providers requires privileged configuration; fetches go through SCMFileSystem/FIleSystemWrapper with the job context and, for multibranch, `getTrustedRevision`. No missing permission check or arbitrary-SCM injection into an untrusted user's reach was confirmed."
+    },
+    {
+      "lead": "StepWrapper.getScript / StepWrapperCPS reachable from sandboxed template and permitting calls on JTE primitives",
+      "reason": "Library step code is intentionally compiled/executed trusted, so exposing step invocation is by design; the concrete escalation path identified is the SandboxWhitelist receiver/method binding, not the StepWrapper API itself."
+    },
+    {
+      "lead": "Potential stored XSS via TemplateLogger console annotations (messages derived from config values, e.g. library names)",
+      "reason": "Message bodies are printed as plain console text; the Annotator only carries log level/message id, and the annotation markup does not embed the message text in the reviewed code. No attacker-controlled HTML/JS sink was confirmed."
+    },
+    {
+      "lead": "JteGroovySourceFileAllowList suffix-based matching (StageCPS.groovy / StepWrapperCPS.groovy)",
+      "reason": "Suffix matching mirrors the upstream GroovySourceFileAllowlist design and applies to plugin-resource source files; no workspace URL path reaching it was established, so exploitability is speculative."
+    }
+  ],
+  "summary": "JTE (Jenkins Templating Engine) plugin review. The single strongest candidate is the plugin's sandbox whitelist (SandboxWhitelist), which grants sandbox scripts unrestricted method invocation on receivers of several JTE types, including the Script subclass used as the base class for the sandboxed pipeline-configuration DSL. Because repository-controlled `pipeline_config.groovy` is executed sandboxed as a subclass of PipelineConfigurationBuilder, this over-broad whitelist exposes unsafe Script/GroovyObject methods (e.g., `evaluate`, reflective `invokeMethod`), creating a plausible sandbox-escape path to arbitrary code execution on the Jenkins controller. Other reviewed areas (governance config merge precedence, governance-tier library resolution, trusted-revision use for multibranch SCM fetches, console notes/log annotations, path construction) did not yield a comparably strong, source-supported candidate and are listed as rejected/uncertain leads. No code was executed; the finding is a lead, not a confirmed vulnerability."
+}

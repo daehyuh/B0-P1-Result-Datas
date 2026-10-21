@@ -1,0 +1,88 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker controls a property name/path (e.g. a form/request parameter name such as 'class' or 'class.classLoader') that an application resolves with BeanUtils/PropertyUtils against a bean exposed as a BeanMap (or any Map whose value for key 'class' is a Class). No attacker control of Java code is needed; the attacker only supplies the property-name string and triggers the existing BeanMap-based read path, e.g. PropertyUtils.getProperty(new BeanMap(target), \"class.classLoader\") or beanMap.get(\"class\").",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that the mitigation exists and works for the non-Map paths, so this is not the 'missing SUPPRESS_CLASS' story: resetBeanIntrospectors() adds SuppressPropertiesBeanIntrospector.SUPPRESS_CLASS (PropertyUtilsBean.java 1200-1204, constructor 123-128), fetchIntrospectionData runs it after DefaultBeanIntrospector (284-295), and getSimpleProperty/setSimpleProperty/isReadable/isWriteable/getMappedProperty/getIndexedProperty/copyProperty/setProperty all resolve 'class' to null and throw/skip for plain POJOs (checked lines 645-695, 933-968, 1066-1118, 1129-1181, 1220-1421, 1443-1476, 1576-1618). DynaBean paths checked and rejected as the bypass: WrapDynaClass builds properties from the suppressed PropertyUtilsBean descriptors (WrapDynaClass.java 255-283) and LazyDynaBean.get(\"class\") returns null rather than a Class (LazyDynaBean.java 459-480, LazyDynaClass.java 218-227). The MappedPropertyDescriptor fallback cannot resolve 'class' unless the class declares getClass(String)/isClass(String)/setClass(...) (MappedPropertyDescriptor.java 272-311). BeanMap is therefore the remaining in-library path that both exposes the 'class' property and feeds PropertyUtilsBean's Map branch.",
+      "id": "class-property-suppression-bypass-via-beanmap",
+      "impact": "Security-control bypass and information disclosure: a Class object and its ClassLoader become reachable despite the library's documented/default 'class' suppression, re-enabling the CVE-2014-0114/CVE-2019-10086 exploitation primitive (classloader manipulation) in applications that use BeanMap with externally controlled property names, which can lead to loading attacker-chosen classes and remote code execution.",
+      "locations": [
+        {
+          "end_line": 499,
+          "path": "src/main/java/org/apache/commons/beanutils2/BeanMap.java",
+          "start_line": 468
+        },
+        {
+          "end_line": 393,
+          "path": "src/main/java/org/apache/commons/beanutils2/BeanMap.java",
+          "start_line": 380
+        },
+        {
+          "end_line": 602,
+          "path": "src/main/java/org/apache/commons/beanutils2/PropertyUtilsBean.java",
+          "start_line": 594
+        },
+        {
+          "end_line": 799,
+          "path": "src/main/java/org/apache/commons/beanutils2/PropertyUtilsBean.java",
+          "start_line": 784
+        },
+        {
+          "end_line": 43,
+          "path": "src/main/java/org/apache/commons/beanutils2/SuppressPropertiesBeanIntrospector.java",
+          "start_line": 37
+        },
+        {
+          "end_line": 1204,
+          "path": "src/main/java/org/apache/commons/beanutils2/PropertyUtilsBean.java",
+          "start_line": 1200
+        }
+      ],
+      "prerequisites": "Application uses the public org.apache.commons.beanutils2.BeanMap (or passes a Map backed by a bean) and lets an external party choose the property name used with BeanUtils/PropertyUtils (the same usage pattern addressed by CVE-2014-0114/CVE-2019-10086). The Pojo/bean itself only needs the inherited getClass(). For the full chain the object returned for 'class' must be a java.lang.Class (true for BeanMap), after which the standard 'classLoader' property of Class is readable through PropertyUtilsBean's descriptor lookup.",
+      "root_cause": "The default mitigation against class-level property access is implemented only inside PropertyUtilsBean's introspection/descriptor machinery (DefaultBeanIntrospector + SuppressPropertiesBeanIntrospector.SUPPRESS_CLASS, PropertyUtilsBean.java 1200-1204). BeanMap does not use PropertyUtilsBean: BeanMap.initialize() (BeanMap.java 468-499) introspects with java.beans.Introspector.getBeanInfo(beanClass) and stores every descriptor, including 'class' -> Object.getClass(), in readMethods (lines 486-492); BeanMap.get(Object) then invokes that read method reflectively (lines 380-393). In addition, PropertyUtilsBean.getNestedProperty/getPropertyOfMapBean treat any java.util.Map (BeanMap implements Map) as a plain map and fetch entries with Map.get (PropertyUtilsBean.java 594-602 and 784-799, line 798), so descriptor-based suppression is skipped entirely for Map beans. Consequently the intended invariant 'the class property is suppressed by default' is not true for a library-provided public class, and nested expressions such as 'class.classLoader' resolve to the ClassLoader when the bean/map argument is a BeanMap.",
+      "title": "BeanMap bypasses the default 'class' property suppression, allowing classloader exposure via 'class.classLoader'",
+      "trace": "1) new BeanMap(bean) -> initialize() -> Introspector.getBeanInfo(bean.getClass()) returns the standard 'class' PropertyDescriptor (read method Object.getClass); no SuppressPropertiesBeanIntrospector is applied here, so readMethods gains 'class' (BeanMap.java 476-492). 2) BeanMap.get(\"class\")/entrySet()/keySet() expose it and invoke getClass() reflectively (BeanMap.java 380-393). 3) PropertyUtilsBean.getNestedProperty(beanMap, \"class.classLoader\"): bean instanceof Map -> getPropertyOfMapBean(beanMap, \"class\") -> beanMap.get(\"class\") returns the Class object, bypassing getPropertyDescriptor/getIntrospectionData and thus the 'class' suppression (PropertyUtilsBean.java 594-602, 784-799). 4) The remaining segment 'classLoader' is resolved on the Class object via getSimpleProperty -> getPropertyDescriptor(java.lang.Class, \"classLoader\") (not suppressed) -> invoke getClassLoader(), returning the ClassLoader. 5) The returned ClassLoader/Class object is exactly the object the default suppression is designed to hide; downstream use (e.g. expressions invoking methods on the returned object) is the classic route to code execution.",
+      "unverified": "Not runtime-confirmed: the snapshot contains no tests and no execution was performed. The exact fix for the known class-property CVE affecting this code base could not be inspected (no patch/diff/ground-truth access), so the candidate is a source-level lead that BeanMap is the residual unsuppressed path rather than a confirmed reproduction. Whether a given application passes a BeanMap (or a Map yielding a Class for key 'class') to BeanUtils/PropertyUtils is deployment-dependent, and the classloader-to-RCE step depends on the consuming framework's use of the returned object.",
+      "weakness_type": "Improper access control / use of externally controlled property name to reach Class.getClassLoader (classloader manipulation; incomplete mitigation, CWE-284/CWE-470)"
+    }
+  ],
+  "coverage_summary": "Reviewed all 157 model-visible files (124 Java sources) via get_source_scope/get_relation_scope, with deep reads of the property-access core (PropertyUtilsBean, BeanUtilsBean, BeanMap, WrapDynaBean/WrapDynaClass, LazyDynaBean/LazyDynaClass/LazyDynaMap/LazyDynaList, DefaultBeanIntrospector, SuppressPropertiesBeanIntrospector, BeanIntrospectionData, DefaultIntrospectionContext, MappedPropertyDescriptor, FluentPropertyBeanIntrospector), the static facades (BeanUtils, PropertyUtils), converters and registration (ConvertUtilsBean, AbstractConverter, ArrayConverter, ClassConverter, InetAddressConverter and default registrations), locale support (LocaleBeanUtilsBean, LocaleConvertUtilsBean), reflection utilities (MethodUtils, ConstructorUtils), expression handling (DefaultResolver), SQL wrappers (AbstractJdbcDynaClass, ResultSetDynaClass, ResultSetIterator), and supporting classes (ContextClassLoaderLocal, BeanComparator, decorators). The P1 relation index was used only for navigation (syntax containment/calls); it provides no data-flow, control-flow, semantic resolution, or reachability, and no tests or build/run artifacts are present in the snapshot, so no execution or dynamic verification was possible. Omitted/unsupported areas: no src/test tree exists to inspect expected behavior; non-Java site/docs files were read only where security-relevant.",
+  "limitations": [
+    "No test sources exist in the assigned snapshot (src/test is absent), so intended security behavior could not be cross-checked against tests.",
+    "No code was executed; no build, scanner, or dynamic analysis was run, and the relation index is syntactic-only (no data flow/control flow/semantic resolution), so the candidate remains a source-evidence lead.",
+    "External references (patch diff, CVE/CWE records, sibling conditions) were intentionally not consulted, so the exact historical fix for the known class-property issue could not be compared against this snapshot.",
+    "The BeanMap bypass requires the consuming application to resolve attacker-influenced property names against a BeanMap or an equivalent Map whose 'class' entry yields a Class; production usage prevalence was not verifiable from source.",
+    "Other potential classloader routes that depend on application-supplied getters returning Class objects (e.g. getDeclaringClass, getType) were identified conceptually but not attributed to this library because they require application-specific beans."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "'class' property not suppressed by default in PropertyUtilsBean",
+      "reason": "Contradicted by source: the default introspector list already contains SuppressPropertiesBeanIntrospector.SUPPRESS_CLASS (PropertyUtilsBean.java 1200-1204, constructor 123-128) and property resolution for non-Map beans demonstrably fails for 'class' (600s-1600s line ranges examined); the documented mitigation is present, so the issue is a coverage/bypass gap (BeanMap/Map path), not a missing default."
+    },
+    {
+      "lead": "DynaBean property access bypasses suppression (LazyDynaBean auto-creates a 'class' DynaProperty)",
+      "reason": "Source shows LazyDynaClass.getDynaProperty('class') can return a synthetic DynaProperty, but LazyDynaBean.get('class') then returns null (values map lookup fails and isDynaProperty is false), so no Class object is returned; WrapDynaBean/WrapDynaClass use the suppressed PropertyUtilsBean descriptors. No classloader exposure."
+    },
+    {
+      "lead": "ClassConverter registered by default allows loading arbitrary classes from strings",
+      "reason": "ConvertUtilsBean registers ClassConverter by default (line 566), but conversion only performs ClassLoader.loadClass with no initialization/instantiation, and requires the destination property to be of type Class; by-design behavior, no demonstrated RCE or classloader manipulation."
+    },
+    {
+      "lead": "InetAddressConverter/URLConverter/FileConverter/PathConverter accept attacker strings",
+      "reason": "These converters construct JDK objects (DNS resolution / URL / File / Path) by design and perform no I/O in the library; impact depends entirely on how a consuming application uses the converted value."
+    },
+    {
+      "lead": "MethodUtils/ConstructorUtils call setAccessible on methods/constructors",
+      "reason": "Upstream JavaBeans default-access workaround guarded by SecurityException handling; it applies only to public members of public classes and is part of the documented public API rather than a reachable trust-boundary violation."
+    },
+    {
+      "lead": "BeanUtilsBean(ConvertUtilsBean) ignores its constructor argument (creates a fresh ConvertUtilsBean)",
+      "reason": "Real inconsistency with its javadoc (BeanUtilsBean.java 150-155), but a functional/configuration defect with no direct security impact demonstrated from source."
+    },
+    {
+      "lead": "AbstractJdbcDynaClass.loadClass uses Class.forName on JDBC metadata class names",
+      "reason": "class name originates from ResultSetMetaData of the JDBC driver, is loaded without initialization, and requires a malicious driver/metadata; no source-evidenced exploit path through BeanUtils itself."
+    }
+  ],
+  "summary": "Reviewed the assigned snapshot: Apache Commons BeanUtils 2.x (artifactId commons-beanutils2, version 2.0.0-M2-SNAPSHOT, ~Jan 2025), 157 visible files (124 Java) under the filters reported by get_source_scope/get_relation_scope (no src/test tree in the snapshot; relation index is syntax-only navigation with no data-flow, control-flow, or semantic resolution). The snapshot implements the class-property mitigation for the standard JavaBeans path: PropertyUtilsBean.resetBeanIntrospectors() installs DefaultBeanIntrospector + SuppressPropertiesBeanIntrospector.SUPPRESS_CLASS (PropertyUtilsBean.java 1200-1204), so BeanUtilsBean/PropertyUtils.getProperty(bean,\"class\") and nested \"class.classLoader\" expressions fail with NoSuchMethodException for plain POJOs (verified across getSimpleProperty, getPropertyDescriptor, isReadable/isWriteable, copyProperty/setProperty, LocaleBeanUtilsBean). The strongest source-evidenced residual gap is that the mitigation is only enforced by PropertyUtilsBean's descriptor lookup: public class BeanMap introspects beans with java.beans.Introspector.getBeanInfo() directly (BeanMap.java 468-499), so its readMethods map still contains \"class\" -> Object.getClass(), and BeanMap.get(\"class\") returns the Class object. Because PropertyUtilsBean.getNestedProperty treats every java.util.Map bean as a map (getPropertyOfMapBean -> Map.get(propertyName), PropertyUtilsBean.java 594-602, 784-799) and BeanMap implements Map, the classic classloader chain resolves: PropertyUtils.getProperty(new BeanMap(anyBean), \"class.classLoader\") returns the ClassLoader (then Class.getClassLoader on the Class returned by BeanMap.get(\"class\")), i.e. the CVE-2014-0114 / CVE-2019-10086-style class-property exposure that the library documentation and SuppressPropertiesBeanIntrospector.SUPPRESS_CLASS are intended to remove by default. This is submitted as one candidate; it is a source-level lead, not runtime-confirmed."
+}

@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A user with Item/Configure (which Replay is derived from) on the job fully controls the replacement main script text and the replacement texts for scripts loaded by the `load` step that are submitted to ReplayAction.doRun (ReplayAction lines 201-218, 245-269). The sandbox flag is not user-supplied but is silently dropped by persistence, so the same submission that would have been forced through the sandbox is later executed without it.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the obvious counterarguments: (a) Replay is gated by a dedicated REPLAY permission derived from Item/Configure and by isReplayableSandboxTest requiring Jenkins.RUN_SCRIPTS for unsandboxed originals - those checks exist and are correct at submission time, so the defect is specifically the loss of the decision after persistence; (b) CpsFlowExecution itself persists `sandbox` (field 250, serialized in ConverterImpl.marshal line 1650, restored in unmarshal lines 1727-1729), showing the project deliberately persists this decision elsewhere, which makes the transient in the replay action inconsistent rather than harmless; (c) doRebuild (ReplayAction 223-232) only runs the unmodified original script, so it is not a second root cause; (d) the transient modifier may have been intended purely to shrink build.xml, and Jenkins core/workflow-job queue persistence is outside this snapshot, so runtime reachability across restart could not be confirmed here.",
+      "id": "case-062-replay-sandbox-flag-not-persisted",
+      "impact": "Sandbox bypass leading to arbitrary code execution on the Jenkins controller (read/modify jobs, credentials, filesystem; typical full-controller compromise) by a user who is only authorized to replay sandboxed Pipelines, bypassing both the RunScripts gate and ScriptApproval. The same deserialization also silently converts a supposedly sandboxed replay into an unsandboxed one even for the legitimate script text, which is a defense-in-depth failure.",
+      "locations": [
+        {
+          "end_line": 70,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/cps/replay/ReplayFlowFactoryAction.java",
+          "start_line": 52
+        },
+        {
+          "end_line": 269,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/cps/replay/ReplayAction.java",
+          "start_line": 257
+        },
+        {
+          "end_line": 123,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/cps/CpsThread.java",
+          "start_line": 117
+        },
+        {
+          "end_line": 37,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/cps/CpsGroovyShellFactory.java",
+          "start_line": 33
+        },
+        {
+          "end_line": 121,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/cps/CpsFlowDefinition.java",
+          "start_line": 109
+        }
+      ],
+      "prerequisites": "Attacker holds Item/Configure (Replay) on a job whose original build used a sandboxed script (isReplayableSandboxTest then returns true without requiring Overall/RunScripts, ReplayAction lines 166-176); Jenkins/JVM restarts (or the action is otherwise persisted and reloaded) after the replay is submitted and before the build starts, so ReplayFlowFactoryAction is deserialized with sandbox=false. No RUN_SCRIPTS permission or ScriptApproval is required on that path because CpsFlowDefinition.create delegates straight to the CpsFlowFactoryAction2 (CpsFlowDefinition lines 110-117) and ReplayFlowFactoryAction.create builds CpsFlowExecution directly.",
+      "root_cause": "ReplayFlowFactoryAction stores the security-relevant sandbox decision in `private transient final boolean sandbox;` (line 56). That field is the only input to the execution constructor in create(): `return new CpsFlowExecution(script, sandbox, owner, hint);` (line 69). Because XStream/Java deserialization skips transient fields, any reload of the action (queue.xml/build.xml) reconstructs it with sandbox=false. ReplayFlowFactoryAction is persisted by design (its non-transient replacementMainScript/replacementLoadedScripts are later read via CpsFlowExecution -> Run.getAction(ReplayFlowFactoryAction.class) in ReplayAction.replacementsIn/replace, lines 276-311), so the sandbox bit is the only piece of this action deliberately not carried across persistence even though it controls whether user-supplied script text is sandboxed.",
+      "title": "Replay sandbox decision is a transient field, so a replayed Pipeline can be created unsandboxed after deserialization (e.g. Jenkins restart while queued)",
+      "trace": "1) ReplayAction.doRun authorizes the interactive replay (REPLAY permission + isReplayableSandboxTest) and calls run2(script, loadedScripts) (ReplayAction 203-218). 2) run2 snapshots the original execution's sandbox bit into a new ReplayFlowFactoryAction(..., execution.isSandbox()) (ReplayAction 257-264). 3) The action is attached to the scheduled build/queue item; it is serialized without the transient sandbox field (ReplayFlowFactoryAction 54-56). 4) After reload, the field is false. 5) CpsFlowDefinition.create (or CpsScmFlowDefinition.create) finds the CpsFlowFactoryAction2 and returns ((CpsFlowFactoryAction2) a).create(this, owner, actions) (CpsFlowDefinition 110-117). 6) ReplayFlowFactoryAction.create ignores `def` and calls `new CpsFlowExecution(script, sandbox /*false*/, owner, hint)` (ReplayFlowFactoryAction 64-70). 7) CpsFlowExecution.isSandbox() now returns false (CpsFlowExecution 494-496), so CpsThread does not wrap the Continuable in SandboxContinuable (CpsThread 120) and createInitialEnv uses DefaultInvoker instead of SandboxInvoker (CpsFlowExecution 560-562); CpsGroovyShellFactory also builds the shell with sandbox=false, selecting a plain CpsTransformer and a non-sandbox CompilerConfiguration (CpsGroovyShellFactory 33-37, 78-99). The unapproved, attacker-authored script therefore executes as trusted Groovy with controller privileges.",
+      "unverified": "No runtime or test evidence exists in this snapshot (all tests and Jelly views are absent). I could not verify in-tree whether Jenkins core persists Queue.Item actions to queue.xml and restores them after restart in this environment, nor whether the transient modifier is upstream-intentional or a modified/reverted line; the impact analysis assumes the standard workflow-cps premise that unsandboxed Pipeline code equals controller code execution.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-693 Protection Mechanism Failure (security flag lost across serialization; sandbox bypass)"
+    }
+  ],
+  "coverage_summary": "All 103 files in the assigned root were enumerated; 63 Java sources (95 files indexed, 8 unparsed non-Java resources) were reviewed in varying depth. Deep review: replay package (ReplayAction, ReplayFlowFactoryAction, ReplayCause, ReplayPipelineCommand, OriginalLoadedScripts), sandbox chain (CpsFlowDefinition, CpsGroovyShell(Factory), CpsWhitelist, GroovyClassLoaderWhitelist, SandboxContinuable, CpsScript, CpsClosure2, CpsThread, CpsVmExecutorService), persistence/serialization (CpsFlowExecution including ConverterImpl/loadProgramAsync, CpsThreadGroup, FlowHead, BodyReference, IteratorHack), step invocation/DSL (DSL, CpsStepContext, CpsBody*), secret masking (ArgumentsActionImpl, EnvActionImpl, ParamsVariable, GlobalVariable*), UI/API (Snippetizer + its Groovy views, CpsThreadDumpAction, PauseUnpauseAction, GroovySample, SnippetizerLink, JS assets), config/validator classes, and steps (LoadStepExecution, ParallelStep*). No tests or Jelly views are present in the snapshot, and no external dependencies (Jenkins core, workflow-job, script-security) are in scope.",
+  "limitations": [
+    "Tests are entirely absent from the snapshot, so no test names or fixtures could corroborate intent; Jelly views (e.g. ReplayAction/index.jelly, Snippetizer/index.jelly) are also absent.",
+    "P1 index provides only syntactic navigation (no control-flow, data-flow, semantic resolution or reachability); 8 files are unindexed and 2472 of 3116 calls are unresolved, so no call-chain claim here is index-verified.",
+    "Jenkins core/workflow-job behavior (queue.xml persistence and restoration of Queue.Item actions across restart, ACL on run actions) is outside the snapshot and could not be inspected; the exploitability of the candidate depends on it.",
+    "No code was executed, and nothing was runtime-confirmed; the transient modifier could be upstream-intentional rather than a planted regression, and I could not diff against upstream or advisory/CVE data by policy."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Snippetizer.doGenerateSnippet (src/main/java/.../Snippetizer.java 486-532) is exposed as a GET with no @RequirePOST and no permission check, loading an arbitrary class by name from the uber classloader and instantiating arbitrary Describables from supplied JSON.",
+      "reason": "Real weak authorization/CSRF surface, but no concrete sink or privilege escalation could be established from source alone, and the method/Usage appears to match the upstream snippet-generator API; impact is speculative (object instantiation and text output), so it does not meet the evidence threshold for the single candidate."
+    },
+    {
+      "lead": "CpsThreadDumpAction.getThreadDump()/doProgramDotXml (CpsThreadDumpAction.java 63-93) and CpsFlowExecution.pause() (1549-1575) as potential permission gaps.",
+      "reason": "doProgramDotXml explicitly requires Jenkins.RUN_SCRIPTS and pause() calls checkPermission(Item.CANCEL); the plain thread-dump page hangs off the Run's ACL. No missing check found in source."
+    },
+    {
+      "lead": "CpsScmFlowDefinition scriptPath handling (CpsScmFlowDefinition.java 112-183) as path traversal.",
+      "reason": "The full-checkout path resolves the file and rejects anything not under the checkout directory (line 177), and the lightweight path goes through SCMFileSystem.child(); no traversal found."
+    },
+    {
+      "lead": "Secret leakage through ArgumentsActionImpl/DSL interpolation warnings or InterpolatedSecretsAction.",
+      "reason": "Masking replaces secret values with ${NAME}, empty values are skipped, warnings record variable names only; no source-level bypass was identified."
+    },
+    {
+      "lead": "Sandbox whitelists (CpsWhitelist, GroovyClassLoaderWhitelist, SandboxContinuable, CpsGroovyShell.doParse) as a sandbox-bypass vector.",
+      "reason": "These match the hardened designs (CPS whitelist delegation to original GroovyMethods, script-classloader allow-listing, per-parse GroovySandbox scope); no deviation was found, though I could not compare against upstream byte-for-byte."
+    }
+  ],
+  "summary": "Reviewed the assigned workflow-cps (Pipeline: Groovy) snapshot as a defensive source assessment. Scope: 103 files (63 Java, rest resources/docs/build), P1 index covers 95 files / 63 parsed Java classes, 8 unindexed non-Java files. I traced the permission model (ReplayAction REPLAY/RUN_SCRIPTS checks, PauseUnpauseAction Item.CANCEL, CpsThreadDumpAction RUN_SCRIPTS, CpsFlowDefinition CONFIGURE), the sandbox enforcement chain (CpsFlowDefinition/CpsGroovyShellFactory/CpsGroovyShell/GroovyClassLoaderWhitelist/CpsWhitelist/SandboxContinuable/CpsThread), script approval usage, persistence (CpsFlowExecution ConverterImpl, CpsThreadGroup program.dat, ReplayFlowFactoryAction), secret masking (ArgumentsActionImpl/DSL/EnvActionImpl) and the Stapler/CLI entry points. Most security machinery is present and internally consistent (Replay's RUN_SCRIPTS gate for unsandboxed builds, REPLAY permission, plugin sandbox jars, etc.). The single strongest source-verified lead is that the Replay action's sandbox decision is held in a transient field and is therefore lost whenever the action is deserialized, causing a replay to be created unsandboxed."
+}

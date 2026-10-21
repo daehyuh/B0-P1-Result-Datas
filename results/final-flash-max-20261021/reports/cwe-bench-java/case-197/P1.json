@@ -1,0 +1,94 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client fully controls the HTTP Host header. For a host ending in one of the local domains (.localhost, .127.0.0.1, .0.0.0), VirtualHostParser returns everything before that suffix as the bucket name without any character filtering, so a value such as '../../../../tmp/evil.localhost' yields the bucket name '../../../../tmp/evil'. Bucket names are also attacker-controlled in path style, but only the virtual-host form can carry '/' characters (path-style names are split on '/' in LocalS3Router, and '%2F' would remain a literal character).",
+      "confidence": "medium",
+      "counterevidence_checked": "Object payloads are stored under server-generated Long IDs, not user keys (Storage/LocalFileSystemStorage, PutObjectService line 47), so object keys cannot traverse. In IN_MEMORY mode the invocation handler is constructed with a null MetadataStore and no file is written, so only PERSISTENCE mode (used by local-s3-docker App and by @LocalS3(mode = PERSISTENCE)) is affected. Path-style bucket names cannot contain '/' due to LocalS3Router's slash counting (lines 69-77); a '%2F'-encoded separator stays literal because no decoding of request.getPath() is visible in this snapshot. The traversal write always appends '.bucket.meta', so it cannot directly overwrite arbitrary binaries/configs, and the interposed netty layer could reject unusual Host values (external dependency, unverifiable here). ListBuckets/other routes remain functional and HTTP errors are returned through the normal exception handlers, i.e. the request is not silently dropped after the write.",
+      "id": "local-s3-bucket-name-path-traversal",
+      "impact": "In the default Docker/PERSISTENCE deployment an unauthenticated HTTP client can create, truncate/overwrite, or delete files whose name ends in '.bucket.meta' at arbitrary locations writable by the service process (root in the shipped openjdk:17-slim image), including places outside the mounted /data directory. This is a filesystem integrity/availability primitive (planting or clobbering files, corrupting other buckets' persisted metadata via paths such as '../data/<other-bucket>' which maps onto <dataPath>/<other-bucket>.bucket.meta). No code execution, arbitrary-byte write, or arbitrary-file read is demonstrated: the filename suffix is fixed and the fetched metadata store is only walked inside dataPath at startup.",
+      "locations": [
+        {
+          "end_line": 60,
+          "path": "local-s3-core/src/main/java/com/robothy/s3/core/storage/FileSystemBucketMetadataStore.java",
+          "start_line": 38
+        },
+        {
+          "end_line": 33,
+          "path": "local-s3-core/src/main/java/com/robothy/s3/core/asserionts/BucketAssertions.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 38,
+          "path": "local-s3-rest/src/main/java/com/robothy/s3/rest/utils/VirtualHostParser.java",
+          "start_line": 16
+        },
+        {
+          "end_line": 111,
+          "path": "local-s3-rest/src/main/java/com/robothy/s3/rest/utils/VirtualHostParser.java",
+          "start_line": 105
+        },
+        {
+          "end_line": 87,
+          "path": "local-s3-rest/src/main/java/com/robothy/s3/rest/handler/LocalS3Router.java",
+          "start_line": 63
+        },
+        {
+          "end_line": 91,
+          "path": "local-s3-core/src/main/java/com/robothy/s3/core/service/manager/LocalS3ServicesInvocationHandler.java",
+          "start_line": 76
+        },
+        {
+          "end_line": 31,
+          "path": "local-s3-core/src/main/java/com/robothy/s3/core/service/manager/FileSystemLocalS3Manager.java",
+          "start_line": 26
+        },
+        {
+          "end_line": 32,
+          "path": "local-s3-docker/src/main/java/com/robothy/s3/docker/App.java",
+          "start_line": 19
+        }
+      ],
+      "prerequisites": "Service started in PERSISTENCE mode (FileSystemLocalS3Manager -> FileSystemBucketMetadataStore + LocalFileSystemStorage), which is the default of the provided Docker image (App.java line 19, dataPath '/data', port 80; Dockerfile exposes port 80 and the endpoint has no authentication). The parent directories used by the traversal must already exist (they do for '/..' and for common targets such as '/tmp'), and the external HTTP layer (netty / io.github.robothy netty-http-router, not in this snapshot) must pass the crafted Host value through to request.getHeaders() — not verifiable in-snapshot.",
+      "root_cause": "Bucket names are only rejected when blank (BucketAssertions.assertBucketNameIsValid, lines 28-33). In persistent mode the bucket name is used directly as a path component when persisting/deleting bucket metadata: FileSystemBucketMetadataStore.store/delete/fetch build 'new File(dataPath.toFile(), bucketName + \".bucket.meta\")' (lines 42, 51, 57). A bucket name containing '../' therefore escapes the data directory. The name can be taken verbatim from the HTTP Host header by VirtualHostParser.parseHostFromLocalDomain (lines 105-111, reached from getBucketRegionFromHost lines 16-38) and injected into the request params by LocalS3Router.matchPath (lines 63-85), so no filesystem-safe bucket-name validation is ever applied on this path.",
+      "title": "Path traversal: unvalidated bucket name (Host-header virtual-host form) used as a filesystem path component by the persistent metadata store",
+      "trace": "1) PUT / (or any @BucketChanged operation, e.g. PUT /?policy=... on the traversal bucket) with Host: '../../../../tmp/evil.localhost'. 2) LocalS3Router.matchPath calls VirtualHostParser.getBucketRegionFromHost -> parseHostFromLocalDomain returns BucketRegion('local', '../../../../tmp/evil'); bucketNameInPath=false and, because trimmedPath is '/', objectKey stays null (bucket operation). 3) setBucketNameAndObjectKeyToRequestParams(params, '../../../../tmp/evil', null). 4) CreateBucketController -> (InMemory)CreateBucketService.createBucket: BucketAssertions.assertBucketNameIsValid passes (name is not blank), bucket added to LocalS3Metadata. 5) LocalS3ServicesInvocationHandler.persistBucketIfNeeded sees @BucketChanged(CREATE) and calls bucketMetaStore.store(name, metadata). 6) FileSystemBucketMetadataStore.store writes Jackson JSON to new File(dataPath, '../../../../tmp/evil' + '.bucket.meta') => <dataPath>/../../../../tmp/evil.bucket.meta, i.e. outside the configured data directory. 7) Symmetrically, DELETE bucket on that name reaches FileSystemBucketMetadataStore.delete and unlinks the same out-of-tree path, and every later mutating call on the bucket re-persists it. File content is largely attacker-influenced JSON (bucketName, region, tagging, bucket policy string, replication, ACL, object/version metadata).",
+      "unverified": "The exact behavior of the external com.robothy.netty / netty-http-router stack (header validation and whether request.getHeaders() exposes the raw Host value, and whether request.getPath() performs URL decoding) was not verifiable from this snapshot; the runtime reachability of the Host-header route therefore rests on source-level reasoning only. Also unverified without execution: whether creating a bucket whose metadata write fails (non-existent parent directory) still leaves the bucket registered in memory, and the concrete exploitability of the resulting file writes against specific deployment layouts. No tests exist in the snapshot to confirm or refute the behavior.",
+      "weakness_type": "CWE-22 Path Traversal / external control of file path (arbitrary file creation, overwrite and deletion outside the configured data directory)"
+    }
+  ],
+  "coverage_summary": "Reviewed against the assigned snapshot (247 model-visible files, 0 excluded by sensitive-name/path filters, 0 symlinks, binary files refused only when a NUL byte appears in the first 8KiB). The P1 index covers 246 files / 216 Java files with 0 parse errors, but reports index_status=partial, 1 source file missing from the index, and 3079 unresolved calls (expected: the netty HTTP router, AWS SDK and other third-party APIs are external to the snapshot); the index provides syntax containment and name/type/arity call candidates only (no control flow, no data flow, no semantic resolution), so every relation used was re-verified in source text. I read, in whole or in part: all REST handlers/controllers and the router/router-factory; VirtualHostParser, RequestUtils, XmlUtils, ResponseUtils, ByteBufUtils, the AWS chunked-decoding streams; all core service interfaces (bucket, object, versioning, multipart upload/part/complete/abort/copy, listing v1/v2/versions/multipart, tagging, policy, ACL, encryption, replication); the assertion utilities; the model/internal metadata classes and converters; the storage implementations and metadata store/loader; JsonUtils/IdUtils/S3ObjectUtils/VersionedObjectUtils/PathUtils/FileUtils; the JUnit extension and resolvers; the Docker app, Testcontainers wrapper, and Gradle/build files. Not inspected in depth: local-s3-datatypes DTO bodies (AccessControlPolicy, response models), native-image reflect configs, and remaining trivial exception classes.",
+  "limitations": [
+    "Static review only: no code was executed, no tests/scanners ran, no build was performed, and no runtime behavior or exploitability is confirmed.",
+    "The HTTP transport layer (com.robothy.netty / io.github.robothy:netty-http-router) is an external dependency that is not part of the snapshot; header/path validation and parameter assembly there are unknown and 3079 call sites remain unresolved in the index.",
+    "The snapshot contains no test sources, so behavior cannot be corroborated by tests.",
+    "The P1 index omits 1 of 247 files and supports only syntactic navigation (no data flow, control flow, semantic resolution, or reachability), so absence of an indexed relation was never treated as evidence of absence.",
+    "Deployment configuration (whether the service is exposed beyond localhost, run as root, and in which mode) is inferred from App.java/Dockerfile defaults rather than from an actual deployment."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE / entity expansion through the Woodstox-backed XmlMapper used for request bodies (CreateBucket, CompleteMultipartUpload, DeleteObjects, Put/Get Bucket/object tagging, PutBucketAcl, PutBucketVersioning): LocalS3.java lines 123-129 and XmlUtils.java lines 17-24 disable only namespace awareness and enable Jdk8/JavaTime modules, setting neither XMLInputFactory.SUPPORT_DTD=false nor IS_SUPPORTING_EXTERNAL_ENTITIES=false.",
+      "reason": "Whether the WstxInputFactory/Woodstox default resolves external or expanded entities cannot be established from this snapshot without executing the library; no in-repo evidence (no tests, no config) proves file-read or SSRF impact, and XML content parsed is echoed back only for a subset of APIs. Treated as a hardening gap, not a supported candidate."
+    },
+    {
+      "lead": "Denial of service in AwsChunkedDecodingInputStream: readUntil() writes into a fixed 256KiB ByteBuffer without bounds checks (BufferOverflowException on oversized chunk headers) and Integer.parseInt(hex,16) throws NumberFormatException for oversized chunk sizes.",
+      "reason": "Impact is bounded to per-request 500 responses / one unbounded header line; not enough to outrank the traversal candidate and not a memory-safety issue in Java."
+    },
+    {
+      "lead": "No authentication, authorization, or transport encryption anywhere in the REST layer; bucket policies/ACLs are stored but never enforced; Docker image binds port 80 on all interfaces.",
+      "reason": "Consistent with the product's purpose as a local S3 test double; treating it as a vulnerability would be a design critique rather than a source-evidenced defect in the reviewed change surface."
+    },
+    {
+      "lead": "Unvalidated object keys and the delimiter parameter (RequestAssertions.assertDelimiterIsValid only returns the value; ObjectAssertions.assertObjectKeyIsValid only rejects blank; empty-string handling in Tagging.toArrays can NPE).",
+      "reason": "Object keys/delimiters are only used as NavigableMap keys and XML/header values; object bytes are stored under server-generated Long IDs, so there is no filesystem or injection sink. Tagging NPE yields a 500 only."
+    },
+    {
+      "lead": "Exception handlers reflect internal exception messages and request URIs to clients (ExceptionHandler line 22, NotFoundHandler line 24, LocalS3ExceptionHandler lines 34-39).",
+      "reason": "Information disclosure of low sensitivity in a local emulator; no trust-boundary violation demonstrated."
+    },
+    {
+      "lead": "LocalS3Extension.afterEach does not reset the @LocalS3 static ThreadLocal for class-level services, and FileSystemBucketMetadataStore.fetchAll trusts on-disk JSON files.",
+      "reason": "Test-scaffolding lifecycle and trusted-local-file concerns; no attacker-controlled input path established."
+    }
+  ],
+  "summary": "Repository: local-s3, a Java S3 emulator (Netty HTTP front end in local-s3-rest, in-memory/persistent engine in local-s3-core, datatypes, JUnit5 extension, Testcontainers wrapper, Docker launcher). I reviewed the request-routing/input path (LocalS3Router, VirtualHostParser, RequestAssertions, all controllers), the core services (bucket/object/versioning/multipart/tagging/policy/ACL), the storage layer (in-memory, layered, copy-on-access, local filesystem), persistence/metadata load-store, XML/JSON handling, and the JUnit/Docker/testcontainer wrappers.\n\nThe strongest source-verifiable issue is a path-traversal in the persistent bucket-metadata store: bucket names are validated only as \"not blank\", but are concatenated into a filesystem path in FileSystemBucketMetadataStore, while bucket names can be supplied unvalidated through the virtual-host (Host header) form of the S3 API. In PERSISTENCE mode (the default mode of the shipped Docker app) this lets an HTTP client write/overwrite/delete files with a \".bucket.meta\" suffix outside the configured data directory.\n\nRejected leads (weaker or unverifiable): XXE via the Woodstox-backed XmlMapper (no DTD/external-entity hardening in LocalS3.java/XmlUtils.java, but in-snapshot evidence cannot establish whether the library resolves external entities by default — not claimed); AwsChunkedDecodingInputStream unbounded header buffering / NumberFormatException (bounded, only yields 500s); unvalidated object keys and delimiters (map keys only, object bytes are stored under server-generated Long IDs, so no traversal); no authentication/TLS (design intent of a local test double, and the same for every endpoint)."
+}

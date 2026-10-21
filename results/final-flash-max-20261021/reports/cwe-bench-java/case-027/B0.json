@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `state` query parameter of a GET request to the callback route (e.g. /callback?code=<code>&state=https://attacker.example). `code` must be a valid authorization code, which the attacker can obtain for their own account by going through the app's normal OAuth2 flow (and capturing the code before/without completing the exchange). `state` is fully attacker-chosen and is also reflected in the response body.",
+      "confidence": "medium",
+      "counterevidence_checked": "Normal-flow `state` is server-generated as the original request URI (line 157), but that value is never persisted, and the code contains no lookup/signature/host check that would reject an externally supplied state; `ctx.fail` only occurs when `code` is missing or the token exchange fails, so a valid code is required for the redirect. `reroute` rejects paths not starting with '/', which limits (but does not prevent) the internal-reroute variant. No validation of state was found in AuthHandlerImpl, RoutingContext implementations, or the OAuth2AuthHandler interface/docs.",
+      "id": "vertx-web-oauth2-state-open-redirect",
+      "impact": "Open redirect after a real authentication event (phishing / credential-relay style abuse), and login CSRF: a victim lured to the crafted callback URL is silently logged into the attacker's account, so subsequent victim activity (or data entered after login) becomes visible to / controllable by the attacker. With no session, the attacker-chosen path is also used for an internal reroute, reaching routes with the victim request context.",
+      "locations": [
+        {
+          "end_line": 157,
+          "path": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/OAuth2AuthHandlerImpl.java",
+          "start_line": 155
+        },
+        {
+          "end_line": 244,
+          "path": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/OAuth2AuthHandlerImpl.java",
+          "start_line": 196
+        },
+        {
+          "end_line": 241,
+          "path": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/OAuth2AuthHandlerImpl.java",
+          "start_line": 230
+        }
+      ],
+      "prerequisites": "Application uses OAuth2AuthHandler.create(...).setupCallback(route) with a SessionHandler (typical documented setup). For the login-CSRF variant, the callback must be reachable and the OAuth2 provider/client configured; the attacker supplies a code for the attacker's own account. For the session-less branch, only the callback route is needed.",
+      "root_cause": "In `OAuth2AuthHandlerImpl.setupCallback` the callback route reads `code` and `state` directly from the query string (line 206). After the authorization code is exchanged, `state` is written verbatim into the `Location` header (line 236) or, with no session, passed to `ctx.reroute(state)` (line 241). The value the server itself puts in `state` in `authURI()` (lines 155-157, the original request URI) is never stored in the session or compared on return, so any caller of the callback endpoint can choose the post-authentication redirect target. There is no normalization, no 'relative path only' check, no host allow-list and no signature/state-store verification anywhere in the class.",
+      "title": "OAuth2 callback uses unvalidated request `state` for redirect and reroute (open redirect / login CSRF)",
+      "trace": "GET /callback?code=<valid code>&state=https://attacker.example -> route handler (line 196) -> state read from query (line 206) -> authProvider.authenticate(code) succeeds -> ctx.setUser(attacker user) and session.regenerateId() (lines 223-228) -> response 302 with `Location: https://attacker.example` (lines 236-238); without a session, ctx.reroute(state) (line 241). Because the session is regenerated and bound to the attacker's user, the victim's browser ends the flow authenticated as the attacker's account.",
+      "unverified": "Not runtime-confirmed; no test or upstream history is available in the snapshot to prove the intended semantics or that a fix exists. Impact for the login-CSRF variant depends on the attacker being able to obtain an unused code for their own account and on the application wiring (setupCallback + session). I could not verify whether recent upstream versions added an explicit option/host check (e.g. an allow-redirect-to-different-host flag), so the finding is a source-evidenced lead, not a confirmed vulnerability.",
+      "weakness_type": "Open Redirect (CWE-601) and missing OAuth state validation enabling login CSRF (CWE-352)"
+    }
+  ],
+  "coverage_summary": "Coverage is limited to the 338 model-visible text files reported by get_source_scope (source_root_files=338, model_visible_files=338; no files excluded for size/sensitivity/symlinks, binary-like files skipped). These are the main sources/resources of vertx-web, vertx-web-common, vertx-web-client, six template-engine modules, vertx-web-api-contract, vertx-web-api-service, and vertx-web-graphql. I read or searched the routing core (RouterImpl, RouteImpl, RouteState, RoutingContext*, Utils, HeaderParser, CookieImpl, LRUCache/ConcurrentLRUCache), all handlers (static, template, body, auth/JWT/OAuth2/form/digest/basic/chain, session, CSRF, CORS, favicon, logger, error, timeout, multi-tenant, virtual host), SockJS/bridge transports, session stores, WebClient internals, API-contract validation/router factory, GraphQL handlers, and the template-engine loaders. No test sources, docs, or dependency (vertx-core) sources are present, and there is no git history to diff against.",
+  "limitations": [
+    "Only main sources are present (no tests, no AsciiDoc/docs, no git history); intended-vs-buggy behavior cannot be checked against upstream.",
+    "vertx-core is a dependency and is not in the snapshot, so behaviors implemented there (HttpUtils.removeDots/normalizePath, redirect handler, cookie encoding) could not be inspected; this blocks confirmation of the Windows backslash traversal lead.",
+    "No code was executed and no runtime/exploit validation was possible; findings are source-level leads only.",
+    "The OAuth2 finding's redirect sink only executes after a successful authorization-code exchange, so its severity depends on application wiring and on the attacker obtaining a valid code.",
+    "The candidate reflects my best source-evidenced judgement; several plausible but conditional leads were rejected and are listed above."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "StaticHandlerImpl path handling (`handle`, lines 131-145; `getFile`, line 611) may allow path traversal on Windows via raw/`%5C` backslashes because `HttpUtils.removeDots` comes from vertx-core and its backslash behavior cannot be inspected in this snapshot.",
+      "reason": "The code explicitly decodes (`URIDecoder.decodeURIComponent`) before `removeDots` and handles a null result; the deciding logic (`removeDots`/`normalizePath`) is in vertx-core, which is not part of this source tree, so the bypass cannot be established from the assigned files."
+    },
+    {
+      "lead": "TemplateHandlerImpl (line 48) passes `context.normalisedPath()` to template engines (FreeMarker/Pebble/Jade/MVEL loaders read arbitrary file-system paths) without decoding or dot removal.",
+      "reason": "`normalisedPath` already resolves literal `.`/`..` segments, the path is never URL-decoded before file lookup, and a traversal would additionally require a template-parseable file; not demonstrable from the snapshot alone."
+    },
+    {
+      "lead": "GraphiQLHandlerImpl inserts `options`/dynamic header JSON into an inline `<script>` via `replacement()` (lines 76-84, 90-119) without escaping `</script>`, a potential XSS sink.",
+      "reason": "Reaching the sink requires the application to wire request-derived data into `graphiQLRequestHeaders`/headers; the default factory returns null and static options are developer-controlled, so attacker control is not established by default."
+    },
+    {
+      "lead": "ErrorHandlerImpl writes `errorMessage`/stack traces into the HTML error template unescaped (lines 120-133).",
+      "reason": "Only active when `ErrorHandler.create(true)` (displayExceptionDetails) is explicitly enabled; default configuration uses the status message, so this is a conditional hardening issue rather than the strongest finding."
+    },
+    {
+      "lead": "CSRFHandlerImpl compares the HMAC signature with `signature.equals(...)` (lines 121-125) instead of a constant-time comparison.",
+      "reason": "Non-constant-time comparison of a 256-bit HMAC is a hardening weakness without a demonstrated practical exploit path in the snapshot."
+    },
+    {
+      "lead": "DigestAuthHandlerImpl keeps nonces in an unbounded, unsynchronized `HashMap` (lines 65, 80-83, 156) with lazy expiration and mutation from request threads.",
+      "reason": "Primarily a memory/consistency (DoS) concern; entries expire by timeout and the map is bounded in practice by request rate, and no concrete privilege impact is evidenced."
+    },
+    {
+      "lead": "WebClient `SessionAwareInterceptor`/`CookieStoreImpl` accept server-provided cookie `Domain` attributes without validating them against the responding host (SessionAwareInterceptor lines 83-98, 127-146), and WebClient copies all request headers onto redirects regardless of host (HttpContext lines 216-218).",
+      "reason": "Requires a malicious/compromised server the client already talks to, and the core redirect handler semantics are outside this snapshot; impact and reachability cannot be confirmed here."
+    },
+    {
+      "lead": "SockJS `BaseTransport.setCORS` reflects the request `Origin` and sets `Access-Control-Allow-Credentials: true` (lines 157-173); raw WebSocket upgrade (RawWebSocketTransport line 202) has no Origin/Upgrade validation.",
+      "reason": "Cross-origin SockJS transports are the protocol's design; authorization is delegated to the bridge permit lists / application handler, so this does not meet the evidence threshold by itself."
+    },
+    {
+      "lead": "AuthHandlerImpl.handlePreflight allows OPTIONS requests carrying `Access-Control-Request-Headers: Authorization` to skip authentication (lines 227-247).",
+      "reason": "This is the intended CORS preflight behavior (UAs strip credentials on preflight); the actual state-changing request still requires authentication."
+    },
+    {
+      "lead": "StaticHandlerImpl directory listing embeds the request path and file names unescaped into HTML (lines 628-718) and `SessionHandlerImpl`/`SockJSHandlerImpl` have minor cookie/SameSite or hash-generation quirks (`BaseTransport.setJSESSIONID`, `SockJSHandlerImpl.getMD5String`).",
+      "reason": "Browsers percent-encode the characters needed for the listing XSS and the remaining items are quality/hardening issues with no clear attacker-controlled privilege impact."
+    }
+  ],
+  "summary": "Reviewed the vertx-web source snapshot (338 visible files: vertx-web core, vertx-web-common, vertx-web-client, template engines, vertx-web-api-contract/service, vertx-web-graphql; only main sources, no tests/docs). I traced request-controlled input through routing, static/template handlers, auth/session/CSRF handlers, SockJS, GraphQL, API-contract validation and WebClient internals. The single strongest source-evidenced issue is in the OAuth2 callback handler: the `state` query parameter is taken verbatim from the callback request and used as the 302 `Location` (or as a reroute path), with no session binding or same-host/relative-URL validation, enabling open redirect and login CSRF once the authorization code is exchanged."
+}

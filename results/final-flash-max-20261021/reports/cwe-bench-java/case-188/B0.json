@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The raw password (CharSequence) is fully attacker-controlled: it arrives from the login form, HTTP Basic, or any custom AuthenticationProvider credential and flows through DaoAuthenticationProvider (or AbstractUserDetailsReactiveAuthenticationManager) into PasswordEncoder.matches. The encoded password is server-side data. An attacker who knows or can guess the first 72 bytes of a victim's long password can authenticate with that prefix plus arbitrary attacker-chosen bytes; conversely, any two enrolled long passwords sharing a 72-byte prefix verify interchangeably.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that (1) the stored-hash validation (BCRYPT_PATTERN) and null/empty checks in matches are present but do not constrain the raw password length; (2) the appended NUL for $2a/$2b/$2y (BCrypt.java 651-653) only lengthens the buffer and does not restore bytes past 72; (3) BCrypt.streamtoword wraps by data.length, but with a password >= 72 bytes each 18-word pass starts at offset 0 and stops at 72, so no wrap occurs and later bytes are unread; (4) constant-time comparison in checkpw prevents timing attacks but cannot compensate for hash equality; (5) no length guard exists anywhere else in the encoder chain (DelegatingPasswordEncoder delegates; no BCRYPT_MAX/length constant found in crypto sources); (6) this is a well-known bcrypt property, so the finding is a genuine design-level verification weakness rather than a code typo. I could not execute tests or compare against the repository's fix history (no git metadata, tests excluded), and I cannot confirm from the snapshot alone that this is the specific commit the review harness targets.",
+      "id": "spring-security-bcrypt-72-byte-prefix-match",
+      "impact": "Authentication bypass / credential confusion for long passwords: authentication succeeds for a password that is not the enrolled password as long as its first 72 bytes match. Passwords longer than 72 bytes effectively have their entropy capped at the 72-byte prefix, and any suffix is ignored. This weakens account protection and can permit unauthorized login wherever a long password is used and its 72-byte prefix is obtained or guessed (e.g., a leaked/partially known passphrase or password-manager value).",
+      "locations": [
+        {
+          "end_line": 134,
+          "path": "crypto/src/main/java/org/springframework/security/crypto/bcrypt/BCryptPasswordEncoder.java",
+          "start_line": 104
+        },
+        {
+          "end_line": 464,
+          "path": "crypto/src/main/java/org/springframework/security/crypto/bcrypt/BCrypt.java",
+          "start_line": 416
+        },
+        {
+          "end_line": 671,
+          "path": "crypto/src/main/java/org/springframework/security/crypto/bcrypt/BCrypt.java",
+          "start_line": 588
+        },
+        {
+          "end_line": 776,
+          "path": "crypto/src/main/java/org/springframework/security/crypto/bcrypt/BCrypt.java",
+          "start_line": 762
+        },
+        {
+          "end_line": 94,
+          "path": "core/src/main/java/org/springframework/security/authentication/dao/DaoAuthenticationProvider.java",
+          "start_line": 89
+        }
+      ],
+      "prerequisites": "The application stores bcrypt hashes (directly via BCryptPasswordEncoder or via DelegatingPasswordEncoder with a {bcrypt} hash) and at least one account credential exceeds 72 bytes (UTF-8) and is known/guessable to 72 bytes. Applications that enforce a <=72-byte password policy at enrollment are not affected. No special privileges or non-default configuration are required.",
+      "root_cause": "BCryptPasswordEncoder.encode and matches (crypto/src/main/java/org/springframework/security/crypto/bcrypt/BCryptPasswordEncoder.java lines 104-111 and 121-134) never enforce bcrypt's 72-byte input limit before calling BCrypt.hashpw/BCrypt.checkpw. The underlying BCrypt implementation consumes exactly 18 P-array words (72 bytes) of the password in ekskey and in every key() pass, resetting the offset each time (BCrypt.java lines 416-429, 452-464), so bytes beyond offset 72 are never read when the password is >= 72 bytes. The trailing NUL appended for $2a/$2b/$2y (BCrypt.java lines 651-653) does not change the first 72 bytes. Consequently the mapping plaintext -> bcrypt hash is not injective above 72 bytes, and matches() returns true for any candidate whose first 72 bytes equal the enrolled password's first 72 bytes.",
+      "title": "BCryptPasswordEncoder.matches accepts any password sharing the first 72 bytes of the real password (bcrypt truncation not enforced)",
+      "trace": "Login request -> UsernamePasswordAuthenticationFilter (or other credential filter) -> ProviderManager -> DaoAuthenticationProvider.additionalAuthenticationChecks: `if (!this.passwordEncoder.matches(presentedPassword, userDetails.getPassword()))` (line 90) -> BCryptPasswordEncoder.matches (lines 121-134: null check, empty check, BCRYPT_PATTERN shape check, no length check) -> BCrypt.checkpw(rawPassword.toString(), encodedPassword) (line 762-765) -> hashpwforcheck -> hashpw(..., for_check=true) -> crypt_raw -> ekskey/key, which consume only the first 18 words = 72 bytes of passwordb -> equalsNoEarlyReturn against the stored hash. For a submitted password whose first 72 bytes equal the enrolled password's first 72 bytes, the computed hash is identical and the comparison returns true, so authentication succeeds with the wrong (longer/different) password.",
+      "unverified": "Runtime confirmation is not possible in this review (no execution allowed); the pass/truncation behavior is established by static reading of the key schedule only. I also did not confirm the upstream fix's exact form (e.g., rejecting >72-byte raw passwords in matches vs. encode). Whether some deployments already cap password length at 72 bytes is application-specific and unknown here.",
+      "weakness_type": "Improper Authentication (CWE-287) / password verification non-injectivity due to bcrypt 72-byte truncation"
+    }
+  ],
+  "coverage_summary": "Scope reported by get_source_scope: 2258 model-visible source files (per-file limit 512 KiB, binary-like files skipped); test sources are not present in the snapshot (verified: crypto/src/test and core/src/test return no files), and no git metadata is available. I reviewed build/version metadata (gradle.properties 6.4.4-SNAPSHOT, libs.versions.toml), the crypto module (BCrypt/BCryptPasswordEncoder, other encoders), core authentication (DaoAuthenticationProvider, ProviderManager, OTT services, method/interceptor authorization), web filters and infrastructure (SecurityContextHolderFilter, HttpSessionSecurityContextRepository, AuthorizationFilter, ExceptionTranslationFilter, CSRF, request matchers, firewall, default login/OTT page generation), config Spring/WebAuthn wiring, oauth2-client resolver/providers, and ACL JDBC queries. I did not exhaustively read all 2258 files (docs, samples, Kotlin DSLs, LDAP/CAS/SAML/messaging details and most config internals were sampled or skimmed), so additional unfixed issues may exist outside the inspected paths.",
+  "limitations": [
+    "Test directories are excluded from the snapshot, so expected-behavior tests (e.g., long-password tests) could not be consulted.",
+    "No git history or commit metadata; the fix commit this snapshot precedes cannot be confirmed, so target identification is inferential.",
+    "No code execution, dependency resolution, or runtime probing was performed; the truncation behavior is reasoned statically from BCrypt.key/ekskey and hashpw/checkpw.",
+    "Large multi-module repository: coverage was targeted, not exhaustive; modules such as LDAP, CAS, SAML2, messaging, and Kotlin configuration were only partially inspected.",
+    "The single-candidate limit means alternative plausible but weaker leads are listed as rejected rather than fully investigated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HtmlTemplates.render() (web .../ui/HtmlTemplates.java lines 86-103) substitutes values with String.replaceAll, so a value containing '$' or '\\' is interpreted as a replacement reference and can throw IllegalArgumentException or corrupt rendered HTML. Usable through token/error parameters on the default login/OTT pages.",
+      "reason": "Value is HTML-escaped before substitution and the pattern is literal (quoted); effect is a rendering/DoS nuisance, not an authorization or injection primitive, and I found no upstream security-fix association. Kept as unconfirmed."
+    },
+    {
+      "lead": "Webauthn4JRelyingPartyOperations uses WebAuthnManager.createNonStrictWebAuthnManager() by default and contains FIXME notes (tokenBindingId, anonymous credential lookups) in the 6.4 WebAuthn support.",
+      "reason": "Non-strict WebAuthn4J validation is a documented default choice; signature/challenge/origin are still validated in authenticate(). No concrete bypass was traced in source; rejected as speculative."
+    },
+    {
+      "lead": "DefaultOAuth2AuthorizationRequestResolver.getAction() (oauth2-client .../web/DefaultOAuth2AuthorizationRequestResolver.java lines 137-143) feeds an unvalidated request parameter into redirect URI template expansion.",
+      "reason": "Only affects applications whose registered redirect-uri template deliberately consumes {action}; the default redirect URI does not, and the redirect_uri must still match the registered client configuration. No evidenced exploit path; rejected."
+    },
+    {
+      "lead": "RegexRequestMatcher (web .../util/matcher/RegexRequestMatcher.java) and CSRF token comparison looked like historical bypass/timing candidates.",
+      "reason": "The matcher compiles with Pattern.DOTALL and matches servletPath+pathInfo+queryString (the post-CVE-2022-22978 shape), and CsrfFilter uses MessageDigest.isEqual with the Xor handler. No deviation found; rejected."
+    }
+  ],
+  "summary": "The snapshot is Spring Security 6.4.4-SNAPSHOT (6.4.x maintenance line, early March 2025; gradle.properties line 17), which is exactly the release cycle in which the bcrypt 72-byte truncation issue (CVE-2025-22228) was fixed. The clearest source-supported weakness is in the bcrypt password path: BCryptPasswordEncoder validates only the stored-hash shape and then calls BCrypt.checkpw on the full submitted password, but the bcrypt key schedule in BCrypt.java consumes only the first 72 bytes (18 Blowfish P-words) of the password bytes in every pass (ekskey/key reset their offsets and never wrap for passwords >= 72 bytes). No length check exists in either encode or matches, so two distinct raw passwords that share a 72-byte prefix are indistinguishable, and matches() returns true for any >72-byte password whose first 72 bytes equal the original password. This is reachable from every username/password authentication entry point through DaoAuthenticationProvider (lines 89-94). Other reviewed areas (web filters/matchers, CSRF, security-context persistence, OAuth2 client, OTT, WebAuthn scaffolding, ACL JDBC SQL, StrictHttpFirewall/RegexRequestMatcher hardening) looked consistent with post-2024 upstream code and produced no equally concrete flaw."
+}

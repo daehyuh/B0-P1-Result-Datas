@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated remote HTTP client fully controls (a) the request Content-Type, and (b) the request body bytes. AttachmentInInterceptor only requires that the content type contains the substring 'multipart/related' (AttachmentUtil.isTypeSupported uses indexOf, not an exact media-type check), for a non-GET request whose InputStream is present, and then parses the body. The attacker supplies the boundary either in Content-Type ('boundary=...') or in the first 2 KB of the body, then streams an arbitrarily long part-header line (or continuation header block) without a terminating LF/CRLF, or repeats headers, driving unbounded accumulation.",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched the entire repository for any header-size limit: no MAX_HEADER_SIZE/header counter, and HeaderSizeExceededException has zero throwers/catchers/references (confirmed by text search and by the relation index, which shows only CONTAINS edges inside its own file). Verified ATTACHMENT_MAX_SIZE/THRESHOLD bound only CachedOutputStream attachment content, are optional (unset by default), and are applied after headers are read, so they do not mitigate this path. Checked MimeBodyPartInputStream (pbAmount only sizes the pushback buffer) and AttachmentUtil (no header bound). Verified the reachable interceptor is registered unconditionally by SoapBindingFactory/XMLBindingFactory (Phase.RECEIVE) and that isTypeSupported is a substring check, so the trigger condition is easy to satisfy and precedes authentication. Noted that the sibling guard CacheSizeExceededException IS actively used in CachedOutputStream/CachedWriter/AttachmentDataSource/MessageContextImpl while HeaderSizeExceededException is not, which supports rather than refutes the missing-enforcement reading.",
+      "id": "cxf-attachment-header-unbounded-dos",
+      "impact": "Remote, unauthenticated memory exhaustion / denial of service against CXF-based servers (CWE-400/CWE-770). Depending on heap size and JVM error handling, impact ranges from repeated request failures and GC thrash to an OutOfMemoryError that can destabilize the whole JVM, affecting co-hosted services. No code execution or data disclosure is claimed.",
+      "locations": [
+        {
+          "end_line": 378,
+          "path": "core/src/main/java/org/apache/cxf/attachment/AttachmentDeserializer.java",
+          "start_line": 324
+        },
+        {
+          "end_line": 40,
+          "path": "core/src/main/java/org/apache/cxf/attachment/HeaderSizeExceededException.java",
+          "start_line": 22
+        },
+        {
+          "end_line": 63,
+          "path": "core/src/main/java/org/apache/cxf/interceptor/AttachmentInInterceptor.java",
+          "start_line": 45
+        }
+      ],
+      "prerequisites": "A CXF endpoint whose binding registers AttachmentInInterceptor, which SoapBindingFactory and XMLBindingFactory add unconditionally to the inbound chain (so plain SOAP 1.1/1.2 or XML-binding HTTP endpoints are exposed even without MTOM being explicitly enabled); the interceptor runs in Phase.RECEIVE, i.e. before authentication/WS-Security processing, so no credentials are needed. The attacker must be able to hold the request open long enough to stream enough bytes to exhaust the server heap (no CXF-level request-body/header cap is applied on this path); deployments that impose a container-level maximum body size would reduce but not necessarily eliminate the impact.",
+      "root_cause": "core/src/main/java/org/apache/cxf/attachment/AttachmentDeserializer.java parses MIME part headers via loadPartHeaders() -> readLine(), appending every attacker byte up to '\\n' into a StringBuilder (no maximum length or cumulative byte counter), and loadPartHeaders() also accumulates header-continuation lines without bound before storing them in a TreeMap. No size limit exists anywhere in the class; only attachment *content* is bounded, and only when the optional ATTACHMENT_MAX_SIZE / ATTACHMENT_MEMORY_THRESHOLD properties are configured (applied via AttachmentUtil.setStreamedAttachmentProperties to CachedOutputStream, not to headers). Critically, the package contains core/src/main/java/org/apache/cxf/attachment/HeaderSizeExceededException.java (identical serialVersionUID to the actively used org.apache.cxf.io.CacheSizeExceededException), but that exception is never thrown or caught anywhere in the tree — the enforcement the guard class exists for is absent, an orphan-guard pattern consistent with a removed header-size limitation.",
+      "title": "Unbounded MIME part header parsing in AttachmentDeserializer enables remote memory-exhaustion DoS",
+      "trace": "HTTP POST -> inbound chain Phase.RECEIVE -> AttachmentInInterceptor.handleMessage() (non-GET, message content InputStream != null, isTypeSupported(contentType,'multipart/related') true) -> new AttachmentDeserializer(message, [\"multipart/related\"]).initializeAttachments() -> initializeRootMessage() -> readTillFirstBoundary() then loadPartHeaders(stream) -> readLine(in, b) loops 'while ((c = in.read()) != -1)' and appends each non-CR/LF byte to the StringBuilder with no bound; the attacker never terminates the header line, so memory grows with the request body (Java StringBuilder uses 2 bytes per char plus copy-on-grow, ~2-3x amplification). Additional parts are parsed the same way through readNext()/loadPartHeaders when attachments are enumerated (LazyAttachmentCollection.iterator()/hasNext()). The resulting OutOfMemoryError propagates out of AttachmentInInterceptor (it catches only IOException), degrading or killing request/thread processing -> denial of service.",
+      "unverified": "Not runtime-confirmed: no code was executed and no test/scanner run was performed. The snapshot contains no test sources, so no test or expected-exception behavior could be observed; the exact upstream fix commit/CVE mapping was not consulted (no web access), so the inference that HeaderSizeExceededException is the guard for exactly this read path rests on the class name, its unused status, and the sibling CacheSizeExceededException pattern rather than a diff. Actual impact depends on deployed heap, container body-size limits, and JVM OOM behavior, none of which were measured.",
+      "weakness_type": "CWE-400/CWE-770: Uncontrolled Resource Consumption / Allocation without limits (denial of service)"
+    }
+  ],
+  "coverage_summary": "Scope: 4,768 repository-relative source files; text filters refused/skip binary-like files (0 reported excluded), 0 symlinks/excluded paths; the P1 index reports all 4,768 files indexed with 0 missing and no SAST oracle. Reviewed in this run: the entire core attachment package (AttachmentDeserializer, AttachmentUtil, AttachmentSerializer, MimeBodyPartInputStream, LazyAttachmentCollection, HeaderSizeExceededException), AttachmentInInterceptor and binding registration (SoapBindingFactory/XMLBindingFactory), TLS setup (TLSClientParameters, SSLUtils, HttpsURLConnectionFactory, DefaultHostnameVerifier), StaxUtils/DOMUtils, JAX-RS XSLT/JAXB/Multipart providers, rt/rs/security/xml (XML signature/encryption handlers, AbstractSamlInHandler), AbstractSTSClient, JMS transport conversion, CachedOutputStream/CacheSizeExceededException, plus repository-wide greps for exec/ProcessBuilder/readObject/ScriptEngine/DocumentBuilderFactory/XMLInputFactory/TransformerFactory/openConnection/SUPPORT_DTD and for header-size limit artifacts. Not covered line-by-line: the large tools/, distribution samples/, services/, osgi/, integration/ and maven-plugins/ trees and most of rt/ (thousands of files) were only screened by targeted searches; no build, tests, or scanners were run (and the snapshot appears to contain no test sources).",
+  "limitations": [
+    "No code execution, build, tests, or scanners were run; findings are source-evidence leads, not runtime confirmations.",
+    "The snapshot appears to have test sources stripped, so no fix-related tests or expected-behavior evidence could be inspected.",
+    "No upstream diff/VCS history, CVE database, or web access was available, so the exact upstream patch and CVE mapping for the orphan HeaderSizeExceededException could not be confirmed.",
+    "P1 relation-index labels (security_call, CALLS, CONTAINS) are name/syntax-based navigation hints only and were verified against source text; the index does not prove reachability or data flow.",
+    "Remote DoS impact depends on deployment factors not present in source (JVM heap size, container request-body limits, reverse-proxy limits, request timeouts).",
+    "Coverage of the full 4,768-file tree was search-driven rather than exhaustive line-by-line review, so an additional injected flaw outside the inspected hot spots cannot be excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "TLS hostname verification weakness in rt/transports/http (SSLUtils.getHostnameVerifier / HttpsURLConnectionFactory)",
+      "reason": "Source shows the hardened path: a custom verifier wins, useHttpsURLConnectionDefaultHostnameVerifier uses the JDK default, AllowAllHostnameVerifier only when disableCNCheck is set, otherwise DefaultHostnameVerifier(PublicSuffixMatcherLoader.getDefault()) is used. No missing check found, so not submitted."
+    },
+    {
+      "lead": "XXE / external entity processing in XML parsing (StaxUtils, DOMUtils, Aegis, STS client)",
+      "reason": "StaxUtils.createXMLInputFactory disables SUPPORT_DTD, entity replacement, and external entities and installs a throwing XMLResolver; AbstractSTSClient.downloadSchema also disables doctype. DOMUtils' cached DocumentBuilder lacks these settings, but the main attacker-facing request paths use StaxUtils and no reachable attacker-controlled DOMUtils parse of untrusted XML was traced, so this remains an unconfirmed lead."
+    },
+    {
+      "lead": "JAX-RS SAML handler sender-vouches logic in AbstractSamlInHandler.checkSenderVouches/compareCredentials",
+      "reason": "The code does cross-check the assertion key against 2-way TLS and against the message-level SIGNING_CERT/SIGNING_PUBLIC_KEY set by AbstractXmlSigInHandler, and it rejects unsigned assertions without TLS. No clearly missing check could be established from source alone, so it was not escalated."
+    },
+    {
+      "lead": "JMS transport deserialization (JMSMessageConverter.fromMessage on ObjectMessage/StreamMessage)",
+      "reason": "Deserialization of Java objects requires a hostile or compromised JMS broker/broker-level write access rather than unauthenticated HTTP attacker control; trust boundary is not clearly exposed by this source snapshot, so rejected as lower evidence."
+    },
+    {
+      "lead": "AttachmentSerializer.writeHeaders emits header names/values and attachment IDs without CRLF filtering",
+      "reason": "The written values originate from server-side attachment metadata (e.g., Content-Disposition values derived from application/media types) rather than demonstrably from remote request input in this snapshot, so it was not shown to be attacker-controllable and was not submitted."
+    },
+    {
+      "lead": "Command execution constructs (Runtime.getRuntime().exec in bin/DoMerges.java and core Compiler.java)",
+      "reason": "These are development/build helpers with fixed argument arrays or tooling-controlled inputs, not reachable from remote request data in the reviewed paths; rejected as non-attacker-controlled."
+    }
+  ],
+  "summary": "Snapshot identified as Apache CXF 3.2.1-SNAPSHOT (root/parent poms, ~4,768 text source files; main sources only — test trees appear stripped from the snapshot). Broad inspection covered the attachment/MIME stack, HTTP transports and TLS setup, Stax/DOM XML parsing, JAX-RS providers, JAX-RS RS XML/SAML security handlers, JMS transport, and targeted greps for exec/deserialization/XXE/SSRF sinks. One candidate lead is submitted: the MIME part-header parser in core AttachmentDeserializer reads attacker-supplied bytes into an unbounded StringBuilder with no size cap, while the package's HeaderSizeExceededException guard (same serialVersionUID as the used CacheSizeExceededException) is dead code, never thrown or caught anywhere in the repository. The reachable, unauthenticated entry point (AttachmentInInterceptor in Phase.RECEIVE, keyed only on a substring match for \"multipart/related\") makes this a remote memory-exhaustion DoS lead with strong source evidence."
+}

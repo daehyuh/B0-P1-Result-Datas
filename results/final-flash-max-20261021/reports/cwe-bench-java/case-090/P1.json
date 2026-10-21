@@ -1,0 +1,95 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote peer controls the full OpenWire frame. The attacker selects the command byte 31 (ExceptionResponse, CommandTypes.EXCEPTION_RESPONSE) and then supplies the unmarshalled `clazz` string (fully qualified class name) and `message` string. `tightUnmarsalThrowable`/`looseUnmarsalThrowable` pass both values unmodified into `createThrowable`, which uses them as the class to load and the single String constructor argument (tight encoding is the default per OpenWireFormatFactory line 38; the loose path at v12 lines 508–513 is equally affected).",
+      "confidence": "high",
+      "counterevidence_checked": "Searched the whole tree for `Throwable.class.isAssignableFrom` / `isAssignableFrom(clazz)` and for `throwableClasses` allowlists: no such validation exists in this snapshot, so this is the pre-mitigation code. Confirmed the catch-all in createThrowable does not prevent constructor side effects (instantiation happens before the cast and catch) and the fallback Throwable is only returned if instantiation fails. Confirmed authentication is not involved: the transport listener only calls TransportConnection.service after readCommand/unmarshal completes, and the default config has no authentication plugin. Confirmed both tight (default) and loose paths call createThrowable, and that legacy v2–v8 copies contain the same code, so version negotiation does not avoid it. Confirmed spring-context and related jars are explicitly packed into the broker distribution by the assembly descriptor. The P1 relation index corroborates the call edges (readCommand->unmarshal; tight/looseUnmarsalThrowable->createThrowable) but only as syntactic candidates; all edges above were re-verified in source text.",
+      "id": "activemq-openwire-throwable-class-instantiation",
+      "impact": "Unauthenticated remote party with network access to the OpenWire port can invoke the String-argument constructor of an arbitrary class present on the broker's classpath, with a fully attacker-controlled argument, before any authentication. With the Spring libraries shipped in the distribution, this gives a direct path to server-side code execution (a Spring application-context constructor interprets the string as a config location, which may be loaded remotely); even without a specific gadget it is an arbitrary-instantiation primitive that breaks the wire-protocol trust boundary and can execute side effects, crash, or hang the broker. The reverse direction (broker->client) affects JMS client applications.",
+      "locations": [
+        {
+          "end_line": 235,
+          "path": "activemq-client/src/main/java/org/apache/activemq/openwire/v12/BaseDataStreamMarshaller.java",
+          "start_line": 227
+        },
+        {
+          "end_line": 192,
+          "path": "activemq-client/src/main/java/org/apache/activemq/openwire/v12/BaseDataStreamMarshaller.java",
+          "start_line": 187
+        },
+        {
+          "end_line": 69,
+          "path": "activemq-client/src/main/java/org/apache/activemq/openwire/v12/ExceptionResponseMarshaller.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 241,
+          "path": "activemq-client/src/main/java/org/apache/activemq/transport/tcp/TcpTransport.java",
+          "start_line": 230
+        },
+        {
+          "end_line": 279,
+          "path": "activemq-client/src/main/java/org/apache/activemq/openwire/OpenWireFormat.java",
+          "start_line": 264
+        },
+        {
+          "end_line": 373,
+          "path": "activemq-client/src/main/java/org/apache/activemq/openwire/OpenWireFormat.java",
+          "start_line": 354
+        },
+        {
+          "end_line": 236,
+          "path": "activemq-openwire-legacy/src/main/java/org/apache/activemq/openwire/v2/BaseDataStreamMarshaller.java",
+          "start_line": 228
+        },
+        {
+          "end_line": 201,
+          "path": "assembly/src/main/descriptors/common-bin.xml",
+          "start_line": 196
+        },
+        {
+          "end_line": 104,
+          "path": "activemq-all/src/main/resources/activemq.xml",
+          "start_line": 98
+        }
+      ],
+      "prerequisites": "TCP reachability to an OpenWire connector. The shipped activemq-all/src/main/resources/activemq.xml exposes `tcp://0.0.0.0:61616` by default and configures no authentication plugin. No prior authentication or ConnectionInfo is required: unmarshalling occurs in the TcpTransport socket-reader loop before the command is dispatched to broker-side TransportConnection.service/processConnectionInfo. Exploitation to full RCE additionally requires a suitable class with a public single-String constructor on the broker's runtime classpath; the binary distribution assembly includes spring-context, spring-beans, spring-core, xbean-spring, xstream and jasypt, so such classes (e.g. Spring application-context types) are present in a standard install.",
+      "root_cause": "BaseDataStreamMarshaller.createThrowable takes the class name and the message text directly from the wire and executes `Class clazz = Class.forName(className, false, <loader>); Constructor constructor = clazz.getConstructor(new Class[] {String.class}); return (Throwable) constructor.newInstance(new Object[] {message});` without first verifying that the resolved class is a Throwable subclass or otherwise allowlisted. The surrounding `catch (Throwable e)` only changes the returned fallback object; it cannot undo side effects of a constructor that has already executed, and the `(Throwable)` cast happens after `newInstance`. The same code is duplicated in all protocol version marshallers (activemq-client v1, v9–v12 and activemq-openwire-legacy v2–v8), so all OpenWire version negotiations are affected.",
+      "title": "Unauthenticated remote arbitrary class instantiation in OpenWire throwable unmarshalling (BaseDataStreamMarshaller.createThrowable)",
+      "trace": "TCP socket -> TcpTransport.run/doRun (lines 210–237) -> readCommand -> wireFormat.unmarshal(dataIn) (lines 239–241) -> OpenWireFormat.unmarshal reads size and calls doUnmarshal (lines 264–279) -> doUnmarshal indexes dataMarshallers[31] and invokes the marshaller (lines 354–373) -> ExceptionResponseMarshaller.tightUnmarshal/looseUnmarshal (lines 65–69 / 109–113) -> BaseDataStreamMarshaller.tightUnmarsalThrowable/looseUnmarsalThrowable (lines 187–225 / 508–513) -> createThrowable (lines 227–235) -> Class.forName + getConstructor(String.class) + newInstance(attacker message). Dispatch to TransportConnection.service happens only after this returns, and connection authentication happens later still in processConnectionInfo, so the reflective construction is pre-auth. The identical client-side code is also used when a JMS client unmarshals broker responses, so a malicious broker can attack connecting clients.",
+      "unverified": "No code was executed, so runtime confirmation of a working end-to-end exploit (specific gadget class present on a given deployment's classpath and its constructor behavior under the installed library versions) was not performed and is not claimed. Whether a particular deployment enables OpenWire or a JVM classpath containing useful constructors is deployment-specific, although the shipped default config and assembly support both. The P1 index has no data-flow analysis, so reachability was established by manual reading of the cited source, not by the index.",
+      "weakness_type": "Unsafe reflection / deserialization of untrusted data during protocol unmarshalling (CWE-470, CWE-502)"
+    }
+  ],
+  "coverage_summary": "Scope: 2,688 files (2,289 Java), version Apache ActiveMQ 5.15.8. P1 index is partial: 2,620 files indexed, 68 source files missing from the index, 71 omitted files, no control-flow or data-flow analyses, and Spring annotation/Facts are name-based only — all conclusions below come from direct source reading, not the index. Reviewed: root/assembly POMs and distribution assembly descriptors; the complete OpenWire marshalling stack for throwables (activemq-client v1 and v9–v12, activemq-openwire-legacy v2–v8), OpenWireFormat unmarshal/dispatch, ExceptionResponse/Response marshallers, TcpTransport and NIO/NIO-SSL read paths, broker TransportConnection listener/service setup, and the shipped activemq.xml default connector configuration. Spot-checked for other remote-input-to-dangerous-sink patterns: ClassLoadingAwareObjectInputStream, STOMP/HTTP XStream usage, JNDI/LDAP configuration code, JMX AnnotatedMBean reflection, console class loading, and command-execution sinks. Not exhaustively reviewed: test sources, OSGi/tooling/perf modules, web console UI internals, and the many persistence-store and network-bridge implementations beyond targeted spot checks.",
+  "limitations": [
+    "No code, tests, or exploit payloads were executed; the candidate is a source-level lead, not a runtime-confirmed vulnerability.",
+    "The P1 relation index is partial (68 of 2,688 source files missing) and has no control-flow/data-flow or semantic resolution; all call-path claims were manually verified in the cited files.",
+    "Full-repository coverage is not claimed: modules such as the web console, OSGi, tooling, and legacy stores were only spot-checked, and the index offers no data-flow facts for them.",
+    "Gadget availability and exact end-to-end exploitability depend on the deployment classpath and configuration; the shipped default config and assembly strongly support the prerequisites but were not exercised at runtime.",
+    "Line ranges refer to the assigned snapshot only; generated per-version marshallers were sampled (v1, v11, v12, legacy v2) and the same createThrowable body was confirmed in each sampled copy by search results, not read in full for all 19 copies."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unrestricted XStream deserialization in the HTTP tunnel wire format (activemq-http XStreamWireFormat.unmarshalText / HttpTunnelServlet, XStream 1.4.10)",
+      "reason": "Distinct root cause and plausible RCE primitive, but it requires the HTTP tunnel transport/webapp to be deployed, which is not part of the default activemq.xml connector set; reachability in a default broker image was not established, so evidence is weaker than the OpenWire path."
+    },
+    {
+      "lead": "ObjectMessage stream deserialization allowlist in ClassLoadingAwareObjectInputStream (default packages include java.util, org.apache.activemq, com.thoughtworks.xstream.mapper)",
+      "reason": "The allowlist (checkSecurity) is present, and object stream deserialization primarily happens in consumers reading message bodies after delivery, not in pre-auth broker command handling; no verified pre-auth broker path was found."
+    },
+    {
+      "lead": "Reflective class loading in AnnotatedMBean / AbstractAmqCommand (Class.forName on user-supplied class or signature strings)",
+      "reason": "Reachable through JMX management invocations or local console command properties, both requiring authenticated/local access; not a remote unauthenticated trust boundary in this snapshot."
+    },
+    {
+      "lead": "JNDI/LDAP configuration in LDAPAuthorizationMap / LDAPLoginModule (attacker-influenced initialContextFactory/connectionURL)",
+      "reason": "Values come from broker configuration, not remote input; configuring them already implies administrative control."
+    },
+    {
+      "lead": "STOMP JmsFrameTranslator/XMLMessageRenderer XStream usage",
+      "reason": "Used for marshalling advisory/output XML-JSON, not for deserializing attacker input; no untrusted-input sink found."
+    }
+  ],
+  "summary": "The snapshot is Apache ActiveMQ 5.15.8 (pre-fix). The strongest, most clearly evidenced issue is the OpenWire throwable unmarshalling path: every OpenWire marshaller version (v1–v12, plus legacy v2–v8) reads a class name and a message string from the wire and passes them to `BaseDataStreamMarshaller.createThrowable`, which performs `Class.forName(...).getConstructor(String.class).newInstance(message)` with no check that the class is a Throwable subclass or allowlisted. This code runs in the socket reader thread during command unmarshalling (`TcpTransport.doRun` → `readCommand` → `OpenWireFormat.unmarshal` → `ExceptionResponseMarshaller.tightUnmarshal/looseUnmarshal` → `tightUnmarsalThrowable/looseUnmarsalThrowable` → `createThrowable`), i.e. before the broker processes `ConnectionInfo` or any authentication. The shipped default `activemq.xml` exposes `tcp://0.0.0.0:61616` with no authentication plugin, and the distribution assembly explicitly packages spring-context (and xbean-spring/xstream/jasypt), so classes such as `org.springframework.context.support.ClassPathXmlApplicationContext` with a public single-String constructor are present on the broker classpath. This yields unauthenticated remote arbitrary class instantiation with an attacker-controlled constructor argument (historically exploited for remote code execution), and the same client-side marshaller code lets a malicious broker attack connecting clients. No runtime execution was performed; findings are source-level. Other leads (unrestricted XStream in the HTTP tunnel wire format, ObjectMessage serialization allowlist, JMX/console class loading) were reviewed and rejected as weaker or unverified; they are listed below rather than submitted."
+}

@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker supplies the HTML/CSS that is passed to AntiSamy.scan(). A <style> element body such as `@import url(http://127.0.0.1:8080/admin);` is parsed by the HTML parser, passed to CssScanner/CssHandler, and its URI string is fully attacker-chosen. In SAX mode the same CSS scanner is also used for inline style attributes (MagicSAXFilter.makeCssScanner() reuses shouldParseImportedStyles), giving a second attacker-controlled entry point.",
+      "confidence": "medium",
+      "counterevidence_checked": "I verified that (a) every shipped policy sets embedStyleSheets=false, so default deployments do not reach the fetch code; (b) CssHandler.importStyle() rejects relative URIs and non-matching URI shapes, and CssScanner enforces an import count and a response-size limit and disables retries/cookies/connection state; (c) DTD/external-entity access is disabled in policy parsing and in the SAX TransformerFactory (ACCESS_EXTERNAL_DTD/STYLESHEET=\"\"), so this is not an XXE chain; (d) inline style attributes in the DOM path use `new CssScanner(policy, messages, false)`, so the DOM attribute path does not fetch (only the <style> element path does, plus style attributes in the SAX path); (e) the fetched URL must match the policy regexes, which do block schemes such as file:, jar: and javascript:. These reduce but do not eliminate the issue: they do not constrain the destination host, and the sanitizer, not the client browser, performs the request.",
+      "id": "antisamy-css-import-ssrf",
+      "impact": "When embedStyleSheets is enabled, a user who can submit sanitized HTML can make the application server issue HTTP(S) requests to arbitrary hosts and ports reachable from the server (loopback, RFC1918, metadata services, internal admin endpoints), enabling blind port scanning/internal service probing, hitting non-idempotent GET endpoints, and limited timing/error-based inference (import failure/size error messages are surfaced via CleanResults.getErrorMessages()). The fetched body is additionally parsed by the CSS engine, so unexpected content can also influence output or trigger parser errors (ScanException). Impact is bounded by maxStyleSheetImports (default 1; 3 in antisamy.xml), the single-URL body size limit and the fact that the response content is not returned verbatim to the attacker.",
+      "locations": [
+        {
+          "end_line": 368,
+          "path": "src/main/java/org/owasp/validator/css/CssScanner.java",
+          "start_line": 261
+        },
+        {
+          "end_line": 349,
+          "path": "src/main/java/org/owasp/validator/css/CssHandler.java",
+          "start_line": 286
+        },
+        {
+          "end_line": 421,
+          "path": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+          "start_line": 403
+        },
+        {
+          "end_line": 216,
+          "path": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+          "start_line": 211
+        },
+        {
+          "end_line": 60,
+          "path": "src/main/resources/antisamy.xml",
+          "start_line": 56
+        },
+        {
+          "end_line": 29,
+          "path": "src/main/resources/antisamy.xml",
+          "start_line": 27
+        }
+      ],
+      "prerequisites": "(1) The policy directive embedStyleSheets must be set to true — it is false in every shipped policy (antisamy.xml line 27), so this is a non-default but documented/supported configuration, and embedStyleSheets is a per-deployment policy decision rather than an attacker-controlled value. (2) The target tag must be validated by the policy (the shipped antisamy.xml defines <style action=\"validate\">). (3) The imported URI must be absolute and satisfy the onsiteURL/offsiteURL regexes; arbitrary internal hosts such as http://10.0.0.5/, http://127.0.0.1:port/ or http://localhost:port/ satisfy offsiteURL. (4) No runtime confirmation was performed; network reachability depends on the deployment.",
+      "root_cause": "Imported stylesheet handling trusts attacker-supplied CSS URIs and performs the fetch server-side. CssHandler.importStyle() accepts any absolute URI that merely matches the policy's broad onsiteURL/offsiteURL regular expressions (no host/IP, scheme or network-range restriction; the result of URI.normalize() is discarded), queues it, and CssScanner.parseImportedStylesheets() then issues an HTTP GET to that URI. The offsiteURL regex in the shipped policy permits arbitrary hosts, including loopback and private addresses, because its character class allows digits, dots and colons (e.g. http://127.0.0.1:8080/). The only guardrails are import count (maxStyleSheetImports) and response-size limits, so the sanitizer can be driven to make server-side requests to internal endpoints.",
+      "title": "Server-side request forgery via attacker-controlled CSS @import when embedStyleSheets is enabled",
+      "trace": "scan(taintedHtml) -> AntiSamyDOMScanner.actionValidate() (or MagicSAXFilter.startElement/endElement Ops.CSS) -> new CssScanner(policy, messages, policy.isEmbedStyleSheets()) -> CssHandler.importStyle(uri, media, ns): policy.isEmbedStyleSheets() check, new URI(uri), importedStyleSheet.normalize() (return value discarded), onsiteURL/offsiteURL regex match, isAbsolute() check, importedStyleSheets.add(uri) -> CssScanner.getCleanStylesheetWithImports() -> CssScanner.parseImportedStylesheets(): builds an Apache HttpClient (default request config/timeouts), for each queued URI `httpClient.execute(new HttpGet(stylesheetUri), responseHandler)` performs a server-side GET, then feeds the response body into parser.parseStyleSheet(). The response body never has to reach the attacker for the request itself to occur (and only valid CSS properties are echoed into the cleaned output), so this is primarily a blind SSRF/network-probing primitive with timing and side-effect potential.",
+      "unverified": "No code was executed and no network call was made; the SSRF is inferred from source only. I could not inspect the Apache HttpClient 5.1.3 or NekoHTML binaries, so default redirect-following behavior (which could extend or bypass the regex-checked URL), the exact exception hierarchy for unsupported schemes (e.g. mailto: accepted by offsiteURL), and any environment-level egress filtering are unverified. Whether a given deployment enables embedStyleSheets is a configuration fact outside the snapshot.",
+      "weakness_type": "Server-Side Request Forgery (SSRF) / unsafe URL fetch (CWE-918)"
+    }
+  ],
+  "coverage_summary": "All 54 model-visible files were enumerated. I read in full or in substantial part: all 21 indexed/scanned Java sources relevant to sanitization (AntiSamy, AntiSamyDOMScanner, AntiSamySAXScanner, MagicSAXFilter, AbstractAntiSamyScanner, Constants, ASHTMLSerializer, ASXHTMLSerializer, Policy, InternalPolicy, CleanResults, TagMatcher, model/{Attribute,Tag,Property,AntiSamyPattern}, css/{CssScanner,CssHandler,CssValidator,CssParser}, util/{URIUtils,HTMLEntityEncoder,XMLUtil,ErrorMessageUtil}) and examined the shipped policy XMLs (antisamy.xml in most detail; directive, common-regexp, global/dynamic attribute, tag-rule and css-rule sections; targeted searches across the ebay/myspace/anythinggoes/slashdot/tinymce policies). I also reviewed pom.xml metadata (version 1.6.6.1), README.md, SECURITY.md and the GitHub workflow files. The P1 relation index covers 48 files with 507 symbols/1468 call records but declares partial status, no data/control-flow, no semantic resolution and 6 source files missing from the index; it was used only for navigation and every cited edge was re-checked against source text.",
+  "limitations": [
+    "No code, tests, builds or scanners were executed; nothing was runtime-confirmed. Every conclusion is static source reading.",
+    "The snapshot contains no test sources and no antisamy.xsd, so schema-validation behavior and the project's own regression tests could not be consulted; test-driven or fuzz-derived bypasses may exist that are not visible here.",
+    "Behavior of third-party binaries is not inspectable in this run: NekoHTML/neko-htmlunit 2.60.0 (attribute-name strictness, CDATA/noscript content models), batik-css 1.14 (SAC parsing and LexicalUnit string values), Apache HttpClient 5 (redirect policy for the imported-stylesheet GET) and the Xalan/batik serializers (escapeURI/printEscaped escaping). Several candidate bypasses hinge on those semantics and remain unverified.",
+    "Policy XML files other than antisamy.xml were searched by keyword rather than fully read line-by-line; a policy-specific weakness (e.g. a permissive attribute rule in the ebay/myspace/anythinggoes policies) could have been missed.",
+    "The P1 index omits 6 files, has no data-flow/control-flow analysis and 1032 unresolved calls, so it cannot establish reachability; I did not treat any index label as a finding.",
+    "The security impact of the submitted SSRF candidate depends on the deployment enabling embedStyleSheets= true (all shipped policies set it false) and on network reachability from the server, neither of which is determinable from the snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "MagicSAXFilter line 280: `boolean isStyle = \"style\".endsWith(element.localpart);` — argument order is inverted relative to the equivalent DOM check (`\"style\".equals(tagNameLowerCase)` in AntiSamyDOMScanner line 357), so a validated element is treated as a style element whenever its name is a suffix of the literal \"style\" (only \"e\", \"le\", \"yle\", \"tyle\").",
+      "reason": "Objectively wrong code, but no security impact could be demonstrated: I searched all six shipped policy files and none defines a validated tag named \"e\", \"le\", \"yle\" or \"tyle\" (antisamy-tinymce.xml defines \"s\", which is not a suffix of \"style\"), and even for such a custom tag the effect is content re-parsing as CSS/possible content loss rather than a sanitizer bypass or script execution. Kept as a latent functional defect, not a vulnerability candidate."
+    },
+    {
+      "lead": "ASXHTMLSerializer does not override escapeURI() while ASHTMLSerializer does (ASHTMLSerializer lines 79-87), so with the shipped default policy (antisamy.xml sets useXHTML=true) URI-typed attributes may be serialized through the base Xalan/batik escapeURI path rather than printEscaped(); some URI attributes in the policy, e.g. `classid` (antisamy.xml line 155-159, `<regexp name=\"anything\"/>`), accept arbitrary values.",
+      "reason": "Unverifiable from this snapshot: whether the base-class escapeURI() HTML-escapes quotes/ampersands lives in the binary xml-serializer dependency, and no in-repo policy-regex evidence shows a quote-bearing URI attribute value being accepted and emitted. Not submitted as a candidate."
+    },
+    {
+      "lead": "Policy loading fetches URLs with only the base URL verified as local: getDocumentElementByUrl()/resolveEntity() call verifyLocalUrl(baseUrl) but then resolve `new URL(baseUrl, href)` / URIUtils.resolveAsString(href, baseUrl) and open the stream (Policy.java lines 567-597, 1011-1044), so an `<include href=\"http://...\">` could cause a remote fetch.",
+      "reason": "The href comes from the policy file, which is trusted deployment configuration (not attacker input in the library's normal threat model); verifyLocalUrl() also rejects non-file/jar base URLs. Classified as a hardening gap rather than an attacker-controlled finding."
+    },
+    {
+      "lead": "AntiSamyDOMScanner.stripNonValidXMLCharacters() (lines 734-741) uses Matcher.matches() after reset(), which is false for any multi-character input containing invalid XML characters, so invalid/control characters are effectively not stripped before the NekoHTML parse (the Javadoc claims they are).",
+      "reason": "Best case impact is a parse error/ScanException (denial of service for that scan) rather than a sanitizer bypass; no source-level evidence that the surviving characters reach output in an exploitable form. Also could not rule out that this matches long-standing upstream behavior."
+    },
+    {
+      "lead": "CssHandler.importStyle() calls importedStyleSheet.normalize() and discards the result (URI is immutable), and the offsiteURL policy regex allows the `mailto:` scheme which HttpClient cannot execute.",
+      "reason": "The discarded normalize() call has no security effect by itself (it is a latent bug), and the mailto: case yields at most a scan exception. Not a distinct vulnerability."
+    }
+  ],
+  "summary": "Reviewed the AntiSamy 1.6.6.1 HTML/CSS sanitizer snapshot (54 model-visible files: 27 Java sources, 6 policy XML files, localized message bundles, pom/build/workflow metadata; tests and antisamy.xsd are absent from the snapshot). I traced the sanitizer's attacker-controlled input paths: NekoHTML DOM/SAX parsing (AntiSamyDOMScanner, AntiSamySAXScanner, MagicSAXFilter), attribute allow-list and value validation (Policy, Attribute, Tag, dynamic `data-` attributes), URI-attribute regexes in antisamy.xml, CSS scanning (CssScanner, CssHandler, CssValidator, CssParser), serializers, and policy loading/XXE/entity hardening. XXE is disabled on policy parsing and the SAX transformer factory blocks external DTD/stylesheet access; DOM and SAX attribute handling are largely consistent allow-lists. The single issue with a concrete attacker-controlled path to a sensitive operation is the server-side HTTP fetch of CSS `@import` targets: when the non-default `embedStyleSheets` directive is enabled, attacker-supplied CSS causes the library itself to issue HTTP GETs to an attacker-chosen (including internal/loopback) host, with only regex-shape, import-count and size limits — a blind SSRF primitive. Other suspicious constructs I found (an inverted `endsWith` style-tag check, a missing `escapeURI` override in the XHTML serializer, base-URL-only local-URL verification for policy includes, and a no-op invalid-XML-character strip) are recorded as rejected leads because their security impact could not be demonstrated from source in this snapshot."
+}

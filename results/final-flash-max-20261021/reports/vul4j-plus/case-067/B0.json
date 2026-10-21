@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "HTTP request parameter names. ProxyingHandlerMethodArgumentResolver.createAttribute builds a MapDataBinder for an interface/`@ProjectedPayload` controller parameter and binds `request.getParameterMap()` (attacker-controlled names and values) into it; the resolver's fallback also accepts any user-defined interface parameter (IGNORED_PACKAGES only covers java/org.springframework). AbstractPropertyAccessor then calls MapPropertyAccessor.setPropertyValue for every parameter name.",
+      "confidence": "low",
+      "counterevidence_checked": "The snapshot contains the upstream hardening for this sink: `SimpleEvaluationContext.forPropertyAccessors(new PropertyTraversingMapAccessor(...)).withConversionService(...).withRootObject(map).build()` (lines 180-185). SimpleEvaluationContext (Spring Framework 4.3.15/5.0.5+, i.e. the Spring version required by this 1.13.11 code) suppresses type references, constructors, bean references and, unless `withInstanceMethods()` is used (it is not), instance/static method invocation, which defeats the classic `T(java.lang.Runtime)...`/`getClass()` exploit chain; additionally `isWritableProperty`/`PropertyPath.from` constrains the non-bracketed portion of the path to real properties of the target type. I also checked for other sinks: no Runtime/ProcessBuilder/ObjectInputStream/XMLDecoder use anywhere; the other SpEL entry points (SpELContext, ExtensionAwareEvaluationContextProvider, SpelEvaluatingMethodInterceptor) evaluate developer-defined @Value/@Query expressions, not attacker text; PropertyPath.from is used by Sort/Querydsl/OrderBy resolution but resolves names against the domain type.",
+      "id": "case-067-cand-1",
+      "impact": "If the evaluation context permits type references or method invocation (the pre-fix configuration for this exact class), the sink yields remote code execution in the application process with the application's privileges. With the context as configured in this snapshot, the same input is parsed as SpEL and rejected/aborted, so impact in this snapshot is limited to unvalidated key/path writes into the binding map and exception-based error handling; no code execution was confirmed. Because the sink accepts arbitrary attacker text as an expression, any relaxation of the context (or a library-level bypass) immediately re-exposes RCE.",
+      "locations": [
+        {
+          "end_line": 194,
+          "path": "src/main/java/org/springframework/data/web/MapDataBinder.java",
+          "start_line": 157
+        },
+        {
+          "end_line": 209,
+          "path": "src/main/java/org/springframework/data/web/MapDataBinder.java",
+          "start_line": 205
+        },
+        {
+          "end_line": 165,
+          "path": "src/main/java/org/springframework/data/web/ProxyingHandlerMethodArgumentResolver.java",
+          "start_line": 158
+        }
+      ],
+      "prerequisites": "Spring Data web support is active (`@EnableSpringDataWebSupport`, Spring Boot auto-configuration, or direct use of MapDataBinder, e.g. Spring Data REST form binding) and a controller exposes an interface-typed parameter the resolver accepts. Attacker can send parameters whose names contain `[...]` index expressions with arbitrary SpEL inside. In this snapshot, exploitation additionally requires the evaluation context to be more permissive than the configured SimpleEvaluationContext (or a bypass of its restrictions); otherwise the classic type-reference/method-invocation chain fails and only causes a NotWritablePropertyException.",
+      "root_cause": "MapDataBinder's MapPropertyAccessor turns each incoming request parameter name into a SpEL expression: `Expression expression = PARSER.parseExpression(propertyName); expression.setValue(context, value);` (MapDataBinder.java:187-190). Validation via `isWritableProperty` -> `getPropertyPath` removes bracketed segments (`propertyName.replaceAll(\"\\\\[.*?\\\\]\", \"\")`, line 207) before resolving the remainder with `PropertyPath.from`, so any SpEL placed inside `[...]` in the parameter name is never validated yet is still parsed and evaluated by the expression parser. The safety of the sink therefore rests solely on the evaluation context created at lines 180-185.",
+      "title": "Attacker-controlled request parameter names parsed and evaluated as SpEL in MapDataBinder property binding",
+      "trace": "1) Attacker sends e.g. POST form data with a parameter name of the form `property[<SpEL>]`. 2) ProxyingHandlerMethodArgumentResolver.createAttribute (lines 158-165) instantiates `new MapDataBinder(parameter.getParameterType(), conversionService)` and calls `binder.bind(new MutablePropertyValues(request.getParameterMap()))`. 3) WebDataBinder applies each property value through MapDataBinder's ConfigurablePropertyAccessor, i.e. MapPropertyAccessor.setPropertyValue (line 158). 4) `isWritableProperty` (line 126) -> `getPropertyPath` (line 205) strips `[...]` and validates only the residual dotted path with `PropertyPath.from`; bracket contents are unvalidated. 5) `PARSER.parseExpression(propertyName)` (line 187) compiles the full, unvalidated name as SpEL and `expression.setValue(context, value)` (line 190) evaluates it with the Map-based root object and a MapAccessor-derived property accessor. 6) A permissive evaluation context (StandardEvaluationContext, as in releases before the 1.13.11/2.0.6 fix) lets this reach arbitrary constructors/type references/methods and thus execute code; the context in this snapshot is SimpleEvaluationContext, which limits the impact.",
+      "unverified": "I could not verify from source alone whether this tree is the pre-fix state of the binder (in which case the sink is exploitable RCE) or the post-fix commit (in which case SimpleEvaluationContext mitigates it); the file's content and the 1.13.11.BUILD-SNAPSHOT version are consistent with the fix commit itself, and no git history is available to compare. SimpleEvaluationContext's exact runtime semantics in the resolved Spring Framework version were not executable/inspectable in this run, and no runtime test was performed.",
+      "weakness_type": "SpEL injection / code injection via attacker-controlled property names (CWE-917, CWE-94)"
+    }
+  ],
+  "coverage_summary": "Analyzed the assigned source snapshot (395 files) with read-only listing/search/read tools. Coverage: all root build/metadata files and the complete src/main/java tree by targeted search for security-relevant APIs (Runtime/ProcessBuilder, ObjectInputStream/readObject, XMLDecoder/DocumentBuilder, Class.forName/loadClass/defineClass/newInstance/setAccessible, ScriptEngine, file/URL/network I/O, crypto/Random, SpEL parsing/evaluation, regex compilation, replaceAll) plus close reading of the attacker-reachable web/querydsl/projection/mapping/convert/repository-init paths. No test sources, git history, build artifacts, or Spring Framework binaries are present in the assigned scope, so behavior of library classes (notably SimpleEvaluationContext) was reasoned from API knowledge rather than inspected, and no code was executed.",
+  "limitations": [
+    "Only src/main sources and resources are present; there are no tests, no .git metadata, and no dependency JARs, so I could not diff against upstream or confirm which upstream commit this tree corresponds to.",
+    "SimpleEvaluationContext's exact restrictions in the Spring Framework version used by this 1.13.11 snapshot could not be inspected or executed; the mitigation assessment relies on documented/inferred semantics.",
+    "No runtime reproduction or exploitability testing was performed (and was out of scope for this review).",
+    "One read attempt used a wrong relative path and failed; the corrected file (org/springframework/data/web/querydsl/QuerydslPredicateArgumentResolver.java) was covered via directory listing/search rather than a full read.",
+    "Package-level dependency configuration (parent POM spring-data-parent 2.0.10.RELEASE) is external to the snapshot, so resolved framework versions and optional-dependency behavior could not be verified."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Jackson2ResourceReader loads a class named by the JSON `_class` property (ClassUtils.resolveClassName) and deserializes into it.",
+      "reason": "Input is a repository-initialization resource file on the application's classpath/local disk, not an HTTP-reachable path; the shared ObjectMapper has no polymorphic default typing and ClassUtils.forName does not initialize loaded classes. No attacker-controlled remote path in this repository."
+    },
+    {
+      "lead": "UnmarshallingResourceReader / XmlBeamHttpMessageConverter parse XML without visible XXE hardening.",
+      "reason": "UnmarshallingResourceReader's parser configuration lives in the supplied Spring OXM Unmarshaller (external configuration) and reads startup resources; XmlBeamHttpMessageConverter delegates to the third-party XmlBeam library and only activates for interfaces annotated @ProjectedPayload. No first-party evidence of an exploitable configuration."
+    },
+    {
+      "lead": "SimpleTypeInformationMapper resolves arbitrary type aliases to classes via ClassUtils.forName(value, null).",
+      "reason": "Values originate from store-module persistent data/type mappings, and the resolve step only produces TypeInformation; no attacker-controlled entry point exists inside spring-data-commons, and class instantiation happens in the store modules (out of scope)."
+    },
+    {
+      "lead": "ExtensionAwareEvaluationContextProvider / SpELContext build StandardEvaluationContext instances with BeanFactoryResolver and ReflectivePropertyAccessor.",
+      "reason": "The expressions evaluated there come from developer-defined @Value/@Query/constructor metadata; method parameters are exposed as variables, not as expression text, so there is no attacker-controlled expression in this repository."
+    },
+    {
+      "lead": "QuerydslBindings.isPathVisible white/black-list logic could allow binding to excluded properties.",
+      "reason": "Visibility strings are developer configuration; I found no attacker string that normalizes into an excluded path in the reviewed logic, and no code-execution impact."
+    },
+    {
+      "lead": "JsonProjectingMethodInterceptorFactory evaluates JSONPath expressions against attacker-controlled JSON.",
+      "reason": "The JSONPath expressions come from developer @JsonPath annotations; the attacker controls only the JSON document, and no dangerous evaluation option is configured in the reviewed code."
+    }
+  ],
+  "summary": "Reviewed the spring-data-commons snapshot (395 files, src/main only: Java sources plus pom/changelog/license resources; version 1.13.11.BUILD-SNAPSHOT, notice.txt 1.13.10, changelog top 2.0.5). The strongest security-relevant pattern is in the web data-binding path: request parameter names (fully attacker-controlled) are parsed and evaluated as Spring Expression Language inside MapDataBinder, after a validation step that deliberately strips bracket index expressions before resolving the property path. This is the exact sink historically associated with the Spring Data Commons property-binder RCE (CVE-2018-1273, fixed in 1.13.11/2.0.6). Important counterevidence: this snapshot already contains the upstream mitigation — the evaluation context is SimpleEvaluationContext (introduced in Spring Framework 4.3.15/5.0.5), which disables type references (T(...)), constructors, bean references and (unless explicitly enabled) method invocation — so the classic RCE payload is not reproducible against this exact source state, and I could not confirm exploitability. I therefore submit it as the single best-evidenced lead with low confidence, and flag the residual risk that the code is still an attacker-reachable SpEL evaluation point whose safety depends entirely on that context configuration. Other candidate sinks (Jackson2ResourceReader _class loading, UnmarshallingResourceReader/JAXB, SimpleTypeInformationMapper class loading, JSONPath/SpEL projection interceptors, Querydsl binding whitelist logic) were examined and rejected for lack of an attacker-controlled path or because the expressions are developer-defined."
+}

@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The caller fully controls the required query parameter appId in GET /consumers/by-appId. No session/role/permission attribute is consulted before the lookup and response. In the default (no-auth) portal profile any network client can call it; under the auth/ldap profiles any authenticated portal user (including users with no role on the target app) can call it.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that (a) the endpoint is only called from the root-gated UI (open/manage.html ng-show=\"isRootUser\"), (b) all three sibling methods in ConsumerController carry @PreAuthorize(\"@permissionValidator.isSuperAdmin()\") while this one does not, (c) the token really is a usable credential (ConsumerAuthenticationFilter accepts it and ConsumerService.getConsumerIdByToken looks it up by value with expiry), and (d) other portal controllers that expose config data use permissionValidator.shouldHideConfigToCurrentUser or @PreAuthorize, so the absence here is an outlier rather than a general pattern. Counter-considerations: I could not diff against upstream in this environment, so I cannot prove the annotation was removed by this snapshot's author rather than historically absent; and in the default no-auth profile the whole portal is unauthenticated, which reduces the incremental exposure for that deployment mode but does not remove the authorization gap under auth/ldap.",
+      "id": "cand-001",
+      "impact": "Disclosure of an OpenAPI bearer token for an arbitrary app to a caller who is not a super admin and may have no relationship to that app. Because the token is the sole credential for the portal's OpenAPI (used by third-party systems to read, modify and publish configuration, including production), this is an authorization bypass enabling confidential-configuration disclosure and, where the consumer holds Modify/Release roles, unauthorized configuration modification and publishing for the victim app.",
+      "locations": [
+        {
+          "end_line": 60,
+          "path": "apollo-portal/src/main/java/com/ctrip/framework/apollo/portal/controller/ConsumerController.java",
+          "start_line": 57
+        },
+        {
+          "end_line": 108,
+          "path": "apollo-portal/src/main/java/com/ctrip/framework/apollo/openapi/service/ConsumerService.java",
+          "start_line": 101
+        },
+        {
+          "end_line": 24,
+          "path": "apollo-portal/src/main/resources/static/open/manage.html",
+          "start_line": 24
+        },
+        {
+          "end_line": 52,
+          "path": "apollo-portal/src/main/java/com/ctrip/framework/apollo/openapi/filter/ConsumerAuthenticationFilter.java",
+          "start_line": 40
+        }
+      ],
+      "prerequisites": "Portal reachable by the attacker; a Consumer/ConsumerToken must already exist for the target appId (created by a super admin, e.g. via /consumers). Under the auth/ldap profile the attacker needs any valid portal login; under the default profile no login is needed.",
+      "root_cause": "ConsumerController.getConsumerTokenByAppId (apollo-portal/.../portal/controller/ConsumerController.java:57-60) has no @PreAuthorize (or equivalent) check, unlike the other endpoints in the same controller (createConsumer line 35-37 and assignNamespaceRoleToConsumer line 62-67, both @PreAuthorize(\"@permissionValidator.isSuperAdmin()\")). The method forwards the caller-controlled appId straight to ConsumerService.getConsumerTokenByAppId (apollo-portal/.../openapi/service/ConsumerService.java:101-108), which reads the Consumer by appId and returns its raw ConsumerToken row (token value is stored in plaintext, ConsumerToken.token). The token is the bearer credential accepted by ConsumerAuthenticationFilter (apollo-portal/.../openapi/filter/ConsumerAuthenticationFilter.java:40-52) for all /openapi/v1/** endpoints, and the only UI that displays it (static/open/manage.html, panel gated by ng-show=\"isRootUser\") is restricted to super admins, so the backend check is missing rather than intentionally absent.",
+      "title": "Missing authorization on portal GET /consumers/by-appId exposes any app's OpenAPI token",
+      "trace": "GET /consumers/by-appId?appId=<victim> -> ConsumerController.getConsumerTokenByAppId (no method-security annotation, so no vote is cast by the MethodSecurityInterceptor) -> ConsumerService.getConsumerTokenByAppId -> ConsumerRepository.findByAppId(appId) -> ConsumerTokenRepository.findByConsumerId(...) -> full ConsumerToken (raw token) serialized to the HTTP response. The attacker then supplies that token in the Authorization header to /openapi/v1/** (ConsumerAuthenticationFilter.mapsto consumerId via ConsumerService.getConsumerIdByToken and stores it in the request), obtaining that consumer's OpenAPI identity (read of the app's namespaces/items/releases and, where the consumer was granted Modify/Release roles, creation/update/deletion of items and releases).",
+      "unverified": "Not runtime-confirmed. I did not verify (i) whether upstream Apollo 1.8.x already lacked this check, (ii) which roles a typical Consumer holds in the target deployment (needed for write, not for read), and (iii) whether every deployment exposes a Consumer for the targeted appId. These determine exploitability, not the existence of the missing check.",
+      "weakness_type": "Missing Authorization (CWE-862) exposing a credential/secret (CWE-200)"
+    }
+  ],
+  "coverage_summary": "Scope: 819 model-visible files under the assigned repository root (Java source, resources, XML/properties/YAML, Dockerfiles, CI files); binary-like files were refused by the tools and no files were excluded by sensitive-name/path or size filters. No test sources are present in the snapshot. I read the security-relevant paths closely (portal controllers, openapi v1 controllers and auth filter, role/permission services, adminservice controllers, configservice config/configfile/notification controllers and access-key filter, apollo-core signature/utils, common utils/exception handler, client config repositories and YAML parser) and grep-swept the tree for process execution, object deserialization, XML parsing, SpEL/script engines, SQL construction, path traversal, URL construction, trust managers, and XSS sinks. Coverage is not exhaustive: large vendor JS bundles, i18n JSON, most DTO/entity/repository classes, large biz services (ReleaseService/NamespaceService/ItemService) beyond targeted reads, and the apollo-client internals were only partially inspected.",
+  "limitations": [
+    "No upstream diff/patch or git history is available, so I cannot confirm whether the missing @PreAuthorize on /consumers/by-appId is a deviation introduced in this snapshot or a long-standing upstream gap.",
+    "No runtime, build, or test execution was performed; all statements are source-level and unconfirmed at runtime.",
+    "Test sources are absent from the snapshot, so I could not use tests to infer intended authorization behavior.",
+    "Exploitability of the token depends on deployment profile (default no-auth vs auth/ldap) and on which roles have been granted to the target Consumer, which cannot be determined from source alone.",
+    "The front-end bundles (vendor angular/lodash) and large generated/JSON resources were not read in full, so an issue hidden there could have been missed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "PermissionController.initAppPermission (POST /apps/{appId}/initPermission) has no @PreAuthorize and lets any caller create namespace env roles/permissions for an arbitrary appId.",
+      "reason": "It only initializes Role/Permission rows for the app and does not assign any role to the caller; no direct privilege gain or secret disclosure was traced, and the endpoint may be intentionally callable during app-creation flows."
+    },
+    {
+      "lead": "AppController.create (POST /apps/envs/{env}) in the portal has no @PreAuthorize and can create App records in a remote environment's admin service.",
+      "reason": "Impact is limited to creating app metadata records (integrity/pollution) rather than credential or config disclosure or privilege gain; could not establish it as the intended control gap."
+    },
+    {
+      "lead": "PermissionController.hasCreateApplicationPermission(userId) and getNamespaceEnvRoles/getNamespaceRoles/getAppRoles expose permission/user-role information for arbitrary apps without checks.",
+      "reason": "Information disclosure limited to authorization metadata (user ids/roles); lower impact than the token disclosure and may be intended by design."
+    },
+    {
+      "lead": "ClientAuthenticationFilter / AccessKeyServiceWithCache skip signature validation when an appId has no enabled access keys (apollo-configservice).",
+      "reason": "This matches Apollo's documented backwards-compatibility behavior for apps without access keys; the filter does enforce HMAC signatures when secrets exist, so it is not treated as a bypass on its own evidence."
+    },
+    {
+      "lead": "Portal InstanceController endpoints expose instance/release info for arbitrary appId without permission checks.",
+      "reason": "Appears to be upstream read-only metadata design (the UI gates display); no credential or config-value disclosure was established."
+    },
+    {
+      "lead": "Vulnerable-looking dependency versions in pom.xml (spring-boot 2.0.5, gson 2.8.0, guava 19.0, snakeyaml/httpclient era versions).",
+      "reason": "Dependency-level review is out of the source-code scope here and I could not confirm a specific exploitable library path from this snapshot."
+    }
+  ],
+  "summary": "Apollo config-center snapshot (1.8.0-SNAPSHOT, 819 readable source/config files; test sources are not present in the assigned scope). I traced the portal's authentication/authorization boundary end to end: Spring Security config (AuthConfiguration), method-level @PreAuthorize usage across portal and openapi controllers, the OpenAPI token filter, the access-key filter in the config service, and the role/permission services. The single strongest issue found is a missing authorization check on the portal endpoint GET /consumers/by-appId, which returns the OpenAPI consumer token (a credential validated by ConsumerAuthenticationFilter) for any caller-supplied appId. Every other sensitive portal endpoint in the same controller is guarded by @PreAuthorize(\"@permissionValidator.isSuperAdmin()\"), and the portal UI that displays the token is gated on isRootUser, which indicates the endpoint is intended to be restricted. I did not find evidence of command execution, SQL injection, deserialization, XXE, or path traversal sinks in the reviewed code; the note/listener resolution, YAML parsing (SafeConstructor), and JDBC access are parameterized or type-limited."
+}

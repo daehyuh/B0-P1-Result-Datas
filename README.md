@@ -1,6 +1,21 @@
 # B0–P1 Java Vulnerability Detection Results
 
-This repository publishes the analysis program and the case-level results used in the study of static source-code relation information for LLM-assisted vulnerability detection.
+Current representative results use **Flash Max only**. [Final tables, 948 selected reports, judgments, and hashes](results/final-flash-max-20261021/).
+
+| Dataset | Cases | CodeQL | B0 (source only) | P1 (VulRIS) | P1−B0 (cases; pp) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Vul4J | 79 | 11 (13.92%) | 13 (16.46%) | 13 (16.46%) | +0; +0.00 pp |
+| VJBench | 42 | 4 (9.52%) | 16 (38.10%) | 16 (38.10%) | +0; +0.00 pp |
+| Vul4J+ | 140 | 17 (12.14%) | 39 (27.86%) | 46 (32.86%) | +7; +5.00 pp |
+| CWE-Bench-Java | 213 | 41 (19.25%) | 52 (24.41%) | 51 (23.94%) | -1; -0.47 pp |
+
+The current representative setting is Flash Max (`deepseek-flash`, reasoning effort `max`). B0 reads the prepared source; P1 also queries VulRIS relation records. Vul4J uses the original multi-candidate protocol (at most 10 candidates); VJBench, Vul4J+, and CWE-Bench-Java use at most one candidate per submission.
+
+The metric is case-level reference-cause and affected-path matching. All 213 CWE-Bench-Java cases have final binary labels, including case-173. Datasets are reported separately because Vul4J and Vul4J+ overlap. The final adopted submissions form a retrospective collection.
+
+P1 and B0 tie on Vul4J and VJBench. P1 identifies seven more Vul4J+ cases (+5.00 pp), and one fewer CWE-Bench-Java case (−0.47 pp). These results show dataset-dependent effects of relation-assisted exploration rather than uniform improvement.
+
+CodeQL counts come from the completed recorded baseline (CLI 2.23.2, Java pack 1.8.1, `java-security-extended.qls`, `build-mode=none`). Exact source-version parity with the corrected LLM inputs has not been established for every case. Report CodeQL values as descriptive baseline results rather than a controlled same-input estimate of the relation index's contribution.
 
 ## Contents
 
@@ -12,22 +27,9 @@ This repository publishes the analysis program and the case-level results used i
 - [`prompts/`](prompts/): the B0/P1 and common prompts used by the recorded experiments.
 - [`figures/`](figures/): figures accompanying the summary.
 
-## Result files
 
-The main summary reports one final score for each case and condition. The VJBench final case table and Vul4J+ final score table are linked from [`results/summary.md`](results/summary.md). Initial responses and separate format-repair executions remain distinct in the audit records; the final score table does not overwrite either source. The VJBench case-039 target correction is documented and linked to its evidence; it was made after reviewing the outputs and must be treated as a post-hoc correction.
+## Provenance and reproduction
 
-The repository does **not** redistribute benchmark source snapshots, generated per-case relation databases, or the large working SQLite database. Dataset source commit/hash information is retained in the result records where available. Obtain benchmark code from its upstream source and follow its license and citation requirements. Rebuild relation data locally with the included analyzer if needed.
+The current snapshot supersedes earlier score tables while preserving original responses and dated records. Other model profiles are archival, not current paper results. [Current protocol](results/final-flash-max-20261021/protocol.json) and [analyzer instructions](analyzer/README.md) describe the inputs and settings. Upstream benchmark sources and generated relation databases are not redistributed. AI-assisted source/patch matching underlies the labels; independent multi-rater agreement and repeated-run variation have not been measured.
 
-## Reproduction
-
-See [`analyzer/README.md`](analyzer/README.md) for installation, commands, data format, and tests. Recreating the recorded LLM results is not automatic: the original prompts and evaluation configuration are included, but access to the upstream datasets and the corresponding model/API service is required.
-
-## Citation
-
-Kang, D. (2026). *B0–P1 Java Vulnerability Detection Results*. GitHub repository: <https://github.com/daehyuh/B0-P1-Result-Datas>.
-
-## Scope and limitations
-
-The reported metric is agreement with a benchmark-designated vulnerability target. A non-match does not establish that a model's other candidate is harmless or false. These adjudications are source- and patch-based reviews, not independent multi-rater reviews or runtime reproductions. Results from different datasets and prompt protocols should not be pooled as one accuracy estimate. See [`results/summary.md`](results/summary.md).
-
-No blanket license is asserted for third-party datasets or code. The licenses and citation terms of the upstream projects remain applicable.
+No blanket license is asserted for third-party datasets or code. Respect upstream license and citation terms.

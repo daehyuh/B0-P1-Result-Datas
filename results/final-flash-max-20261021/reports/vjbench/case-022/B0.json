@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any unauthenticated network client that can reach the admin-console HTTP/HTTPS port controls the `host` query parameter of GET /getFavicon (e.g. `host=internal-host:port` or `host=host/path`). Redirects from an attacker-controlled host further control the final destination URL of the server-side request.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that /getFavicon is not covered by AuthCheckFilter (web.xml filter-mappings only target *.jsp, PluginServlet, dwr-invoker) and that AdminConsolePlugin.createWebAppContext() installs no Jetty ServletSecurityHandler/security constraints (no container-level auth). Checked the servlet itself for host validation, allow-lists, IP filtering or redirect restrictions: none exist; LaxRedirectStrategy explicitly enables cross-host redirects. Verified that the mapping and servlet declaration are active in web.xml. Acknowledged design intent (admin-console pages use it to show favicons) does not remove the issue because the endpoint is anonymously callable and the raw `host` value is attacker-controlled.",
+      "id": "case-022-favicon-ssrf",
+      "impact": "Server-side request forgery: the Openfire process can be used as a proxy to reach hosts/ports not otherwise reachable by the attacker (internal networks, localhost-only services, cloud metadata endpoints), and the fetched response body is returned to the attacker, giving a read primitive for HTTP GET responses. It also allows internal port/service probing via response/timing differences and can be abused for resource consumption against internal endpoints; response bodies are read unbounded into memory (EntityUtils.toByteArray) and cached.",
+      "locations": [
+        {
+          "end_line": 127,
+          "path": "xmppserver/src/main/java/org/jivesoftware/util/FaviconServlet.java",
+          "start_line": 117
+        },
+        {
+          "end_line": 182,
+          "path": "xmppserver/src/main/java/org/jivesoftware/util/FaviconServlet.java",
+          "start_line": 153
+        },
+        {
+          "end_line": 201,
+          "path": "xmppserver/src/main/java/org/jivesoftware/util/FaviconServlet.java",
+          "start_line": 184
+        },
+        {
+          "end_line": 101,
+          "path": "xmppserver/src/main/webapp/WEB-INF/web.xml",
+          "start_line": 63
+        },
+        {
+          "end_line": 150,
+          "path": "xmppserver/src/main/webapp/WEB-INF/web.xml",
+          "start_line": 147
+        }
+      ],
+      "prerequisites": "Admin console listener enabled and reachable (default 9090/9091); FaviconServlet initialized (default at startup). No session, account or CSRF token is required.",
+      "root_cause": "FaviconServlet.doGet() takes the raw `host` request parameter (FaviconServlet.java:119), passes it to getImage(), which builds an outbound URL as `\"http://\" + host + \"/favicon.ico\"` (line 164) and executes it with a pooled HttpClient (lines 185-198), returning the full response body to the requester (lines 196-197, 123-126, 134-145). There is no validation/allow-list of the host (no restriction to local users' domains, no private/loopback/metadata IP filtering, no scheme/port restriction), and the client is built with LaxRedirectStrategy (line 87), so an attacker-controlled 302 can redirect the server-side request to any URL/path. Critically, the servlet is reachable without authentication: web.xml maps it at /getFavicon (web.xml:147-150) while AuthCheckFilter is only mapped to *.jsp, PluginServlet and dwr-invoker (web.xml:63-101).",
+      "title": "Unauthenticated SSRF via /getFavicon host parameter (FaviconServlet)",
+      "trace": "GET /getFavicon?host=X -> web.xml servlet-mapping (no AuthCheckFilter mapping for this URL) -> FaviconServlet.doGet (line 119) -> getImage(host, defaultBytes) (line 123) -> `getImage(\"http://\" + host + \"/favicon.ico\")` (line 164) -> RequestBuilder.get(url) + HttpClient.execute (lines 191-195) -> EntityUtils.toByteArray (line 197) -> writeBytesToStream (lines 123-126) writes the internal response body back to the attacker. Because LaxRedirectStrategy is configured (line 87), the fixed `/favicon.ico` suffix can be bypassed via an HTTP redirect to an arbitrary internal URL/path.",
+      "unverified": "Not runtime-confirmed; no exploit traffic was sent. The redirect-based bypass of the fixed `/favicon.ico` suffix is inferred from the configured LaxRedirectStrategy and was not executed. I could not map the snapshot to an external CVE/advisory, and I cannot exclude that an upstream/harness-specific patch exists.",
+      "weakness_type": "Server-Side Request Forgery (CWE-918)"
+    }
+  ],
+  "coverage_summary": "Coverage was source-only: 1,031 model-visible files (parent/plugins/starter/distribution/xmppserver Java, web.xml, conf, SQL, docs). Binary-like files are skipped and 0 files were excluded by size/sensitivity filters. I focused on remotely reachable and security-sensitive Java: admin console filters/servlets (AuthCheckFilter, WebManager, FaviconServlet, PluginServlet, PluginIconServlet, SystemProperties/Cache servlets), HTTP/BOSH and WebSocket (HttpBindManager/Servlet/Session, HttpSessionManager, XmppWebSocket), auth/SASL/authorization (AuthFactory, DefaultAuthProvider, AuthorizationManager, DefaultAuthorizationPolicy, SASLAuthentication, ExternalClientSaslServer, ScramSha1SaslServer, SASL server factory), keystore/trust (OpenfireX509TrustManager, CertificateStoreManager), S2S/dialback, MUC authorization handlers, handlers (IQRegister, IQBind, offline/private/roster/presence), WebDAV, container/plugin management, and schema/config. Suspicious leads were traced to concrete sinks where possible. I did not exhaustively read the largest files (e.g. LocalMUCRoom, MultiUserChatServiceImpl, HttpSession, MUCPersistenceManager, LdapManager, PubSub/Roster) line by line, and the snapshot contains no JSP/web-view files (0 *.jsp), so admin-console view-layer issues could not be reviewed.",
+  "limitations": [
+    "No git history/diff, no advisory or CVE metadata, and no way to compare against upstream were available, so I could not confirm that this snapshot is the parent of a specific security fix.",
+    "No code was executed; the SSRF and all other leads are static source findings, not runtime-confirmed.",
+    "JSPs and other web-view files are absent from the visible file set, limiting review of admin-console presentation-layer vulnerabilities (XSS/CSRF checks in JSPs).",
+    "Several very large security-relevant classes (LocalMUCRoom, MultiUserChatServiceImpl, HttpSession, MUCPersistenceManager, LdapManager, PubSub/Roster) were only spot-checked, not fully audited.",
+    "The favicon redirect-amplification (bypassing the fixed /favicon.ico suffix via LaxRedirectStrategy) is inferred from configuration and HttpClient semantics, not demonstrated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "IQRegisterHandler.js possible in-band-registration bypass: at lines 326-370 an authenticated user who sends only <username>+<password> has the `registrationEnabled` check skipped (`onlyPassword`), so line 359-362 calls userManager.createUser() for a different username even when `register.inband=false`, despite the comment 'An admin can create new accounts when logged in'.",
+      "reason": "Requires an authenticated account, cannot overwrite/change another existing user's password (createUser throws UserAlreadyExistsException), and the code shape/comment appears consistent with long-standing upstream behavior, so intent cannot be established from this snapshot alone. Lower impact and weaker evidence than the SSRF candidate."
+    },
+    {
+      "lead": "WebDAVLiteServlet.isAuthorized returns true regardless of the getOccupantsByBareJID() result (lines 145-173), so any authenticated user could read/write/delete files of any MUC room.",
+      "reason": "WebDAVLiteServlet is not declared or mapped in web.xml in this snapshot ('work in progress and is checked in for future use'), so it is not reachable through the packaged admin console; no exploitable path found."
+    },
+    {
+      "lead": "PluginServlet.handleOtherRequest builds a File path from request path info without canonicalization (lines 460-509); handleDevJSP compiles JSPs from disk (lines 523+).",
+      "reason": "Jetty rejects/normalizes literal '..' segments; /plugins/* is behind AuthCheckFilter; dev-JSP compilation requires non-default development mode and pre-existing attacker-writable files. No reliable unauthenticated traversal/RCE demonstrated."
+    },
+    {
+      "lead": "AuthCheckFilter.testURLPassesExclude wildcard exclusion logic (lines 151-181) permits any URL beginning with an excluded prefix as long as it contains no '..' and no '%2e'.",
+      "reason": "The traversal checks are present; I could not construct a bypass from source alone (double-encoding leaves literal percent sequences that Jetty does not decode again). Unconfirmed."
+    },
+    {
+      "lead": "HttpBindServlet.doGet double-decodes the query string (line 117) before parsing the BOSH body.",
+      "reason": "Only reachable when the non-default `xmpp.httpbind.scriptSyntax.enabled` property is true; impact would be limited to attribute injection into the parsed body. Not pursued."
+    },
+    {
+      "lead": "UpdateManager parses XML fetched from a remote update source with an unhardened SAXReader (lines 566-570, 614-618), and uses HTTP for an update/plugin listing.",
+      "reason": "Requires MITM/compromise of the update endpoint to inject XML; no direct attacker-controlled input path. Parser hardening is a best practice, not a demonstrated vulnerability here."
+    },
+    {
+      "lead": "Parent pom pins log4j 2.11.2 (pom.xml:126), a version historically affected by JNDI-lookup issues.",
+      "reason": "Dependency-level lead only; no concrete source path showing attacker-controlled data reaching a JNDI lookup was verified in this snapshot, and the packaging/harness scope does not include the log4j jar."
+    }
+  ],
+  "summary": "Reviewed the Openfire 4.5.0-SNAPSHOT source snapshot (1,031 model-visible files: Java core, web.xml/config, SQL schema, docs). The strongest source-evidenced issue is an unauthenticated SSRF in the admin-console web application: the FaviconServlet is mapped at /getFavicon, is not covered by AuthCheckFilter (which only guards *.jsp, PluginServlet and dwr-invoker), takes an arbitrary `host` query parameter, concatenates it into `http://<host>/favicon.ico`, performs the request server-side with an HttpClient that follows redirects, and returns the response body to the caller. This yields an unauthenticated server-side request primitive (including redirect-mediated access to arbitrary internal HTTP paths, not just /favicon.ico). Several other leads were examined and rejected as weaker/unsupported (listed below). One candidate is submitted; it is a lead, not a runtime-confirmed vulnerability."
+}

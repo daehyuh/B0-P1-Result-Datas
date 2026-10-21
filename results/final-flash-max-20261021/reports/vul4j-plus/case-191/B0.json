@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The header bytes/stream passed to the public API CiphertextHeaderV2.decode(byte[], Function) and CiphertextHeaderV2.decode(InputStream, Function). These methods exist to parse a cleartext header prepended to ciphertext, i.e. data received from an untrusted party in any decrypt/verify flow. The key name is fully attacker-chosen and is consumed before the HMAC check and before any key lookup succeeds (a missing key only aborts after the reading loop).",
+      "confidence": "medium",
+      "counterevidence_checked": "1) The literal undeclared identifier MAX_KEYNAME_LEN means the snapshot cannot compile; therefore the intended bounded behavior is absent from the source but the DoS cannot be demonstrated in a built artifact without resolving the symbol - this is the main reason confidence is only medium and the finding is explicitly not runtime-confirmed. 2) The byte[] overload is safer: a truncated buffer makes bb.get() throw BufferUnderflowException, which is caught and converted to EncodingException, so the endless loop is specific to the InputStream overload (or requires an unbounded stream). 3) Parsing happens before HMAC verification, so the HMAC does not mitigate the resource consumption. 4) No caller inside this snapshot uses CiphertextHeaderV2, so exploitation depends on downstream consumers using the public API on untrusted data.",
+      "id": "CAND-1",
+      "impact": "Denial of service: a single malformed/hostile ciphertext header can drive an unbounded allocation loop and a non-terminating read in a server thread, exhausting heap (OutOfMemoryError) or hanging request processing; no valid key or MAC is required, and the header is processed before authentication. The same loop without an enforced cap also allows reading/buffering an arbitrarily large key name from a non-terminating stream (resource exhaustion).",
+      "locations": [
+        {
+          "end_line": 208,
+          "path": "src/main/java/org/cryptacular/CiphertextHeaderV2.java",
+          "start_line": 199
+        },
+        {
+          "end_line": 283,
+          "path": "src/main/java/org/cryptacular/CiphertextHeaderV2.java",
+          "start_line": 276
+        },
+        {
+          "end_line": 168,
+          "path": "src/main/java/org/cryptacular/CiphertextHeaderV2.java",
+          "start_line": 163
+        },
+        {
+          "end_line": 218,
+          "path": "src/main/java/org/cryptacular/CiphertextHeaderV2.java",
+          "start_line": 214
+        },
+        {
+          "end_line": 113,
+          "path": "src/main/java/org/cryptacular/CiphertextHeaderV2.java",
+          "start_line": 113
+        }
+      ],
+      "prerequisites": "Application code calls CiphertextHeaderV2.decode(InputStream, keyLookup) (the unbounded-growth/hang path requires the stream overload) on untrusted header data, and the header contains no 0x00 terminator for the key name (e.g. truncated stream, stream that ends, or an endless stream). Note the source as shipped references undeclared symbols (MAX_KEYNAME_LEN and three ByteUtil methods), so a compiled artifact does not exist without resolve/fix; the defect is in the source semantics of the parsing loop.",
+      "root_cause": "In CiphertextHeaderV2.decodeInternal (src/main/java/org/cryptacular/CiphertextHeaderV2.java), the symbolic key name is read byte-by-byte from attacker-supplied header data in `while ((b = readByteFn.apply(source)) != 0)` and accumulated in a ByteArrayOutputStream. The only intended cap, `if (out.size() > MAX_KEYNAME_LEN)` (line 204), cannot take effect because MAX_KEYNAME_LEN is not declared anywhere in the repository (repository-wide search finds only this single reference), and the encoding/decoding helpers it relies on (ByteUtil.toUnsignedByte(int), ByteUtil.toInt(Byte), ByteUtil.toString(byte[],int,int)) are likewise absent. In the InputStream overload, readByte() returns `(byte) input.read()`; at EOF input.read() returns -1, which becomes 0xFF (nonzero), so the sentinel condition is never met and the loop appends forever, growing memory until OOM (and hanging the caller). Parsing occurs before HMAC verification, so no key material is needed to trigger it.",
+      "title": "CiphertextHeaderV2 decodes untrusted key name without an effective length bound (undefined MAX_KEYNAME_LEN; stream EOF never terminates) leading to unbounded memory growth / hang",
+      "trace": "decode(InputStream,keyLookup) [lines 163-168] -> decodeInternal(input, keyLookup, ByteUtil::readInt, CiphertextHeaderV2::readByte, CiphertextHeaderV2::readInto) [183-229] -> key-name loop `while ((b = readByteFn.apply(source)) != 0)` [200-208]; readByte() [276-283] returns `(byte) input.read()` so EOF (-1 -> 0xFF) keeps the loop alive; out.write(b) [203] grows a ByteArrayOutputStream without limit because the guard `out.size() > MAX_KEYNAME_LEN` [204-206] references an undeclared constant and cannot enforce anything; HMAC verification [217-226] and key lookup [210-213] occur only after this parsing/resource-consumption stage.",
+      "unverified": "Exact upstream intent/version could not be diffed (no history or network access); the runtime DoS could not be executed (per instructions) and the tree does not compile as-is due to the referenced-but-undeclared symbols (MAX_KEYNAME_LEN, ByteUtil.toUnsignedByte, ByteUtil.toInt(Byte), ByteUtil.toString(byte[],int,int)). Whether consumers ever call the stream overload on untrusted data is not determinable from this snapshot alone.",
+      "weakness_type": "CWE-770 Allocation of Resources Without Limits or Throttling (with CWE-835 loop with unreachable exit condition); pre-authentication DoS"
+    }
+  ],
+  "coverage_summary": "Coverage: get_source_scope reports 131 model-visible source files, 0 excluded for size/sensitivity, 0 binary-like exclusions, same filters for B0/P1. I read the pom, README, .travis.yml, assembly/checkstyle files and all 128 Java sources (package by package: adapter, asn, bean, codec, generator (+sp80038a/d), io, pbe, spec, util, x509 (+dn), plus the root classes CiphertextHeader, CiphertextHeaderV2, SaltedHash, exceptions). No test sources are present in the snapshot. Verification was static only (no execution, build, or external lookups). Search was also used to confirm that MAX_KEYNAME_LEN, ByteUtil.toUnsignedByte, ByteUtil.toInt(Byte) and ByteUtil.toString(byte[],int,int) are referenced but declared nowhere in the tree.",
+  "limitations": [
+    "No build/test execution was permitted; additionally the snapshot as provided cannot compile because CiphertextHeaderV2 references undeclared symbols (MAX_KEYNAME_LEN and three ByteUtil helpers), so no runtime confirmation of the DoS is possible and the finding is a source-level lead.",
+    "No repository history, upstream version, patch, CVE data, or sibling-condition information was available, so I could not prove which lines were modified relative to a released cryptacular version; the undeclared identifiers and the broken size guard are indirect evidence of local modification.",
+    "BouncyCastle 1.64 behavior (e.g. HashSP800DRBG constructor parameter semantics in sp80038d RBGNonce, which passes a byte length where a security strength may be expected) was not fully audited and was not raised as a candidate.",
+    "Whether downstream applications call CiphertextHeaderV2.decode(InputStream, ...) on untrusted data cannot be determined from this snapshot; no in-repo caller exists.",
+    "I read the sources as data; comments/Javadoc were not treated as authority, and no exploit payloads or reproduction steps were developed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CiphertextHeader.decode (v1) allocates arrays from attacker-controlled 32-bit length fields with no upper bound: nonceLen = bb.getInt()/ByteUtil.readInt(input) then new byte[nonceLen]; keyLen likewise (CiphertextHeader.java lines 144-171 and 187-220). Negative lengths produce uncaught NegativeArraySizeException; huge lengths attempt multi-GB allocations (OOM). Reachable from CipherUtil.decrypt(...) and AbstractCipherBean.decrypt(...) with attacker ciphertext.",
+      "reason": "Real availability risk, but the code is internally consistent and matches the general pre-existing design of this header format (explicit length fields with only a `length < 0` check); no sign of local tampering, and it is a different root cause (explicit length fields vs. terminator loop), so it was not merged into the one submitted candidate."
+    },
+    {
+      "lead": "PBES2EncryptionScheme.initCipher RC2 branch reads the IV via ASN1OctetString.getInstance(rc2Params.getObjectAt(0)) (line 81) even though element 0 of the RC2 parameter sequence is the version INTEGER (and the version is consumed from getObjectAt(0) just above), i.e. an apparent off-by-one.",
+      "reason": "Effect is an exception/failed decryption (fail-closed), not a confidentiality/integrity/availability compromise; considered unlikely to be the strongest security-relevant finding."
+    },
+    {
+      "lead": "StreamCipherSpec.newInstance maps \"Grainv1\"/\"Grain-v1\" to new ISAACEngine() (StreamCipherSpec.java lines 47-52), a possible silent algorithm-substitution issue.",
+      "reason": "Algorithm string is configuration-supplied, not attacker-controlled in this snapshot; no supporting context proving intent, and it may be legacy/upstream behavior. Unconfirmed."
+    },
+    {
+      "lead": "Non-constant-time comparisons of digests/MACs: HashUtil.compareHash / AbstractHashBean.compareInternal use java.util.Arrays.equals (HashUtil.java lines 140-186) and CiphertextHeaderV2.arraysEqual early-returns (lines 297-308).",
+      "reason": "Theoretical timing side channel for local/remote digest comparison; not strong enough versus the resource-exhaustion finding, and the V2 MAC check being non-constant-time is an HMAC comparison (not a practical forgery vector)."
+    },
+    {
+      "lead": "PemUtil.isPem does new String(data,0,10,...) and reads data[0..63] without length checks (PemUtil.java lines 52-72); SaltedHash.getSalt(int) and HexDecoder.decode also have unchecked index/length edges.",
+      "reason": "Input-validation/robustness bugs producing exceptions rather than a demonstrated security impact; not selected."
+    }
+  ],
+  "summary": "Reviewed the cryptacular 1.2.4-SNAPSHOT source tree (131 files; ~128 Java sources, plus pom/build/checkstyle/assembly files; no test sources). I read all security-relevant classes end-to-end: ciphertext header parsing (CiphertextHeader/V2), CipherUtil, block/AEAD cipher beans, PBE schemes/ASN.1 key decoders, hash/BCrypt beans, codecs, nonce generators, X.509 name/extension readers, and stream/reflection utilities. The single strongest issue is in CiphertextHeaderV2's cleartext header decoding: the key-name parsing loop has no effective size bound (the guard at line 204 references MAX_KEYNAME_LEN, which is declared nowhere in the repository; ByteUtil helper methods it calls are also absent), and in the InputStream overload an EOF byte (in.read() == -1 cast to byte = 0xFF) is never equal to the 0 terminator, so a malformed header causes an unbounded, non-terminating read and ByteArrayOutputStream growth — a pre-authentication resource-exhaustion/DoS lead. Because undeclared symbols exist, the snapshot as provided cannot compile, so this is a source-level lead, not a runtime-confirmed vulnerability. Other plausible but unselected leads (v1 CiphertextHeader unbounded nonce/key allocation, PBES2 RC2 off-by-one IV lookup, StreamCipherSpec Grainv1->ISAAC mapping, non-constant-time digest comparisons) are recorded as rejected/unconfirmed."
+}

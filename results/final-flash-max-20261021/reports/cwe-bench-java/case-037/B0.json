@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls: (a) GET /submit?resumableFilename=...&resumableIdentifier=...&resumableChunkNumber=...&resumableCurrentChunkSize=... (doDSGet lines 146/216-222 -> DoGetResumable), which lets them mkdir a directory named by resumableIdentifier under the upload temp dir and probe part<chunkNumber> files; (b) POST /submit as multipart/form-data containing resumableIdentifier/resumableChunkNumber before a file part (doDSPost lines 243-260 -> doPostResumable -> FileUploadRequest lines 98-111 writes the chunk bytes into tempDir/resumableIdentifier/part<chunkNumber>); (c) the final multipart POST carrying resumableTotalChunks, resumableTotalSize and the path-traversal value in resumableFilename, which is flushed to disk by makeFileFromChunks (lines 1700-1712). All three parameters are raw request parameter strings; no validation is performed on them.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified Bitstream.retrieve() performs its own READ authorization (so unrelated bitstream servlets are not the sink); checked that /submit is behind RegisteredOnlyFilter (not unauthenticated) and that the resumable branches run before any workspace-item checks; checked FileUploadRequest.getFilename() exists but is applied only to normal upload filenames and not to resumableFilename used by makeFileFromChunks; verified makeFileFromChunks' finally only deletes the chunk directory, and the only destination-file delete (line 300) is skipped when UploadStep.processUploadFile throws (null submission item). Did not execute code or confirm persistence/runtime behavior; path resolution depends on the configured upload temp dir and filesystem write permissions.",
+      "id": "cand-001",
+      "impact": "Arbitrary file write/truncation with attacker-controlled content as the DSpace service user. A registered user can overwrite configuration or web resources and can write a JSP/script into a servlet-container-served web application directory, which typically results in remote code execution under the DSpace/Tomcat account; zero-length writes can also destroy config/state (denial of service). The GET side independently allows creation of attacker-named directories and existence/size probing of part<n> files.",
+      "locations": [
+        {
+          "end_line": 1712,
+          "path": "dspace-jspui/src/main/java/org/dspace/app/webui/servlet/SubmissionController.java",
+          "start_line": 1697
+        },
+        {
+          "end_line": 264,
+          "path": "dspace-jspui/src/main/java/org/dspace/app/webui/servlet/SubmissionController.java",
+          "start_line": 243
+        },
+        {
+          "end_line": 1611,
+          "path": "dspace-jspui/src/main/java/org/dspace/app/webui/servlet/SubmissionController.java",
+          "start_line": 1571
+        },
+        {
+          "end_line": 111,
+          "path": "dspace-jspui/src/main/java/org/dspace/app/webui/util/FileUploadRequest.java",
+          "start_line": 98
+        }
+      ],
+      "prerequisites": "Network access to the JSPUI webapp and a registered account (web.xml maps /submit behind the RegisteredOnlyFilter; self-registration is commonly enabled). The DSpace/Tomcat process must be able to write the traversal target path (normal for its own temp dir, config dir, and typically the webapp deployment dirs when they are writable/symlinked as in the shipped Dockerfile). Because FileUploadRequest only writes a chunk when the chunk directory already exists, the attacker first uses the GET resumable request (or the first POST) to create that directory under the temp dir.",
+      "root_cause": "SubmissionController.makeFileFromChunks() builds the destination path as tmpDir + File.separator + resumableFilename, where resumableFilename is the raw multipart form field value (request.getParameter(\"resumableFilename\")) with no path-component stripping/validation. The same request family lets the attacker control resumableIdentifier (used to build the chunk directory) and resumableChunkNumber (used to build chunk file names), and FileUploadRequest writes the uploaded chunk to tempDir + File.separator + resumableIdentifier + \"/part\" + resumableChunkNumber. Thus an attacker can assemble attacker-supplied chunk bytes and write them to a traversal-selected path relative to upload.temp.dir/java.io.tmpdir.",
+      "title": "JSPUI resumable upload path traversal: attacker-controlled resumableFilename/resumableIdentifier used in filesystem paths (arbitrary file write)",
+      "trace": "GET /submit?resumableFilename=x&resumableIdentifier=<dir>&resumableChunkNumber=1&resumableCurrentChunkSize=1 -> SubmissionController.doDSGet (line 146 reads resumableFilename, lines 216-222 call DoGetResumable) -> DoGetResumable lines 1583-1597 computes tempDir = tempDir + File.separator + resumableIdentifier, mkdirs it, and probes tempDir/part<n> (unsanitized identifier; also allows arbitrary single-level directory creation and file existence/size probing). POST /submit (multipart) with resumableIdentifier/resumableChunkNumber fields before the file part -> doDSPost lines 243-260 -> doPostResumable (lines 1650-1693: chunkDirPath = tempDir + File.separator + resumableIdentifier; checks part1..partN and totals; resumableTotalSize/Chunks are attacker supplied) -> when foundAll && currentSize >= resumableTotalSize, makeFileFromChunks lines 1700-1712 reads resumableFilename raw and does destFile = new File(tmpDir + File.separator + resumableFilename), createNewFile(), new FileOutputStream(destFile) (truncates existing files), and copies attacker-controlled chunk bytes. Back in doDSPost lines 278-303 the assembled file is opened and passed to UploadStep.processUploadFile; because no workspace/workflow id is supplied, getSubmissionInfo returns a SubmissionInfo whose submission item is null, so UploadStep line 535 (subInfo.getSubmissionItem().getItem()) throws NullPointerException before the cleanup at line 300 (completedFile.delete()), leaving the written file on disk. Using resumableTotalChunks=0/resumableTotalSize=0 reaches makeFileFromChunks without any chunk and returns a zero-length file that is also never deleted (length()>0 is false), giving arbitrary file creation/truncation on its own.",
+      "unverified": "Runtime exploitability was not executed. Whether the final destination file persists in a specific deployment depends on the NPE path being taken (requiring that no valid workspace/workflow item is supplied) and on filesystem permissions of the target; the exact upstream fix/commit and CVE mapping were not consulted. The chunk-directory creation via GET assumes the temp-dir parent is writable, which is the normal configuration.",
+      "weakness_type": "CWE-22 Path Traversal (leading to CWE-434 unrestricted/arbitrary file write; possible RCE)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 2,286 text files reported by get_source_scope (no binaries, no symlinks excluded). Focused on web-facing code paths: JSPUI servlets (SubmissionController, FileUploadRequest, Bitstream/Retrieve/HTML/Suggest/ControlledVocabulary/SearchResultLog/OpenSearch/SearchResultLog, edit/admin servlets and web.xml filter mappings), JSPUI JSPs, XMLUI actions/transformers (including SafeResourceReader/ThemeResourceReader and authentication actions), dspace-rest resources/token handling, dspace-sword/swordv2 deposit and parsing paths, dspace-oai controllers, dspace-lni DAV servlet, and core dspace-api areas (authorization, content, browse/DAO, statistics/LogAnalyser, packagers, authenticators, media filter exec calls). Searched for command execution, SQL concatenation, XML parsers, path construction from request parameters, redirects, file upload/extraction, and missing authorization checks. The resumable-upload file-write path was traced end to end; other areas were sampled rather than exhaustively line-reviewed.",
+  "limitations": [
+    "No code execution, build, or runtime testing was performed; all conclusions are source-level.",
+    "The snapshot's upstream commit/CVE identity is unknown; no patch, advisory, or ground-truth data was consulted.",
+    "2286 files is large, so many JSPs/actions were reviewed by pattern search rather than exhaustively; configuration files under dspace/config and XMLUI sitemaps/xconfs were not present/visible in scope, so deployment-specific bindings could not be fully verified.",
+    "The candidate's persistence argument depends on the NullPointerException path in UploadStep (submission item null) skipping the destination-file delete; exact filesystem permissions and temp-dir configuration in a given deployment were not verifiable from source alone.",
+    "For the GET resumable probe, behavior depends on the servlet container's handling of non-numeric resumableChunkNumber/resumableCurrentChunkSize (unhandled NumberFormatException is expected to abort the request before the path check)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Open redirect in ControlledVocabularyServlet.doDSGet: response.sendRedirect(callerUrl) with callerUrl straight from the request (/controlledvocabulary, no auth filter).",
+      "reason": "Genuine but low-severity (unvalidated redirect) and only one of several similar redirect sinks (SearchResultLogServlet /dso-display also redirects to a raw redirectUrl parameter); not the strongest impact in this tree and less clearly tied to a high-value trust boundary."
+    },
+    {
+      "lead": "Open redirect / host-header-derived redirects in JSPUI Authenticate/UIUtil.getOriginalURL and XMLUI LoginRedirect/AuthenticateAction (sendRedirect of stored/session original URL).",
+      "reason": "Values are derived from request URI/session state rather than arbitrary absolute URLs in most paths; impact is phishing-class and requires additional conditions, so it was not selected."
+    },
+    {
+      "lead": "Reflected/stored XSS candidates in JSPUI views (e.g., suggest.jsp line 85/123 raw title/handle; search/discovery.jsp line 191 raw dso.getName() and line 199 raw spellCheckQuery).",
+      "reason": "Several unescaped outputs exist, but reachability is constrained (suggest page requires a resolvable item handle and a same-host Referer; spellcheck text comes from Solr tokens), so none reached the evidence threshold of the file-write candidate."
+    },
+    {
+      "lead": "SQL string concatenation in LogAnalyser.getNumItems (type value) and UpdateHandlePrefix (old/new handle prefixes).",
+      "reason": "Both run in command-line administrator tooling with arguments supplied by the local operator, not web-reachable attacker input; DatabaseManager's SET CONSTRAINTS concatenation also uses a class-provided constant."
+    },
+    {
+      "lead": "XML parsing with default DocumentBuilderFactory/SAXParserFactory in MetadataWebService ctask, ControlledVocabulary, WorkflowFactory, ItemImport, and SHERPA/LC authority clients (XXE-style exposure).",
+      "reason": "Inputs are local configuration/CLI files or responses from administrator-configured remote services; no request-controlled XML reaches these parsers in the inspected paths, so it is a hardening concern rather than a demonstrated attacker-controlled issue."
+    },
+    {
+      "lead": "HTMLServlet serving item bitstreams with their stored MIME type (text/html) inline (possible stored XSS via uploaded HTML).",
+      "reason": "Bitstream.retrieve() enforces READ authorization and this is long-standing DSpace behavior gated by deployment settings; it is a design risk, not a single clearly-changed vulnerable line."
+    }
+  ],
+  "summary": "The snapshot is a DSpace 5.10 JSPUI/XMLUI/REST/SWORD/OAI source tree. After broad sampling of web-facing entry points (JSPUI servlets and JSPs, XMLUI actions, REST resources, SWORD/OAI/LNI), the strongest source-evidenced issue is in the JSPUI \"resumable upload\" handling: the multipart parameter `resumableFilename` (and `resumableIdentifier`/`resumableChunkNumber`) is taken directly from the request and concatenated into filesystem paths, giving any registered user an arbitrary-file-write / path-traversal primitive (potential RCE via writing into a deployed web application, plus arbitrary file truncation/creation and directory probing). Other plausible but weaker leads (open redirects, XSS, CLI-only SQL string building, config-driven XML parsing) are listed as rejected/unconfirmed."
+}

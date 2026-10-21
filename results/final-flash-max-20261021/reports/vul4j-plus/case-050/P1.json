@@ -1,0 +1,82 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated HTTP client that can reach <context>/monitoring (the shipped web-fragment.xml maps MonitoringFilter to /* with no security constraint and no code-level authentication; allowed-addr-pattern is null by default) fully controls the query parameters `action`, `counter`, `part` and `graph`, and any client controls the `X-Forwarded-For` request header (used to plant the stored sessions-page payload).",
+      "confidence": "high",
+      "counterevidence_checked": "Checked that (1) actions other than CLEAR_COUNTER/MAIL_TEST require system-actions-enabled — CLEAR_COUNTER is explicitly exempt, so the primary vector is unaffected; (2) some writers do call htmlEncode (request names, session ids, remote user), which shows the project's own convention and indicates the raw writes are missing encoding rather than internally sanitized data; (3) the `resource` parameter is protected by replace(\"..\",\"\") and classpath lookup, so that path is not the issue; (4) the monitoring URL is documented to be protected by deployers (allowed-addr-pattern / security constraints) — this is a deployment mitigation that can reduce exposure but is not implemented in code, and the stored X-Forwarded-For variant can be planted by any app user; (5) no global escaping filter, CSP, or output-encoding wrapper exists around these writers in the snapshot.",
+      "id": "javamelody-monitoring-report-xss",
+      "impact": "Script execution in the origin of the monitored application (the monitoring filter runs inside the app), so the attacker's script can read the monitoring data (including session details/attributes) and the user's cookies, and can silently invoke monitoring actions exposed by the page/URLs (GC, heap dump, thread kill, session invalidation, cache clearing, file purge) with the victim's access; the stored X-Forwarded-For variant does not even require the victim to click a crafted link.",
+      "locations": [
+        {
+          "end_line": 320,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/HtmlCoreReport.java",
+          "start_line": 296
+        },
+        {
+          "end_line": 126,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/MonitoringController.java",
+          "start_line": 100
+        },
+        {
+          "end_line": 132,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/Action.java",
+          "start_line": 127
+        },
+        {
+          "end_line": 160,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/I18N.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 392,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/HtmlCounterReport.java",
+          "start_line": 350
+        },
+        {
+          "end_line": 163,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/HtmlSessionInformationsReport.java",
+          "start_line": 158
+        },
+        {
+          "end_line": 322,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/MonitoringFilter.java",
+          "start_line": 313
+        }
+      ],
+      "prerequisites": "Monitoring URL reachable by the attacker and, for the reflected variants, a user with access loading the crafted URL (standard reflected-XSS delivery) — no system-actions setting is required because CLEAR_COUNTER is exempt and the graph part is not gated. The stored X-Forwarded-For variant additionally requires the application to create a session for the attacker's request and the SessionListener to be registered (standard web-fragment.xml setup).",
+      "root_cause": "The HTML report writers embed values derived from HTTP requests in HTML attributes and JavaScript string/script contexts without context-appropriate escaping. `I18N.javascriptEncode` (javamelody-core/src/main/java/net/bull/javamelody/I18N.java:137-140) and its alias `urlEncode` (142-144) escape only backslash, newline, double and single quotes (not `<` or `/`), and `I18N.htmlEncode` (152-160) does not escape quotes. `HtmlCoreReport.writeMessageIfNotNull` (HtmlCoreReport.java:296-320) writes the action-result anchor directly into a JS single-quoted string with no encoding at all (lines 309-312), and the preceding `alert(...)` uses the bypassable `javascriptEncode` (line 301). The anchor/message are populated with the raw `counter` request parameter through `MonitoringController.executeActionIfNeeded` (MonitoringController.java:100-126, lines 108-119) and `Action.getContextName`/`Action.clearCounter` (Action.java:127-132 and 264-278). `Action.CLEAR_COUNTER` is explicitly excluded from `checkSystemActionsEnabled` (MonitoringController.java:109-111), and `collector.clearCounter` silently ignores unknown counter names (Collector.java:876-879), so an arbitrary payload is reflected into the page. Separately, `HtmlCounterReport.writeGraphDetailScript` (HtmlCounterReport.java:350-392, line 378) embeds the `graph` parameter through `urlEncode` inside a `<script>` block, so a `</script>` payload breaks out; and `HtmlSessionInformationsReport.writeSession` (HtmlSessionInformationsReport.java:158-163) writes the session remote address raw, which `MonitoringFilter.putUserInfoInSession` (MonitoringFilter.java:313-322) builds from the attacker-supplied `X-Forwarded-For` header (stored XSS on the sessions page).",
+      "title": "Cross-site scripting in the JavaMelody monitoring reports via request-controlled values written into HTML/JavaScript without proper encoding (action message/anchor from `counter`, `graph` script block, X-Forwarded-For session address)",
+      "trace": "Reflected vector A (no config needed): GET /monitoring?action=clear_counter&counter=';alert(document.cookie)// → MonitoringFilter.doMonitoring (MonitoringFilter.java:333-362) → MonitoringController.doActionIfNeededAndReport (128-142) → executeActionIfNeeded: Action=CLEAR_COUNTER, checkSystemActionsEnabled skipped (109-111), counterName = payload (112); Action.clearCounter formats 'Statistiques_reinitialisees' with the raw name and returns a no-op message (Action.java:264-278) and getContextName returns the raw counter as anchor (Action.java:127-132). doReport → doReportCore (format null) → doCompressedHtml → HtmlController.doHtml with part==null (HtmlController.java:82-109) → HtmlReport.toHtml(message, anchor) → HtmlCoreReport.writeMessageIfNotNull(message, null, anchor); lines 309-312 emit `location.href = '#<payload>';`, so the single quote closes the JS string and the injected code runs when the page loads. Vector B (graph): GET /monitoring?part=graph&graph=</script><script>alert(1)</script> → HtmlController.doHtmlPart → HtmlReport.writeRequestAndGraphDetail → HtmlCounterRequestGraphReport.writeRequestAndGraphDetail; for an unknown id, request==null and isGraphDisplayed returns true, then writeGraphDetailScript emits `...src = '?graph=<urlEncode(graph)>...'` inside a script element; urlEncode leaves `<` and `/` intact, so `</script>` terminates the block and the injected script executes. Vector C (stored, header): a request with X-Forwarded-For: <script>…</script> that creates a session stores `remoteAddr + ' forwarded for ' + header` in the session (MonitoringFilter.java:313-322); SessionInformations exposes it (SessionInformations.java:136-141) and HtmlSessionInformationsReport.writeSession (158-163) writes it unencoded, firing for any user who opens ?part=sessions. The same partial-encoding defect is also present in the collector UI (CollectorServlet.doPost appName → CollectorController.showAlertAndRedirectTo:433-441 raw `redirectTo`, and HtmlCoreReport.writeApplicationsLinks:706-734 raw application names), which I list as a related instance rather than a separate candidate.",
+      "unverified": "No code was executed; browser-level behavior of the `</script>` breakout and of the raw anchor injection is inferred from standard HTML/JS parsing, not runtime-confirmed. Whether a given deployment adds a security constraint on /monitoring is unknown. The stored variant assumes the monitored app creates a session for the attacker's request and that SessionListener is registered (standard per META-INF/web-fragment.xml). Which exact vector (if any) matches a reference CVE could not be verified without ground-truth data.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation (Cross-site Scripting)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 287 model-visible source files (no symlinks/sensitive-path exclusions, no files over 5 MiB); get_relation_scope reports the P1 index covered all 287 files with 0 mismatches and 0 missing, and explicitly states it is name/syntax-based navigation only (not SAST, no data-flow/reachability/exploitability proof, no build or tests run). I reviewed the javamelody-core request entry points and report writers in depth (MonitoringFilter, MonitoringController, HtmlController/HtmlCoreReport/Html*Report, Action/Parameters/I18N, SerializableController, CollectorServlet/CollectorController/CollectorServer/RemoteCollector/LabradorRetriever/TransportFormat, DatabaseInformations, MBeans, JndiBinding, SessionListener/SessionInformations, VirtualMachine/HeapHistogram/PID/ProcessInformations, CustomResourceFilter, Jira/Plugin/Liferay filters, web.xml/web-fragment.xml, help/translations), and skimmed the swing module, collector/demo/test webapps and build files. No code, tests or scanners were executed.",
+  "limitations": [
+    "No runtime verification: all conclusions are from source reading; the XSS payloads were not executed and no browser/DOM behavior was observed.",
+    "The monitoring page is documented to be protected by deployers (security constraints / allowed-addr-pattern); actual exposure is deployment-dependent and unknown here.",
+    "The P1 relation index is syntactic/name-based only: its 'security_call' facts (e.g., output/deserialization/sql) are navigation hints, not findings, and no call-graph or taint results were used as proof.",
+    "javamelody-swing, the demo/test webapps, JS/CSS/properties resources and PDF/XStream code paths were reviewed only at a skim level; PdfController/Pdf* reports were not exhaustively traced.",
+    "The exact vector a reference vulnerability database would key on (if any) cannot be confirmed; no CVE/patch/ground-truth data was consulted.",
+    "The stored X-Forwarded-For variant assumes the application creates a session for the attacker's request and SessionListener is active, which I could not verify for a specific deployment."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Insecure deserialization: TransportFormat.readSerializableFrom (TransportFormat.java:231-258) uses ObjectInputStream.readObject (and XStream.fromXML for text/xml) on the HTTP response body fetched by LabradorRetriever (LabradorRetriever.java:279-302) from monitored-application URLs, reachable in collector mode via the unauthenticated POST add-application form (CollectorServlet.java:122-140 → CollectorServer.addCollectorApplication/collectForApplication), which could give RCE on the collector server.",
+      "reason": "Attacker control requires collector-server deployment plus a malicious or attacker-registered application URL, and a classpath gadget; the monitored application is a configured/trusted peer by design, and I found no unconditional path from an untrusted client in the non-collector role. Strong but conditional; not submitted."
+    },
+    {
+      "lead": "Missing authorization on 'explainPlan': SerializableController.java:188-192 and CollectorController.java:311-313 handle part=explainPlan without Action.checkSystemActionsEnabled, taking SQL text from the `request` HTTP header and executing `explain plan ... for <sql>` via Statement.execute (DatabaseInformations.java:329-399).",
+      "reason": "Impact is limited to EXPLAIN PLAN (not general SQL execution), the sink requires a direct monitoring request with a custom header (not CSRF-able), and the text after ';' is truncated; no demonstrable concrete impact beyond error/schema disclosure."
+    },
+    {
+      "lead": "Collector-mode stored XSS via application name and SSRF via app URLs (CollectorServlet.java:122-140 → CollectorController.showAlertAndRedirectTo:433-441 raw redirectTo; HtmlCoreReport.writeApplicationsLinks:706-734 raw application name; CollectorController.doJmxValue/doProxy build URLs from configured applications).",
+      "reason": "Same missing-encoding class as the submitted candidate but requires collector mode, a successful initial collect from the attacker-supplied URL, and a viewing admin; mentioned in the trace as a related instance rather than a second candidate."
+    },
+    {
+      "lead": "Unauthenticated system actions (gc, heap dump, kill thread, invalidate sessions, clear caches) reachable via the monitoring URL; Parameter.java:166 documents 'false par défaut' while Parameters.isSystemActionsEnabled (Parameters.java:314-317) returns true when the parameter is absent.",
+      "reason": "This appears to be the documented operating model (the deployer is told to protect /monitoring, and the demo webapp explicitly sets the parameter to true and adds a ForbiddenActionsFilter); the doc/code mismatch looks like stale documentation, not a code-level authorization flaw I could substantiate."
+    }
+  ],
+  "summary": "Review of javamelody 1.47.0-SNAPSHOT (core, swing, collector, demo/test webapps). Entry points are the monitoring filter/controller (MonitoringFilter → MonitoringController/HtmlController/PdfController/SerializableController) and the collector servlet/controller. The strongest distinct, source-substantiated issue is cross-site scripting in the monitoring reports: request-controlled values (action result message/anchor derived from the `counter` parameter, the `graph` parameter, and the X-Forwarded-For header stored as the session remote address) are concatenated into HTML/JavaScript without context-appropriate encoding, while the codebase's own encoders are incomplete (I18N.javascriptEncode/urlEncode escape only \\\\, \\\\n, quotes; htmlEncode does not escape quotes). `Action.CLEAR_COUNTER` is explicitly exempt from `checkSystemActionsEnabled`, so the strongest vector needs no configuration and no prior state; the monitoring URL is mapped to /* with no authentication/security constraint in the shipped web-fragment.xml. Other reviewed issues (collector-side deserialization/XStream, explainPlan without system-actions gating, collector app-name handling) are weaker or deployment-conditional and are listed as rejected leads."
+}

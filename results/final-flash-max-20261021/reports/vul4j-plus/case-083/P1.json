@@ -1,0 +1,64 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Indirect: any application that places untrusted data into a response header value (a very common pattern: custom headers, Set-Cookie values, Location/Refresh, debugging headers). The 2016 Undertow header-injection issue (CVE-2016-4993) is based on exactly this trust model. Direct attacker influence of headers that Undertow itself builds is limited, and cookie values parsed from requests normally cannot contain raw CR/LF, so the defect is primarily a defense the library fails to apply consistently rather than an unauthenticated direct injection.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the fast path really sanitizes both reason phrase and values (writeString at 191/233); verified header names are protected by HttpString newline checks; verified the AJP conduit sanitizes equivalents; checked that request-derived cookie values normally cannot carry raw CR/LF into a response header; checked that the stateful path is only entered on buffer exhaustion; confirmed the anomaly is localized (no similar raw write elsewhere in the HTTP conduit).",
+      "id": "undertow-httpresponseconduit-stateful-crlf",
+      "impact": "If reachable, an injected '\\r\\n' in a response header value lets an attacker terminate the header block early and inject arbitrary headers or a second response on the connection (response splitting), enabling cookie/session fixation, cache poisoning, or script injection in a victim's browser. The same write truncates non-Latin-1 characters (char cast to byte), a secondary correctness/encoding issue.",
+      "locations": [
+        {
+          "end_line": 425,
+          "path": "core/src/main/java/io/undertow/server/protocol/http/HttpResponseConduit.java",
+          "start_line": 405
+        },
+        {
+          "end_line": 312,
+          "path": "core/src/main/java/io/undertow/server/protocol/http/HttpResponseConduit.java",
+          "start_line": 301
+        },
+        {
+          "end_line": 234,
+          "path": "core/src/main/java/io/undertow/server/protocol/http/HttpResponseConduit.java",
+          "start_line": 220
+        }
+      ],
+      "prerequisites": "1) A response header value containing CR or LF reaches the exchange. 2) Response header serialization overflows the pooled header buffer so processStatefulWrite(STATE_HDR_VAL) is used for that value (e.g., ~16 KiB of response headers, large Set-Cookie/echoed values, or a reduced buffer pool under memory pressure). 3) The application does not filter the value itself. Entity-body status codes/HEAD responses etc. do not remove the header-serialization path.",
+      "root_cause": "HttpResponseConduit enforces CR/LF-to-space substitution only when a header value fits into the pooled header buffer. In the fallback path used when the buffer is exhausted, the header value is written out byte-for-byte without the sanitization step, so the file's own invariant (\"header values are sanitized before reaching the wire\") does not hold for large header sets.",
+      "title": "Header-value CR/LF neutralization skipped in HttpResponseConduit's stateful (large-header) writer",
+      "trace": "processWrite() writes the status line/reason phrase and each header value via writeString(), which replaces '\\r' and '\\n' with spaces (lines 301-312, used at 191 and 233). If the header value does not fit in the pooled buffer, state is moved to STATE_HDR_VAL and processStatefulWrite() is entered (lines 223-232). There, case STATE_HDR_VAL does `buffer.put((byte) string.charAt(charIndex++))` (line 409) with no CR/LF check, so the bytes are emitted verbatim; the char is also narrowed to a byte. Counter-checks: the AJP response writer (AjpServerResponseConduit.putString, lines 150-162) performs the same CR/LF-to-space substitution for header values, confirming the intended invariant; the same snake path for header names is protected because HttpString rejects CR/LF at construction (HttpString.checkForNewlines, lines 127-133).",
+      "unverified": "I could not diff against upstream Undertow or run any code, so I cannot exclude that this omission exists in released upstream code rather than being a regression introduced in this snapshot. Reachability with an attacker-influenced CR/LF-bearing header value was not demonstrated end-to-end; it depends on application behavior and on exceeding the pooled header-buffer size. The P1 index is syntactic only and cannot prove data flow.",
+      "weakness_type": "CWE-113 Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Response Splitting') / header injection"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 923-file snapshot (core, servlet, websockets-jsr, benchmarks, examples) using both raw source and the P1 syntactic relation index (index_status complete; 923/923 files indexed; 35,359 call rows/31,911 edges/604 name-based facts; navigation only, no data-flow or reachability proof). Inspected HTTP/1.1 and HTTP/2 request parsing and response conduits, transfer-encoding handling, cookie parsing/serialization, authentication mechanisms, servlet security-constraint/path matching, resource serving and symlink checks, proxy/mod_cluster, sessions, and logging/error pages. There are no test sources in the snapshot and no upstream diff or release artifacts were available.",
+  "limitations": [
+    "No runtime/build execution and no upstream baseline: I could not confirm whether the stateful-writer omission is upstream code or a regression, nor reproduce response splitting end-to-end.",
+    "Reachability of the fallback writer with a CR/LF-bearing attacker-influenced header value is conditional (application behavior plus header volume exceeding the pooled buffer); the claim is source-evidence based, not runtime-confirmed.",
+    "The P1 index is syntactic/navigation-only: it cannot prove call reachability, data flow, or exploitability, and its absence of a record for an area is not evidence that the area is safe.",
+    "No test sources exist in the snapshot, so no test-name/behavioral corroboration was possible; documentation, examples, and remaining low-level framing code were skimmed rather than exhaustively read."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Http2UpgradeHandler.handleRequest: `if(HttpContinue.requiresContinueResponse(exchange) && false)` (core/src/main/java/io/undertow/server/protocol/http2/Http2UpgradeHandler.java lines 79-98) permanently disables the Expect: 100-continue branch for h2c upgrades, leaving its callback as dead code.",
+      "reason": "This is a clear anomaly (only `&& false` in the tree) and is inconsistent with Http2ReceiveListener.handleInitialRequest marking the continue as sent (lines 227-229), but I could not establish a concrete attacker security impact: a malicious client can already stall a request body without Expect, the interplay does not obviously produce request smuggling, and the observed effect is at most an interop/hang issue. Kept out of the candidate list because it fails the 'concrete security impact' evidence bar."
+    },
+    {
+      "lead": "CanonicalPathUtils line 32: Boolean.parseBoolean(\"io.undertow.DONT_CANONICALIZE_BACKSLASH\") parses the literal instead of System.getProperty(...), so the documented escape hatch can never be enabled.",
+      "reason": "Dead configuration code, but the forced behavior (always canonicalizing backslashes) is the stricter direction; no traversal or bypass follows from it."
+    },
+    {
+      "lead": "ProxyPeerAddressHandler.mostRecent (lines 132-139) takes the first X-Forwarded-For/X-Forwarded-Proto element, which is spoofable if an upstream proxy appends rather than replaces the header.",
+      "reason": "Explicitly documented as requiring a proxy that always sets/strips these headers ('This should only be used behind a proxy that always sets this header'); by-design trust assumption rather than a code defect."
+    },
+    {
+      "lead": "DirectoryUtils.renderDirectoryListing inserts resource names into HTML links/text without HTML escaping (lines 137-139).",
+      "reason": "Requires directoryListingEnabled plus attacker-controlled file names on disk; plausible stored XSS but weaker and more configuration-dependent than the selected candidate, and I could not confirm it deviates from upstream."
+    },
+    {
+      "lead": "HttpRequestParser/URLUtils parameter-count comparisons differ (>= in handleQueryParameters vs > in URLUtils) and multiple auth mechanisms reproduce expected structures.",
+      "reason": "Difference tightens rather than loosens limits; reviewed Basic/Digest/Form auth, SecurityPathMatches, Connectors.areRequestHeadersValid, cookie parsing and resource managers without finding a stronger concrete issue."
+    }
+  ],
+  "summary": "Undertow 2.2.15.Final-SNAPSHOT source review (core/servlet/websockets-jsr/benchmarks/examples; 923 files, no test sources). I traced HTTP request parsing, response writing, transfer-encoding handling, cookie/session handling, authentication mechanisms, servlet security-constraint matching, resource serving and proxy paths. The strongest defensible lead is an asymmetric CRLF neutralization in the HTTP response header writer: the fast path sanitizes header values, but the large-header (\"stateful\") fallback writes header-value bytes verbatim, which can permit HTTP response splitting/header injection (CWE-113) when a response header value that contains CR/LF is large enough (or is preceded by enough headers) to push serialization into the fallback path."
+}

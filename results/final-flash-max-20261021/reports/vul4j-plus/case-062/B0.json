@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The tar.gz entries inside the archive supplied to `neo4j-admin load --from <archive>` (entry names such as '../../<path>/file', absolute '/<path>/file', or a directory entry followed by file entries). Archive contents are fully attacker-controlled; `TarArchiveInputStream.getNextEntry()` returns entry names verbatim.",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched the Loader and its helpers for any normalization/containment validation: none (no `normalize`, `startsWith`, `toRealPath`, or `isSameOrChildPath` usage in community/dbms archive classes). `Loader.validatePath` only checks that the destination directories themselves do not already exist and that their parent is writable - it never inspects entry names. `Dumper` writes entries as './'+relative paths, but that is irrelevant to a hostile archive processed by the Loader. `LoadCommand` canonicalizes only the operator-provided destination paths. The project does use containment helpers elsewhere (`Util.isSameOrChildPath`), so the omission here is not an API limitation. No code execution, tests, or PoC were run; no upstream fix metadata is available in the snapshot.",
+      "id": "case-062-loader-zip-slip",
+      "impact": "Arbitrary file write/overwrite and directory creation with the privileges of the process running `neo4j-admin load` (commonly the neo4j service account, and root in some container/distribution setups). Files that are writable by that account can be clobbered (database/config/log/script/plugin locations), which can lead to data destruction, denial of service, or code execution if a location that is later parsed or executed can be overwritten. Integrity and availability impact on the host and database.",
+      "locations": [
+        {
+          "end_line": 113,
+          "path": "community/dbms/src/main/java/org/neo4j/dbms/archive/Loader.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 59,
+          "path": "community/dbms/src/main/java/org/neo4j/dbms/archive/Loader.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 85,
+          "path": "community/dbms/src/main/java/org/neo4j/dbms/archive/Loader.java",
+          "start_line": 79
+        },
+        {
+          "end_line": 88,
+          "path": "community/dbms/src/main/java/org/neo4j/commandline/dbms/LoadCommand.java",
+          "start_line": 73
+        }
+      ],
+      "prerequisites": "An operator runs `neo4j-admin load` against an archive obtained from an untrusted source (e.g. a shared/received dump). The OS user running neo4j-admin must have write permission on the target paths the attacker chooses. No server-side authentication is involved; this is a local CLI action on attacker-supplied data.",
+      "root_cause": "Loader.extract loop trusts archive entry names. In `loadEntry`, `Path file = destination.resolve(entry.getName())` is used directly for `Files.createDirectories(file)` and `Files.newOutputStream(file)` with no `normalize()` and no containment check that the result stays under `destination`. `determineEntryDestination` only looks at `Paths.get(entry.getName()).getFileName()` to choose between the database and transaction-log directories, so it does not constrain the full path used for extraction. Nothing in the Loader (or its helpers `Utils`, `IncorrectFormat`) sanitizes, rejects, or re-roots entry names, even though a containment helper (`Util.isSameOrChildPath`) exists elsewhere in the command-line module.",
+      "title": "Zip Slip path traversal (arbitrary file write) in neo4j-admin load archive extraction",
+      "trace": "1) `LoadCommand.execute` (community/dbms/.../commandline/dbms/LoadCommand.java:73-88) computes canonical `databaseDirectory`/`transactionLogsDirectory` and calls `Loader.load(archive, databaseDirectory, transactionLogsDirectory)`. 2) `Loader.load` (Loader.java:43-60) opens the tar.gz and loops over `nextEntry`. 3) `determineEntryDestination` (Loader.java:79-85) routes entries only by base name; it does not sanity-check the path. 4) `loadEntry` (Loader.java:99-113) does `destination.resolve(entry.getName())`; for a name like `../../etc/...` or an absolute name, `resolve` yields a path outside `destination` (absolute `other` replaces the base entirely). `Files.createDirectories` then creates arbitrary directories and `Files.newOutputStream` writes arbitrary files as the neo4j-admin process user. A malicious archive can include directory entries first to create any missing parent directories before writing files.",
+      "unverified": "Not runtime-confirmed. Exploitability depends on the permissions of the user running neo4j-admin and on the operator actually loading an attacker-supplied archive; I could not verify upstream fix history/CVE mapping from the snapshot, and no build/test execution was performed.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal'), Zip Slip / arbitrary file write"
+    }
+  ],
+  "coverage_summary": "Scope: 6,009 model-visible files (get_source_scope reports 0 files excluded for size, sensitive names, or symlinks; binary-like files are refused/skipped). Reviewed/traced: community/server (REST resources, authorization filters, batch, HtmlFormat/representations, JMX/console), community/security and enterprise/security (auth managers, realms, LDAP, caches, user-management procedures), community/bolt (auth fatality, message logging), community/kernel (URL access rules, procedure registry/dispatch, settings), community/cypher (LOAD CSV resource handling, procedure call modes), community/dbms (archive Dumper/Loader, admin commands), enterprise/cluster (network receiver pipeline, serialization), plus targeted searches for exec/deserialization/XML/zip/tar/path handling. Not fully read: large parts of kernel storage/transaction code, HA/causal-clustering internals, cypher compiler, tests (test directories are absent from the snapshot).",
+  "limitations": [
+    "No build, test, or PoC execution; the candidate is a source-evidence lead, not a runtime-confirmed vulnerability.",
+    "No git history, CVE metadata, or upstream patch data in the snapshot, so the exact fixed commit/version for the issue could not be verified.",
+    "Not all 6,009 files were read line-by-line; coverage was driven by security-relevant tracing and targeted searches.",
+    "Dependency/library vulnerabilities (e.g. bundled Netty/Shiro/Commons Compress versions) were not assessed.",
+    "Exploitability details depend on deployment specifics (OS permissions of the neo4j-admin process, how archives are obtained) that are outside the source tree."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unfiltered Java deserialization in the Enterprise HA cluster protocol (`enterprise/cluster` Netty `ObjectDecoder` in NetworkReceiver pipeline, plus `LenientObjectInputStream`/`AtomicBroadcastSerializer.readObject`), reachable on `ha.host.coordination` (default 0.0.0.0:5001-5099).",
+      "reason": "Real design concern (CWE-502), but it requires Enterprise HA mode plus network reachability, depends on gadget availability, and the protocol may be considered a trusted cluster network; I found no source evidence tying it to the snapshot's fix window, and it is harder to substantiate as the repository's injected/fixed issue than the Loader traversal. Not selected."
+    },
+    {
+      "lead": "XSS in the REST HTML representation (HtmlFormat/HtmlHelper render relationship types, property keys, exception messages unescaped).",
+      "reason": "The rendering code does contain unescaped user data, but `HtmlFormat` is not registered as a `RepresentationFormat` service (no `@Service.Implementation` annotation and no `META-INF/services` entry anywhere in the snapshot; no `new HtmlFormat` call), and `RepresentationFormatRepository` only uses service-loaded formats plus JSON defaults, so the HTML output path appears unreachable. Rejected as dead code."
+    },
+    {
+      "lead": "SSRF / arbitrary file read via `LOAD CSV` (http/https/ftp always permitted; FileURLAccessRule containment).",
+      "reason": "http(s)/ftp loading is intentional LOAD CSV functionality, and the file rule normalizes and checks `startsWith(rootPath)`. Only a symlink-following caveat remains, which depends on local filesystem setup and an account able to plant symlinks. Not selected."
+    },
+    {
+      "lead": "Missing admin check on DBMS-mode procedures (e.g. `dbms.security.createUser`).",
+      "reason": "The apparent absence of a mode check in `ProcedureRegistry` is compensated by enforcement inside the procedures/components (`PersonalUserManager.assertUserManager()` for the user-management procedures, explicit `assertAdmin()` for config/cache procedures). Rejected after tracing the enforcement."
+    },
+    {
+      "lead": "Auth cache not invalidated on user suspension/deletion (`ShiroCaffeineCache`, `MultiRealmAuthManager.clearAuthCache`).",
+      "reason": "User-management procedures call `clearAuthCache`/kickout paths and the cache paths I inspected did not show a clear exploitable staleness bug within the time budget. Left unconfirmed and not selected."
+    }
+  ],
+  "summary": "Source-only review of the Neo4j 3.4.9-SNAPSHOT tree (6,009 visible files; no exclusions reported by get_source_scope). I traced attacker-controlled input through the server REST layer, authentication/authorization code (community + enterprise), Bolt, URL-access rules for LOAD CSV, procedure dispatch, and the enterprise cluster/backup code. The single issue with the strongest source evidence is a Zip Slip / path-traversal flaw in the community `neo4j-admin load` archive extraction path (`community/dbms`): tar entry names are resolved directly against the destination directory without normalization or containment validation, so `../` or absolute entry names can write outside the intended database/transaction-log directories. Other plausible-looking leads were checked and not selected (see rejected leads)."
+}

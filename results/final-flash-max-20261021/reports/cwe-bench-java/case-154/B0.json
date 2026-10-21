@@ -1,0 +1,78 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client controls the HTTP request body (and content type). If a controller/method binds that JSON body to a parameter whose declared type is `Object`, `Map<String,Object>`, a generic container, or any interface/abstract/Object-valued property, the attacker controls the polymorphic type id (`@type`) and the property values fed to the instantiated class.",
+      "confidence": "medium",
+      "counterevidence_checked": "The output-side serializer used by `JacksonRenderFactory` is a plain `new ObjectMapper()` (JacksonStringSerializer.getConfig()), and `JacksonRenderTypedFactory` explicitly represents the opt-in `@type_json` renderer, so output serialization is not affected. Requiring the Jackson plugin and a polymorphic target type narrows reachability; a controller whose body type is a purely concrete DTO hierarchy is not directly exploitable. `deserializeFromBody(ctx)` first parses to JsonNode with `readTree`, so the gadget instantiation happens in the typed `readValue` step, not during tree parsing. This code appears long-standing/upstream rather than newly introduced, so I could not confirm it is the benchmark's ground-truth issue.",
+      "id": "CAND-1",
+      "impact": "Remote arbitrary class instantiation and property injection from a normal JSON request; with available gadget/effect classes this leads to code execution (classic Jackson `enableDefaultTyping` gadget chains such as JNDI-triggering JDK classes), or at minimum server-side request forgery/JNDI injection and denial of service. The same unsafe mapper pattern exists in the Nami Jackson decoder, so an untrusted or spoofed RPC peer can also trigger it client-side.",
+      "locations": [
+        {
+          "end_line": 100,
+          "path": "solon-projects/solon-serialization/solon-serialization-jackson/src/main/java/org/noear/solon/serialization/jackson/JacksonActionExecutor.java",
+          "start_line": 84
+        },
+        {
+          "end_line": 192,
+          "path": "solon-projects/solon-serialization/solon-serialization-jackson/src/main/java/org/noear/solon/serialization/jackson/JacksonActionExecutor.java",
+          "start_line": 150
+        },
+        {
+          "end_line": 75,
+          "path": "solon-projects/nami/nami-coder-jackson/src/main/java/org/noear/nami/coder/jackson/JacksonDecoder.java",
+          "start_line": 60
+        }
+      ],
+      "prerequisites": "Application uses the `solon-serialization-jackson` (or jackson-xml/typed) plugin so that `JacksonActionExecutor` is registered as an execute handler; a handler binds a JSON body to a type that contains a polymorphic (Object/interface/abstract/generic) element; a usable gadget/effect class exists on the application classpath (e.g., JNDI-capable JDK classes). The Nami variant additionally requires a Nami client decoding a response from an untrusted/compromised peer.",
+      "root_cause": "`JacksonActionExecutor.newMapper(...)` calls `mapper.activateDefaultTypingAsProperty(mapper.getPolymorphicTypeValidator(), ObjectMapper.DefaultTyping.JAVA_LANG_OBJECT, \"@type\")`. `ObjectMapper.getPolymorphicTypeValidator()` returns Jackson's permissive default (`LaissezFaireSubTypeValidator`) - i.e., no class allow-list. This mapper is installed as the serializer config in the executor constructor (`config(newMapper(new JavaTimeModule()))`) and is then used to deserialize the HTTP request body in `changeValue(...)` via `serializer.getConfig().readValue(tokens, new TypeReferenceImpl<>(p))`. Requests are matched for any `application/json` (and ndjson) content type by `JacksonStringSerializer.matched(...)`, so the typed mapper is used for ordinary JSON bodies, not only for an explicitly requested typed format.",
+      "title": "Jackson request-body deserialization enables default typing (unsafe polymorphic `@type` deserialization) in solon-serialization-jackson",
+      "trace": "HTTP request (Content-Type: application/json) -> JacksonActionExecutor.matched() via JacksonStringSerializer.matched() -> changeBody() -> JacksonStringSerializer.deserialize(body, null) -> getConfig().readTree() (typed mapper) -> changeValue() -> serializer.getConfig().readValue(treeAsTokens(node), new TypeReferenceImpl<>(ParamWrap)) -> ObjectMapper configured by newMapper() with activateDefaultTypingAsProperty(..., JAVA_LANG_OBJECT, \"@type\") -> Jackson instantiates the class named in `@type` and applies properties/setters during deserialization.",
+      "unverified": "No runtime or dynamic testing was performed; exploitability depends on the concrete controller parameter type and available classpath gadgets, and on the exact Jackson version's handling of `getPolymorphicTypeValidator()`. Whether the project later classified/changed this behavior (e.g., a restrictive BasicPolymorphicTypeValidator or content-type gating) could not be verified from the snapshot.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data / unsafe polymorphic typing"
+    }
+  ],
+  "coverage_summary": "Reviewed the Solon core (`solon/src/main/java`, including Context/path handling, routing/auth rule matching, session state, serialization hooks) plus the main plugin families under `solon-projects`: solon-boot adapters (servlet, jdkhttp, smarthttp, jetty, undertow, vertx, websocket, upload/multipart), solon-web (staticfiles, cors, servlet, sse, rx, sdl, stop), solon-security (auth, validation, web headers, vault), solon-serialization (jackson/jackson-xml/fastjson/fastjson2/fury/kryo), nami (channels/coders), solon-net (httputils, stomp), solon-data (sqlutils/sqlink/cache), solon-cloud-gateway, solon-expression, solon-faas-luffy, solon-docs-openapi, solon-tool/maven-plugin, and the __hatch netty modules. Searches covered sensitive sinks (ProcessBuilder/Runtime, ObjectInputStream/readObject, Class.forName, new File, getResource, redirects, TLS trust managers, autoType/default typing, SQL string building, CORS/auth/validation logic). Not every one of the 2553 files was read line-by-line; modules with lower security relevance (scheduling, logging, native/aot, configuration-processor, view engines, docs UI, test app) were surveyed only via targeted searches.",
+  "limitations": [
+    "No code execution, build, tests, or scanners were run; all findings are static source observations and a candidate is only a lead, not a confirmed vulnerability.",
+    "The repository has no git metadata in scope, so I could not diff against upstream Solon or against a fix commit; I could not distinguish newly introduced code from long-standing upstream design.",
+    "Severity/reachability of the Jackson candidate depends on application-level factors (controller parameter types, classpath gadgets, plugin selection, Jackson version), which are outside the framework source.",
+    "Other deserialization surfaces (fastjson global autoType, fastjson2 SupportAutoType, Fury/Kryo with class registration disabled, Java-native JavabinSerializer/ThrowableJsonDeserializer readObject) are credible but were not selected because they are either conditionally reachable, mitigated by library deny-lists, or would duplicate the same root-cause class in the single-candidate output.",
+    "The __hatch, __release and __test trees are incubating/packaging/test artifacts and were only spot-checked; a vulnerability confined to those trees would be missed.",
+    "No internet access was used, so no external advisory/CVE/fix information informed the assessment."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "solon-net-httputils HttpSsl: `DefaultX509TrustManager` with empty checkServerTrusted/checkClientTrusted and `DefaultHostnameVerifier.verify()` returning true, used by `getSSLSocketFactory()` (JdkHttpUtils sets it on HttpsURLConnection; OkHttpUtilsFactory also sets the always-true hostname verifier), disabling TLS server authentication for HttpUtils/Nami HTTP channel (CWE-295).",
+      "reason": "Real weakness with clear MITM impact, but it is a deliberate client-side default in the library (a correct `getX509TrustManager()` helper exists and is used by the OkHttp binding), no request-controlled input, and could not be confirmed as the case's target."
+    },
+    {
+      "lead": "nami-coder-fastjson FastjsonDecoder static block calls `ParserConfig.getGlobalInstance().setAutoTypeSupport(true)`, enabling fastjson 1.x autoType process-wide (CWE-502); fastjson2 decoder enables `JSONReader.Feature.SupportAutoType` per parse.",
+      "reason": "Genuine insecure-deserialization enablement, but the scoped fastjson2 usage and fastjson 1.2.83's built-in deny list weaken a concrete exploit claim; the module is a decoder for RPC peers rather than a default web body parser. Kept as unconfirmed."
+    },
+    {
+      "lead": "solon-serialization-kryo `KryoBytesSerializer` (`setRegistrationRequired(false)` + `readClassAndObject`) and solon-serialization-fury `FuryBytesSerializer` (`requireClassRegistration(false)`, blacklist check level WARN only) deserialize attacker-supplied binary request bodies.",
+      "reason": "Same unsafe-deserialization family as the chosen candidate, in optional codecs; left out to keep a single root-cause candidate, but they are plausible if the deployment uses those plugins."
+    },
+    {
+      "lead": "JwtSessionStateFactory ships a hardcoded default JWT signing key (`DHPjbM5QczZ2cysd4gpDbG/4SnuwzWX3sA1i6AXiAbo=`), used whenever `server.session.state.jwt.secret` is not configured.",
+      "reason": "Hardcoded-key weakness (CWE-798/321) with session-forgery impact, but it is an explicitly documented default with a configuration override; not attacker-input driven."
+    },
+    {
+      "lead": "solon-web-cors AbstractCross defaults (`allowedOrigins=\"*\"`, origin reflection, `allowCredentials=true`) produce `Access-Control-Allow-Origin: <reflected>` plus `Access-Control-Allow-Credentials: true`.",
+      "reason": "Permissive default (CWE-942), but it only applies when the application explicitly installs CrossFilter/CrossInterceptor; classified as configuration hardening rather than a traced vulnerability."
+    },
+    {
+      "lead": "IpUtil trusts `X-Real-IP`/`X-Forwarded-For` unconditionally; used by solon-web-stop (`/_run/stop/` whitelist check, default 127.0.0.1) and by solon-security-auth IP verification, so a spoofed header can satisfy the IP allow-list.",
+      "reason": "Plausible spoofing/DoS (CWE-290) when `solon.stop.enable=true` or `@AuthIp` is used, but it is a common framework behavior, feature is disabled by default, and I could not confirm intended semantics."
+    },
+    {
+      "lead": "solon-faas-luffy: `LuffyHandler` passes `ctx.pathNew()` into `JtFunctionLoaderFile`/`JtFunctionLoaderDebug`, which do `new File(_baseDir, path)` with no `../` validation, then read the file content and execute it via `ExecutorFactory` (potential arbitrary file read / script execution).",
+      "reason": "A genuine unvalidated request-path-to-File flow (unlike StaticMappings/RenderManager which do reject `../`), but it is a legacy plugin that the application must wire to a handler; exploitability depends on the loader in use (debug/external-file mode) and on an attacker-writable script file."
+    },
+    {
+      "lead": "HstsHeaderHandler sets the response header name `\"Strict-Transport-Security=\"` (trailing `=`) so a valid HSTS header is never emitted (CWE-319/1004).",
+      "reason": "Looks like a real typo/bug, but impact is a missing hardening header rather than an attacker-controlled vulnerability; treated as a hardening opportunity per the review criteria."
+    }
+  ],
+  "summary": "The snapshot is the Solon 3.1.3-SNAPSHOT framework tree (2553 files). I concentrated on request-handling boundaries (servlet/netty/smarthttp contexts, path handling, static files, multipart), security plugins (auth, validation, CORS, security headers, vault, JWT session state), serialization codecs (Jackson, fastjson/fastjson2, fury, kryo), Nami RPC channels/coders, the cloud gateway, and the faas/luffy function loader. The single strongest, best-evidenced candidate is unsafe polymorphic deserialization in the Jackson serialization plugin: the default request-body executor enables Jackson default typing (with a lax polymorphic-type validator) before reading the attacker-supplied JSON body, which can turn a normal `application/json` request into arbitrary class instantiation / gadget-chain execution (CWE-502). Other issues were considered and left as unconfirmed leads rather than additional candidates."
+}

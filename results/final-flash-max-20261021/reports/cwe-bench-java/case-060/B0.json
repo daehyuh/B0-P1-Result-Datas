@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated remote attacker fully controls the request parameters: GET /auth/authorize?scope=...&response_type=code&client_id=<payload>&redirect_uri=<payload>&state=<payload> (or a POST to /auth/actions/login with the same fields). FormData reads them from the URL-encoded query/form (HttpTranscoder-independent handler), so HTML metacharacters and arbitrary absolute URLs survive URL decoding.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked the template engine for any output-encoding feature (none: VarStatement appends raw values, no HTML-escape helper exists in the codebase); checked the response path (HandlerContext.render only sets Content-Type text/html/content length, no CSP or other mitigation); checked that the page is unauthenticated (AuthHandler.requireAuth()==false, HttpHandler skips auth entirely and passes a null user); checked sendRedirect (sets the Location header directly with no same-origin/allow-list check); checked both GET (/auth/authorize) and POST (/auth/actions/login error path) render the same template with attacker-supplied values; checked that requireParameters would not strip or encode the values (FormData simply stores decoded strings). The main residual uncertainty is that the external .proto route annotations for other APIs are not in the snapshot, but this handler is registered directly in HttpServer and does not depend on them.",
+      "id": "auth-redirect-uri-xss-open-redirect",
+      "impact": "Reflected script execution in the authentication origin (the page where users enter credentials), allowing credential and session-token theft or a fully controlled fake login form, plus an open redirect that leaks authorization codes and enables account takeover via /auth/token. Both are reachable without authentication and without any Yamcs privileges.",
+      "locations": [
+        {
+          "end_line": 80,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/auth/AuthHandler.java",
+          "start_line": 77
+        },
+        {
+          "end_line": 128,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/auth/AuthHandler.java",
+          "start_line": 124
+        },
+        {
+          "end_line": 179,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/auth/AuthHandler.java",
+          "start_line": 174
+        },
+        {
+          "end_line": 205,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/auth/AuthHandler.java",
+          "start_line": 191
+        },
+        {
+          "end_line": 53,
+          "path": "yamcs-core/src/main/resources/auth/templates/authorize.html",
+          "start_line": 48
+        },
+        {
+          "end_line": 20,
+          "path": "yamcs-core/src/main/java/org/yamcs/templating/VarStatement.java",
+          "start_line": 14
+        },
+        {
+          "end_line": 49,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/auth/OpenIDAuthenticationRequest.java",
+          "start_line": 45
+        },
+        {
+          "end_line": 361,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/HandlerContext.java",
+          "start_line": 356
+        }
+      ],
+      "prerequisites": "No Yamcs account or privilege is required to render the vulnerable page (AuthHandler.requireAuth() returns false; the handler is registered for the `/auth` path in HttpServer). For the XSS branch the victim only has to open the crafted link; for the authorization-code/open-redirect branch the victim must complete a login on the genuine page. Yamcs must be configured with an AuthModule that uses the login form (e.g. directory or OpenID/SPNEGO setups), and the browser must follow the Location header (standard behavior).",
+      "root_cause": "AuthHandler accepts arbitrary `redirect_uri`, `state` and `client_id` from unauthenticated requests. (1) The values are passed into `authorize.html` and emitted with the project's template engine, whose VarStatement appends values verbatim with no HTML encoding, so the login page reflects markup/script supplied in `redirect_uri`/`state`/`client_id`. (2) The same `redirect_uri` is later used as the post-login redirect target in `AuthHandler.redirectWithCode` without any client-registration/allow-list validation (there is no client registry in the code at all), and `HandlerContext.sendRedirect` writes it straight to the Location header. Both sinks share the same missing validation/encoding of the OAuth request parameters in the login flow.",
+      "title": "Reflected XSS and open redirect in the authentication UI via unvalidated/unescaped redirect_uri (authorization-code theft)",
+      "trace": "1) Attacker sends a crafted /auth/authorize request. 2) AuthHandler.handleAuthorize -> new OpenIDAuthenticationRequest(ctx) stores the attacker's client_id/redirect_uri/state. 3) showLoginForm puts request.getMap() into the template vars and calls HandlerContext.render. 4) TemplateProcessor/VarStatement substitute `{{ request.redirect_uri }}` etc. verbatim (no escaping) into value=\"...\" attributes of authorize.html, so injected `\"><script>...` executes in the Yamcs origin (a Content-Type text/html response with no CSP is returned by HandlerContext.render). 5) After a successful login, redirectWithCode builds `Location: <attacker redirect_uri>?code=<auth code>&state=<state>` via QueryStringEncoder and ctx.sendRedirect without any validation; the victim's browser is sent to the attacker's host. 6) The leaked single-use `code` (valid 60s in CODE_CACHE) can be exchanged by the attacker at /auth/token with grant_type=authorization_code for an access token/refresh token for the victim's account.",
+      "unverified": "Not runtime-confirmed (no code execution permitted). The exact set of configured AuthModules in a given deployment cannot be seen from the snapshot; if Yamcs is run in the default unsecured mode the login page is still rendered when /auth/authorize is requested. Mapping to an external CVE/advisory identifier was intentionally not attempted.",
+      "weakness_type": "CWE-79 Reflected XSS; CWE-601 Open Redirect (unvalidated redirect target)"
+    }
+  ],
+  "coverage_summary": "Scope reported by get_source_scope: 2394 readable files, 0 excluded for size/sensitive-name/symlink reasons, binary-like files filtered. I listed/inspected the yamcs-core HTTP layer (HttpServer, HttpHandler, ApiHandler, Route/RouteContext, HttpTranscoder, HandlerContext, StaticFileHandler, WebSocket handlers), auth/security code (AuthHandler, JwtHelper, JwtToken, TokenStore, OpenIDAuthModule, LdapAuthModule, SecurityStore, Directory, Iam/Clearance/Sessions APIs), storage/file code (BucketsApi, FileSystemBucket, FileSystemBucketDatabase, YarchDatabaseInstance, CfdpService, FileSaveHandler, FileTransferApi), MDB/XTCE loading, and spot-checked other API classes (AlarmsApi, CommandsApi, PacketsApi, ProcessingApi, TableApi, StreamArchiveApi, AuditApi, RocksDbApi, LinksApi, TimelineApi, MdbApi/MdbOverrideApi). Grep-based sweeps covered ProcessBuilder/exec, Files/File sinks, XML parsers (XXE hardening present), SQL construction (SqlBuilder is parameterized), and privilege-check call sites.",
+  "limitations": [
+    "No tests, .proto files or generated protobuf/route artifacts are present in the snapshot, so the exact HTTP route templates/bindings (e.g. how objectName is bound, wildcard support) could not be confirmed; conclusions about other endpoints avoid depending on them.",
+    "No dynamic verification, execution, or exploit payloads were used; all findings are static source-level leads, not confirmed vulnerabilities.",
+    "The repository is large; many yamcs-web TypeScript/Angular files and parts of yamcs-xtce and simulator modules were only skimmed, so additional issues may exist outside the reviewed areas.",
+    "The mapping between this snapshot (5.8.6) and any specific CVE/advisory was deliberately not consulted or asserted."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal in the storage/bucket layer: BucketsApi.getObject/deleteObject do not call verifyObjectName (and OBJ_NAME_REGEXP allows '.' and '/'), while FileSystemBucket.getObject/deleteObject/findObject do `root.resolve(objectName)` with no canonical-path check (only putObject has a check, and that check is a prefix comparison that can be bypassed into sibling directories such as ../<bucketName>x/). A user with ReadBucket/ManageBucket on a filesystem-backed bucket (e.g. the example 'displays'/'stacks'/'cfdpUp' buckets) could potentially read/delete files outside the bucket root.",
+      "reason": "Real-looking second candidate with high impact, but it requires object privileges on a filesystem-backed bucket and the generated route template for objectName could not be inspected in the snapshot; kept as runner-up rather than submitted to respect the single-candidate cap."
+    },
+    {
+      "lead": "LDAP authentication filter injection: LdapAuthModule.searchUserInfo builds `userFilter.replace(\"{0}\", username)` with the raw login name (no RFC 4515 escaping).",
+      "reason": "Filter manipulation is possible, but authentication still requires a successful password bind against the resolved DN, so a direct auth bypass was not established from source; plausible but weaker than the selected candidate."
+    },
+    {
+      "lead": "IamApi.listRoles/getRole/listUsers-like endpoints lack explicit ctx.checkSystemPrivilege (only the audit-log privilege checker covers the class), exposing role/user metadata to any authenticated user.",
+      "reason": "Information disclosure of limited security value; no privilege escalation path identified."
+    },
+    {
+      "lead": "FileSystemBucket.putObject's canonical-path prefix check (startsWith without separator) permits writes to sibling directories whose names share the bucket-root prefix.",
+      "reason": "Write range is constrained to sibling paths sharing the bucket name prefix; weaker than the read/delete gaps and subsumed by the traversal lead above."
+    },
+    {
+      "lead": "OpenIDAuthModule.getAuthenticationInfo decodes the client-supplied 'oidc <jwt>' unsigned token with JwtHelper.decodeUnverified and later decodes the IdP id_token unverified.",
+      "reason": "No direct bypass found: the code is exchanged server-to-server with the configured IdP using the configured client credentials, so an attacker cannot mint the resulting identity; noted as design risk only."
+    }
+  ],
+  "summary": "Reviewed the Yamcs 5.8.6 snapshot (2394 visible files across yamcs-core, yamcs-web, yamcs-xtce, client/simulator modules; no tests or .proto files are present in scope, so generated HTTP route metadata could not be inspected). I traced attacker-controlled input through the HTTP/auth/storage layers and selected the single strongest candidate: the authentication UI reflects and redirects to an unvalidated, unescaped `redirect_uri`/`state`/`client_id` supplied by unauthenticated requests. The template engine performs no HTML escaping and `redirectWithCode` uses the same value as the Location target, giving reflected XSS on the login page and open-redirect/authorization-code theft. Other plausible leads (filesystem bucket object-name traversal, LDAP filter injection, minor IAM info disclosure, bucket upload prefix check) are recorded as rejected/unconfirmed; the bucket traversal was the closest runner-up and is documented in rejected_leads rather than as a second candidate."
+}

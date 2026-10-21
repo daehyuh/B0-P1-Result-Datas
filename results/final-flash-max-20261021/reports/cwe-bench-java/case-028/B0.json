@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Indirect: the resource type used by the deep search comes from resource.getResourceType() (SlingServletResolver 170, ResourceCollector 192-195). A user able to author content (set sling:resourceType) or an internal caller that passes a scriptName/resource type can supply a relative type containing '..' segments (e.g. 'foo/../../libs/x'). For relative types, LocationCollector concatenates it onto each search path without normalization, so the traversal segments reach ResourceCollector.addLocationServlet.",
+      "confidence": "low",
+      "counterevidence_checked": "The children loop in ResourceCollector.getWeightedResources (232-236) validates each child's actual getPath(), so ordinary resource scripts under disallowed paths remain blocked. If the resolver instead returns a real resource for the traversed path, location.getPath() becomes the normalized path and addLocationServlet's check rejects it, so the bypass requires the synthetic/raw-path case. SlingServletResolver.resolveServletInternal normalizes absolute resource types (458), so the absolute-type route is protected; the gap is only the collector's final location-servlet lookup. No runtime confirmation was possible in this read-only review, and the resolver's normalization behavior is external to this repository.",
+      "id": "servletresolver-execution-path-check-vs-fetch-mismatch",
+      "impact": "Bypass of the servletresolver.paths execution-path restriction for the '.servlet' candidate: a servlet that the administrator intended to be unreachable (mounted outside the allowed prefixes) can be resolved and invoked (including non-safe methods permitted by its sling.servlet.methods). Direct script execution through the children loop is not affected because each child's real path is checked.",
+      "locations": [
+        {
+          "end_line": 377,
+          "path": "src/main/java/org/apache/sling/servlets/resolver/internal/helper/ResourceCollector.java",
+          "start_line": 365
+        },
+        {
+          "end_line": 151,
+          "path": "src/main/java/org/apache/sling/servlets/resolver/internal/helper/LocationCollector.java",
+          "start_line": 135
+        },
+        {
+          "end_line": 306,
+          "path": "src/main/java/org/apache/sling/servlets/resolver/internal/helper/LocationCollector.java",
+          "start_line": 294
+        },
+        {
+          "end_line": 778,
+          "path": "src/main/java/org/apache/sling/servlets/resolver/internal/SlingServletResolver.java",
+          "start_line": 745
+        }
+      ],
+      "prerequisites": "Non-default configuration with a non-empty execution-path restriction (ResolverConfig.servletresolver_paths default '/' means all paths allowed); a ResourceResolver implementation that normalizes '.'/'..' on getResource (typical Sling behavior); and a servlet/.servlet resource mounted at the normalized target (e.g. a servlet registered with an absolute sling.servlet.resourceTypes or a path registration outside the allowed prefix), with the un-normalized location not resolving to an existing normal resource so the SyntheticResource/raw path is retained.",
+      "root_cause": "ResourceCollector.addLocationServlet (lines 365-377) computes path = location.getPath() + \".servlet\" and calls SlingServletResolver.isPathAllowed(path, executionPaths) on that raw string, then fetches the same string through ResourceResolver.getResource(), which normalizes paths. LocationCollector builds location paths by raw string concatenation of search-path + ResourceUtil.resourceTypeToPath(resourceType) (lines 136-147) and, when the resolver does not resolve that raw path, stores a SyntheticResource that keeps the un-normalized path (lines 294-306). The check therefore sees the attacker-influenced un-normalized prefix (e.g. /apps/...) while the fetch sees the normalized target (e.g. /libs/...), so a servlet resource (.servlet) outside the configured execution paths can be selected. Unlike the other validation sites (SlingServletResolver.resolveServletInternal 457-461, NamedScriptResourceCollector 95-102, SlingScriptResolverImpl 69-90), this site never calls ResourceUtil.normalize before isPathAllowed (745-778).",
+      "title": "Execution-path check performed on un-normalized location path in ResourceCollector.addLocationServlet",
+      "trace": "1) Request/resource has relative resource type containing '..'. 2) SlingServletResolver.resolveServletInternal skips the absolute-resource-type branch (charAt(0) != '/') and builds a ResourceCollector. 3) LocationCollector.handleResourceType adds searchPath + resourceTypeToPath(resourceType) as a raw string. 4) LocationCollector.getResource tries resolver.getResource(rawPath); if null it creates a SyntheticResource with the raw path. 5) ResourceCollector.getWeightedResources runs the children loop (real child paths are checked and rejected), then calls addLocationServlet(location). 6) addLocationServlet checks isPathAllowed(rawPath + '.servlet'), which passes because the raw string still starts with the permitted prefix. 7) resolver.getResource(rawPath + '.servlet') normalizes and returns the servlet resource from outside the allowed prefix, which getServlet() adapts to a Servlet; the servlet is used for the request.",
+      "unverified": "Whether the deployed Sling ResourceResolver normalizes '..' inside getResource() for the exact synthetic-path case; whether any servlet in a real installation is mounted outside the configured execution paths in a way reachable via '.servlet' locations; and whether the upstream fix (not inspectable here) targets this line rather than another validation site.",
+      "weakness_type": "Path traversal / security-control bypass (execution path restriction bypass)"
+    }
+  ],
+  "coverage_summary": "Read all 40 model-visible files (main sources, pom, metadata). Full reads of SlingServletResolver, ResourceCollector, NamedScriptResourceCollector, AbstractResourceCollector, LocationCollector, PathBasedServletAcceptor, WebConsolePlugin, DefaultErrorHandlerServlet, ScriptResourceResolver, ScriptResource(Decorator), SlingScriptResolverImpl, ServletMounter, ServletResourceProvider(Factory), MergingServletResourceProvider, ResolutionCache, ResolverConfig, SlingServletConfig, and the bundle package. The focused trace covers attacker input -> resolution -> isPathAllowed -> resolver fetch across all validation call sites. Test sources and git history are not present in the snapshot, so fixes/tests that might confirm the intended issue could not be inspected.",
+  "limitations": [
+    "No test sources, git history, changelog, or patch are present; the intended upstream fix for this snapshot (2.10.0, 2023-10-05) could not be compared.",
+    "All findings are static only; no code was executed and no resolver/container behavior (e.g. ResourceResolver '..' normalization, servlet container decoding) could be runtime-verified.",
+    "The candidate depends on non-default configuration (non-empty servletresolver.paths) plus external Sling ResourceResolver/ResourceProvider behavior, so exploitability is unproven.",
+    "Only repository-relative main sources were inspected; OSGi runtime wiring, service-user mappings, and deployed servlet registrations are outside this snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ScriptResourceResolver.getResource(Resource base, String path) (lines 98-104) concatenates base path + relative path without normalization or isPathAllowed, allowing relative traversal of the script resolver.",
+      "reason": "All in-repo callers pass resolver-internal paths or request selectors. Selectors cannot contain '.' because RequestPathInfo splits selectors on '.', so '..' cannot be delivered via the request URL through this route; no request-controlled caller was found in this snapshot."
+    },
+    {
+      "lead": "NamedScriptResourceCollector works on an un-normalized directory path (line 113) before listing children.",
+      "reason": "Each candidate child is still validated with isPathAllowed(child.getPath()) (line 119) against its real path, and the exact-match branch normalizes first (line 96), so no clear restriction bypass is demonstrated."
+    },
+    {
+      "lead": "WebConsolePlugin.getServletDetails (lines 420-449) inserts bundle.getSymbolicName() into HTML without ResponseUtil.escapeXml.",
+      "reason": "Requires installing an OSGi bundle (already trusted/high privilege), and all request-controlled fields (url, method, resource path, selectors, extension, suffix) are escaped; impact is not reachable from the stated attacker model."
+    },
+    {
+      "lead": "BundledScriptTracker.collectInheritanceChain (lines 670-687) recurses over bundle-wire capabilities without cycle detection; WebConsolePlugin getRequestPathInfo parses an attacker URL with new URL().",
+      "reason": "The recursion needs a malicious installed bundle, and new URL() performs no network I/O, so no SSRF/remote DoS with source evidence; treated as hardening observations only."
+    },
+    {
+      "lead": "DefaultErrorHandlerServlet rendering and HandleError responses.",
+      "reason": "Checked escaping: status message, request URI, servlet name, stack trace and progress tracker are written through ResponseUtil escaping or JsonGenerator; no unescaped attacker-controlled output was found."
+    }
+  ],
+  "summary": "Reviewed the 40-file Apache Sling Servlets Resolver snapshot (org.apache.sling.servlets.resolver 2.10.0, Oct 2023) as a defensive source review, focusing on the module's central security control: the servletresolver.paths execution-path restriction (SlingServletResolver.isPathAllowed) and every code path that fetches a candidate servlet/script. Most call sites normalize the path immediately before the isPathAllowed check and then fetch the same normalized string (SlingServletResolver.resolveServletInternal 457-461; NamedScriptResourceCollector 95-102; SlingScriptResolverImpl 69-90; ResourceCollector children check 232-236). One call site does not: ResourceCollector.addLocationServlet (365-377) validates a path built from location.getPath(), while LocationCollector can supply a SyntheticResource carrying an un-normalized, string-concatenated location path (136-147, 294-306), and the subsequent resolver.getResource(path) can normalize. That check/fetch mismatch is the single strongest candidate I can support from source; it is a lead, not a confirmed exploit. No other issue reached the same evidence level; rejected leads are listed."
+}

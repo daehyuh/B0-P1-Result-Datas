@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The parsed XML comes from files in the build workspace selected by the configured test-results glob (JUnitParser.ParseResultCallable uses Util.createFileSet(ws, testResults), JUnitParser.java:140-146). Anyone able to influence workspace contents that match that pattern - untrusted code in a PR/multibranch build, a test or dependency that writes a report file, or any workspace-write capability - controls the document body, including a DOCTYPE. The freshness check (buildTime-3000 <= lastModified, TestResult.java:205,249) is trivially satisfied because the attacker's build can write the file while it runs. No repository code validates or sanitizes the XML against a JUnit schema or DOCTYPE.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the only SAXReader use in the repository is SuiteResult.java:164 (search SAXReader). Checked for any mitigations: setFeature, disallow-doctype, external-general-entities, FEATURE_SECURE_PROCESSING return no matches. The custom XMLEntityResolver is not a countermeasure - its non-TestNG branch returns null (default resolution). Verified the parse path is reachable from both the freestyle recorder and the Pipeline step, and that files are read from the workspace on the agent via workspace.act rather than from a trusted master-only path. The deprecated ParserConfigurator import in SuiteResult.java:28 is unused, so no extension-driven parser hardening is applied. Considered that a security-conscious deployment could set JVM/JAXP flags globally, but no such configuration exists in this source tree and it is not the plugin's default. XStream is used only to load the build's own junitResult.xml (TestResultAction.java:131-133,302-309), not the attacker-supplied report, so the report content cannot be used for deserialization gadgets via this path.",
+      "id": "junit-xxe-saxreader-unhardened",
+      "impact": "Out-of-band and in-band XXE against the JVM that parses the report (Jenkins controller when the workspace is on the built-in node, otherwise the agent): reading files accessible to that process (e.g., credential/secret files), SSRF via external DTD/entity fetches to internal or attacker-chosen URLs, and denial of service through entity expansion / parser resource exhaustion. Because expanded values are stored and displayed in test results, exfiltration can also occur without a separate network channel when the substituted content appears in failure messages or suite output.",
+      "locations": [
+        {
+          "end_line": 178,
+          "path": "src/main/java/hudson/tasks/junit/SuiteResult.java",
+          "start_line": 159
+        },
+        {
+          "end_line": 71,
+          "path": "src/main/java/hudson/tasks/junit/XMLEntityResolver.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 349,
+          "path": "src/main/java/hudson/tasks/junit/TestResult.java",
+          "start_line": 346
+        },
+        {
+          "end_line": 147,
+          "path": "src/main/java/hudson/tasks/junit/JUnitParser.java",
+          "start_line": 137
+        }
+      ],
+      "prerequisites": "1) JUnit archiver/publisher or the pipeline step is configured for the job and its pattern matches the malicious .xml file; 2) parsing executes on a JVM whose JAXP/Xerces parser resolves external entities by default and the transitive dom4j/JAXP defaults are not overridden by a JVM-level system property or SecurityManager (the dom4j/JDK versions are not pinned in this snapshot); 3) the file is newly written relative to the build start time.",
+      "root_cause": "SuiteResult.parse builds a default dom4j SAXReader and only calls setEntityResolver(new XMLEntityResolver()) with no parser feature hardening (SuiteResult.java:164-169). XMLEntityResolver.resolveEntity returns null for all systemIds except those beginning with http://testng.org/ (XMLEntityResolver.java:54-70); per the SAX EntityResolver contract, returning null means the parser performs default resolution, i.e., it opens the external DTD/entity URI. There is no disallow-doctype-decl, external-general-entities=false, external-parameter-entities=false, or FEATURE_SECURE_PROCESSING configuration anywhere in the repository (searched: setFeature, disallow-doctype, external-general-entities, FEATURE_SECURE_PROCESSING -> no matches).",
+      "title": "XML External Entity (XXE) processing when parsing JUnit report files (SuiteResult.parse / XMLEntityResolver)",
+      "trace": "JUnitResultArchiver.perform -> parseAndAttach (JUnitResultArchiver.java:150-166) or JUnitResultsStepExecution.run -> JUnitResultArchiver.parseAndAttach (JUnitResultsStepExecution.java:50) -> JUnitParser.parseResult -> workspace.act(new ParseResultCallable(...)) (JUnitParser.java:114) -> ParseResultCallable.invoke builds TestResult from the DirectoryScanner (JUnitParser.java:146) -> TestResult.parse(long, DirectoryScanner, ...) -> parse(File, PipelineTestDetails) (TestResult.java:346-348) -> SuiteResult.parse -> new SAXReader(); setEntityResolver(new XMLEntityResolver()); saxReader.read(FileInputStream) (SuiteResult.java:164-169). Because the resolver returns null for non-TestNG systemIds, the underlying SAX parser resolves the external entity/DTD URI itself; substituted entity text becomes part of Element text (e.g., suite.attributeValue/name, CaseResult.getError/failure text, system-out/system-err at SuiteResult.java:201-256, CaseResult.java:129-138), is persisted through TestResultAction to junitResult.xml, and is exposed on the test-result pages and XML/JSON API.",
+      "unverified": "No code was executed and no exploit payload was tested; runtime confirmation of external-entity resolution is not possible from source alone. The dom4j and JDK JAXP versions are supplied transitively (not pinned in this pom), so the effective parser feature defaults were not observable in the snapshot. Actual exposure depends on deployment specifics: whether a job archives attacker-influenceable report files, whether parsing runs on the controller or an agent, and any JVM-wide XML hardening configured outside this repository. Severity and exfiltration ergonomics (blind vs. in-band) were not validated end to end.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Read all 20 Java source files in the snapshot (hudson.tasks.junit core classes plus the pipeline step package) and reviewed the 129 resource files as localization/help bundles via listing and targeted searches; the P1 relation index reports complete coverage of all 149 files (0 missing, 816 edges / 927 call relations, no index facts loaded and no SAST oracle). The candidate was traced end to end through source text for every hop of the call chain (archiver/pipeline entry points -> JUnitParser callable on the workspace -> TestResult -> SuiteResult -> SAXReader), and the resolver, parser configuration, and hardening-absence were verified by direct file reads and literal searches. No runtime execution, dependency inspection, or view/Jelly inspection was possible in this run.",
+  "limitations": [
+    "No test sources or Jelly/UI view files exist in the snapshot, so display-layer escaping and integration behaviors could not be reviewed.",
+    "Third-party dependencies (dom4j, JAXP/Xerces, Jenkins core, workflow APIs) are not vendored; their exact versions and default parser features could not be confirmed statically.",
+    "The P1 relation index provides syntactic navigation only - no data-flow, reachability, runtime, or exploitability proof - and contained no scanner findings or configuration facts.",
+    "Execution of builds, parsers, or proof-of-concept payloads was prohibited in this review, so the XXE is a source-evidenced candidate rather than a runtime-confirmed vulnerability.",
+    "Localization/help resource files were not exhaustively read line by line; they contain no executable logic, but this is noted for completeness."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Stored XSS via test names, class/package names, stdout/stderr, or failure messages parsed from reports (CaseResult/SuiteResult keep raw strings; TestObject.safe only makes names URL-safe).",
+      "reason": "The rendering layer (Jelly views) is not present in this snapshot and no escaping/building decision can be verified from the files in scope; Jenkins core's TestObject.safe is external. No source evidence of an unescaped output sink inside the reviewed tree, so this does not meet the evidence threshold."
+    },
+    {
+      "lead": "History.getList(int,int) parses request parameters start/end and calls subList(start,end), which can throw IndexOutOfBounds/IllegalArgumentException for out-of-range or inverted values (History.java:78-81,108-110,146-148).",
+      "reason": "Requires Overall/Read access and only yields an unhandled exception/HTTP 500; no confidentiality or integrity impact, and the code catches NumberFormatException only. Robustness/limited DoS, not a strong candidate."
+    },
+    {
+      "lead": "XMLEntityResolver TestNG branch loads getClass().getClassLoader().getResource(dtdFileName) from a report-controlled systemId (XMLEntityResolver.java:60-67).",
+      "reason": "Resource lookup is bounded to the classpath and no concrete file read outside classpath was demonstrated; the more general default-resolution behavior (returning null) is the dominant issue and is covered by the selected candidate. Kept as unconfirmed."
+    },
+    {
+      "lead": "XStream2-based load of junitResult.xml in TestResultAction (TestResultAction.java:131-133,205-215,302-309) as a deserialization vector.",
+      "reason": "The file lives in the build directory and is normally written by the plugin from parsed results; Jenkins core's XStream2 carries its own allow-list protections, and no attacker path to overwrite that file before load is shown in this snapshot."
+    },
+    {
+      "lead": "testResults Ant glob expansion through build.getEnvironment(listener).expand(task.getTestResults()) (JUnitResultArchiver.java:164) and FileSet pattern scanning.",
+      "reason": "The pattern is job configuration (not derived from parsed XML), and Ant DirectoryScanner/Util.createFileSet confine scanning to the workspace basedir; no source-supported path traversal or arbitrary-file parse was demonstrated."
+    }
+  ],
+  "summary": "Repository is the Jenkins JUnit plugin at version 1.24-SNAPSHOT (pom.xml line 10, parent plugin 3.0, core 2.7.3). The snapshot contains 149 files: 20 Java sources under src/main/java/hudson/tasks/junit plus localization/help resource bundles; there are no test sources and no Jelly views in scope. The strongest source-supported issue is unhardened XML parsing of JUnit report files in SuiteResult.parse: a default org.dom4j SAXReader is configured only with a custom EntityResolver (SuiteResult.java:164-169), and that resolver returns null for every systemId that does not start with http://testng.org/ (XMLEntityResolver.java:54-70), which delegates to default resolution rather than blocking it. JUnit XML is read from the build workspace during archiving (JUnitParser.ParseResultCallable invoked through workspace.act, JUnitParser.java:114,137-147; reachable from JUnitResultArchiver.perform/parseAndAttach and the pipeline jUnit step), so content controlled by a build/PR can supply a DOCTYPE with external entities. No XXE hardening (setFeature / disallow-doctype-decl / FEATURE_SECURE_PROCESSING / entity limits) exists anywhere in the repository, which was verified by text search. Impact includes disclosure of files readable by the parsing process (controller when parsing on the built-in node, otherwise the agent), SSRF via external DTD retrieval, and parser resource exhaustion. I selected this single candidate because it has the clearest attacker-input-to-sensitive-sink path in the snapshot; other leads (History request-parameter subList, classpath resource lookup in the TestNG branch, XStream load of junitResult.xml, XSS in result views) were inspected and do not reach the same evidence level, as recorded in rejected leads."
+}

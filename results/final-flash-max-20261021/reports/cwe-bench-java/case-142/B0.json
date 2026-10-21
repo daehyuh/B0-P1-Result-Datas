@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `userid` path/query parameter (e.g. `/enrollment/fido2/attestation?userid=`, `/enrollment/fido2/registration/{userid}`, `/enrollment/otp/creds/{userid}`, `/enrollment/twilio_sms/send-code?userid=&number=`, `/2fa/turn-on/{userid}`) is fully attacker-controlled. The attacker also controls the credential artifacts they submit (WebAuthn attestation result, OTP secret, SMS phone number).",
+      "confidence": "medium",
+      "counterevidence_checked": "The endpoints do require a valid, active bearer token with the declared scopes, so this is not unauthenticated access; the `userid` used is the user's inum (UUID-like) rather than the username, so the attacker must discover the victim's inum — but nothing in the code derives or verifies ownership, and inums are routinely exposed in URLs/API payloads. I checked for any ownership/identity binding in AuthorizationProcessingFilter, the WS classes and their services: none exists (the Casa JSF `SessionContext` is not used by these token-protected REST endpoints). I also checked that scope annotations are present on the classes/methods (so the bypass is the missing owner check, not a missing annotation).",
+      "id": "casa-rest-missing-owner-check",
+      "impact": "Account takeover / 2FA bypass: an authenticated low-privileged user can silently enroll their own authenticator (passkey, OTP secret, SMS number) into another user's account, or disable that user's 2FA, using only the victim's (non-secret) inum. Also allows SMS delivery to attacker-chosen numbers via a victim's `userid` and enumeration of 2FA state via `/2fa/user-info/{userid}`.",
+      "locations": [
+        {
+          "end_line": 95,
+          "path": "jans-casa/app/src/main/java/io/jans/casa/rest/AuthorizationProcessingFilter.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 161,
+          "path": "jans-casa/app/src/main/java/io/jans/casa/plugins/authnmethod/rs/PasskeysEnrollingWS.java",
+          "start_line": 57
+        },
+        {
+          "end_line": 157,
+          "path": "jans-casa/app/src/main/java/io/jans/casa/plugins/authnmethod/rs/OTPEnrollingWS.java",
+          "start_line": 111
+        },
+        {
+          "end_line": 161,
+          "path": "jans-casa/app/src/main/java/io/jans/casa/plugins/authnmethod/rs/MobilePhoneEnrollingWS.java",
+          "start_line": 49
+        },
+        {
+          "end_line": 104,
+          "path": "jans-casa/app/src/main/java/io/jans/casa/rest/SecondFactorUserWS.java",
+          "start_line": 37
+        }
+      ],
+      "prerequisites": "Casa is deployed; the attacker has any account able to obtain a token bearing the Casa scopes (`https://jans.io/casa.enroll` for enrollment endpoints, `https://jans.io/casa.2fa` for the 2FA endpoints — these are ordinary end-user scopes in Casa deployments); the attacker knows the victim's inum (the value used for `inum=<userid>` DNs; it is passed in URLs/webservice calls and is not treated as a secret). No runtime test was performed.",
+      "root_cause": "Casa's REST authorization filter validates only that the bearer token is active and contains the annotation-declared scopes (e.g. https://jans.io/casa.enroll, https://jans.io/casa.2fa). It never compares the token subject to the `userid` used by the enrollment / 2FA handlers. Each handler then resolves `persistenceService.getPersonDn(userId)` = \"inum=<userId>,...\" directly from the request and performs the operation on that user, so any account holding the Casa scopes can act on another account.",
+      "title": "Casa REST enrollment/2FA endpoints authorize only by token scope, not by user ownership (user-controlled `userid`)",
+      "trace": "1) POST/GET to a Casa enrollment endpoint with a valid Casa-scoped bearer token: `AuthorizationProcessingFilter.filter` (lines 56-95) introspects the token and checks only `tokenScopes.containsAll(expectedScopes)`; it never inspects `response.getSub()` nor any user identifier from the request. 2) `PasskeysEnrollingWS.getAttestationMessage(userId)` fetches the person for the attacker-supplied `userid` (line 68) and calls `fido2Service.doRegister(person.getUid(), ...)` (line 74), causing the FIDO2 server to issue attestation options for the victim; it also plants the `casa_upreg_<userId>` cache marker (line 77). 3) The attacker completes WebAuthn with their own authenticator and posts the result to `registration/{userId}`; `sendRegistrationResult` (lines 88-130) verifies it and `getLatestPasskey(userId, ...)`/cache keying bind the new passkey registration to the victim's user (Fido2Service filters on `personInum=userId`, lines 69-103/209-220). 4) Alternatively `OTPEnrollingWS.finishEnrollment` (line 141) or `MobilePhoneEnrollingWS.finishEnrollment` (line 150) add an attacker-controlled OTP secret / phone number to the victim's account, and `SecondFactorUserWS.switch2FA` (lines 65-104) turns the victim's 2FA on/off. The attacker's own credential is now registered for the victim and can be used to authenticate as that user (passkey/OTP second factor, or passkey-based login).",
+      "unverified": "No runtime or build verification was possible (read-only review); the upstream fix/CVE mapping is unknown; exploitability depends on Casa being deployed, the attacker being able to obtain the casa scopes for its own account, and knowing the victim's inum.",
+      "weakness_type": "CWE-639/CWE-862 Missing authorization / authorization bypass through user-controlled key (IDOR)"
+    }
+  ],
+  "coverage_summary": "Reviewed the snapshot via file listings and targeted source reads/searches across jans-auth-server (authorize, PAR, token, introspection, auth filter, session/select-account), jans-config-api (AuthorizationFilter/OpenIdAuthorizationService, AssetResource, Agama repo, SAML plugin), jans-casa (REST filters and enrollment/2FA webservices and services), jans-scim (protection filters), jans-fido2, jans-core (document store, SAML, script, jsf-util) and jans-orm. The snapshot contains Java/Kotlin/JS/XML/YAML sources only; Python, Go and Rust sources are absent, so those modules (jans-pycloudlib, jans-linux-setup, jans-cli-tui, terraform provider, cedarling) could not be reviewed. Not every one of the 4914 visible files was read; coverage of the auth-server/webapp front-end and many less security-relevant modules is partial.",
+  "limitations": [
+    "No execution, build, or runtime confirmation was possible; findings are source-level only.",
+    "Python/Go/Rust sources are not present in the assigned snapshot, so vulnerabilities in those components cannot be assessed here.",
+    "Could not diff against upstream or inspect the fixing patch, so I cannot confirm which issue the case targets.",
+    "The Casa finding depends on deployment specifics (Casa enabled, end users able to obtain casa.enroll/casa.2fa tokens, victim inum known), which I could not verify in this environment.",
+    "Large areas (auth-server webapp JS/XHTML, orm backends, lock server) were only sampled, so additional issues may exist."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SSRF via config-api /agama-repo/download?downloadLink= (AgamaRepoService.getAgamaProject does new URL(url).openStream())",
+      "reason": "Real server-side fetch sink with attacker-controlled URL, but reachable only with `agama_repo` read/write or super-admin scopes (admin-privileged caller), and the fetched bytes are returned, making it a privileged SSRF rather than the strongest end-user issue."
+    },
+    {
+      "lead": "SSRF via request_uri at the authorization endpoint (JwtAuthorizationRequest.queryRequest fetches arbitrary request_uri)",
+      "reason": "By design for JAR/PAR (request_uri by reference); guarded by requestUriParameterSupported, client request_uris and requestUriBlockList defaults (localhost/127.0.0.1). Response body is parsed as a JWT so exfiltration is limited; no clear missing check found."
+    },
+    {
+      "lead": "XXE-prone XML parsing in jans-core/saml SAMLMetadataParser (disallow-doctype-decl set to false) and SAXUtils",
+      "reason": "Parser does permit DOCTYPE and does not disable external entities, but the only in-repo caller takes a metadata file retrieved via the keycloak-integration job scheduler from an admin-managed trust relationship; reachability and impact are limited and unverified."
+    },
+    {
+      "lead": "JWT 'none' algorithm acceptance",
+      "reason": "Gated correctly: rejectJwtWithNoneAlg checks in AuthCryptoProvider/ServerCryptoProvider; none-alg is rejected in FAPI paths; no bypass found."
+    },
+    {
+      "lead": "Math.random-based OTP code generation in MobilePhoneEnrollingWS/SmsDeliveryWS",
+      "reason": "Uses a non-CSPRNG for codes, but codes are only validated against the attacker-supplied enrollment context, so it does not independently enable a takeover; noted as a hardening issue."
+    },
+    {
+      "lead": "Java/Kryo deserialization of Agama flow continuations (SerializationUtil/KryoSerializer with registrationRequired=false)",
+      "reason": "Unsafe-deserialization surface exists, but the serialized blob is produced server-side from flow execution state; I could not establish a source-to-sink path where attacker-controlled bytes reach it."
+    }
+  ],
+  "summary": "Snapshot is the Janssen (janssenproject/jans) monorepo at roughly v1.7.0+ (Java/Kotlin/JS/XML sources only; Python, Go and Rust sources are not present in this snapshot). I reviewed the auth-server, config-api, casa, core, scim, fido2 and orm modules, tracing attacker-controlled inputs, authentication/authorization gates and dangerous sinks. One issue stands out with clear source evidence: the Casa REST API performs only bearer-token scope validation and never binds the caller-supplied `userid` (path/query parameter) to the token's subject, so any authenticated user holding a Casa scope can enroll/detach/toggle authenticators for an arbitrary other user, enabling account takeover. Other leads (SSRF in Agama repo download, request_uri fetch, XXE-prone SAML metadata parsing) are lower-severity/less certain and are listed as rejected."
+}

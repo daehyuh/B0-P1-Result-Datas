@@ -1,0 +1,82 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated remote client controls the Thrift method arguments: `TSyncIdentityInfo.pipeName`/`database` for `handshake`, `TSyncTransportMetaInfo.fileName`/`startIndex` and file bytes for `sendFile`, and `TPipeTransferReq.type`/`version`/`body` for `pipeTransfer`. It also controls the deletion path and time range encoded in a legacy `DeletionPipeData` and the filename/path segments used by the modern receiver.",
+      "confidence": "high",
+      "counterevidence_checked": "Normal DataNode RPC methods (`executeStatementInternal`, `executeBatchStatement`, `setStorageGroup`, etc.) explicitly enforce `SESSION_MANAGER.checkLogin`, which shows the pipe methods are outliers rather than a globally authentication-disabled mode. `ProcessorWithMetrics` and `RPCServiceThriftHandler` contain no authorization interceptor. `handleTransferHandshakeV2` does call `tryLogin`, but the dispatcher also accepts V1 and V1 does not; the attacker can select V1. The receiver agents are constructed unconditionally in `PipeDataNodeAgent`, and `PipeDataNodeReceiverAgent` creates the legacy and modern agents in its constructor. `TThreadPoolServer` is used for `RPCService`, so the connection's unauthenticated `ClientSession` is available on the worker thread for `handshake`'s `getClientAddress()` call. The legacy `sendFile` `.patch` suffix limits that one path, but the modern file-piece path and legacy `sendPipeData` deletion path are not subject to it.",
+      "id": "case-170-pipe-receiver-unauth",
+      "impact": "Unauthenticated creation, overwrite, or truncation of files writable by the DataNode process, which can corrupt data/configuration and may enable code execution if a writable startup, configuration, cron, or shell-readable path is reachable. The legacy receiver additionally gives unauthenticated attackers SUPER_USER-level deletion of arbitrary time-series data or entire time-series schema, plus unauthenticated database creation. Integrity and availability are directly impacted; confidentiality is also impacted if the written path is later served or executed.",
+      "locations": [
+        {
+          "end_line": 2697,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/protocol/thrift/impl/ClientRPCServiceImpl.java",
+          "start_line": 2672
+        },
+        {
+          "end_line": 119,
+          "path": "iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/pipe/receiver/IoTDBFileReceiver.java",
+          "start_line": 94
+        },
+        {
+          "end_line": 404,
+          "path": "iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/pipe/receiver/IoTDBFileReceiver.java",
+          "start_line": 308
+        },
+        {
+          "end_line": 304,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/pipe/receiver/protocol/legacy/IoTDBLegacyPipeReceiverAgent.java",
+          "start_line": 269
+        },
+        {
+          "end_line": 76,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/pipe/receiver/protocol/legacy/loader/DeletionLoader.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 69,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/protocol/thrift/handler/BaseServerContextHandler.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 43,
+          "path": "iotdb-core/node-commons/src/assembly/resources/conf/iotdb-system.properties",
+          "start_line": 42
+        }
+      ],
+      "prerequisites": "Network access to the DataNode client RPC port; the distribution default is `dn_rpc_address=0.0.0.0` and `dn_rpc_port=6667`, and the server does not require an authenticated session before these handlers. The modern receiver needs an accepted V1 handshake; for file write the target parent directory must exist and be writable by the DataNode OS account. For legacy `sendFile`, a `.patch` suffix is appended; the `pipeTransfer` file-piece path and the legacy deletion path do not have that suffix limitation.",
+      "root_cause": "The pipe receiver Thrift methods exposed by `ClientRPCServiceImpl` do not require an authenticated session. The modern receiver's V1 handshake (`IoTDBFileReceiver.handleTransferHandshakeV1`) creates a receiver directory without calling the `tryLogin` check used by V2, and subsequent file-piece requests pass an attacker-controlled `fileName` into `new File(receiverFileDir, fileName)` and `RandomAccessFile` without normalization. The legacy receiver applies the same pattern to `metaInfo.fileName` and `pipeName`, and its `DeletionLoader` executes generated delete statements with a hard-coded SUPER_USER SessionInfo.",
+      "title": "Unauthenticated pipe receiver RPC allows arbitrary file write and SUPER_USER data deletion",
+      "trace": "1. A TCP connection gets an unauthenticated `ClientSession` from `BaseServerContextHandler.createContext` (lines 58-69). 2. The client invokes `ClientRPCServiceImpl.pipeTransfer` with a `HANDSHAKE_DATANODE_V1` request; `IoTDBDataNodeReceiver.receive` dispatches to `IoTDBFileReceiver.handleTransferHandshakeV1`, which does not call `tryLogin`, unlike the V2 path. 3. The client sends `TRANSFER_TS_FILE_PIECE`; `PipeTransferFilePieceReq` reads `fileName` and bytes from the request body, and `IoTDBFileReceiver.handleTransferFilePiece` calls `updateWritingFileIfNeeded`, which resolves `new File(receiverFileDirWithIdSuffix.get(), fileName)` and opens it with `RandomAccessFile(\"rw\")`. `../` segments escape the receiver directory; offset-mismatch handling truncates non-`.tsfile` targets and a retry writes at offset 0. 4. Alternatively, the client invokes the legacy `handshake` and `sendFile`; `IoTDBLegacyPipeReceiverAgent.transportFile` builds `new File(fileDir, fileName + \".patch\")` and writes at the supplied offset. 5. For deletion, the client invokes legacy `handshake` with an empty database and `sendPipeData` with a crafted `DeletionPipeData`; `DeletionLoader.load` builds a `DeleteTimeSeriesStatement` or `DeleteDataStatement` and executes it with `new SessionInfo(0, AuthorityChecker.SUPER_USER, ...)`. 6. `handshake` with a non-empty `database` also calls `registerDatabase` as SUPER_USER, creating a database without authentication.",
+      "unverified": "No server was started and no request payload was executed, so runtime reachability and exploitability are not confirmed. The exact deployment may restrict the RPC port with a firewall or network policy; the source default is 0.0.0.0:6667. The DataNode OS account's filesystem permissions determine which target paths can be created or overwritten. The generated Thrift IDL/stubs are not present in the source snapshot, so wire-structure assumptions come from the Java handlers. The exact issue expected by the review case is unknown, and some source files are missing from the P1 index.",
+      "weakness_type": "Missing authentication for critical function (CWE-306) and path traversal (CWE-22)"
+    }
+  ],
+  "coverage_summary": "Source scope: 4,194 files (about 25 MB; 3,954 Java files). P1 relation index: 4,103 indexed files, 91 source files missing from the index, 121,533 unresolved calls, no control-flow/data-flow or semantic resolution. I focused on the DataNode client RPC/service registration and session handling, the modern and legacy pipe receivers/connectors, auth (Basic and OpenID), REST filters/services, and configuration defaults. I also keyword-swept for deserialization, process execution, file writes, archive extraction, and path handling across the tree. I did not inspect all 4,194 files line by line; consensus, client, UDF library, metrics, and integration-test modules were mostly keyword-level review. Generated Thrift classes and IDL are not present in the snapshot.",
+  "limitations": [
+    "Static source review only; no server, unit test, integration test, or exploit payload was executed.",
+    "Runtime reachability is inferred from source and default configuration; firewall/network policy and deployment-specific settings may restrict the RPC port.",
+    "The DataNode OS account's permissions determine which filesystem paths can be created or overwritten.",
+    "Generated Thrift IDL/stubs are absent, so exact wire serialization is inferred from Java handler code.",
+    "The P1 index omits 91 source files and has no data-flow or semantic resolution; index facts were used only for navigation.",
+    "The review was limited to one candidate; other unconfirmed leads are listed above and were not fully verified."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "OpenID JWT expiration is effectively disabled by `setAllowedClockSkewSeconds(Long.MAX_VALUE / 1000)` in `OpenIdAuthorizer.validateToken` (iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/auth/authorizer/OpenIdAuthorizer.java:196-203).",
+      "reason": "This is a real hardening concern, but it only matters when the non-default OpenID authorizer is configured and an attacker already possesses a valid signed token. It was not selected over the default-reachable pipe receiver issue."
+    },
+    {
+      "lead": "`ClusterAuthorityFetcher` treats any cached `isOpenIdUser()` as fully authorized and accepts any password for that cached user (iotdb-core/datanode/src/main/java/org/apache/iotdb/db/auth/ClusterAuthorityFetcher.java:390-400, 91-93, 275).",
+      "reason": "Potentially severe in OpenID deployments, but conditional on OpenID mode and a cached OpenID user; I did not verify the cache-population and role semantics end to end, so it remains an unconfirmed lead."
+    },
+    {
+      "lead": "Logical-view source paths are checked for READ_SCHEMA but not clearly for READ_DATA at query time; `AlterLogicalViewNode` carries a TODO about adding an auth check for source paths (iotdb-core/datanode/src/main/java/org/apache/iotdb/db/queryengine/plan/statement/metadata/view/CreateLogicalViewStatement.java:78-109; .../AlterLogicalViewNode.java:64-77).",
+      "reason": "Suggestive of a permission gap, but the query-time authority-scope and source-path expansion behavior was not traced to a concrete unauthorized read, so it was not selected."
+    },
+    {
+      "lead": "REST `UserCache` keeps successful Basic credentials for eight hours by default (iotdb-core/datanode/src/main/java/org/apache/iotdb/db/protocol/rest/filter/UserCache.java:33-39, IoTDBRestServiceConfig.java:52).",
+      "reason": "This delays password-change/deletion revocation, but the REST service is disabled by default and the issue is narrower than the unauthenticated pipe receiver paths."
+    }
+  ],
+  "summary": "Static review of the Apache IoTDB 1.3.4-SNAPSHOT source tree. The strongest source-backed issue is the client-facing pipe receiver Thrift surface. `pipeTransfer`, `handshake`, `sendPipeData`, and `sendFile` are callable before login; the V1 handshake path skips the `tryLogin` performed by the V2 path; receiver `fileName`/`pipeName` values are used directly as filesystem paths; and the legacy deletion loader executes with a hard-coded SUPER_USER SessionInfo. A remote client that can reach the default DataNode RPC port (0.0.0.0:6667) has an unauthenticated arbitrary-file-write/truncate primitive and an unauthenticated SUPER_USER data/schema deletion primitive. No runtime test or exploit was executed; this is a candidate lead, not a confirmed vulnerability."
+}

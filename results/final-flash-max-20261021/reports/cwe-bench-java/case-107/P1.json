@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any party that can open a Dubbo-protocol connection to the provider port supplies the entire request: method name ($invoke), parameter-type array, argument array, and attachments (including the `generic` key). Evidence that this data is decoded straight from the wire: DecodeableRpcInvocation.decode (dubbo-rpc/dubbo-rpc-dubbo/.../DecodeableRpcInvocation.java lines 106-180) sets method name, arguments and attachments from the request, and RpcUtils.isGenericCall permits the $invoke descriptor without the interface declaring such a method. The attacker can therefore (i) send no/`true` generic value and place a Map with a `class` key in the arguments (default PojoUtils.realize path), (ii) set `generic=bean` and send JavaBeanDescriptor objects, or (iii) set `generic=java` and send a Java-serialized byte array.",
+      "confidence": "medium",
+      "counterevidence_checked": "TokenFilter (dubbo-rpc-api .../TokenFilter.java lines 39-57) mitigates only when the provider explicitly configures a token; it is not cryptographic authentication and is not the default. The serialization security check (DecodeableRpcInvocation lines 126-128 -> CodecSupport.checkSerialization lines 161-180) defaults to false and only compares the outer serialization id, so it does not constrain PojoUtils.realize, JavaBean descriptor instantiation, or the inner nativejava ObjectInputStream. GenericFilter excludes interfaces that implement GenericService, but ordinary services are exactly the affected ones. The PojoUtils class override only triggers for Map arguments, which are trivially supplied; `generic.include.class` defaults to true but the override is not gated by it. The exploit needs a suitable gadget/side-effect class on the provider classpath, which is a real but commonly satisfied precondition. Nothing indicates a class allow-list or provider opt-in exists in this snapshot (no SerializeSecurityManager/SerializeClassChecker in the tree).",
+      "id": "dubbo-generic-invoke-rce",
+      "impact": "Remote code execution in the provider JVM (arbitrary constructor/setter/field invocation on attacker-chosen classes; JNDI/URLClassLoader/Templates-style gadget chains; direct Java deserialization). Consequences include full compromise of the service process, access to configuration/registry credentials, lateral movement, and data theft. Even without a working RCE gadget, the primitive allows attacker-driven instantiation of arbitrary classes and writes to their properties on every provider node.",
+      "locations": [
+        {
+          "end_line": 152,
+          "path": "dubbo-rpc/dubbo-rpc-api/src/main/java/org/apache/dubbo/rpc/filter/GenericFilter.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 394,
+          "path": "dubbo-common/src/main/java/org/apache/dubbo/common/utils/PojoUtils.java",
+          "start_line": 386
+        },
+        {
+          "end_line": 500,
+          "path": "dubbo-common/src/main/java/org/apache/dubbo/common/utils/PojoUtils.java",
+          "start_line": 466
+        },
+        {
+          "end_line": 438,
+          "path": "dubbo-common/src/main/java/org/apache/dubbo/common/beanutil/JavaBeanSerializeUtil.java",
+          "start_line": 389
+        },
+        {
+          "end_line": 44,
+          "path": "dubbo-serialization/dubbo-serialization-jdk/src/main/java/org/apache/dubbo/common/serialize/nativejava/NativeJavaObjectInput.java",
+          "start_line": 31
+        }
+      ],
+      "prerequisites": "Provider application exposes any Dubbo RPC service on a reachable port (default 20880, no authentication by default; token auth only if `token` is configured, and the auth filter only if explicitly enabled). For path (a) the service interface only needs one method with at least one parameter (its declared type is overwritten by the attacker's class entry); for (b)/(c) a class whose construction/setters or Java-deserialization triggers harmful behavior must exist on the provider classpath (common gadget/libs). The optional serialization security check must be off (the default: `serialization.security.check=false`).",
+      "root_cause": "The provider-side generic invocation handler trusts client-supplied invocation data. GenericFilter.invoke treats any request whose method name is `$invoke`/`$invokeAsync` with three arguments as a generic call for any non-GenericService interface and derives a client-controlled `generic` mode from request attachments. It then either: (a) calls PojoUtils.realize on the client argument array, and PojoUtils.realize0 replaces the declared parameter type with the class named by an attacker-supplied `\"class\"` entry inside any Map argument (ClassUtils.forName), then instantiates that class (public or private constructor, setAccessible(true)) and applies attacker keys as setter/field writes; (b) deserializes an attacker-supplied JavaBeanDescriptor via JavaBeanSerializeUtil.deserialize, which resolves arbitrary class names (name2Class/Class.forName) and instantiates them; or (c) native-Java-deserializes attacker bytes via NativeJavaObjectInput (new ObjectInputStream(is).readObject()). No allow-list, class check, or provider opt-in guards these paths.",
+      "title": "Remote code execution on Dubbo providers via unauthenticated generic invocation ($invoke): attacker-controlled class instantiation and deserialization",
+      "trace": "1) Wire request is decoded by DecodeableRpcInvocation.decode: method name line 120, args lines 144-161, attachments lines 165-173. 2) Provider filter chain runs GenericFilter (`@Activate(group=PROVIDER, order=-20000)`, line 55); lines 60-63 match method name `$invoke`/`$invokeAsync` with 3 args for a non-GenericService interface. 3) The `generic` mode is read from client attachments at lines 82-86 (falling back to RpcContext). 4) Default/`true`/`raw.return` mode (lines 88-91) calls PojoUtils.realize(args, params, genericParameterTypes); in PojoUtils.realize0 the Map's `\"class\"` string overrides the target type at lines 386-394 via ClassUtils.forName; the type is instantiated at line 466 -> newInstance (lines 560-589, falls back to the shortest declared constructor with setAccessible(true)); each remaining map entry is applied through a setter (lines 474-489, method.invoke) or through setAccessible(true) field writes (lines 490-497, getField lines 643-664). 5) `generic=bean` (lines 112-125) calls JavaBeanSerializeUtil.deserialize -> instantiateForDeserialize (lines 389-438) -> name2Class/Class.forName (lines 447-467) -> instantiate with the shortest constructor forced accessible (lines 326-352); attacker-controlled properties are then applied via setters/fields in deserializeInternal (lines 264-299). 6) `generic=java` (lines 92-101) loads the `nativejava` serialization extension and calls deserialize(...).readObject(); NativeJavaObjectInput wraps the attacker bytes in a plain ObjectInputStream (lines 35-36), so the full Java serialization gadget space is exposed.",
+      "unverified": "No code was executed and no payload was built; the deserialization/instantiation primitive, wire reachability (DecodeableRpcInvocation -> filter chain -> GenericFilter) and absence of allow-lists were established only by source reading. I could not verify SPI filter registration because META-INF/dubbo descriptors are absent from the snapshot, and I could not confirm that a specific gadget class is present on a given deployment's classpath. The exact upstream CVE identifier (this snapshot contains several RCE-class issues fixed in later 2.7.x releases) is not asserted; the finding is stated from source evidence alone.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (combined with CWE-470 Use of Externally-Controlled Input to Select Classes / unsafe reflection; impact: RCE)"
+    }
+  ],
+  "coverage_summary": "Scope reported by get_source_scope: 1468 model-visible files; per-file limit 5 MiB; 0 files excluded as binary/sensitive/symlink. Relation index (get_relation_scope): built over 1460 files (1321 Java parsed, 0 parse errors, 8 source files missing from the index); relations are syntactic name/containment/call candidates only; control flow, data flow, semantic resolution and Spring runtime wiring are not implemented, and the index is explicitly not SAST. The snapshot contains no test sources and almost no SPI/META-INF descriptors, so registrations (e.g., GenericFilter in org.apache.dubbo.rpc.Filter) could only be inferred from @Activate annotations and call sites. I read and traced, among others: dubbo-rpc-api filters (GenericFilter, TokenFilter, ContextFilter), dubbo-common PojoUtils/JavaBeanSerializeUtil/ReflectUtils/ClassUtils, dubbo-serialization-jdk NativeJavaObjectInput, dubbo-serialization-hessian2 factory/whitelist classes, dubbo-rpc-dubbo DecodeableRpcInvocation/DecodeableRpcResult, dubbo-remoting ExchangeCodec/CodecSupport, dubbo-cluster script/condition/tag routers and ConfigParser, dubbo-registry RegistryDirectory router construction, dubbo plugin qos/telnet handlers and dubbo-auth. Areas not exhaustively reviewed: config-center/registry client implementations and most serialization modules (kryo/fst/protobuf/protostuff/native-hessian), metadata/report modules, spring integration, and demo/distribution code.",
+  "limitations": [
+    "Not runtime-confirmed: no code, tests, scanners, or exploits were executed; every statement is source-derived, and the harness explicitly disallows execution.",
+    "The exact CVE attribution is uncertain: this 2.7.9 snapshot contains several independent RCE-class issues fixed in later releases (generic invocation, YAML rule parsing, script router, Hessian2/native-Java deserialization), and the case metadata was not available to me; I selected the single candidate with the strongest remote, unauthenticated source evidence and listed the others as rejected leads.",
+    "SPI registration files (META-INF/dubbo) and all test sources are absent from the filtered snapshot, so default filter activation and expected unit-level behavior could not be checked directly.",
+    "The relation index is partial/syntactic (8 files missing, no data-flow or reachability proof) and was used only for navigation; all cited relations were verified against source text.",
+    "Presence of a concrete gadget class (e.g., JNDI-capable setter chain) on the provider classpath was not verified, and the Dubbo RPC port is often network-restricted in production, which lowers practical exploitability from 'assumed exposed' to 'conditionally exposed'.",
+    "Dependency behavior (hessian-lite 3.2.8, fastjson 1.2.70, SnakeYAML 1.20, Nashorn availability) was not inspected at bytecode/runtime level; only version declarations in pom files were observed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SnakeYAML insecure constructor in rule parsing: ConfigParser.parseObject (dubbo-cluster/.../configurator/parser/ConfigParser.java lines 75-83), ConditionRuleParser.parse (lines 40-48) and TagRuleParser.parse (lines 27-41) create `new Yaml(new Constructor(...))`, which honors explicit `!!` tags and can instantiate arbitrary classes.",
+      "reason": "Real unsafe-deserialization pattern, but exploitation requires the ability to publish/alter dynamic configuration content in the config center or governance rules (a different, usually privileged trust boundary), and the strongest remote/unauthenticated evidence is in the generic invocation path. Likely corresponds to a separate YAML-deserialization advisory (CVE-2021-30180/36162 class), so it is not selected as the single candidate."
+    },
+    {
+      "lead": "Nashorn script router: ScriptRouter constructor compiles the `rule` URL parameter (lines 65-77) and route() evaluates it (lines 109-121) with an unsandboxed ScriptEngine obtained by name (lines 96-106).",
+      "reason": "Also RCE-class and source-evidenced, but requires control over router URLs delivered from the registry/config center (RegistryDirectory.toRouters lines 285-310), i.e., a privileged configuration/registry write, and Nashorn availability depends on the JDK. Kept as a secondary lead (CVE-2021-30181 class)."
+    },
+    {
+      "lead": "Hessian2 deserialization defaults: Hessian2FactoryInitializer.getInstance (dubbo-serialization-hessian2) selects a serializer factory whose class allow/deny behavior is off unless configured; the default permits classes.",
+      "reason": "The dangerous blacklist/whitelist enforcement lives in the external hessian-lite 3.2.8 artifact (not in this snapshot), so in-repo evidence for a concrete deserialization gadget/RCE is weaker than for the generic invocation sinks."
+    },
+    {
+      "lead": "dubbo-auth replay: AccessKeyAuthenticator.authenticate (lines 44-66) verifies the HMAC signature but never validates the request timestamp for freshness/expiry, so a captured signed request could be replayed.",
+      "reason": "Weaker impact (requires interception of a signed request), and the module is only active when service authentication is explicitly enabled; not the strongest candidate."
+    },
+    {
+      "lead": "QoS/telnet management commands (InvokeTelnetHandler, LogTelnetHandler, ShutdownTelnetHandler, etc.).",
+      "reason": "The QoS server rejects non-loopback clients by default (LocalHostPermitHandler lines 39-47), and LogTelnetHandler only reads the configured log file; no remote unauthenticated path with comparable evidence was found."
+    }
+  ],
+  "summary": "Reviewed the assigned Apache Dubbo 2.7.9 source snapshot (1468 files; 1321 Java files parsed by the relation index; no test sources and almost no META-INF/SPI descriptors were included in the snapshot). The strongest source-evidenced issue is a provider-side remote code execution path through the generic invocation handler: a remote client able to reach a Dubbo provider port can send an invocation whose method name is `$invoke`/`$invokeAsync`, control the `generic` attachment and the argument array, and make the provider perform attacker-driven class instantiation / deserialization. GenericFilter is annotated `@Activate(group = PROVIDER)` with no value filter, so it runs for ordinary (non-GenericService) services; the `generic` attachment is read from the decoded request without validation, and the default branch calls `PojoUtils.realize`, which honors a client-supplied `\"class\"` key in any Map argument and replaces the declared parameter type with `ClassUtils.forName(...)`, then instantiates that class (including non-public constructors) and writes attacker-supplied properties via setters/fields. The `generic=bean` branch resolves arbitrary class names from attacker-supplied JavaBeanDescriptor objects, and the `generic=java` branch performs native Java deserialization (`ObjectInputStream.readObject`) of attacker bytes. Counter-checks: the RPC port is normally internal and TokenFilter exists only when a token is configured; the optional `serialization.security.check` is disabled by default and only validates the outer serialization id. I could not runtime-confirm anything and did not attempt exploitation."
+}

@@ -1,0 +1,88 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The filter arguments are taken from API request bodies parsed by the plugin: `credentials.username` in the authenticate-user request (Credentials.getUsername, model/Credentials.java:46-48 -> LdapAuthenticator.authenticateWithAuthConfig:57 -> ApacheDsLdapClient.authenticate:61 -> findLdapEntryForAuthentication:162), `search_term` in the search-users request (SearchUserRequest.getSearchTerm -> SearchUserExecutor.searchUsers:73), and `username` in the is-valid-user request (IsValidUserRequest.getUsername -> IsValidUserRequestExecutor.findUser:73). These values originate from GoCD server/web requests and are passed verbatim as `new String[]{username}` / `new String[]{searchTerm}` into `search(...)` and then into `MessageFormat.format`.",
+      "confidence": "medium",
+      "counterevidence_checked": "The JNDI client (JNDILdapClient:143) escapes filter arguments, so a deployment with `use.jndi.ldap.client=true` is not affected by this argument-injection vector; the injected argument is only attacker-controlled for the request fields listed above, not for the filter template itself (UserSearchFilter/UserLoginFilter are admin configuration); `Util.encloseParentheses` and the legacy unused `framework/ldap/filter` classes do not participate in this path; the authentication path performs a real bind against the matched entry DN with the caller-supplied password (ApacheDsLdapClient:62-64, 157-159), which limits injection to lookup manipulation rather than credential bypass; for the standard single-placeholder login filter, payloads that close the outer parenthesis produce invalid multi-filter strings and are rejected by the LDAP filter parser. I did not execute the plugin or an LDAP server, so exploitability against a specific directory was not runtime-confirmed.",
+      "id": "ldap-filter-injection-apacheds-client",
+      "impact": "Injection of attacker-chosen LDAP filter assertions into searches executed as the Manager DN. On the search-users/is-valid-user paths this enables directory enumeration and disclosure of user attributes (username/displayName/mail of up to 100 entries per request) beyond the intended search, and allows blind predicate testing against attributes the calling user could not read directly because the query is evaluated with the manager's privileges. On the authentication path the lookup can be redirected (wildcard/substring/attribute-assertion patterns), potentially changing which entry is matched; however, because login filters are usually single-placeholder equality filters such as `(uid={0})` (README example) and because the subsequent bind still uses the matched entry's DN and the supplied password, I could not establish an authentication bypass from this defect alone. Availability is also affected: crafted filters force multi-match/parse failures or expensive directory scans, and `MultipleUserDetectedException` denies login.",
+      "locations": [
+        {
+          "end_line": 123,
+          "path": "src/main/java/cd/go/apacheds/ApacheDsLdapClient.java",
+          "start_line": 98
+        },
+        {
+          "end_line": 173,
+          "path": "src/main/java/cd/go/apacheds/ApacheDsLdapClient.java",
+          "start_line": 161
+        },
+        {
+          "end_line": 38,
+          "path": "src/main/java/cd/go/authentication/ldap/LdapFactory.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 85,
+          "path": "src/main/java/cd/go/authentication/ldap/executor/SearchUserExecutor.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 80,
+          "path": "src/main/java/cd/go/authentication/ldap/executor/IsValidUserRequestExecutor.java",
+          "start_line": 64
+        },
+        {
+          "end_line": 68,
+          "path": "src/main/java/cd/go/authentication/ldap/LdapAuthenticator.java",
+          "start_line": 50
+        }
+      ],
+      "prerequisites": "Default configuration (no `-Duse.jndi.ldap.client=true`) plus at least one LDAP authorization config. The attacker must be able to trigger a plugin request that carries a filter argument: a login attempt (authenticate-user), a user search (search-users), or an is-valid-user check. Searches are performed over pooled connections bound with the configured Manager DN (ApacheDsLdapClient:49-53, pool/ConnectionPoolFactory.java:58-60), so the injected predicates are evaluated with the manager's directory read privileges. No LDAP server response or runtime behavior was executed in this review.",
+      "root_cause": "`ApacheDsLdapClient.search(String filter, Object[] filterArgs, ...)` composes the LDAP search filter with `java.text.MessageFormat.format(filter, filterArgs)` (src/main/java/cd/go/apacheds/ApacheDsLdapClient.java:112). MessageFormat only substitutes arguments; it does not apply LDAP/RFC-4515 escaping to special characters (`*`, `(`, `)`, `\\\\`, NUL). The repository contains no LDAP-encoding helper at all (searches for `escape` return nothing), so every user-controlled value passed as a filter argument becomes part of the filter grammar. The other implementation of the same `LdapClient.search(filter, filterArgs, ...)` contract is safe because JNDI escapes filter arguments itself (`context.search(base, filter, filterArgs, ...)`, src/main/java/cd/go/framework/ldap/JNDILdapClient.java:143), which demonstrates that these API values are meant to be treated as data, not filter syntax. The default client is the Apache DS one: `LdapFactory.ldapForConfiguration` returns `ApacheDsLdapClient` unless the JVM system property `use.jndi.ldap.client=true` is set (src/main/java/cd/go/authentication/ldap/LdapFactory.java:28-38, PluginSystemProperty.java:20-24).",
+      "title": "LDAP filter injection via unescaped user-controlled filter arguments in ApacheDsLdapClient",
+      "trace": "Request JSON -> AbstractExecutor.parseRequest (Gson) -> SearchUserRequest/IsValidUserRequest/Credentials -> SearchUserExecutor.searchUsers line 73 or IsValidUserRequestExecutor.findUser line 73 or LdapAuthenticator line 57 -> ApacheDsLdapClient.authenticate line 61 / search line 98 -> findLdapEntryForAuthentication line 162 passes `new String[]{username}` -> ApacheDsLdapClient.search line 112 `.setFilter(format(filter, filterArgs))` -> SearchRequestImpl -> LDAP query. Because the default user search filter is `(|(sAMAccountName=*{0}*)(uid=*{0}*)(cn=*{0}*)(mail=*{0}*)(otherMailbox=*{0}*))` (LdapConfiguration.java:36) and each placeholder accepts arbitrary characters, a search term containing filter metacharacters can close/rebalance the surrounding `(|...)` structure and supply attacker-chosen attribute assertions, e.g. `*)(objectClass=*))(...)`-style payloads. Results are mapped through UserMapper and returned as up to 100 user records (SearchUserExecutor:39, 73-78).",
+      "unverified": "Whether filter restructuring payloads remain syntactically valid for arbitrary admin-configured UserSearchFilter/UserLoginFilter templates; which callers/permissions in GoCD can reach search-users and is-valid-user in a given deployment; the exact privilege level of the manager DN against sensitive attributes; and whether any authentication bypass (as opposed to enumeration/DoS) can be constructed in practice. No tests exist in this snapshot and no code was executed.",
+      "weakness_type": "CWE-90 LDAP Injection"
+    }
+  ],
+  "coverage_summary": "Reviewed all 62 model-visible files (49 Java sources under src/main plus resources, build/CI/docs). I read in full the LDAP client layer (ApacheDsLdapClient, JNDILdapClient, Environment, ConnectionConfiguration, pool classes, filter classes), all executors (UserAuthenticationExecutor, SearchUserExecutor, IsValidUserRequestExecutor, VerifyConnectionRequestExecutor, RequestFromServer), the authenticator and mapper layer (LdapAuthenticator, UsernameResolver, UserMapper, LdapMapperFactory, AttributesMapper, ResultWrapper), the model layer (LdapConfiguration, Credentials, AuthConfig, User, request/response models), Util, PluginSystemProperty, ManagerCredentialValidator, LdapFactory, LdapPlugin, Constants, and the CI/build/README/template files. Remaining unread items are small/auxiliary: .github/dependabot.yml, .gitignore, .idea/*, settings.gradle, gradle-wrapper.properties, exception classes (NoSuchRequestHandler, InvalidProfileException, InvalidUsernameException, SearchResultLimitExceededException), Mapper/Filter/AndFilter/OrFilter interfaces, and README lines 121-229. There are no test or integration-test sources in the assigned snapshot (build.gradle references src/integration and src/testdata, which are absent), so no test-based confirmation was possible. External dependencies (gocd-plugin-base dispatcher/GsonTransformer, GoCD server caller behavior, LDAP server implementations) were not inspectable.",
+  "limitations": [
+    "No code execution, LDAP server, or exploit payloads were used; all conclusions are static source analysis, and the candidate is a lead, not a confirmed vulnerability.",
+    "The snapshot contains no tests or integration tests, so request/response behavior and escaping assumptions could not be verified against test fixtures.",
+    "GoCD server-side caller semantics (who can invoke search-users/is-valid-user, whether blank passwords are forwarded) and gocd-plugin-base dispatch/validation code are outside the snapshot.",
+    "LDAP server behavior (unauthenticated bind acceptance, manager DN attribute privileges, filter parser strictness for multi-part payloads) is assumed from specifications and not verified.",
+    "No precomputed source-relation index was available (B0), so call-graph coverage relied on manual text search and may have missed dynamic or reflection-based paths in external libraries."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "No rejection of blank/empty user passwords before the LDAP simple bind: `Credentials.getPassword()` (model/Credentials.java:50-52) flows unchecked into both clients' bind calls (`ApacheDsLdapClient.authenticate:64/83` `BindRequestImpl.setCredentials(password)`; `JNDILdapClient:96-98/157-159` puts it into SECURITY_CREDENTIALS). Only the manager password is validated, and only for presence when ManagerDN is set (ManagerCredentialValidator.java:29-34, VerifyConnectionRequestExecutor.java:56-59).",
+      "reason": "This is a genuine missing control (CWE-521/CWE-287 pattern) that could allow an unauthenticated bind on servers that accept a DN with a zero-length password (as Active Directory does), but exploitability cannot be established from this snapshot: it depends on external LDAP server behavior and on GoCD forwarding blank passwords. It is an absent check rather than a demonstrated transformation/trust-boundary flaw, so it was recorded as an unconfirmed lead rather than the single submitted candidate."
+    },
+    {
+      "lead": "Exception/error message leakage to the GoCD server: `LdapPlugin.handle` returns `INTERNAL_ERROR` with `e.getMessage()` (LdapPlugin.java:72-75) and `VerifyConnectionRequestExecutor` returns raw LDAP error text (lines 83-89, 110-118).",
+      "reason": "Low-severity information disclosure to the server that already owns the configuration; no sensitive credential value is included."
+    },
+    {
+      "lead": "Connection pool keyed by `configuration.toString()` including the plaintext manager password, with `synchronized (configuration.toString().intern())` (ConnectionPoolFactory.java:43-53; ConnectionConfiguration.toString:86-95).",
+      "reason": "The password is retained in the JVM string intern pool and in a static map, but no logging or external exposure of that string was found in this snapshot; hardening issue rather than a demonstrable vulnerability."
+    },
+    {
+      "lead": "Blocking connection pool configuration (`maxActive=250`, `maxWait=-1`, `WHEN_EXHAUSTED_BLOCK`, no eviction/testOnBorrow) in ConnectionPoolConfiguration.java:29-43.",
+      "reason": "Potential thread-exhaustion DoS when the LDAP server is slow or unreachable, but it is an availability configuration choice without attacker-controlled amplification shown in source."
+    },
+    {
+      "lead": "`Util.encloseParentheses` uses `!startsWith(\"(\") && !endsWith(\")\")` instead of `||` (Util.java:89-99), so malformed filters such as `(uid={0}` are accepted unchanged.",
+      "reason": "Only impacts admin-supplied configuration; the resulting malformed filter fails closed (search error), so no attacker-controlled impact was identified."
+    },
+    {
+      "lead": "Legacy `cd.go.framework.ldap.filter` classes (CompareFilter/LikeFilter, CompareFilter.java:33-39) interpolate values into filters without escaping.",
+      "reason": "Dead code in this snapshot; no references from any main source path were found (grep for EqualsFilter/LikeFilter/OrFilter shows only their own definitions)."
+    },
+    {
+      "lead": "Build-time supply chain: build.gradle line 18 applies an unpinned remote Gradle script from raw.githubusercontent.com over the network.",
+      "reason": "Real hardening/SSRF-adjacent build risk, but it is not part of the shipped plugin runtime and is not attacker-controlled from the plugin's request surface."
+    }
+  ],
+  "summary": "This snapshot is the GoCD LDAP/AD authentication plugin (authorization extension v2, build.gradle pluginVersion 2.1.0). I traced attacker-controlled strings (login username, `search_term`, `is-valid-user` username) from the plugin API executors to the LDAP layer. The strongest source-evidenced defect is LDAP filter injection in the default Apache DS client: `ApacheDsLdapClient.search` builds the query with `java.text.MessageFormat.format(filter, filterArgs)`, substituting user-controlled values into LDAP filter grammar without any RFC 4515 escaping, while the alternative (opt-in) JNDI client safely relies on JNDI's built-in filter-argument escaping. Searches execute on connections authenticated as the configured Manager DN, so injected filter predicates are evaluated with the manager's directory privileges. Impact: filter-grammar manipulation for directory enumeration/attribute disclosure and lookup redirection in the authentication path; authentication bypass is not established for the common single-placeholder login filter. I considered but did not select a missing blank-password check (unauthenticated-bind risk) because it depends on external LDAP/GoCD behavior that cannot be verified from this snapshot."
+}

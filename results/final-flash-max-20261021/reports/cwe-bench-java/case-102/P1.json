@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The remote address evaluated by the check (`getMessageContext().getHttpServletRequest().getRemoteAddr()`) is the source address of whoever sends the HTTP request, and the access token is supplied by the caller in the `Authorization` header. The registered `clientIpAddress` is server-side configuration, but the inverted comparison means requests from any address other than that one pass the check, so an attacker outside the intended network origin is accepted.",
+      "confidence": "medium",
+      "counterevidence_checked": "I considered that `clientIpAddress` might be intended as a deny-list, but that is implausible from the field name/API (`Client.getClientIpAddress`), the fact that it is copied into `AccessTokenValidation` as the token's client attribute, and the thrown message \"Client IP Address is invalid\" — all consistent with reject-on-mismatch. I checked for another enforcement point that could compensate: repo-wide search for `ClientIpAddress`/`setClientIpAddress` shows this filter is the only consumer, so nothing else enforces the binding. I noted that `getRemoteAddr()` may return a proxy address, but that does not alter the inverted logic. I verified the filter is a public `@Provider` and is also subclassed as `OAuthRequestInterceptor` (an interceptor-chain entry), so it is a real enforcement path when configured.",
+      "id": "cxf-oauth2-inverted-client-ip-check",
+      "impact": "Authorization bypass of the OAuth2 client IP-address restriction: an access token minted for an IP-bound client can be used from an arbitrary network location (for example an attacker host), defeating a defense-in-depth control whose stated purpose is to bind token use to the client's address. The same inversion also causes a denial of service for the legitimate client when it calls from its registered IP. Confidentiality and integrity of the OAuth2-protected endpoints are affected once such a token is obtained.",
+      "locations": [
+        {
+          "end_line": 129,
+          "path": "rt/rs/security/oauth-parent/oauth2/src/main/java/org/apache/cxf/rs/security/oauth2/filters/OAuthRequestFilter.java",
+          "start_line": 122
+        },
+        {
+          "end_line": 66,
+          "path": "rt/rs/security/oauth-parent/oauth2/src/main/java/org/apache/cxf/rs/security/oauth2/common/AccessTokenValidation.java",
+          "start_line": 57
+        },
+        {
+          "end_line": 332,
+          "path": "rt/rs/security/oauth-parent/oauth2/src/main/java/org/apache/cxf/rs/security/oauth2/common/Client.java",
+          "start_line": 326
+        }
+      ],
+      "prerequisites": "An application whose JAX-RS/JAX-WS endpoints are protected with CXF's OAuth2 `OAuthRequestFilter`/`OAuthRequestInterceptor` and whose `OAuthDataProvider` returns clients/tokens carrying a `clientIpAddress` (i.e., the client IP-binding feature is in use). The caller must present an access token issued for such a client (for example a token obtained or leaked through logs, redirects or a compromised client). No additional privileges are needed to originate a request from a different IP.",
+      "root_cause": "In `OAuthRequestFilter.validateRequest(...)`, the check intended to restrict an access token to the client's registered IP address is inverted: it throws 403 when the request's remote address *equals* the registered client IP (`accessTokenV.getClientIpAddress().equals(remoteAddress)`) and therefore admits the request when the address differs. The correct predicate is `!equals`. Because the security control fails open, it provides no protection and simultaneously blocks legitimate use from the allowed address.",
+      "title": "Inverted client-IP comparison in OAuthRequestFilter defeats OAuth2 client IP binding",
+      "trace": "Inbound request -> `OAuthRequestFilter.filter` -> `validateRequest(m)` -> `getAccessTokenValidation(...)` builds `AccessTokenValidation` from the token, copying `token.getClient().getClientIpAddress()` (AccessTokenValidation.java:57-61) -> lines 122-128 evaluate `remoteAddress == null || clientIpAddress.equals(remoteAddress)`. If the source IP matches the registered IP the request is rejected with 403 (\"Client IP Address is invalid\"); if it does not match, execution continues to the scope/verb checks and the protected resource is served.",
+      "unverified": "Runtime confirmation was not performed (no code executed). Whether the dataset's intended target is this specific defect is not established; the finding is based on source evidence. Whether a given deployment registers clients with `clientIpAddress` (the vulnerable control is optional/configuration-dependent) was not verified, and behaviour behind reverse proxies (`getRemoteAddr` returning a proxy IP) was not tested.",
+      "weakness_type": "CWE-863 Incorrect Authorization (CWE-697 Incorrect Comparison)"
+    }
+  ],
+  "coverage_summary": "Snapshot = Apache CXF 3.0.11 tree: 4,350 files (3,528 Java, ~22.5 MB), all `src/test` sources stripped. P1 relation index is partial: 4,299 files indexed, 51 source files missing from the index, 5 parse errors, and no control-flow/data-flow or semantic resolution (syntactic call/inheritance/containment candidates only, ~96k unresolved calls); index labels were used purely for navigation and every cited location was verified in source text. I reviewed the HTTP transport/servlet stack (servlet controller, service-list writers, CORS, TLS/JSSE helpers, Netty/Jetty destinations), JAX-RS frontend and body providers (XMLSource, SourceProvider, XPath/JAXB/DOM4J/XMLBeans/XSLT providers, RequestPreprocessor), JOSE/JWT/JWS/JWE, OAuth 1.0 and OAuth2 (filters, grant handlers, redirection services, data providers), SAML/OIDC SSO, WS-Security/STS schema download, management-web Atom/log code, and selected core utilities (StaxUtils, Compiler, TunedDocumentLoader). Large areas were only sampled: CORBA/JMS/JCA transports, WS-RM/WS-Policy/WS-Addressing, OSGi/blueprint wiring, code-generation tools, and the bundled samples/benchmarks.",
+  "limitations": [
+    "Static source review only: no code was compiled, executed or fuzzed, and no exploit payloads were used; reachability and impact are based on source reading.",
+    "No test trees exist in the snapshot, so fix/regression behaviour could not be inferred from tests.",
+    "The relation index is explicitly partial (51 source files unindexed, 5 parse errors) and lacks control/data-flow and semantic resolution; unindexed/unparsed files cannot be treated as reviewed via the index.",
+    "Whether the specific candidate matches the benchmark's underlying CVE/fix commit is inferred, not confirmed; no external CVE, patch or ground-truth data was consulted.",
+    "The client-IP binding is an optional OAuth2 feature, so real-world exploitability depends on deployment configuration that is not present in this snapshot.",
+    "No runtime validation of `getRemoteAddr()` behaviour behind proxies/load balancers was possible."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Blind SSRF via `JwtRequestCodeFilter.process` (`request_uri` parameter) — `isRequestUriValid` only checks `startsWith(\"https://\")` (with a TODO about restricting hosts) before `WebClient.create(requestUri).get(String.class)`.",
+      "reason": "Real weakness, but it is an optional `AuthorizationCodeRequestFilter` that must be configured, requires an authenticated OAuth client, and the fetched content must still pass JWT signature/decryption verification, making it a blind SSRF with weaker evidence than the submitted candidate."
+    },
+    {
+      "lead": "Unencoded request URI / Host reflected into the services page (`FormattedServiceListWriter` lines 55, 58, 112-118, 162-165; `ServiceListGeneratorServlet` line 116 builds the stylesheet path from `request.getRequestURI()`).",
+      "reason": "No HTML escaping is applied, but browser URI encoding of `<`, `>` and `\"` and container normalization make a browser-executable XSS uncertain from source alone; impact is also limited to deployments exposing the service list page. Unconfirmed."
+    },
+    {
+      "lead": "Setter typo in `AbstractOAuthJoseJwtConsumer.setDecryptWithClientSecret` (lines 61-63) assigns `decryptWithClientSecret = verifyWithClientSecret`, ignoring the parameter.",
+      "reason": "Silently leaves JWE decryption disabled (JWE-only configurations fail), which looks like an availability/configuration defect rather than an authentication bypass; no path was found where it weakens a successful verification decision."
+    },
+    {
+      "lead": "CORS filter reflects any `Origin` when `allowCredentials` is enabled with default (empty) allow-origins (`CrossOriginResourceSharingFilter` lines 323-339).",
+      "reason": "Configuration-dependent design choice rather than an unconditional flaw; not chosen as the single candidate."
+    },
+    {
+      "lead": "XXE in JAX-RS `XMLSource` (`rt/frontend/jaxrs/.../ext/xml/XMLSource.java`).",
+      "reason": "The class already creates DOMs through `StaxUtils` (core `StaxUtils.createXMLInputFactory`, lines 307-351, disables DTDs, entity replacement and external entities and installs a blocking XMLResolver), so no XXE path was found. The remaining `DocumentBuilderFactory` usages (`AbstractSTSClient.downloadSchema` sets `disallow-doctype-decl`; Aegis `XMLTypeCreator.readAegisFile` parses local `.aegis.xml` mapping files) were likewise not attacker-reachable from request data."
+    },
+    {
+      "lead": "Header/method overrides in `RequestPreprocessor` (`_method`, `X-HTTP-Method-Override`) and CRLF/redirect handling in `AbstractHTTPServlet`.",
+      "reason": "Investigated; no concrete cross-boundary bypass could be established from source without knowing the consuming application's authorization model."
+    }
+  ],
+  "summary": "Scope analyzed: Apache CXF snapshot at the 3.0.11 release state (root pom `3.0.11`, release notes 3.0.11), 4,350 source files / 3,528 Java files, with all `src/test` sources absent. I surveyed the HTTP transport/servlet layer, JAX-RS frontend and providers, JOSE/JWT, OAuth 1.0/2.0, SAML/OIDC, WS-Security/STS, XML parsing utilities, and management-web. The strongest verifiable security defect is an inverted authorization comparison in the OAuth2 resource-server filter: an access token bound to a client IP address is accepted from every address except the bound one, so the IP restriction fails open (and the legitimate client is denied). Static review only; no code was executed."
+}

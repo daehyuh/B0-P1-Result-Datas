@@ -1,0 +1,68 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any unauthenticated HTTP client controls the request path and can request paths that the operator intended to protect via `para.security.protected` (e.g. console/static/admin paths co-deployed on the same server) or that match `RestRequestMatcher.INSTANCE`; the attacker simply omits the Authorization header, and the request is authorized by the `/**` permitAll rule.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether another layer compensates: (a) `RestAuthFilter` still rejects unauthenticated REST calls (jwt/signature/permission checks) - so /v1 data is not wide open; (b) `IgnoredRequestMatcher` paths are intentionally public; (c) `security.protected` is null by default (`ParaConfig.protectedPaths`, reference.conf only defines `para.security.ignored`), so impact requires an operator to use the documented feature; (d) the same ordering quirk is also present in the second-order defect found in `parseProtectedResources` (HttpMethod.valueOf throws for role names such as 'ADMIN', the inner catch swallows it, and roles stay empty so DEFAULT_ROLES = USER/MOD/ADMIN/APP is used), which independently widens role checks. I could not diff against upstream, so I cannot exclude that the `/**` rule is an intentional upstream catch-all rather than an introduced flaw; the REST filter's independent enforcement is why I rate this medium confidence rather than high.",
+      "id": "securityconfig-rule-order-bypass",
+      "impact": "Silent loss of authentication/role enforcement for any resource the operator marked protected through Spring Security: unauthenticated/unauthorized access to protected pages or endpoints (information disclosure, privileged functionality exposure), and a false sense of security because the feature is documented and seems configured. The API itself retains the plugin's custom signature/JWT checks (`RestAuthFilter`), which limits the blast radius for `/v1/*`.",
+      "locations": [
+        {
+          "end_line": 103,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/SecurityConfig.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 179,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/SecurityConfig.java",
+          "start_line": 140
+        }
+      ],
+      "prerequisites": "(1) A deployment that relies on `para.security.protected` (a documented setting in `ParaConfig.protectedPaths()/parseProtectedResources`) or on the Spring-level `authenticated()` rule for `/v1/*`; (2) the request must reach the Spring Security filter chain (all paths do; `/v1/*` is additionally re-checked by the plugin's own RestAuthFilter). Default installations do not set `security.protected`, so the hidden impact is configuration-dependent.",
+      "root_cause": "In `SecurityConfig.filterChain(HttpSecurity)` the authorization rules are added through three separate `authorizeHttpRequests(...)` calls on the same `AuthorizationManagerRequestMatcherRegistry`, which accumulates mappings in insertion order (`RequestMatcherDelegatingAuthorizationManager` returns the decision of the first matching mapping). Line 99 registers `requestMatchers(\"/**\").permitAll()` before the `IgnoredRequestMatcher` and `RestRequestMatcher.INSTANCE.authenticated()` rules (lines 100-101) and before `parseProtectedResources(http, protectedResources)` (line 103, rule creation at lines 140-179). Because `/**` matches every request, the `authenticated()` requirement and every `hasAnyRole(...)` rule built from `para.security.protected` are dead code: requests that are supposed to require authentication/roles are permitted anonymously. The catch-all rule should be registered after (or instead of) the specific rules.",
+      "title": "Authorization rules rendered unreachable by a catch-all `/**` permitAll matcher registered first in SecurityConfig",
+      "trace": "SecurityConfig.filterChain (l.92) reads `protectedPaths` (l.97) -> adds `/** permitAll` (l.99), `IgnoredRequestMatcher permitAll` (l.100), `RestRequestMatcher authenticated` (l.101) -> parseProtectedResources adds `requestMatchers(patternz).hasAnyRole(rolz)` (l.172) / `requestMatchers(method, patternz).hasAnyRole(rolz)` (l.175). At build time all mappings land in one ordered list; at request time `RequestMatcherDelegatingAuthorizationManager.check()` evaluates them in order and returns the first match, so `/**` (l.99) always wins and l.101/l.172/l.175 are never consulted. `RestAuthFilter` later authenticates only REST (`/v1/*`, excluding ignored paths) API calls, so non-REST protected resources are served without authentication.",
+      "unverified": "No build, test or HTTP request was executed; the claim that later mappings are unreachable is based on Spring Security's documented first-match, insertion-order semantics for `RequestMatcherDelegatingAuthorizationManager`, not on runtime observation. Operator-side configuration of `para.security.protected` and the concrete protected resources are deployment-specific. The role-parsing defect in `parseProtectedResources` was identified by reading but not tested.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-862 Missing Authorization (Spring Security rule-ordering misconfiguration)"
+    }
+  ],
+  "coverage_summary": "Scope: 199 source files (para-core, para-server, para-client, para-jar, Maven/CI/scripts). Read or searched all security-relevant server code (SecurityConfig, JwtConfigurer, SecurityModule, RestAuthFilter, JWTRestfulAuthFilter/Provider, Password/Passwordless/LDAP/SAML/OAuth filters, SecurityUtils, AuthenticatedUserDetails, Simple*Handlers, matchers), the full REST layer (Api1, RestUtils, FieldFilter), the permission engine (App, User, CoreUtils, ValidationUtils, Constraint, ParaObjectUtils), persistence/search/cache/queue/storage implementations, metrics/health utilities, config classes and default config files; skimmed the 74KB ParaClient, domain classes (Sysprop/Tag/Address/Link/Vote/Translation/Webhook/Linker), scripts and workflows. Tests are absent from the snapshot, so no test-derived evidence was available. No code execution, build or exploit was performed; all findings are source-reading inferences.",
+  "limitations": [
+    "No git history/upstream copy is available in the snapshot, so I could not distinguish an introduced regression from long-standing upstream behavior; this materially affects attribution of every candidate.",
+    "The snapshot contains no test sources (only src/main), so behavior documented by upstream tests (e.g. whether `security.protected` was ever enforced) cannot be checked.",
+    "No runtime verification was possible: Spring Security ordered-matcher semantics and Jetty behavior were reasoned about from the source and framework semantics, not observed.",
+    "Several alternative weaknesses were examined but not confirmed (CORS credentials, create-time `groups` assignment, S3 public-read ACL for the credentials file, password-lock unit bug, unauthenticated `_setup`, SAML signature defaults, vote casting with client-supplied voter id, `_permissions` guest read access).",
+    "Dependency-version CVEs were not audited beyond a quick scan of the POMs (versions appear current for the snapshot's date)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CORS allows any origin with `Access-Control-Allow-Credentials: true` (CORSFilter defaults `DEFAULT_ALLOWED_ORIGINS=\"*\"` + `DEFAULT_SUPPORTS_CREDENTIALS=\"true\"`, and ParaServer.corsFilterRegistrationBean sets `cors.support.credentials=true` without restricting origins, lines 274-289).",
+      "reason": "Mechanism is real (handleSimpleCORS echoes the Origin header and sets Allow-Credentials), but this server has no cookie/session-based authentication on the API (JWTs/signatures are sent in the Authorization header; the only server-set cookie is the non-auth `para-returnto` cookie and Spring sessions are disabled with SessionCreationPolicy.NEVER/NullAuthenticatedSessionStrategy), so a malicious origin cannot cause the browser to attach credentials - practical impact is low, and the defaults appear to be a long-standing upstream configuration rather than a single introduced defect."
+    },
+    {
+      "lead": "Client-controlled `groups` (and `active`, `tokenSecret`) accepted when creating users: `getCreateResponse`/`getBatchCreateResponse`/`restoreHandler` call `ParaObjectUtils.setAnnotatedFields(...)` without the `@Locked` filter, so `POST /v1/users` with `\"groups\":\"admins\"` persists an admin user that can then sign in via the public `/jwt_auth?provider=password` flow.",
+      "reason": "The `@Locked` javadoc states the annotation only means fields cannot be updated after creation, and all create paths systematically omit the filter while both update paths pass `Locked.class` - so this looks like intended design; exploitation also requires the app to grant a non-admin subject the `users` POST/batch permission (deny-by-default otherwise). Kept as an unconfirmed lead because it is a genuine trust-boundary concern if an app grants self-registration through the CRUD API."
+    },
+    {
+      "lead": "`AWSFileStore.store` uploads every object with `acl(ObjectCannedACL.PUBLIC_READ)`, including the root-credentials config file that HealthUtils writes through the same FileStore when the root app is created/unhealthy or outside production (HealthUtils.saveConfigFile line 148).",
+      "reason": "The public-read ACL is plausibly intended for avatars (GenericOAuth2Filter/MicrosoftAuthFilter call store() for user pictures and return the S3 URL as the profile picture), and the credential write only happens on first boot/unhealthy/non-production paths. Bucket and object-key predictability are deployment-specific; source alone does not establish that credentials are publicly readable in a production default."
+    },
+    {
+      "lead": "`User.passwordMatches` computes `lockedUntil` with `TimeUnit.HOURS.toNanos(...)` added to `System.currentTimeMillis()` (User.java line 740-741), a ~1000x unit error that extends the failed-login lock to ~42 days with the default 1-hour setting.",
+      "reason": "A correct password still succeeds and clears the lock (`bcryptMatches` true branch removes `lockedUntil` before any lock check), so the bug only throttles wrong passwords and does not lock out legitimate users - security impact is negligible and it is likely a benign upstream bug."
+    },
+    {
+      "lead": "Unauthenticated `GET /v1/_setup` creates the root app and returns its credentials (Api1.setupHandler + `reference.conf` ignored paths).",
+      "reason": "`HealthUtils.onInitialize` runs `Para.setup()` before the HTTP listener starts, so the root app normally exists before any request; not exploitable by default (only relevant if a deployment somehow serves HTTP before initialization)."
+    },
+    {
+      "lead": "Passwordless SSO accepts JWTs signed with the app-level `app_secret_key` setting or, for the root app, with the global `para.app_secret_key` config (`PasswordlessAuthFilter.getOrCreateUser` line 117, and deprecated default `md5(\"paraseckey\")` in `ParaConfig.appSecretKey()`); groups from the JWT are applied to the user.",
+      "reason": "Requires the operator to have configured `para.app_secret_key`/the app setting (the default in `getSettingForApp` is `app.getSecret()`, so the hard-coded md5 value is not actually used); no bypass without knowledge of that secret."
+    },
+    {
+      "lead": "SAML auth defaults `SECURITY_WANT_ASSERTIONS_SIGNED` and `SECURITY_WANT_MESSAGES_SIGNED` to false (`SAMLAuthFilter.getSAMLSettings` lines 332-340).",
+      "reason": "Strict mode is enabled and both flags are per-app configurable; I could not verify java-saml's strict-mode signature requirements from this source, so this remains unconfirmed."
+    }
+  ],
+  "summary": "Reviewed the 199-file Para snapshot (para-core, para-server, para-client, para-jar plus configs/scripts) with list/search/read-only inspection, tracing HTTP input through the Spring Security chain, the custom RestAuthFilter/JWT filters, the permission engine, the REST handlers and the storage/persistence layers. The single strongest source-level candidate is the authorization-rule ordering in SecurityConfig: a catch-all `requestMatchers(\"/**\").permitAll()` is registered before the `authenticated()` rule and before the role rules generated from `para.security.protected`, so those later rules are unreachable and the documented protected-resource enforcement is silently a no-op at the Spring layer. Several other suspicious spots (permissive CORS with credentials, create-time mass assignment of `groups`, public-read S3 ACLs, password-lock unit bug, unauthenticated `_setup`) were examined and are reported as rejected/unconfirmed leads rather than additional candidates. No code was executed and no runtime behavior was confirmed."
+}

@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A request to the descriptor endpoint (Jenkins convention: `/descriptorByName/com.cloudbees.jenkins.plugins.advisor.AdvisorGlobalConfiguration/validateServerConnection`) is controlled by the requester; no parameters, admin interaction, or CSRF-relevant state are needed for the health-check variant. Any principal with Overall/Read (in many installations anonymous/authenticated users) can reach it.",
+      "confidence": "medium",
+      "counterevidence_checked": "1) The descriptor's other HTTP entry points explicitly check `Jenkins.ADMINISTER` (line 472, line 479) and state-changing ones require POST (lines 264, 476), showing the intended pattern that this method deviates from. 2) `doCheckAcceptToS` (lines 463-468) also lacks a check, but it has no side effect or sensitive output, so it is not treated as part of the strongest finding. 3) `validateServerConnection` returns only a fixed status/exception string, not instance data, and the destination host is fixed (AdvisorClientConfig.properties line 1, overridable only via JVM system property), so this is not arbitrary SSRF. 4) Direct Stapler routing of a Descriptor `configure` override plus `JSONObject` binding was not verifiable from the snapshot (Jenkins/Stapler sources are not included), so the `configure` location is treated as the same root cause with unverified reachability. 5) `doConfigure` itself is correctly protected (`@RequirePOST` + ADMINISTER), so the management-link UI path is not the issue.",
+      "id": "advisor-descriptor-missing-permission-check",
+      "impact": "Forced, attacker-triggered controller-side outbound requests to the configured Advisor service. Because the default connect/read timeouts are 60 minutes each, repeated invocations can tie up request/worker threads and network connections (resource-consumption/DoS), and the endpoint can be used to repeatedly probe external service reachability without any Jenkins privilege. For the `configure` variant, if the override is directly reachable, the impact escalates to unauthorized modification of the global Advisor configuration, including setting `ccs`/`email` so that the daily support bundle (system configuration, logs, monitors, thread dumps) uploaded to CloudBees is additionally delivered to attacker-chosen addresses (confidentiality impact).",
+      "locations": [
+        {
+          "end_line": 496,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/advisor/AdvisorGlobalConfiguration.java",
+          "start_line": 484
+        },
+        {
+          "end_line": 534,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/advisor/AdvisorGlobalConfiguration.java",
+          "start_line": 498
+        },
+        {
+          "end_line": 468,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/advisor/AdvisorGlobalConfiguration.java",
+          "start_line": 463
+        }
+      ],
+      "prerequisites": "Plugin installed and configured (for the network call to occur, `AdvisorGlobalConfiguration.isValid()` must be true, i.e. acceptToS set and a non-blank email); the requester must be able to reach the descriptor URL; for the `configure` variant, an authenticated request with a CSRF crumb and successful form/JSON binding to `JSONObject` would additionally be required, and direct routing of a Descriptor `configure` override is unverified.",
+      "root_cause": "Methods on the Stapler-exposed `AdvisorGlobalConfiguration.DescriptorImpl` that perform privileged operations do not call `Jenkins.get().checkPermission(Jenkins.ADMINISTER)`. Authorization is only enforced in the sibling caller/UI methods (`doConfigure` line 269, `doCheckEmail` line 472, `doTestSendEmail` line 479), so any request that reaches the descriptor directly bypasses it. Primary: `validateServerConnection()` (lines 484-496) is public, takes no parameters (thus needs no special Stapler binding) and unconditionally performs a controller-side outbound HTTP GET when the Advisor configuration is valid. Same root cause in the state-changing `configure(StaplerRequest2, JSONObject)` override (lines 498-534), which mutates the singleton configuration (email, CC recipients, acceptToS, nagDisabled, excludedComponents) with no check of its own.",
+      "title": "Advisor descriptor HTTP entry points perform privileged operations without authorization checks (validateServerConnection; state-changing configure)",
+      "trace": "validateServerConnection(): lines 485-491 `AdvisorGlobalConfiguration.getInstance()` and `config.isValid()`; line 490-491 `new AdvisorClient(new Recipient(null)).doCheckHealth()`; AdvisorClient.doCheckHealth() (AdvisorClient.java:54-69) -> HttpUrlConnectionFactory.openGetConnection(AdvisorClientConfig.healthURI()) (HttpUrlConnectionFactory.java:14-22) -> `GET https://advisor.cloudbees.com/api/health` with connect timeout `insightsUploadIdleTimeoutMilliseconds()` and read timeout `insightsUploadTimeoutMilliseconds()` (AdvisorClientConfig.java:29-42; default 60 minutes each). The response (line 492) or `e.getMessage()` (line 494) is returned to the caller. Same file, lines 500-526, show `configure` reading `acceptToS`/`email`/`ccs`/`nagDisabled`/`excludedComponents` from the submitted JSON and writing them to the singleton without any permission check; only the caller `doConfigure` (line 269) checks ADMINISTER.",
+      "unverified": "Reachability was not runtime-verified (no execution allowed/possible). Jenkins/Stapler routing of a no-argument public descriptor method and of a Descriptor `configure(StaplerRequest2, JSONObject)` override could not be confirmed from the snapshot; the practical severity of the forced-request/DoS behavior and whether the `configure` variant permits configuration changes without ADMINISTER remain unverified. The bundled Jelly views (which reference these methods) and all test sources are absent from the snapshot.",
+      "weakness_type": "Missing authorization / permission check on an exposed function (CWE-862); unauthenticated or Overall/Read-triggerable privileged operation"
+    }
+  ],
+  "coverage_summary": "All 34 visible files were listed and every Java source file was read in full or in relevant ranges, including AdvisorGlobalConfiguration, AdvisorClient/Config, MultipartConnection, HttpUrlConnectionFactory, BundleUpload/Monitor, Reminder, Recipient, EmailValidator/EmailUtil, FileHelper, PluginHelper, the JCasC configurator, DTOs, resources/properties/help files, pom.xml, docs, and GitHub/Maven configuration. The snapshot contains no test sources and no Jelly/webapp views, and no dependency or Jenkins/Stapler core sources, so endpoint routing and UI rendering behavior could only be reasoned about from convention, not verified. No code was executed and no network targets were contacted.",
+  "limitations": [
+    "No runtime verification: reachability of descriptor methods via `/descriptorByName/...` and the effect of the 60-minute timeouts could not be confirmed by execution.",
+    "Jelly views (`index.jelly`, `validateOnLoad.jelly`, monitor views) and test sources are absent from the snapshot, so the intended call paths and any output-escaping sinks could not be inspected.",
+    "Jenkins core/Stapler sources and dependencies are not included, so whether Descriptor `configure` is directly routable and whether `JSONObject` parameters are bound automatically is unverified.",
+    "No access to git history/patches or CVE data (prohibited), so it cannot be determined whether the missing check is original code or a modification.",
+    "Severity of the forced outbound-request/thread-exhaustion behavior depends on deployment details (thread pool, service reachability, connect/read timeout system properties) that are outside the snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Weak email validation: `EmailValidator.isValidEmail` (EmailValidator.java:20-23) ignores the declared `EMAIL_REGEX`/`PATTERN` (lines 13-14) and only requires non-blank input; `validateEmail` (lines 25-35) only rejects blank and ';'/','. Combined with the unencoded `username` interpolation into `AdvisorClientConfig.apiUploadURI` (lines 52-62), arbitrary characters could alter the upload URL path/query.",
+      "reason": "The email is only settable through ADMINISTER-guarded flows (`doConfigure` line 269, `doCheckEmail` line 472, JCasC `AdvisorRootConfigurator` admin-only) or via the local config XML, so no privilege boundary is crossed; impact is configuration robustness rather than attacker-controlled exploitation. CC values are URL-encoded (AdvisorClient.java:83-86). Left as an unconfirmed lead."
+    },
+    {
+      "lead": "Possible HTML injection / stored XSS: `BundleUpload` builds HTML messages embedding `response.getMessage()` and `e.getMessage()` (BundleUpload.java:127-142) that are stored as `lastBundleResult` and exposed by `BundleUploadMonitor.getFailureMessage()` (BundleUploadMonitor.java:54-56) and `message.properties` (`<strong>...{0}</strong>`).",
+      "reason": "No Jelly/webapp view is present in the snapshot to establish an unescaped output sink, and the injected data comes from the trusted CloudBees service or local exception text (URLs containing the admin-set email), so attacker control at a trust boundary is not demonstrated."
+    },
+    {
+      "lead": "`doCheckAcceptToS` (AdvisorGlobalConfiguration.java:463-468) lacks a permission check and `@POST`.",
+      "reason": "The method only echoes an error/ok for a boolean and exposes no state or information; no security impact by itself."
+    },
+    {
+      "lead": "`Reminder.doAct` (Reminder.java:37-48) and `BundleUploadMonitor.doAct` (BundleUploadMonitor.java:40-47) lack permission checks.",
+      "reason": "Both are `@RequirePOST` and only issue redirects/forward-to-previous-page based on request parameters; no state change or data exposure identified."
+    },
+    {
+      "lead": "Support-bundle handling details: predictable multipart boundary (MultipartConnection.java:29), redirect following during upload (line 38), bundle written under `$JENKINS_HOME/support/advisor` with default filesystem permissions (BundleUpload.java:35-37, 98-101), and time-based `.zip` cleanup (lines 156-171).",
+      "reason": "Boundary is not a secret and no second part is injectable; redirect target is the fixed service; directory cleanup and permissions depend on deployment/umask and system-property overrides available only to administrators. No cross-boundary exploit path established."
+    }
+  ],
+  "summary": "Reviewed all 34 files in the assigned snapshot (Java main sources, resources, docs, and CI/build files) of the Jenkins Health Advisor by CloudBees plugin. Most of the snapshot is consistent and defense-in-depth (explicit `Jenkins.ADMINISTER` checks on `doConfigure`, `doCheckEmail`, and both `doTestSendEmail` endpoints, `@RequirePOST`/`@POST` on state-changing endpoints, component allow-listing before bundle generation, URL-encoding of CC recipients). The strongest source-supported issue is an authorization inconsistency in the Advisor global-configuration descriptor: `validateServerConnection()` is a public, no-argument, Stapler-exposed descriptor method that performs a controller-side outbound HTTP request and has no permission check, unlike its sibling methods in the same class. The adjacent public `configure(...)` method (the state-changing variant of the same pattern) is included as the same root cause but its direct Stapler reachability is uncertain. Other leads (weak email validation, possible HTML injection into `lastBundleResult`, unchecked `doCheckAcceptToS`) are reported as rejected/unconfirmed."
+}

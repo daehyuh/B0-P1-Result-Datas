@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `renameto` query parameter of the public page-info view (e.g. `/PageInfo.jsp?page=<Page>&renameto=...`, or the short-URL form `/wiki/<Page>?do=PageInfo&renameto=...`). No authentication is needed to send the crafted URL; the payload is rendered when the victim opens the link.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the reflection is not neutralized downstream: WikiJSPFilter/JSPWikiServletResponseWrapper only buffer output to substitute resource markers (WikiJSPFilter.java:92-120, 252+) and do not encode HTML. Verified intentional escaping exists elsewhere for the same value and in the same file (`Rename.jsp:104-106`, `default/InfoContent.jsp:53-57`, `TextUtil.replaceEntities` at TextUtil.java:211-215), so the raw echo is an inconsistency rather than intended behavior. Confirmed the page is reachable with only VIEW permission (PageCommand.INFO) and that both shipped templates contain the sink. Recognized the rename-permission gate on the form body, which limits but does not remove the attack (admins and editors are exactly the high-value victims).",
+      "id": "info-content-renameto-reflected-xss",
+      "impact": "Reflected cross-site scripting in the victim's authenticated wiki session. Script can read the session and page content, invoke same-origin actions with the victim's privileges (including administrative rename/edit actions when an admin follows the link), and exfiltrate data to the attacker. Because the sink is in a privileged form, it is a plausible path to full account takeover of an administrator.",
+      "locations": [
+        {
+          "end_line": 43,
+          "path": "jspwiki-war/src/main/webapp/templates/default/InfoContent.jsp",
+          "start_line": 42
+        },
+        {
+          "end_line": 126,
+          "path": "jspwiki-war/src/main/webapp/templates/default/InfoContent.jsp",
+          "start_line": 119
+        },
+        {
+          "end_line": 45,
+          "path": "jspwiki-war/src/main/webapp/templates/210/InfoContent.jsp",
+          "start_line": 44
+        },
+        {
+          "end_line": 146,
+          "path": "jspwiki-war/src/main/webapp/templates/210/InfoContent.jsp",
+          "start_line": 140
+        }
+      ],
+      "prerequisites": "The target page must exist (the form is inside `<wiki:PageExists>`/`<wiki:PageType type=\"page\">`) and the victim must hold the `rename` permission for that page, since the sink is inside `<wiki:Permission permission=\"rename\">` (default/InfoContent.jsp:115, 210/InfoContent.jsp:136). This is normally true for logged-in editors and always true for admins, which makes a link-targeted attack against a privileged user realistic. The template in use is `jspwiki.templateDir` (default `default`).",
+      "root_cause": "The page-info content template reads `renameto` straight from the servlet request (`request.getParameter(\"renameto\")`) and prints it into a double-quoted HTML attribute (`value=\"<%= parm_renameto %>\"`) with no HTML-attribute encoding. The codebase has the intended neutralizer (`TextUtil.replaceEntities`), and Rename.jsp even stores an escaped copy of the very same value as a request attribute (Rename.jsp:104-106), but InfoContent.jsp ignores the escaped attribute and uses the raw parameter; the same file escapes other user data (e.g. `creationAuthor` at default/InfoContent.jsp:57) and escapes `pagename` via `<wiki:Variable>` on the adjacent line, confirming the omission is a bug, not a deliberate raw-output design.",
+      "title": "Reflected XSS: unescaped 'renameto' request parameter echoed into the page-info rename form",
+      "trace": "GET PageInfo.jsp?page=X&renameto=PAYLOAD -> PageInfo.jsp builds the INFO WikiContext (PageInfo.jsp:34) and passes the access check for PagePermission VIEW (PageCommand.INFO at PageCommand.java:56-57) -> TemplateManager resolves `ViewTemplate.jsp`, whose <wiki:Content/> includes the command content template `InfoContent.jsp` (ContentTag.java:159-183) -> InfoContent.jsp:42/44 assigns `parm_renameto = request.getParameter(\"renameto\")` with no sanitization -> line 126 (default) / 146 (210) concatenates it into `value=\"...\"` inside the rename form. A value such as `\"><script>...` closes the attribute and tag and is parsed/executed as markup; the JSP filter and response wrapper perform marker rewriting only and do not escape output.",
+      "unverified": "Not executed or reproduced at runtime (no build/deploy performed). The exact rename grants could not be confirmed because the WEB-INF/jspwiki.policy file is not present in this snapshot, so the set of users who render the form is inferred from WikiContext/PageCommand permissions and the template's permission tag. Both shipped templates were inspected; other templates/themes from third parties were not.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation (Cross-site Scripting)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 1155-file snapshot (no files excluded by the scope filters; binary-like files skipped). Focused on web entry points and trust boundaries: AttachmentServlet, WikiServlet/URL constructors, WikiAjaxDispatcherServlet and registered AJAX modules (Search, Progress, UserManager JSON), WikiServletFilter/WikiJSPFilter, AuthenticationManager/AuthorizationManager/UserManager/GroupManager and login modules (cookie assertion/authentication), XML/JDBC user and group databases, filters (SpamFilter), plugin manager and built-in plugins, markup/render pipeline, plus the 117 JSP templates (haddock/default and 210 themes). Weakness classes searched across the tree: unescaped request-parameter/attribute output in JSPs, path traversal in file operations, authorization checks on JSP/servlet entry points, unsafe deserialization/XML/JDBC usage, SSRF/redirect handling, and upload filename validation. No tests are present in the snapshot; no code, build, or scanner was executed.",
+  "limitations": [
+    "Static, source-only review: no runtime confirmation, deployment, or exploit payload execution.",
+    "The snapshot does not contain WEB-INF/jspwiki.policy, so exact default permission grants (notably who receives the `rename` permission required to render the vulnerable form) could not be verified; the candidate's victim precondition is inferred from WikiContext/PageCommand and the template's <wiki:Permission> tag.",
+    "No repository history is available, so I could not confirm which post-2.11.0.M3 commit fixed which issue; the candidate is a lead, not a confirmed CVE match.",
+    "Third-party JavaScript/CSS libraries under jspwiki-war/src/main/scripts and styles were only spot-checked; XML-RPC and Atom servlets are disabled by default in web.xml and were not traced in depth.",
+    "The changenote sink in the same template file is arguably as severe (stored variant); I could not determine from the snapshot alone which one the intended fix addressed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CookieAuthenticationLoginModule path traversal: `getCookieFile` does `new File(cookieDir, uid)` with `uid` taken verbatim from the attacker-controlled `JSPWikiUID` cookie (CookieAuthenticationLoginModule.java:175-215), then reads the file as a username, calls `setLastModified`, and `clearLoginCookie` deletes `new File(cookieDir, uid)` (lines 295-312). With enough `../` segments this can reach arbitrary readable/deletable files and could enable login-name spoofing if a controllable file contains a valid login name.",
+      "reason": "Real missing-validation pattern, but gated on non-default configuration (`jspwiki.cookieAuthentication` is off by default per ini/jspwiki.properties:546-548); the read value is not echoed back and an auth bypass requires a second precondition (a server file whose content is exactly a valid login name). Kept as a secondary lead instead of the single candidate."
+    },
+    {
+      "lead": "Stored XSS via unescaped page change note: `Edit.jsp` stores `changenote` without escaping (Edit.jsp:73, 167-169) and InfoContent.jsp renders it raw in/default template (`<c:set var=\"changenote\" .../><td class=\"changenote\">${changenote}</td>`, default/InfoContent.jsp:206-207) and via `<%= changenote %>` in the 210 template (210/InfoContent.jsp:247-248, 399-400); AttachmentTab.jsp:154-155 is the analogous sink (attachment change notes are escaped at upload, AttachmentServlet.java:521, page change notes are not).",
+      "reason": "Same file/class of flaw (missing output encoding in InfoContent.jsp) and a plausible alternative ground-truth CVE; not submitted as a second candidate because it shares a root cause with the reflected `renameto` finding and requires an edit-privileged staging step."
+    },
+    {
+      "lead": "XHRHtml2Markup.jsp writes `new HtmlStringToWikiTranslator().translate(htmlPageText, ...)` to a text/html response with no encoding (XHRHtml2Markup.jsp:44-48); the translator prints JDOM Text nodes verbatim (XHtmlElementToWikiTranslator.java:95-116), so HTML entities like `&lt;script&gt;` can round-trip into raw `<script>` in the response.",
+      "reason": "Plausible reflected XSS, but reachable by design as an editor helper (VIEW permission) and requires a more indirect parser round-trip argument than the direct parameter echo; left unconfirmed."
+    },
+    {
+      "lead": "AttachmentServlet upload filtering: `isTypeAllowed`/`validateFileName` use `endsWith` on the whole multipart filename before slash-splitting and only block `.jsp`/`.jspf` (AttachmentServlet.java:157-176, AttachmentManager.java:637-679), so names like `x.jsp.` / `x.jsp/..` are not caught, and `..` can survive as a file name.",
+      "reason": "Stored files are served from the attachment storage directory rather than executed, and the traversal value is URL-encoded by BasicAttachmentProvider (mangleName), so no concrete execution or traversal impact was established from source alone."
+    },
+    {
+      "lead": "ShortURLConstructor.getForwardPage maps the `do` request parameter directly to `<value>.jsp` and WikiServlet forwards to `\"/\" + jspPage` (ShortURLConstructor.java:221-227, WikiServlet.java:96-100).",
+      "reason": "Requires the non-default short-URL constructor and the container normalizes the dispatcher path; target JSPs still perform their own access checks, so no impact could be shown."
+    },
+    {
+      "lead": "Serializer.deserializeFromBase64 uses ObjectInputStream on data read from the XML/JDBC user database (Serializer.java:60-71; XMLUserDatabase.java:682-686, JDBCUserDatabase.java:741-745), which would be a deserialization gadget sink if an attacker could write attributes into those stores.",
+      "reason": "The serialized data is written by JSPWiki itself; no attacker-controlled path into the XML/JDBC attribute store was found in this snapshot."
+    }
+  ],
+  "summary": "JSPWiki 2.11.0.M3-RC2 snapshot (1155 files; jspwiki-main, jspwiki-war, jspwiki-util, jspwiki-markdown, it-tests). The strongest source-evidenced issue is a missing-output-encoding flaw in the page-info template: `renameto`, a raw request parameter, is written unescaped into an HTML attribute in both the `default` and `210` templates, giving reflected XSS in an authenticated page. The same template file also renders the page change note without escaping, and CookieAuthenticationLoginModule builds a login-cookie file path from an unvalidated cookie value; both are noted as rejected/secondary leads rather than additional candidates."
+}

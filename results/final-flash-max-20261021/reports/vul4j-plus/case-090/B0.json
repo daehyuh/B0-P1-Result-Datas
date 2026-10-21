@@ -1,0 +1,106 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote network client that can open a TCP connection to the broker remoting port (default 10911, or the VIP port) can send RequestCode.UPDATE_BROKER_CONFIG (25) with a java-Properties-format body; the name server port (default 9876) accepts RequestCode.UPDATE_NAMESRV_CONFIG (318). Property keys and values (rocketmqHome, namesrvAddr, filterServerNums, configStorePath, storePathRootDir, etc.) are fully attacker-controlled strings/ints; values may contain spaces, shell metacharacters and Properties \\n escapes. No credentials or signatures are required when broker ACL is disabled (the default, aclEnable=false; distribution/conf/broker.conf does not enable it) and the name server exposes no ACL check at all.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked whether any allowlist/validation exists in the handlers: none in updateBrokerConfig/updateConfig, Configuration.update, MixAll.properties2Object, or the BrokerConfig/NamesrvConfig setters. Checked request routing: UPDATE_BROKER_CONFIG is not specially registered and is served by AdminBrokerProcessor registered as the default processor (BrokerController 620-622), so it is reachable from remote clients. Checked authentication: aclEnable defaults to false and initialAcl returns early when disabled (BrokerController 502-506); PlainPermissionManager.validate does enforce admin permission for RequestCode 25 only when ACL is enabled; NamesrvController has no ACL hook. Checked Configuration.update semantics: mergeIfExist only restricts what enters allConfigs, but properties2Object invokes setters unconditionally, so fields such as rocketmqHome/configStorePath take effect even if the key was not previously present. Checked properties2Object: it silently ignores non-primitive/String setters and swallows reflection errors, so only meaningful fields are affected. Checked the Windows branch of buildStartCommand (uses start /b ... mqfiltersrv.exe) and the platform check. Checked that filterServerNums has no lower-bound/sanitization (setter is a plain assignment) and that createFilterServer has no enable flag. Checked that no tests or runtime artifacts are present to confirm exploitability.",
+      "id": "rocketmq-unauth-config-update-to-rce",
+      "impact": "Broker: unauthenticated remote OS command execution with the privileges of the broker process (typically the RocketMQ service account), enabling full host compromise, theft or modification of stored messages, reuse of broker/ACL credentials, and lateral movement. Name server: unauthenticated arbitrary file write to paths writable by the name-server process (content is the name-server configuration, whose values the attacker also controls), which can corrupt service configuration or overwrite other files for further compromise. Both are reachable without any prior authentication in the default configuration.",
+      "locations": [
+        {
+          "end_line": 552,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java",
+          "start_line": 518
+        },
+        {
+          "end_line": 217,
+          "path": "common/src/main/java/org/apache/rocketmq/common/Configuration.java",
+          "start_line": 175
+        },
+        {
+          "end_line": 360,
+          "path": "common/src/main/java/org/apache/rocketmq/common/MixAll.java",
+          "start_line": 322
+        },
+        {
+          "end_line": 319,
+          "path": "common/src/main/java/org/apache/rocketmq/common/BrokerConfig.java",
+          "start_line": 313
+        },
+        {
+          "end_line": 543,
+          "path": "common/src/main/java/org/apache/rocketmq/common/BrokerConfig.java",
+          "start_line": 537
+        },
+        {
+          "end_line": 95,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/filtersrv/FilterServerManager.java",
+          "start_line": 53
+        },
+        {
+          "end_line": 41,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/filtersrv/FilterServerUtil.java",
+          "start_line": 24
+        },
+        {
+          "end_line": 884,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/BrokerController.java",
+          "start_line": 882
+        },
+        {
+          "end_line": 590,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/processor/DefaultRequestProcessor.java",
+          "start_line": 557
+        },
+        {
+          "end_line": 74,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/NamesrvController.java",
+          "start_line": 69
+        },
+        {
+          "end_line": 85,
+          "path": "common/src/main/java/org/apache/rocketmq/common/namesrv/NamesrvConfig.java",
+          "start_line": 79
+        }
+      ],
+      "prerequisites": "Network reachability to the broker or name-server remoting port. Broker command-execution chain: ACL disabled (default) or possession of an ACL account with admin=true (when ACL is on, RequestCode 25 is in Permission.ADMIN_CODE and PlainPermissionManager.checkPerm requires admin); a Unix-like broker host for the \"sh\" branch (Windows takes a different start /b branch); the FilterServerManager scheduled task runs from broker start (5 s initial delay, 30 s period). Name-server file-write chain: any path the name-server process can create/write (string2File writes <path>.tmp and renames, creating parent directories).",
+      "root_cause": "Neither update-config endpoint validates the keys or values it accepts. AdminBrokerProcessor.updateBrokerConfig (RequestCode.UPDATE_BROKER_CONFIG) and DefaultRequestProcessor.updateConfig (RequestCode.UPDATE_NAMESRV_CONFIG) parse the request body with MixAll.string2Properties and pass the result to Configuration.update(), which calls MixAll.properties2Object(properties, configObject) for every registered config object. properties2Object reflectively invokes any setter whose lower-camel-case name matches a property key, so security-critical operational fields are remotely settable: BrokerConfig.setRocketmqHome(String), BrokerConfig.setFilterServerNums(int), BrokerConfig.setNamesrvAddr(String), NamesrvConfig.setConfigStorePath(String). There is no allowlist, no sensitive-key rejection, and no authentication requirement on either endpoint (broker ACL is off by default and the name server has no ACL implementation). Broker: FilterServerManager.createFilterServer() builds the string \"sh <rocketmqHome>/bin/startfsrv.sh <config>\" (or a Windows equivalent), and FilterServerUtil.callShell splits it on spaces and runs it through Runtime.getRuntime().exec; attacker-controlled rocketmqHome/namesrvAddr are concatenated directly into that command line, and filterServerNums controls periodic execution, so injection into the sh argument vector yields OS command execution. Name server: Configuration.getStorePath() reads NamesrvConfig.configStorePath (set via setStorePathFromConfig in NamesrvController), and Configuration.update() unconditionally calls persist() -> MixAll.string2File(allConfigs, storePath), so changing configStorePath in the same request makes the name server write its config content to an attacker-chosen path (parent directories are created).",
+      "title": "Unauthenticated remote config update applies arbitrary properties to internal config objects, enabling OS command execution on the broker and arbitrary file write on the name server",
+      "trace": "UPDATE_BROKER_CONFIG request -> NettyRemotingServer default processor -> AdminBrokerProcessor.processRequest case UPDATE_BROKER_CONFIG (162-163) -> updateBrokerConfig (518-552) -> BrokerController.getConfiguration().update(properties) (530) -> Configuration.update (175-199) -> MixAll.properties2Object (185 / MixAll 322-360) -> BrokerConfig.setRocketmqHome / setFilterServerNums / setNamesrvAddr -> FilterServerManager scheduled createFilterServer (53-74) -> buildStartCommand concatenates rocketmqHome/namesrvAddr into an sh command line (76-95) -> FilterServerUtil.callShell -> Runtime.getRuntime().exec (28) with the broker's privileges. Parallel name-server trace: UPDATE_NAMESRV_CONFIG -> DefaultRequestProcessor.processRequest (130-131) -> updateConfig (557-590) -> NamesrvController.getConfiguration().update(properties) (584) -> Configuration.update -> NamesrvConfig.setConfigStorePath -> Configuration.persist (198, 201-217) -> MixAll.string2File(allConfigs, attacker-chosen path) (146-162).",
+      "unverified": "Source-level finding only; no code was executed and no broker/name-server was contacted, so the exact tokenization behavior of FilterServerUtil.splitShellString and the precise argument-injection payload were not runtime-confirmed (the underlying pattern is the well-known RocketMQ config-update command-execution class). The name-server arbitrary-write impact depends on a writable target path and on the properties-format content being useful to the attacker; this branch was analyzed statically and not exercised. The snapshot's version markers are inconsistent (pom says 4.9.6-SNAPSHOT while MQVersion.CURRENT_VERSION is V4_9_5 and the Version enum is padded to V5_9_9), so CVE-to-snapshot mapping could not be validated from source metadata.",
+      "weakness_type": "Missing authentication/authorization for a critical function (CWE-306) leading to OS command injection (CWE-78) on the broker and external control of file path (CWE-73) on the name server"
+    }
+  ],
+  "coverage_summary": "Scope: all 875 model-visible files in the assigned snapshot (tool filters: NUL-byte binaries skipped by read/search; nothing excluded by name, path, size, or symlink policy; parity with P1). There are no src/test sources, no git metadata, build scripts are limited to Maven/CI configs. I read the broker admin, send, pull, client-manage, reply and transaction processors' request dispatch paths; AdminBrokerProcessor in detail; the namesrv DefaultRequestProcessor and NamesrvController; common Configuration/MixAll/BrokerConfig/NamesrvConfig/TopicValidator; the acl module (PlainAccessValidator, PlainPermissionManager.validate/checkPerm, AclSigner, AclUtils, RemoteAddressStrategyFactory); remoting NettyDecoder/RemotingCommand; store/filter/client files were sampled via targeted searches (Runtime.exec, ProcessBuilder, string2File, new File, JSON.parse, properties2Object, getConfiguration). Requests reachable from remote clients were prioritized over client-side and tools code. Version metadata is anomalous and was treated as untrusted repository content.",
+  "limitations": [
+    "No test sources are present in the snapshot, so no test names/intent could be used as corroborating evidence.",
+    "No git history, tags, changelogs, or external references are available in the run, so I could not diff against fixed upstream revisions; the candidate is based solely on static reading of this snapshot.",
+    "No code was built or executed and no broker/name-server instance was contacted; exploitability mechanics (space-split tokenization, property escaping, shell argument-injection behavior) are reasoned from source, not runtime-confirmed.",
+    "Large files (CommitLog.java, DefaultMessageStore.java, MQClientAPIImpl.java, AdminBrokerProcessor.java sections, SelectorParser) were reviewed by targeted ranges/search rather than exhaustively line-by-line.",
+    "The name-server arbitrary file-write branch of the candidate has a more conditional impact (path writability and content usefulness) than the broker command-execution branch.",
+    "Version markers conflict (pom 4.9.6-SNAPSHOT, MQVersion.CURRENT_VERSION=V4_9_5, Version enum padded to V5_9_9/HIGHER_VERSION), so the snapshot's exact upstream revision could not be established and CVE mapping is inferential."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Broader unauthenticated broker admin plane (e.g., UPDATE_AND_CREATE_TOPIC, DELETE_TOPIC_IN_BROKER, GET_BROKER_CONFIG, RESET_CONSUMER_OFFSET_IN_BROKER are all reachable without credentials when ACL is disabled)",
+      "reason": "Same missing-auth design as the selected finding, but these do not by themselves provide an OS-level code-execution or file-write sink; treated as lower-impact, same-class exposure rather than a separate candidate."
+    },
+    {
+      "lead": "PlainPermissionManager.validate returns early when an account's whiteRemoteAddress strategy matches, skipping signature and per-resource permission checks (ACL 653-698)",
+      "reason": "This is intentional trusted-IP behavior in RocketMQ's ACL design, requires a matching ACL account entry/global whitelist, and is not itself an OS command execution path; not selected as the strongest candidate."
+    },
+    {
+      "lead": "Remote-input parsing/resource surfaces: NettyDecoder FRAME_MAX_LENGTH 16 MiB, RemotingCommand/RocketMQSerializable decoding, MessageDecoder, and filter SQL parser generated code",
+      "reason": "These are potential resource-exhaustion or malformed-input surfaces; I did not find source evidence of a memory-safety or authentication bypass with concrete impact in the reviewed code, so no candidate was raised."
+    },
+    {
+      "lead": "fastjson parsing of request bodies (RemotingSerializable.fromJson, JSON.parseObject)",
+      "reason": "pom pins fastjson 1.2.69_noneautotype and the code uses typed parsing (Class argument), so no autoType deserialization RCE evidence was found."
+    },
+    {
+      "lead": "Configuration.persist / MixAll.string2File writing to a path derived from config (broker and name server)",
+      "reason": "This is the name-server half of the selected candidate (configStorePath via UPDATE_NAMESRV_CONFIG); it is included in the single candidate rather than reported as a separate issue."
+    }
+  ],
+  "summary": "Reviewed the Apache RocketMQ 4.9.6-SNAPSHOT snapshot (875 model-visible files; no test sources, no VCS metadata, no precomputed relation index under B0). I traced the remotely reachable request paths of the broker and name server and the shared Configuration/MixAll config plumbing. The strongest candidate is the unauthenticated remote configuration-update weakness: AdminBrokerProcessor.updateBrokerConfig (RequestCode 25) and DefaultRequestProcessor.updateConfig (RequestCode 318) take an arbitrary client-supplied Properties body and hand it to Configuration.update, which reflectively invokes every matching setter on BrokerConfig/NamesrvConfig with no key allowlist. On the broker this lets a remote client overwrite rocketmqHome/namesrvAddr/filterServerNums; FilterServerManager periodically builds \"sh <rocketmqHome>/bin/startfsrv.sh ...\" and FilterServerUtil.callShell executes it with Runtime.getRuntime().exec, so attacker-controlled values reach an OS command line (command execution). On the name server the same weakness lets a client set configStorePath and Configuration.persist immediately writes the (attacker-influenced) config to that path, an unauthenticated arbitrary file write. Broker ACL is disabled by default (aclEnable=false), and the name server has no ACL layer at all. This matches the root cause of the widely known RocketMQ config-update RCE class; no runtime verification was performed. Other leads (broader unauthenticated broker admin APIs, ACL white-address early return, frame-size/parser DoS surfaces) were considered and rejected as weaker or not standalone code-execution paths."
+}

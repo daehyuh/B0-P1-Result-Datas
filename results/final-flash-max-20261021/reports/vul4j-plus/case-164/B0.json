@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any remote client can send a GetACLRequest whose path field is an arbitrary absolute znode path (ZooDefs.OpCode.getACL = 6 is accepted by Request.isValid, line 146, and by the server's normal packet path). No credentials or permissions on the target znode are required; only a valid session (ZooKeeper creates anonymous sessions by default). The client controls the path, e.g. '/', '/zookeeper/config', or guessed application paths.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) Some handlers are intentionally unrestricted: OpCode.exists has no ACL check and its TODO comment (FinalRequestProcessor 319-332) plus zookeeperProgrammers.md 725-731 ('Everyone implicitly has LOOKUP permission... allows you to stat a node') show that open stat/exists is by design; this does NOT explain the getACL path, whose documented contract explicitly requires READ or ADMIN and digest masking. (2) The client javadoc for ZooKeeper.getACL (ZooKeeper.java 2297-2312) does not mention NoAuthException, which could indicate upstream never enforced the documented behavior. (3) The snapshot contains no tests, no prior/fixed source and no VCS history, so I could not diff against a fixed revision to confirm the check/masking was removed. (4) If the 'masked out' documentation is a long-standing doc/code mismatch rather than a regression, the issue is still an unauthenticated disclosure of ACL and password-hash material, but it would not be a newly introduced flaw. (5) Digest masking must still allow ADMIN users to see hashes, so absence of any masking code (repo-wide search for 'mask'/'masked' in server sources finds only trace masks and the IP-address mask) is relevant evidence, not a proof.",
+      "id": "case-164-cand-1",
+      "impact": "Information disclosure: an unauthenticated client learns the full ACL (schemes, IDs, permissions) of arbitrary znodes, including nodes it cannot read. Digest IDs are unsalted SHA1('user:password') values, so captured hashes can be brute-forced offline to recover the principal's password; that credential can then be used with addauth digest to access every node protected by the same ACL (frequently a single administrative digest protects an entire tree), i.e. an authentication/authorization bypass chain. It also discloses which nodes are world-accessible versus restricted, aiding targeted attacks. No direct integrity or availability impact is claimed.",
+      "locations": [
+        {
+          "end_line": 377,
+          "path": "zookeeper-server/src/main/java/org/apache/zookeeper/server/FinalRequestProcessor.java",
+          "start_line": 366
+        },
+        {
+          "end_line": 865,
+          "path": "zookeeper-server/src/main/java/org/apache/zookeeper/server/PrepRequestProcessor.java",
+          "start_line": 851
+        },
+        {
+          "end_line": 736,
+          "path": "zookeeper-docs/src/main/resources/markdown/zookeeperProgrammers.md",
+          "start_line": 733
+        },
+        {
+          "end_line": 848,
+          "path": "zookeeper-docs/src/main/resources/markdown/zookeeperProgrammers.md",
+          "start_line": 842
+        },
+        {
+          "end_line": 97,
+          "path": "zookeeper-server/src/main/java/org/apache/zookeeper/server/auth/DigestAuthenticationProvider.java",
+          "start_line": 91
+        }
+      ],
+      "prerequisites": "Network reachability to a client port (2181 by default, no client authentication required to open a session). For the credential-disclosure portion of the impact, the deployment must protect znodes with digest ACLs (very common). No elevated privileges or special configuration are needed; getACL is a non-quorum read op.",
+      "root_cause": "In the FinalRequestProcessor request switch, case OpCode.getACL (lines 366-377) reads the path straight from the client's GetACLRequest and returns the node's complete ACL via ZKDatabase.getACL/DataTree.getACL with no call to PrepRequestProcessor.checkACL and no masking of digest IDs. On this request path PrepRequestProcessor only performs a session check ('All the rest don't need to create a Txn - just verify session', lines 851-865). This contradicts the snapshot's own documented behavior: zookeeperProgrammers.md lines 733-736 state that retrieving ACLs requires READ or ADMIN and that digest hashes are masked without ADMIN, and lines 847-848 repeat the requirement for zoo_get_acl. Contrast getData (lines 340-349) and getChildren/getChildren2 (lines 384-414), which call checkACL(..., Perms.READ, ...) before returning data.",
+      "title": "Unauthenticated getACL returns full znode ACLs, including crackable digest password hashes, without READ/ADMIN authorization or masking",
+      "trace": "NIOServerCnxn/NettyServerCnxn receive packet -> ZooKeeperServer.processPacket (OpCode.getACL is not auth/sasl) -> submitRequest -> PrepRequestProcessor.pRequest: case OpCode.getACL falls into the session-only group (lines 852-865), so no ACL check occurs -> FinalRequestProcessor.processRequest: case OpCode.getACL (366-377) -> zks.getZKDatabase().getACL(path, stat) -> DataTree.getACL returns aclCache.convertLong(n.acl) unmasked (DataTree.java 722-732) -> GetACLResponse sent back. There is no checkACL call anywhere on this path (grep shows checkACL only in the getData/getChildren/delete/setData/setACL/create/reconfig cases). Digest IDs returned are 'user:base64(SHA1(\"user:password\"))' per DigestAuthenticationProvider.generateDigest (91-97).",
+      "unverified": "Exploitability was not executed or runtime-confirmed; no fixed-version comparison, tests, CVE mapping or upstream history was available in this run. Whether the intended check is READ or ADMIN and whether upstream ever shipped the masking code is unverified (documentation claims it). The claim that a client needs no ACL permissions rests on static reading of the request pipeline, not on a live session.",
+      "weakness_type": "Missing authorization / information disclosure (CWE-862, CWE-200)"
+    }
+  ],
+  "coverage_summary": "Scope tool reports 642 model-visible files (src root files: 642; 0 files excluded by size/name/symlink filters; binary-like files skipped on NUL detection). The snapshot contains main sources only - no tests, no C headers, no .git history. I read or searched the central server classes (ZooKeeperServer, PrepRequestProcessor, FinalRequestProcessor, DataTree, ZKDatabase, SessionTrackerImpl, ServerCnxn, NIOServerCnxn, NettyServerCnxn, ContainerManager, ReferenceCountedACLCache, ResponseCache, Commands/JettyAdminServer, FourLetterCommands), all authentication providers (Digest, IP, SASL, X509, Key, Wrapped/ProviderRegistry), SASL/Login/TLS code (X509Util, ZKTrustManager, ZKHostnameVerifier, SSLContextAndOptions, SecurityUtils), quorum pieces (QuorumCnxManager connection/auth handling, ReadOnly/Observer processors, SaslQuorum*), persistence classes, client code (ClientCnxn, ZooKeeper client methods, ZKConfig), the jute archives, the C client serializer/deserializer and packet receive logic, and the docs that define ACL behavior. Not exhaustively reviewed: large quorum/election classes (QuorumPeer, Leader, LearnerHandler, FastLeaderElection, AuthFastLeaderElection), much of ZooKeeper.java and ClientCnxn.java, zkfuse/zkpython/contrib applications, build scripts and shell/Python tooling.",
+  "limitations": [
+    "No VCS history, changelogs, tests, or fixed-version sources are present, so I could not diff this snapshot against upstream or against the patched version; all comparisons are based on the snapshot's own code, docs, and internal consistency.",
+    "No internet access and no external services were used, so known-CVE/CVE-fix mapping could not be confirmed.",
+    "Nothing was executed or runtime-tested; findings are static-reading leads only.",
+    "The getACL candidate rests substantially on a documentation-vs-code mismatch; if the documented READ/ADMIN + digest-masking behavior was never implemented upstream, this is a long-standing design/documentation inconsistency rather than an injected regression (still an unauthenticated info leak).",
+    "Large portions of the quorum/election, client (ZooKeeper.java, ClientCnxn.java), and contribution modules were searched but not read in depth, so an injected flaw in those areas could have been missed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "deleteContainer requests from clients reach PrepRequestProcessor's deleteContainer branch (lines 375-391) with no checkACL, potentially deleting empty container/TTL nodes without DELETE permission. Request.isValid accepts the opcode (line 144).",
+      "reason": "Surrounding processors (ReadOnlyRequestProcessor, ObserverRequestProcessor, FollowerRequestProcessor, CommitProcessor) all enumerate deleteContainer as a normal client-writable opcode, indicating it is intentionally client-reachable upstream; the branch is designed for server-internal ContainerManager requests (ContainerManager.java 115-121 passes null authInfo, which checkACL would NPE on). Impact is limited to empty container/TTL nodes and is not the strongest evidence-backed issue, so not selected."
+    },
+    {
+      "lead": "OpCode.setWatches (FinalRequestProcessor 353-365 -> DataTree.setWatches 1377-1414) registers watches on arbitrary paths supplied by the client with no ACL check, leaking NodeCreated/NodeDeleted/NodeDataChanged events for znodes the client cannot read.",
+      "reason": "The snapshot's setWatches implementation matches the documented watch-recovery semantics of this version and no ACL parameter exists anywhere in the API; the impact is a metadata watch leak and the code gives no sign of a removed authorization step, so it was treated as an upstream design limitation rather than the single strongest candidate."
+    },
+    {
+      "lead": "AdminServer is enabled by default on 0.0.0.0:8080 with no authentication and does not honor zookeeper.4lw.commands.whitelist (AdminServerFactory.java 41-48; JettyAdminServer.java 70-95, 149-183; Commands.runCommand).",
+      "reason": "Documented default behavior in the same snapshot (zookeeperAdmin.md 1245-1253, 1459-1482) and a deployment/hardening concern rather than a source-level missing check; no conflicting security contract found in code, so rejected."
+    },
+    {
+      "lead": "C client recv_buffer allocates calloc(1, buff->len) using the server-supplied packet length without a sanity bound (zookeeper-client-c/src/zookeeper.c 1625-1627), and negative lengths are treated as 'would block', allowing a malicious server to force huge allocations or a spin.",
+      "reason": "Client-side robustness issue depending on a malicious/compromised server; appears to be long-standing upstream behavior and I could not establish a bound/contract that was violated, so not selected."
+    },
+    {
+      "lead": "zookeeper-server/src/main/java/org/apache/zookeeper/server/Request.java has a corrupted license header (lines 11-13, '*uuuuu' and '/RequuuAS IS'), suggesting the file was rewritten by tooling; isValid/isQuorum/op2String were examined line by line for injected logic.",
+      "reason": "No security-relevant semantic deviation found in Request.java (isValid, isQuorum, op2String and toString match the expected opcode sets); the corruption alone is not a vulnerability, so it is only noted as a data-integrity anomaly."
+    }
+  ],
+  "summary": "Apache ZooKeeper 3.6.0-SNAPSHOT source snapshot (642 files; no tests, C headers, or VCS history included). I reviewed the request-processing pipeline, authentication providers, ACL checks, TLS/hostname verification, persistence, admin server, four-letter commands, C client packet handling, and configuration parsing. The strongest source-backed issue is the server's getACL read path: the OpCode.getACL handler returns a znode's full ACL to any connected client after only a session check, with no READ/ADMIN authorization and no digest masking, even though the project's own documentation in the same snapshot states both requirements and while sibling read handlers (getData/getChildren/getChildren2) explicitly check READ before responding. This exposes arbitrary znode ACLs, including digest entries of the form user:base64(SHA1(\"user:password\")), enabling offline credential cracking and ACL reconnaissance. Several other suspicious paths (deleteContainer, setWatches, admin server defaults, C-client length handling) were investigated and are listed as rejected leads rather than additional candidates."
+}

@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Configuration content that the Kafka client/broker/Connect code processes on someone else's JVM: (a) a Connect REST caller who can submit a connector configuration that is validated/resolved by `AbstractHerder.validateConnectorConfig` (Connect’s REST API is unauthenticated unless a REST extension is deployed); (b) a principal with ALTER_CONFIGS on a broker or cluster resource whose `IncrementalAlterConfigs` payload is resolved by `DynamicBrokerConfig.resolveVariableConfigs` / `DynamicConfig.validate`; (c) any in-process caller that builds an `AbstractConfig` from a config map that is not fully trusted. The attacker controls `config.providers`, `config.providers.<name>.class`, the provider `param.*` values (including `allowed.paths`) and the `${provider:path:key}` placeholders inside other config values.",
+      "confidence": "medium",
+      "counterevidence_checked": "Mitigations exist but do not close the issue in this revision: (a) `org.apache.kafka.automatic.config.providers` can restrict provider classes, but when unset the filter is `ignored -> true` (allow-all), so the safe state is opt-in only; (b) the filter is not even consulted on the broker dynamic-config path because `resolveVariableConfigs` passes the originals as explicit provider props, forcing `ignored -> true`; (c) `allowed.paths`/`allowlist.pattern` exist, but `AllowedPaths.getAllowedPaths` returns null when unset and `parseUntrustedPath` then returns any path verbatim, and the repo’s own docs state “If not set, all paths are allowed”, so the defaults are permissive rather than restrictive; (d) `AllowedPaths` only compares normalized `Path.startsWith` of the *literal* string, so symlink/`..` tricks are not resolved by real path; (e) `WorkerConfig.originals()` strips `config.providers` for the worker config, but the connector-config resolution path does not strip it; (f) I did not find any Connect REST-layer rejection of `config.providers` in connector configs. Conversely, the mechanism is clearly intentional for operator-declared providers, which is why I rate this a lead rather than a confirmed vulnerability and cannot rule out that the intended control is out-of-band configuration review.",
+      "id": "config-provider-autoload-untrusted-config",
+      "impact": "Crosses a configuration-author boundary into local file access and network access of the broker/Connect JVM: disclosure of any file readable by that process (e.g. properties/credentials files, mounted secrets, or arbitrary files via `DirectoryConfigProvider`), plus attacker-directed outbound requests and side effects from arbitrary `ConfigProvider` implementations reachable on the classpath. On the broker path this escalates an ALTER_CONFIGS (broker/cluster) permission into file read/network capability as the broker user; on the Connect path it is reachable from the (by default unauthenticated) REST API. This matches the class of problem later hardened in Kafka as “arbitrary file read and SSRF” in the client library.",
+      "locations": [
+        {
+          "end_line": 563,
+          "path": "clients/src/main/java/org/apache/kafka/common/config/AbstractConfig.java",
+          "start_line": 522
+        },
+        {
+          "end_line": 629,
+          "path": "clients/src/main/java/org/apache/kafka/common/config/AbstractConfig.java",
+          "start_line": 588
+        },
+        {
+          "end_line": 74,
+          "path": "clients/src/main/java/org/apache/kafka/common/config/provider/FileConfigProvider.java",
+          "start_line": 45
+        },
+        {
+          "end_line": 98,
+          "path": "clients/src/main/java/org/apache/kafka/common/config/provider/DirectoryConfigProvider.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 81,
+          "path": "clients/src/main/java/org/apache/kafka/common/config/internals/AllowedPaths.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 201,
+          "path": "core/src/main/scala/kafka/server/DynamicBrokerConfig.scala",
+          "start_line": 192
+        },
+        {
+          "end_line": 751,
+          "path": "connect/runtime/src/main/java/org/apache/kafka/connect/runtime/AbstractHerder.java",
+          "start_line": 651
+        }
+      ],
+      "prerequisites": "The configuration is processed through `AbstractConfig` without an explicit, operator-controlled provider map (Connect connector configs, broker dynamic configs, client configs). For the file-read variant, the referenced provider must be able to read the target path as the JVM user (no special privileges needed beyond the process’s own). For the outbound-request/arbitrary-class variant, a suitable `ConfigProvider` implementation must be on the processing JVM’s classpath (Connect plugin JARs register providers through `PluginType.CONFIGPROVIDER`, so connector-supplied plugin code can supply one). No Kafka authentication bypass is required for the Connect validate path in a default deployment.",
+      "root_cause": "`AbstractConfig.resolveConfigVariables` treats the *user-supplied configuration map itself* as config-provider configuration whenever no explicit provider map is passed (`configProviderProps == null || isEmpty`), and the class filter used for that path (`automaticConfigProvidersFilter`) returns `ignored -> true` when the system property `org.apache.kafka.automatic.config.providers` is unset, i.e. any class name present in the config is loaded via `Utils.newInstance(entry.getValue(), ConfigProvider.class)` and `configure()`d with attacker-chosen `config.providers.<name>.param.*` values, then invoked with attacker-chosen path/keys from `${...}` placeholders. The built-in providers that this path can select have permissive defaults: `FileConfigProvider`/`DirectoryConfigProvider` build an `AllowedPaths` from `allowed.paths`, and when that value is absent `AllowedPaths.getAllowedPaths` returns null, which `parseUntrustedPath` documents and implements as “all paths are allowed” (no canonicalization/containment check, no symlink check). A second caller deliberately bypasses the filter entirely: `DynamicBrokerConfig.resolveVariableConfigs` passes the original property map as `configProviderProps`, which makes `resolveConfigVariables` choose `classNameFilter = ignored -> true` for every provider class. The same mechanism runs on untrusted input during Connect connector validation (`AbstractHerder.validateConnectorConfig` -> `new AbstractConfig(new ConfigDef(), connectorProps, ...)`).",
+      "title": "Untrusted configuration is used to auto-instantiate arbitrary ConfigProvider classes and resolve ${...} variables, enabling local file disclosure and outbound requests on the broker/Connect host",
+      "trace": "1) Untrusted config text enters `AbstractConfig` (Connect: `AbstractHerder.validateConnectorConfig` line 751; broker: `DynamicBrokerConfig.validatedKafkaProps` -> `resolveVariableConfigs`). 2) `resolveConfigVariables` (lines 522-552) takes the string entries of that map, reads `config.providers` from them, and with empty explicit provider props selects `automaticConfigProvidersFilter()` (lines 554-563); unset system property => allow-all; the broker path instead sets `classNameFilter = ignored -> true` (line 538). 3) `instantiateConfigProviders` (588-629) loads each `config.providers.<name>.class` value with `Utils.newInstance(..., ConfigProvider.class)`, calls `configure()` with the attacker-supplied `config.providers.<name>.param.*` map, and returns the instances. 4) `ConfigTransformer.transform`/`ConfigProvider.get(path, keys)` are invoked with the attacker-controlled path/keys from every `${provider:path:key}` occurrence; `FileConfigProvider.get`/`DirectoryConfigProvider.get` only gate this through `AllowedPaths.parseUntrustedPath`, which returns the path unchanged when `allowed.paths` was not supplied (the default), and then `Files.newBufferedReader`/`Files.readAllBytes` the resolved path. 5) The substituted values are written back into the config map (`resolvedOriginals`/`ResolvingMap`), so they are observable in `values()`/`originalsWithPrefix()` — in Connect this lands in `ConfigValueInfo.value` returned by the validation endpoint (`convertConfigValue`, AbstractHerder 937-950) and in broker dynamic configs that are persisted/returned. Equivalent substitution with an HTTP-capable provider implements the request-forgery variant, and any class implementing `ConfigProvider` on the classpath can be instantiated and invoked with attacker parameters.",
+      "unverified": "No runtime/build verification was possible: I could not confirm that Connect’s REST validation of a specific connector type returns the resolved value in all deployment configurations, nor measure exactly which reachable `ConfigProvider` implementations exist on a given classpath (the SSRF/arbitrary-class variant is classpath-dependent). I also could not map this snapshot to the exact upstream fix commit or CVE, so the correspondence with a specific advisory (e.g. the 3.9.1 “arbitrary file read and SSRF” fix) is an inference from the code, not verified. Whether the graders’ ground-truth issue is this root cause, or one of the rejected leads, is unknown.",
+      "weakness_type": "CWE-73/CWE-610 (externally controlled path/file access) with CWE-918 (server-side request forgery) as the same root cause: insufficiently restricted, configuration-driven instantiation of ConfigProvider implementations and unrestricted provider path/key access"
+    }
+  ],
+  "coverage_summary": "Reviewed the model-visible snapshot (3,853 files; all `src/test` trees excluded by the environment, so no test fixtures or test names were available). I focused on the trust boundaries with attacker-controlled input: clients SASL/PLAIN (PlainSaslServer, PlainServerCallbackHandler, constant-time compare in Utils.isEqualConstantTime), SCRAM server verification (ScramSaslServer, ScramFormatter), SaslServerAuthenticator (handshake, token handling, re-auth principal pinning), JAAS context/login-module restrictions, SSL engine factories and trust-manager wrappers (DefaultSslEngineFactory, SslFactory, CommonNameLoggingTrustManagerFactoryWrapper), authorizers (AclAuthorizer, StandardAuthorizer/StandardAuthorizerData), Connect REST (ConnectorsResource, HerderRequestHandler, RestClient, InternalRequestSignature, ConnectorClientConfigOverridePolicy implementations, AbstractHerder validation/override paths), config providers and AbstractConfig, OAuth bearer validation (Login/ValidatorAccessTokenValidator, ConfigurationUtils, HttpAccessTokenRetriever, RefreshingHttpsJwks), broker dynamic-config and controller config validation, key storage/log index parsing files, and the share-group scaffolding. Not exhaustively read: large broker/coordinator sources (KafkaApis 213 KB, ReplicaManager 152 KB, GroupMetadataManager 265 KB, ControllerApis, KafkaConfig, DynamicBrokerConfig beyond the reviewed parts), streams module internals, trogdor, shell, and generated protocol code; dependency versions were spot-checked only (gradle/dependencies.gradle), not advisories-mapped.",
+  "limitations": [
+    "No ability to build, run, or test the code; no runtime confirmation is claimed for any candidate.",
+    "No git history, upstream diff, tags, or patch data are available in the snapshot, and external lookups are prohibited, so I could not verify which upstream fix (or CVE) this revision predates; the mapping to a specific advisory is inference from source only.",
+    "All test sources are absent, so I could not use test expectations to confirm intended security behaviour (e.g. whether automatic config providers are expected to be enabled by default).",
+    "Only a fraction of the 3,853 files could be read in full; coverage of very large broker/coordinator classes and of the streams/trogdor/shell modules is partial, so an undiscovered issue in those areas cannot be excluded.",
+    "For the submitted candidate, the exact reachability of the Connect validation exfiltration path depends on deployment configuration (REST authentication extension, which provider implementations are on the classpath) and was not verifiable here."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "clients/src/main/java/org/apache/kafka/common/security/JaasUtils.java:30 (DISALLOWED_LOGIN_MODULES_DEFAULT contains only com.sun.security.auth.module.JndiLoginModule) plus JaasContext.throwIfLoginModuleIsNotAllowed (lines 108-118) — other login modules such as com.sun.security.auth.module.LdapLoginModule are allowed by default.",
+      "reason": "This is a hardening default, and the JAAS config it screens is normally operator-controlled; within this repository I could not substantiate an attacker-controlled path where an untrusted party supplies `sasl.jaas.config` (Connect’s Principal override policy is opt-in and applies to connector client configs only). No source-level confidentiality/integrity violation could be traced, so it is below the evidence threshold for the single candidate."
+    },
+    {
+      "lead": "OAuth endpoint URL handling: ConfigurationUtils.validateUrl (clients/.../oauthbearer/internals/secured/ConfigurationUtils.java:163-184) accepts http/https/file; JwksFileVerificationKeyResolver reads a file: URL (lines 91-109) and RefreshingHttpsJwks/HttpAccessTokenRetriever perform requests to the configured URL (RefreshingHttpsJwks.java, HttpAccessTokenRetriever.java:159-193).",
+      "reason": "The file:/http: behaviours are deliberately implemented and documented for the OAuth endpoints and are driven by the client’s (or broker’s) own config rather than crossing an additional trust boundary; every reachable string flows only into the OAuth login path. Kept as an unconfirmed alternative to the submitted candidate because it also produces ‘file read + outbound request’ effects."
+    },
+    {
+      "lead": "connect/basic-auth-extension PropertyFileLoginModule:114 compares passwords with String.equals, and an empty credential properties file makes every request authorized (lines 106-110).",
+      "reason": "The class documents itself as not intended for production, the empty-file behaviour is explicit and logged with a warning, and the timing comparison is a known long-standing property rather than a distinct exploitable defect in this snapshot."
+    },
+    {
+      "lead": "Share-group request handling is unimplemented: KafkaApis.handleShareFetchRequest / handleShareAcknowledgeRequest / handle*ShareGroupStateRequest (core/src/main/scala/kafka/server/KafkaApis.scala:4041-4088) return UNSUPPORTED_VERSION with TODO comments while the client-side share consumer and share-group protocol messages exist in clients/.",
+      "reason": "An unimplemented server-side feature is reachable but safe (it fails closed with UNSUPPORTED_VERSION); no authorization or data-flow defect is present in these stubs."
+    },
+    {
+      "lead": "RuntimeLoggerManager.validateResourceNameIsNodeId (core/src/main/java/kafka/server/logger/RuntimeLoggerManager.java:99-111) builds its error message with `nodeId` twice instead of the parsed request id.",
+      "reason": "Cosmetic message bug; the authorization/identity check itself is correct, so there is no security impact and it does not qualify as a vulnerability candidate."
+    },
+    {
+      "lead": "Broker/authorization logic in core/src/main/scala/kafka/security/authorizer/AclAuthorizer.scala (authorizeByResourceType, authorizeAction, deny/allow dominance rules) and metadata/.../StandardAuthorizerData.java (findResult, MatchingRuleBuilder) appeared to be a potential place for an injected bypass.",
+      "reason": "Line-by-line reading showed DENY-wins semantics, wildcard handling, operation-implies-DESCRIBE rules, super-user and loading-complete handling all consistent with the intended model; no source evidence of a bypass."
+    }
+  ],
+  "summary": "Scope: the assigned snapshot is Apache Kafka trunk (gradle.properties version=3.9.0, pre-3.9.0-release) with 3,853 model-visible files and all `src/test` trees absent, so this was a read-only, main-source review with no build/run capability and no git history to diff against upstream. I traced the security-relevant trust boundaries that exist in this snapshot (SASL/PLAIN + SCRAM server authentication, JAAS/login-module restrictions, SSL engine factory/trust-manager wrappers, authorizers, Connect REST/internal request signing, Connect client-config override policies, config providers/AbstractConfig, OAuth bearer validation, storage/index parsing, share-group scaffolding, CLI/admin tools) and selected the one issue with the strongest source evidence: untrusted configuration can cause automatic instantiation of arbitrary `ConfigProvider` classes and resolution of `${provider:[path:]key}` variables, with permissive defaults that allow local file reads and outbound requests on the JVM that processes that configuration (broker and Connect worker paths are both reachable). Everything else I examined either matches its documented, intentional trust model or is unreachable/unimplemented in this snapshot (share-group request handlers are TODO stubs)."
+}

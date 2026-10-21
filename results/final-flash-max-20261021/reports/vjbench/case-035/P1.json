@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Indirect but remote: the JSON written by addInitialFlow contains (a) appConfig.requestURL set from the request URL in JavaScriptBootstrapHandler.createAndInitUI, and (b) the initial UI state produced by the application rendering the request (route/query parameters decoded by the servlet container, or stored user data). An attacker who controls a link to the application can supply percent-encoded '</script>' plus HTML/JS that the container decodes before the application renders it into the initial UIDL; the payload itself need not contain raw '<' in the HTTP request target.",
+      "confidence": "low",
+      "counterevidence_checked": "Checked that in the default configuration (isEagerServerLoad()==false) addInitialFlow only writes the CSRF token, which cannot contain '<' (UUID) - so the issue is limited to deployments with the initial UIDL enabled; checked that Jsoup escapes attributes (<base href>, dev-mode gizmo) so those sinks are not vulnerable; checked that the {{APP_ID}} substitution is sanitized to [a-zA-Z0-9]; checked the V14 bootstrap path does escape '<' but only for the initial UIDL string, not for {{CONFIG_JSON}} (appConfig for the main bootstrap path carries no request-derived values other than relative 'contextRoot'), so that path is not equivalently exploitable; checked ServerRpcHandler/UIDL CSRF handling, ElementListenerMap/MapSync DisabledUpdateMode and inactive-node checks, and RouteNotFoundError (Jsoup.clean) and found them properly guarded, so this is not a duplicate of those.",
+      "id": "case-035-c1",
+      "impact": "Reflected/stored cross-site scripting in the application's origin for deployments using the V15+ bootstrap with eager server load: attacker JavaScript can act with the victim's session (read/modify UI state, issue client-callable/RPC actions, exfiltrate page data). Because the injected JSON is inside the bootstrapping script, it also breaks application startup (DoS) even without a full XSS payload.",
+      "locations": [
+        {
+          "end_line": 178,
+          "path": "flow-server/src/main/java/com/vaadin/flow/server/communication/IndexHtmlRequestHandler.java",
+          "start_line": 165
+        },
+        {
+          "end_line": 90,
+          "path": "flow-server/src/main/java/com/vaadin/flow/server/communication/IndexHtmlRequestHandler.java",
+          "start_line": 77
+        },
+        {
+          "end_line": 1044,
+          "path": "flow-server/src/main/java/com/vaadin/flow/server/BootstrapHandler.java",
+          "start_line": 1033
+        },
+        {
+          "end_line": 243,
+          "path": "flow-server/src/main/java/com/vaadin/flow/server/communication/JavaScriptBootstrapHandler.java",
+          "start_line": 216
+        }
+      ],
+      "prerequisites": "1) The V15+ (client-side) bootstrap is used and the initial UIDL is included in index.html, i.e. DeploymentConfiguration.isEagerServerLoad()/vaadin.initialUidl=true (BootstrapInitialPredicate -> VaadinService.getBootstrapInitialPredicate, default false but commonly enabled for server-side routing of this era). 2) An application view reflects attacker-influenced text into the initial UI state (a standard pattern). 3) The serializer leaves '<' unescaped (see unverified).",
+      "root_cause": "IndexHtmlRequestHandler.addInitialFlow() serializes the initial JSON (which contains the initial UIDL, i.e. arbitrary server-side UI state, plus appConfig including requestURL) with JsonUtil.stringify() and appends it raw into a Jsoup DataNode inside a <script> element. JsonUtil.stringify only escapes JSON/JS string metacharacters, so a '<' in any string value can form '</script>' (or '<!--') and terminate the raw-text script element. The equivalent legacy path, BootstrapHandler.BootstrapPageBuilder.getBootstrapJS(), applies initialUIDLString.replace(\"<\", \"\\\\x3C\") with a comment explaining precisely these two problems, and JavaScriptBootstrapHandler/IndexHtmlRequestHandler's newer code path omits that neutralization. UiDL string values can originate from request data that the servlet container URL-decodes (path/route parameters and query parameters reflected by the application's views), so an encoded payload such as %3C%2Fscript%3E%3Cscript%3E... becomes '</script><script>...' inside the JSON.",
+      "title": "Initial UIDL/app-config JSON embedded unescaped into index.html <script> (client-side bootstrap), enabling script-block breakout/XSS",
+      "trace": "Request -> VaadinServlet/IndexHtmlRequestHandler.synchronizedHandleRequest (line 65) -> BootstrapInitialPredicate.includeInitialUidl true -> includeInitialUidl() -> getInitialJson() -> createAndInitUI(JavaScriptBootstrapUI) adds appConfig.requestURL and getInitialUidl(ui) returns UidlWriter.createUidl(ui,...) containing UI state -> addInitialFlow() builds 'window.Vaadin = {TypeScript: ' + JsonUtil.stringify(initialJson) + '};' and appends it as a DataNode to a new <script> element inserted at head position 0 -> indexDocument.html() writes the DataNode raw -> browser terminates the script at the injected '</script>' and parses the following attacker HTML/JS in the application origin. Contrast: the same initial UIDL written by BootstrapHandler.getBootstrapJS() is neutralized via replace(\"<\", \"\\\\x3C\") before being substituted into {{INITIAL_UIDL}}.",
+      "unverified": "Could not verify (a) that elemental.json's JsonUtil.stringify really leaves '<' unescaped - the in-repo comment/escaping in BootstrapHandler is the evidence, but the library is an external dependency not present in the snapshot; (b) that the initial UIDL is present in index.html in the target deployment (depends on eagerServerLoad/vaadin.initialUidl and on whether the app renders request-derived text before the first client round-trip); (c) servlet-container decoding behaviour assumed from spec/implementation knowledge (getPathInfo/getParameterMap decode %3C/%2F, raw '<' in the request target is typically rejected). No runtime verification was performed.",
+      "weakness_type": "CWE-79 / CWE-116 (improper neutralization of '<' when embedding JSON in HTML script context)"
+    }
+  ],
+  "coverage_summary": "Inspected the flow-server request-handling core (VaadinService/VaadinServlet/VaadinSession, BootstrapHandler + BootstrapUtils, JavaScriptBootstrapHandler, IndexHtmlRequestHandler, WebComponentBootstrapHandler/WebComponentProvider, UidlRequestHandler/UidlWriter/ServerRpcHandler and all rpc/* handlers, StreamRequestHandler/StreamReceiverHandler/StreamResourceRegistry/AbstractStreamResource, StaticFileServer/ResponseWriter, DevModeHandler, Pwa/PwaIcon, PushHandler/PushRequestHandler, Connect controller/access checker/name checker and Spring config, router internals and error views), the flow-data RendererUtil, flow-push resources, and parts of the GWT client and TypeScript frontend (Flow.ts, FlowBootstrap.js, Authentication.ts, Connect.ts, SimpleElementBindingStrategy, ElementListenerMap/ElementPropertyMap, SystemErrorHandler). The P1 relation index was used only for navigation; per get_relation_scope it is partial (671 files parsed, 2 omitted, no control/data-flow or semantic resolution, Spring enforcement unverified) and its 'security_call'/'input' entries are name-based hints, so no area was treated as reviewed merely because the index had no record there. Unit tests under src/test are not present in this snapshot, so no test-based cross-checking was possible.",
+  "limitations": [
+    "The elemental.json library (com.vaadin.external.gwt:gwt-elemental) is an external dependency not present in the snapshot; its string escaping behaviour for '<' could only be inferred from Flow's own workaround/comment in BootstrapHandler (lines 1035-1044).",
+    "Whether the initial UIDL is embedded in index.html depends on DeploymentConfiguration.isEagerServerLoad()/vaadin.initialUidl (default false), so the candidate applies to deployments with that flag enabled; this could not be verified for the evaluated deployment.",
+    "Servlet-container behaviour (decoding of %3C/%2F in path/query, rejection of raw '<') was assumed from general knowledge; no container configuration or runtime was inspected.",
+    "Unit/integration test sources are absent from the snapshot, so behaviour could not be confirmed against tests, and no code was executed (no runtime confirmation of any finding).",
+    "P1 index coverage is partial (671/1700 files parsed; no data-flow/control-flow; Spring annotation handling and DI/runtime enforcement unverified), so some attacker-input -> sink chains may be missing from this review.",
+    "Large client-side artifacts (GWT-compiled/bundled JS such as vaadinPush.js, atmosphere.js, workbox) were only spot-checked, not fully audited."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "WebComponentBootstrapHandler.getServiceUrl()/modifyPath() trust the request parameter 'url' and use it as the application's SERVICE_URL and as the base for rewritten src attributes in generated JavaScript (flow-server/.../communication/WebComponentBootstrapHandler.java:419-434, 347-363, 260-300).",
+      "reason": "Real attacker-controlled parameter without validation, but no convincing exploitation path could be substantiated from source: the src-rewriting path passes values through URI.create(), which rejects quote/illegal-URI characters used for JS-string breakout, and the appConfig JSON is JSON-escaped; the only party that normally sets 'url' is the embedding page itself (WebComponentProvider generates '?url='+bootstrapAddress from the script's own src), so there is no cross-user victim path. Kept as unconfirmed hardening lead only."
+    },
+    {
+      "lead": "DefaultArchiveExtractor.extractZipArchive() extracts zip entries without the canonical-path containment check that the tar branch performs (flow-server/.../frontend/installer/DefaultArchiveExtractor.java:79-96 vs 122-152) - a Zip Slip pattern.",
+      "reason": "Genuine asymmetry and CWE-22 pattern, but the archive is the Node.js distribution downloaded from https://nodejs.org (or a developer-configured node.download.root) during a build/dev-time install, not an attacker-supplied input in the runtime threat model; no attacker-controlled path to a malicious archive was evidenced."
+    },
+    {
+      "lead": "FrontendUtils.getStatsFromExternalUrl() builds a server-side URL from the request 'host' and 'scheme' headers and fetches it (flow-server/.../frontend/FrontendUtils.java:545-601).",
+      "reason": "Looks like SSRF/URL injection but is gated behind the non-default isStatsExternal() configuration ('vaadin.externalStatsFile'), the response is only parsed for assetsByChunkName, and no clear confidentiality or integrity impact could be established from source alone."
+    },
+    {
+      "lead": "Unbounded UIDL body read in ServerRpcHandler.getMessage() (StringBuilder loop) - potential memory-exhaustion DoS.",
+      "reason": "Container request-size limits and servlet-level protections exist, no size cap is enforced by the framework, but no source evidence of exploitable impact beyond ordinary request handling; not selected."
+    },
+    {
+      "lead": "ResponseWriter.writeRangeContents(): Long.parseLong on attacker-controlled Range values can throw NumberFormatException (500), and 'bytes=0-,0-' makes end-start+1 overflow, producing an empty/incorrect 206 part (flow-server/.../internal/ResponseWriter.java:182-300).",
+      "reason": "Both are robustness/availability defects with no disclosure or injection impact identified; the overflow leads to fewer bytes written, not to file-content leakage."
+    }
+  ],
+  "summary": "Reviewed the Vaadin Flow snapshot (Flow 6.0-SNAPSHOT, ~1702 files) with emphasis on server-side request handling: bootstrap handlers (BootstrapHandler, JavaScriptBootstrapHandler, IndexHtmlRequestHandler, WebComponentBootstrapHandler/Provider), UIDL/RPC path (UidlRequestHandler, ServerRpcHandler, EventRpc/MapSync/PublishedServerEventHandler handlers, Stream receivers/resources, StaticFileServer/ResponseWriter), router/error views, Connect endpoints and their access checker, plus client GWT/TS bootstrapping code. One lead stands out for a source-evidenced missing defense: the client-side (V15+) bootstrap path embeds the initial UIDL/app-config JSON into a <script> element in index.html without escaping `<`, whereas the sibling V14 bootstrap path explicitly escapes `<` for exactly this reason. Other suspicious spots (web-component `url` parameter trust, Zip Slip in the Node archive extractor, Host-header-based stats fetch, Range-header parsing) are weaker/unconfirmed and are listed as rejected leads."
+}

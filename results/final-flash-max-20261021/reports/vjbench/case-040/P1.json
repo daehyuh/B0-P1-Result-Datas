@@ -1,0 +1,94 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The full text of the document being validated is attacker-controlled once an attacker supplies an .xsd file (e.g. in a cloned repo or downloaded schema), or any XML file whose root element is bound to the XML Schema namespace (DOMUtils.isXSD checks both the .xsd extension and the root namespace). The attacker controls the DOCTYPE declarations and external SYSTEM identifiers (file:///…, http://attacker/…, and parameter-entity chains) that the validator will process. The remote DTD/entity fetch additionally gives the attacker control over follow-up entity declarations.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the sibling XML validation path (LSPXMLParserConfiguration/XMLValidator) which does honour resolveExternalEntities (default false) and disallowDocTypeDecl, so the project's intended posture is to disable these; confirmed the XSD path never reads those settings. Confirmed XSDValidator only runs for documents detected as XSD (DOMUtils.isXSD: .xsd suffix or XML-Schema root namespace), which narrows the attack surface to an opened/edited schema. Confirmed the cache resolver knows only http/https/ftp (so file: entities bypass download gating) and that CacheResourceException is a RuntimeException used as an error signal, not a sanitizer. The explicit `true` constants look like long-standing upstream code rather than a locally added line, so this may be intentional DTD-in-schema support — but it is inconsistent with the rest of the validator and creates the XXE primitive. No counterevidence was found that limits entity resolution, DOCTYPE processing, or expansion limits in this path.",
+      "id": "case-040-xxe-xsd-validator",
+      "impact": "When a user opens a malicious schema/XML-schema-rooted document, the language-server process can be made to read arbitrary local files reachable by the JVM (e.g., /etc/passwd, user files) and to issue attacker-directed network requests from the victim's machine (SSRF into internal networks). Via external parameter entities the file content can be exfiltrated out-of-band to an attacker-controlled host; expanded content may also be reflected in diagnostics sent to the client. Because this path configures no entity-expansion SecurityManager (unlike LSPXMLParserConfiguration, which sets expansion/occur limits), entity-expansion resource exhaustion is also plausible. A user setting xml.validation.resolveExternalEntities=false or disallowDocTypeDecl=true gives no protection here, which is a security-control bypass in addition to the XXE itself.",
+      "locations": [
+        {
+          "end_line": 103,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/extensions/xsd/participants/diagnostics/XSDValidator.java",
+          "start_line": 66
+        },
+        {
+          "end_line": 84,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/extensions/xsd/participants/diagnostics/XSDValidator.java",
+          "start_line": 81
+        },
+        {
+          "end_line": 55,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/extensions/xsd/participants/diagnostics/XSDDiagnosticsParticipant.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 79,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/utils/DOMUtils.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 71,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/extensions/contentmodel/participants/diagnostics/LSPXMLParserConfiguration.java",
+          "start_line": 64
+        },
+        {
+          "end_line": 50,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/extensions/contentmodel/settings/XMLValidationSettings.java",
+          "start_line": 29
+        },
+        {
+          "end_line": 74,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/uriresolver/URIResolverExtensionManager.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 103,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/extensions/contentmodel/uriresolver/XMLCacheResolverExtension.java",
+          "start_line": 72
+        }
+      ],
+      "prerequisites": "XML validation enabled (default true) and the user opening/editing the malicious schema document (XMLTextDocumentService.didOpen/didChange triggers validation automatically). No non-default setting is required for the file: case. Remote out-of-band exfiltration requires the default download configuration (xml.downloadExternalResources.enabled defaults to true); with downloads disabled, http(s)/ftp entity fetches are rejected by the cache resolver but file: entities are still resolved through the default resolver and remain exploitable for local file reads.",
+      "root_cause": "XSDValidator.doDiagnostics builds an XMLGrammarPreparser over the content of the current document and explicitly sets EXTERNAL_GENERAL_ENTITIES_FEATURE=true and EXTERNAL_PARAMETER_ENTITIES_FEATURE=true (lines 81-84), sets no disallow-doctype-decl feature and no entity-expansion SecurityManager, and never consults XMLValidationSettings.isResolveExternalEntities()/isDisallowDocTypeDecl(). The parallel XML path (LSPXMLParserConfiguration constructor, lines 64-71) disables external entities unless the user enables them and optionally disallows DOCTYPE, so the security control and its defaults are silently bypassed for schema documents.",
+      "title": "XXE in XSD validation: external general/parameter entities hard-enabled and security settings bypassed",
+      "trace": "didOpen/didChange -> XMLTextDocumentService.triggerValidationFor -> XMLDiagnostics.doDiagnostics (gated only by xml.validation.enabled, default true) -> XSDDiagnosticsParticipant.doDiagnostics (runs when DOMUtils.isXSD(document) is true) -> XSDValidator.doDiagnostics: creates LSPXMLGrammarPreparser/XMLSchemaLoader, sets EXTERNAL_GENERAL_ENTITIES_FEATURE=true and EXTERNAL_PARAMETER_ENTITIES_FEATURE=true, sets the LSPXMLEntityResolver, then preparseGrammar on the document's own content. A crafted DOCTYPE such as <!ENTITY % xxe SYSTEM \"file:///etc/passwd\"> (or a parameter entity pointing at an attacker URL, which is fetched through XMLCacheResolverExtension for http/https/ftp) is therefore resolved: URIResolverExtensionManager.resolveEntity consults the catalog/cache resolvers and finally DefaultURIResolverExtension, which converts the expanded system id into an XMLInputSource that Xerces opens itself. With external parameter entities enabled, the classic multi-stage OOB chain (remote DTD defines a file-reading entity and then builds a second entity whose SYSTEM id embeds the file content) causes the local file content to be sent to the attacker's server. Expanded content can additionally surface in diagnostics/related information, since the error reporter formats Xerces arguments into LSP diagnostics.",
+      "unverified": "Xerces 2.12.2 runtime semantics for XMLGrammarPreparser/XMLSchemaLoader (feature propagation and actual entity resolution) were reasoned from the API and surrounding code, not executed; the snapshot has no tests, and the index provides no data-flow or reachability proof. Whether file content actually reaches diagnostics versus only the parser state is likewise unverified. Attack vector assumed an attacker-supplied schema opened by the user; no runtime or exploit validation was performed.",
+      "weakness_type": "CWE-611: Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Source scope: 445 files (407 Java parsed by the P1 index; 38 non-Java), no files excluded by name/size/symlink filters, no parse errors reported, and the index declares no control-flow, data-flow, or semantic resolution. I reviewed in depth the XSD/DTD/content-model validation pipeline, the URI resolvers and cache/download manager, the LSP entry points and command handlers, validation/formatting settings plumbing, generators, catalog and entity participants, and several utilities. I read only lightly large low-signal files not central to the finding: XMLCompletions, XMLFormatter, XMLPositionUtility, XMLSymbolsProvider, XMLRename, TreeLineTracker, XMLScanner/DOMParser internals, and parts of CMXSDDocument/XSDUtils. Binary/resource files were not executable-reviewable. No test sources exist in the snapshot.",
+  "limitations": [
+    "No code was compiled or executed; Xerces 2.12.2 behavior (feature support on XMLGrammarPreparser/XMLSchemaLoader, entity resolution, expansion limits) and URL/path normalization semantics were reasoned from source and API knowledge, not observed.",
+    "The P1 index provides syntax-level navigation only: no data flow, control flow, runtime reachability, semantic resolution, or exploitability proof; 6039 calls are unresolved, so some cross-file call paths may be missing.",
+    "The snapshot contains no tests and no version control metadata, so I could not compare against upstream or a fix commit to confirm whether the XSD entity configuration is the intended target rather than long-standing intended behavior.",
+    "Impact statements (file disclosure, out-of-band exfiltration, SSRF, diagnostics reflection) describe plausible source-level consequences, not verified runtime behavior; no payloads were executed and none are provided.",
+    "Some attack variants are platform- or configuration-dependent (Windows-only path handling; download-disabled settings; client support for related information), as noted in the rejected leads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DOMUtils.loadDocument (lines 133-141) uses new URL(documentURI).openStream() and is called unguarded from ReferencedGrammarDiagnosticsInfo.getGrammarDocument() (lines 88-92) with the referenced grammar URI (potentially http://attacker/...), bypassing CacheResourcesManager and the xml.downloadExternalResources.enabled control.",
+      "reason": "Real but weaker: blind SSRF only (content is used solely to compute diagnostic ranges and is not returned), and only when the remote grammar errors or related-information is supported; the unguarded call site cannot be shown to be the injected defect versus an upstream oversight. Not selected over the stronger XXE candidate."
+    },
+    {
+      "lead": "AssociateGrammarCommand.getTargetNamespace (line 153) fetches an arbitrary URL via new URL(xsdURI).openStream() and returns the first element's targetNamespace into a WorkspaceEdit.",
+      "reason": "Reachable only from a client-initiated xml.associate.grammar.insert command with a user-picked grammar URI; a malicious document cannot invoke it by itself, and only one attribute value is returned. Insufficient attacker control for a high-severity claim."
+    },
+    {
+      "lead": "CacheResourcesManager.downloadResource (lines 184-238) follows up to 5 redirects from arbitrary Location headers without scheme restriction, so an attacker HTTP server can redirect the download to file:// (local file content is then cached and parsed as a grammar).",
+      "reason": "A malicious document can already point xsi:schemaLocation/DOCTYPE at file:// directly, so this adds little beyond the by-design local grammar resolution; no proven channel back to the attacker without the XXE primitive above. Kept as context, not submitted."
+    },
+    {
+      "lead": "Cache path handling on Windows: getResourceCachePath checks only the decoded '/../' text, so percent-encoded backslashes (%5C) in http:// URLs can build Windows paths that escape the cache; ContentModelManager.evictCacheFor (line 438) then calls Files.deleteIfExists on the cachedResolvedUri, potentially deleting a file outside the cache when the xml.validation.file command runs.",
+      "reason": "Requires Windows, a crafted schema location, a failed cache attempt to set cachedResolvedUri via the fallback, and the client to invoke the revalidation command; Path.toUri()/toAbsolutePath() normalization behavior was not verifiable statically. Unconfirmed, so not selected."
+    },
+    {
+      "lead": "XMLServerSocketLauncher (lines 45-63) binds 0.0.0.0:5008 and serves LSP without authentication.",
+      "reason": "Developer/utility launcher, not the default entry point (XMLServerLauncher uses stdio), and unchanged upstream behavior; treated as hardening rather than the reviewed vulnerability."
+    },
+    {
+      "lead": "URIResolverExtensionManager.unregisterResolver (lines 91-93) adds the resolver instead of removing it; ParentProcessWatcher builds a shell command with the PID; MarkdownConverter adds the file: protocol to link safelists; CacheResourcesManager has no response size limit.",
+      "reason": "Functional bug or deliberate client-side behavior without a clear attacker-controlled security impact; PID is numeric and cannot inject shell syntax; file: links require a client-side click; unbounded download is a DoS hardening gap only."
+    }
+  ],
+  "summary": "Snapshot reviewed: Eclipse LemMinX 0.19.0-SNAPSHOT (445 files; 407 Java files parsed by the P1 index, which explicitly provides no data-flow/control-flow/reachability proof and leaves 6039 calls unresolved). I traced the grammar/XSD/DTD resolution and validation pipeline, the cache download manager, the LSP command surface, settings plumbing, generators, and utilities. The strongest source-evidenced issue is an XXE-prone configuration in the XSD validation path: XSDValidator hard-enables external general and parameter entities while parsing the opened schema document and never consults the xml.validation.resolveExternalEntities / disallowDocTypeDecl settings that the sibling XML validation path honours (defaults: resolveExternalEntities=false). A malicious .xsd (or any document with an XML-Schema-namespace root, per DOMUtils.isXSD) can therefore make the language server read local files and issue attacker-directed requests (entity resolver chain reaches file:/ and remote URLs, including out-of-band exfiltration via parameter entities). I found no stronger single candidate; several other leads are recorded as rejected/unconfirmed because they either require the trusted client to initiate them or have only blind/limited impact."
+}

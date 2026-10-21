@@ -1,0 +1,87 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls refresh-token presentation: POST /rest/v2/oauth/token with grant_type=refresh_token&refresh_token=<value> (handled by the OAuth2 token endpoint), which a load balancer may route to any middleware node. The revocation trigger is a legitimate event (client logout via POST /v2/oauth/revoke, or an administrator invalidating/blocking the user), so attacker control is indirect: the attacker retains a token that the server believes it revoked, and because of the listener defect it is still honored on peer nodes.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the access-token removal listener is correct (ServerTokenStoreImpl.java:208-213), so only refresh-token removal is affected; verified the message carries the refresh-token value (TokenStoreRemoveRefreshTokenMsg.java:24-34) and the send path is reached (lines 684-688); verified DB-backed storage does not mitigate because memory is checked before DB (lines 540-547); noted the local (revoking) node removes correctly and that single-node deployments/restarts clear stale entries; considered that a well-behaved client discards its refresh token on logout, but server-side revocation must not rely on client behavior; the add-on's own JMX/revocation features (ServerTokenStore.removeTokensByUserLogin, OAuthTokenController) are premised on working server-side revocation.",
+      "id": "CAND-1",
+      "impact": "Server-side revocation of REST refresh tokens (logout, token revocation endpoint, user invalidation/blocking) does not take effect cluster-wide: a holder of a revoked refresh token can keep exchanging it for new access tokens on other nodes for up to the refresh-token lifetime (default 365 days with cuba.rest.reuseRefreshToken=true), re-obtaining API access with fresh access tokens (default 12h). This is a session/token-invalidation bypass for clustered deployments, undermining logout and account-blocking controls.",
+      "locations": [
+        {
+          "end_line": 231,
+          "path": "modules/core/src/com/haulmont/addon/restapi/store/ServerTokenStoreImpl.java",
+          "start_line": 226
+        },
+        {
+          "end_line": 706,
+          "path": "modules/core/src/com/haulmont/addon/restapi/store/ServerTokenStoreImpl.java",
+          "start_line": 691
+        },
+        {
+          "end_line": 689,
+          "path": "modules/core/src/com/haulmont/addon/restapi/store/ServerTokenStoreImpl.java",
+          "start_line": 677
+        },
+        {
+          "end_line": 105,
+          "path": "modules/rest-api/src/com/haulmont/addon/restapi/api/auth/OAuthTokenRevoker.java",
+          "start_line": 91
+        },
+        {
+          "end_line": 77,
+          "path": "modules/core/src/com/haulmont/addon/restapi/security/UserInvalidationListener.java",
+          "start_line": 73
+        }
+      ],
+      "prerequisites": "Multi-node (clustered) CUBA deployment running this add-on; REST token state replicated in memory or DB (default cuba.rest.storeTokensInDb=false; DB storage does not help because memory is consulted first); attacker already holds a refresh token that was revoked via /v2/oauth/revoke or whose user was invalidated/blocked; the refresh request is served by a node other than the one that processed the revocation.",
+      "root_cause": "In ServerTokenStoreImpl.initClusterListeners() the ClusterListener registered for TokenStoreRemoveRefreshTokenMsg calls removeAccessTokenFromMemory(message.getTokenValue()) instead of removeRefreshTokenFromMemory(message.getTokenValue()). removeRefreshToken() on the node processing the revocation removes the token from its own refresh-token maps and broadcasts TokenStoreRemoveRefreshTokenMsg, but every peer node executes a no-op against the access-token maps, leaving refreshTokenValueToRefreshTokenStore / refreshTokenValueToAuthenticationStore / refreshTokenValueToAccessTokenValueStore entries in memory.",
+      "title": "Refresh-token revocation is a no-op on other cluster nodes (wrong removal method in TokenStoreRemoveRefreshTokenMsg listener)",
+      "trace": "OAuthTokenController.revokeToken (OAuthTokenController.java:52-75) -> OAuthTokenRevoker.revokeRefreshToken (OAuthTokenRevoker.java:92-101) -> ClientProxyTokenStore.removeRefreshToken (ClientProxyTokenStore.java:319-321) -> ServerTokenStoreImpl.removeRefreshToken (ServerTokenStoreImpl.java:677-689): local removeRefreshTokenFromMemory + clusterManagerAPI.send(new TokenStoreRemoveRefreshTokenMsg(refreshTokenValue)). On peer nodes the listener at ServerTokenStoreImpl.java:226-231 calls removeAccessTokenFromMemory(refreshTokenValue) (line 229) - the refresh-token maps are untouched. The token is later still returned by ServerTokenStoreImpl.getRefreshTokenByTokenValue (lines 534-549) -> ClientProxyTokenStore.readRefreshToken (lines 290-302) -> DefaultTokenServices.refreshAccessToken issues a new access token. The same path is used by UserInvalidationListener.handleUserInvalidation (lines 73-77) when a user is invalidated/blocked. Contrast with the correctly implemented access-token listener (lines 208-213).",
+      "unverified": "No runtime or cluster test was executed; delivery of cluster messages and load-balancer routing were not observed. Whether a blocked user's trusted re-login (ClientProxyTokenStore.processSession, lines 203-222) is rejected by the platform could not be verified because the CUBA core sources are outside this snapshot. Severity depends on deployment topology (number of middleware nodes) and on whether stolen tokens are a realistic threat in the target environment.",
+      "weakness_type": "CWE-613 Insufficient Session Expiration / broken server-side token revocation in a clustered deployment"
+    }
+  ],
+  "coverage_summary": "Scope filters: 150 model-visible source files (no binaries/symlinks excluded); the P1 relation index covers 144 files (107 Java, 0 parse errors) and omits 6 files, with no control-flow, data-flow or semantic resolution and 2700 unresolved calls. I reviewed all REST controllers and their manager classes in modules/rest-api, the full authentication/token flow (CubaAnonymousAuthenticationFilter, CubaUserAuthenticationProvider, ClientProxyTokenStore, ExternalOAuthTokenGranter, OAuthTokenRevoker, OAuthTokenIssuer, UniqueAuthenticationKeyGenerator, CubaTokenEnhancer, CubaRestLastSecurityFilter), the filter/query configuration and parser classes, the security XML (rest-dispatcher-spring.xml), the core token store (ServerTokenStoreImpl, message classes, JMX MBean), UserInvalidationListener, RestApiUserAccessChecker, the global entities/config/app-component, and the web/portal sample property and web.xml files. I sampled/skimmed rather than fully reviewed: SwaggerGeneratorBean (approximately the first quarter of 832 lines), RestJsonTransformations (first half), several DTO/event/exception classes, the 1453-line swagger YAML, build.gradle, checkstyle, .travis.yml and DB init scripts. No build, tests, scanners or runtime checks were executed.",
+  "limitations": [
+    "Static review only: no code execution, cluster run, test build or scanner output; all statements are source-level leads, not runtime-confirmed vulnerabilities.",
+    "CUBA platform core/framework sources (trusted login checks, DataManager/EntityImportExportService permission enforcement, FileTypesHelper MIME map, cluster manager delivery semantics) are outside this snapshot and could not be verified, which limits conclusions that depend on them.",
+    "The relation index provides only syntactic navigation candidates (containment/call/name hints), no data flow or reachability proof; its symbol and call edges were used only to navigate and every cited line was re-read in source.",
+    "The index omits 6 of 150 files and does not cover non-Java resources semantically; configuration/property files were reviewed manually but framework property propagation (app-component.xml to consuming apps) could not be validated.",
+    "Line-based findings reflect this snapshot; version metadata (.travis.yml, bom.properties: spring-security 5.5.8, spring-security-oauth2 2.5.1) was noted but dependency-vulnerability analysis was out of scope."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "FileDownloadController serves uploaded content inline with Content-Type derived from the file extension (lines 94-96, 118-124) and FileUploadController lets the client choose the name/extension - a possible stored XSS/HTML-rendering issue in the application origin.",
+      "reason": "Default 'inline' behavior is documented in the bundled swagger spec (rest-api-swagger.yaml:1182-1189) and depends on FileTypesHelper's extension-to-MIME table (not present in this snapshot) as well as on the victim opening an attacker-supplied link; no confirmation that .html/.svg are rendered as active content, so impact is unverified."
+    },
+    {
+      "lead": "Default OAuth client credentials cuba.rest.client.id=client / cuba.rest.client.secret={noop}secret and cuba.rest.allowedOrigins=* (app-component.xml:57-64, web/portal-app.properties) shipped as add-on defaults.",
+      "reason": "Documented default credentials for the password grant (real user credentials are still required); the external grant type is not registered with the token endpoint in rest-dispatcher-spring.xml, and it could not be verified that these app-component properties are applied to consuming applications rather than only to the add-on's sample apps. Insecure-default hardening rather than a demonstrated exploit."
+    },
+    {
+      "lead": "Sample property files contain fixed secrets/values: cuba.trustedClientPassword=MLdWm1Ik4NmM (core/web/portal app.properties), cuba.keyForSecurityTokenEncryption=WsAMIUQOEMrNB8fr (core app.properties), and cuba.portal.anonymousUserLogin=admin (portal-app.properties:29).",
+      "reason": "These are sample/demo application properties for the add-on's own web/portal demo modules, not runtime logic loaded by consuming applications; hardcoded demo credentials are a hardening concern but no source-level exploit path is demonstrable here."
+    },
+    {
+      "lead": "Spring Security intercept-url list misses /rest/v2/user-session/**, /rest/v2/permissions/effective and /rest/v2/version (rest-dispatcher-spring.xml:163-170).",
+      "reason": "The user-session/permissions managers throw when no CUBA SecurityContext exists, so an unauthenticated request cannot obtain data or change state unless a stale thread-local security context is present; the thread-local cleanup design (RestCleanupInterceptor only runs for dispatched MVC handlers) is suspicious but no concrete reachable leakage could be proven from this snapshot."
+    },
+    {
+      "lead": "User-controlled class loading via Class.forName(enumClassName) in EnumsControllerManager (line 62) and MessagesControllerManager (line 84), reachable via /v2/metadata/enums/{class} and /v2/messages/enums/{class}.",
+      "reason": "Only loads classes and iterates enum constants/messages; no object construction or method invocation on attacker-chosen types, so no demonstrated security impact beyond possible static-initializer side effects."
+    },
+    {
+      "lead": "Potential sensitive-data exposure: CubaRestLastSecurityFilter debug logging includes the raw query string (lines 109-127, 145-148), and the swagger docs recommend passing access_token in the URL.",
+      "reason": "Requires DEBUG logging to be enabled and is a logging hygiene issue; no default-configuration leak."
+    },
+    {
+      "lead": "Java deserialization in ServerTokenStoreImpl.setState (ObjectInputStream, lines 179-198) flagged by the relation index.",
+      "reason": "The byte array comes from CUBA's internal cluster state channel (clusterManagerAPI.set/getState), not from a request parameter; no attacker-controlled path to this method is shown in the snapshot."
+    },
+    {
+      "lead": "JPQL construction from user input in EntitiesControllerManager.addOrderBy / RestFilterParser (sort and filter property names concatenated into JPQL).",
+      "reason": "Property names are validated through metaClass.getPropertyPath and values are bound as named parameters; no bypass of the metadata-model validation was identified."
+    }
+  ],
+  "summary": "Reviewed the CUBA REST API add-on snapshot (150 files: rest-api controllers/managers/auth/config, core token store/JMX/security listener, global entities/config, plus portal/web sample configs). Strongest finding: refresh-token revocation is not replicated to sibling cluster nodes because the cluster listener for TokenStoreRemoveRefreshTokenMsg removes from the wrong map, so a revoked (or user-invalidated) refresh token stays alive on other nodes and can still mint access tokens. Other plausible but weaker leads (file-download MIME/inline rendering, default client credentials/CORS, missing intercept-urls, user-input Class.forName, debug log of access_token in URL, cluster-state Java deserialization) are recorded as rejected/unconfirmed."
+}

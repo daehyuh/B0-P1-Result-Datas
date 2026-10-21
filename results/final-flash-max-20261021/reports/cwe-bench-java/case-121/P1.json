@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "`userIds` is fully attacker-controlled: DELETE /sys/user/deleteRecycleBin?userIds=... (@RequestParam) and PUT /sys/user/putRecycleBin with JSON body {\"userIds\": \"...\"} (SysUserController lines 1244 and 1226). Each comma-separated element is interpolated into the SQL; injecting a single quote and a comment (e.g. an id followed by `') OR 1=1 -- `) changes the WHERE clause. No SqlInjectionUtil/filterContent call exists on this path.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked that (a) the endpoint is not anon (ShiroConfig only opens /sys/user checkOnlyUser, register, phoneVerification, passwordChange), so a JWT is required; (b) no global SQLi/XSS filter or MyBatis interceptor sanitizes SQL - MybatisInterceptor only fills audit fields, no SQL rewrite; (c) other batch operations in the codebase use `#{...}`/removeByIds and the mapper author even comments 'SQL注入风险' on the neighboring updateNullByEmptyString (whose ${fieldName} is only ever called with hardcoded \"email\"/\"phone\"); (d) the values are wrapped in quotes but never escaped, which is the flaw; (e) role checks are disabled on this controller. Remaining uncertainty is runtime-only (no execution performed).",
+      "id": "CAND-1",
+      "impact": "Arbitrary SQL execution in the context of the application's DB account on the `sys_user` table. With `OR 1=1` (or equivalent) the DELETE becomes `DELETE FROM sys_user WHERE del_flag = 1 AND id IN ('x') OR 1=1`, removing every user row (full account wipe-out / denial of service), and the UPDATE sets del_flag=0 for all rows. Boolean/time-based predicates (e.g. SLEEP/IF forms) permit blind extraction of sensitive columns such as password hashes and salts for offline cracking. The operation runs inside @Transactional but succeeds for valid injected SQL.",
+      "locations": [
+        {
+          "end_line": 1249,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysUserController.java",
+          "start_line": 1224
+        },
+        {
+          "end_line": 487,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/service/impl/SysUserServiceImpl.java",
+          "start_line": 459
+        },
+        {
+          "end_line": 150,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/mapper/xml/SysUserMapper.xml",
+          "start_line": 134
+        },
+        {
+          "end_line": 143,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/mapper/SysUserMapper.java",
+          "start_line": 130
+        }
+      ],
+      "prerequisites": "A valid X-Access-Token (the endpoint is not in the Shiro anon list; it falls under the `/**` jwt chain). No administrator role is needed: the `//@RequiresRoles({\"admin\"})` line at SysUserController:1242 is commented out and there is no class-level authorization annotation. An ordinary/demo/self-registered account suffices. MySQL/PG-style single-statement injection only; no multi-statement support is required.",
+      "root_cause": "Request-supplied user IDs are not validated or quote-escaped. SysUserController takes `userIds`, splits on \",\" and passes the raw List to the service. SysUserServiceImpl.revertLogicDeleted (line 462) and removeLogicDeleted (line 469) build a SQL fragment with String.format(\"'%s'\", String.join(\"','\", userIds)) and hand it to the mapper, where SysUserMapper.xml uses raw MyBatis substitution: `AND id IN (${userIds})` in revertLogicDeleted (line 144) and `AND id IN (${userIds})` in deleteLogicDeleted (line 149). Because a `'` inside any element is never escaped, it terminates the string literal and lets the attacker append arbitrary boolean/function expressions to the WHERE clause of the DELETE/UPDATE.",
+      "title": "Authenticated SQL injection in /sys/user/deleteRecycleBin and /sys/user/putRecycleBin via unescaped userIds interpolation",
+      "trace": "HTTP request (DELETE /sys/user/deleteRecycleBin?userIds=... | PUT /sys/user/putRecycleBin body) -> SysUserController.deleteRecycleBin / putRecycleBin -> Arrays.asList(userIds.split(\",\")) -> SysUserServiceImpl.removeLogicDeleted / revertLogicDeleted -> String.format(\"'%s'\", String.join(\"','\", userIds)) -> SysUserMapper.deleteLogicDeleted / revertLogicDeleted -> MyBatis XML `${userIds}` -> SQL text sent to `sys_user` DELETE / UPDATE. Because the interpolated value is only single-quoted, a `'` in the value escapes the literal.",
+      "unverified": "Not runtime-confirmed. DB-specific parsing of the injected comment/quote was not executed; MySQL and PostgreSQL accept `-- ` while Oracle uses `--` - the payload is adaptable. The availability of default/demo credentials and the exact JWT/captcha flow were inferred from source (ShiroConfig, LoginController) and not exercised.",
+      "weakness_type": "CWE-89 Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+    }
+  ],
+  "coverage_summary": "Source scope: 840 model-visible files (553 Java, plus resources/SQL/JS); 0 files excluded for size, sensitive names, or symlinks; binary-like files are skipped only when a NUL byte appears in the first 8 KiB. Relation index: complete (840/840 files indexed, 553 Java parsed, 0 parse errors, 0 missing files), but it provides only syntax-level containment/call/inheritance candidates with no control-flow, data-flow, or semantic resolution (13,304 unresolved calls), so every relation lead was re-verified in source text. I read and traced the base-core query/dict/security/shiro/sign/filter/config classes, the system module's user, dict, comment, upload, data-source, announcement, quartz and api controllers plus their service/mapper XML sinks, the CAS client path, the demo mock/online controllers, and the cloud gateway/xxl-job configuration. I did not exhaustively review all 840 files: vendor/static JS assets, the large SQL dumps, and many boilerplate CRUD controllers were only sampled.",
+  "limitations": [
+    "No code was executed; the SQL injection is a source-level finding and was not runtime-confirmed.",
+    "Authentication requirements (JWT validity, captcha/login flow) were inferred from ShiroConfig/JwtFilter/LoginController source, not exercised.",
+    "DB-specific parsing of injected quotes/comments was not tested; impact (mass delete/restore, blind extraction) is a modeled consequence of the raw substitution.",
+    "The P1 index has no data-flow or reachability analysis; all navigation labels were treated as unverified and confirmed only by reading source.",
+    "Coverage was targeted rather than exhaustive for the many CRUD controllers and static/vendor assets in the 840-file snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SSRF in /sys/common/transitRESTful (CommonController 353-394 -> RestUtil.request 207-235): arbitrary url parameter, caller token forwarded, no scheme/host allowlist.",
+      "reason": "Plausible authenticated SSRF, but it looks like intended proxy functionality and the impact chain (internal metadata/admin API access) is less direct than the confirmed raw-SQL interpolation; not selected."
+    },
+    {
+      "lead": "Dictionary/table SQL injection endpoints with raw ${} (SystemApiController.queryFilterTableDictInfo line 596 -> SysDictMapper.xml line 72/74; SysDictController.loadDictItem lines 272-287 -> SysDictMapper.xml line 207) have no SqlInjectionUtil filtering at all.",
+      "reason": "Strong SQLi shapes, but these paths sit behind SignAuthInterceptor (jeecg.signUrls) and require knowledge of jeecg.signatureSecret, whose default is shipped in config; that adds prerequisites and configuration dependence, so the recycle-bin sink was preferred as the single candidate."
+    },
+    {
+      "lead": "Quartz arbitrary class instantiation: QuartzJobServiceImpl.getClass() uses Class.forName(classname).newInstance() on a user-supplied jobClassName (lines 178-180) and controller role checks are commented out.",
+      "reason": "Requires an attacker-supplied class name that implements org.quartz.Job and is available on the classpath; no concrete gadget class was verified, so exploitability is uncertain."
+    },
+    {
+      "lead": "Systemic missing function-level authorization: nearly every admin mutation in system controllers has @RequiresRoles(\"admin\") commented out.",
+      "reason": "Real broken-access-control smell, but it is a broad design assumption spanning many files rather than one distinct root-cause sink; kept as context for the selected finding."
+    },
+    {
+      "lead": "Path traversal in /sys/common/static/** (CommonController.view lines 211-264).",
+      "reason": "The method strips literal '..' from the decoded path attribute and Tomcat/Spring reject encoded slashes; no concrete bypass of the filter was established from source."
+    },
+    {
+      "lead": "Exposed Druid stat-view servlet with admin/123456 and Shiro anon /druid/** (application-{dev,prod,test}.yml druid.stat-view-servlet).",
+      "reason": "Default-credential configuration weakness rather than a code-level injection; not selected."
+    }
+  ],
+  "summary": "This snapshot is JeecgBoot 3.4.3 (Spring Boot 2.6.6, Shiro + JWT, MyBatis-Plus). It is a large multi-module Java project (840 source-tree files, 553 Java). Many previously reported SQL-injection holes already carry mid-2022 mitigations (SqlInjectionUtil filters, sign interceptor, bizPath checks, Freemarker SAFER_RESOLVER, JdbcSecurityUtil), so I focused on remaining raw-SQL sinks that still receive request data. The strongest single candidate is an authenticated SQL injection in the user recycle-bin delete/restore feature: controller-supplied `userIds` are split on commas, wrapped in single quotes by string formatting, and inserted through MyBatis `${userIds}` directly into a DELETE and an UPDATE on `sys_user`. A single quote in one element breaks out of the literal, and the controller-level `@RequiresRoles(\"admin\")` is commented out, so any authenticated account can execute injected SQL (mass delete/restore of all users or blind extraction)."
+}

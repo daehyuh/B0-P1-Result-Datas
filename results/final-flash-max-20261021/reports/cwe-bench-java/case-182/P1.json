@@ -1,0 +1,64 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `from` query parameter of `/loginEntry` (e.g. `/loginEntry?from=//evil.example`), fully attacker-controlled and deliverable as a link/redirect to a victim.",
+      "confidence": "low",
+      "counterevidence_checked": "The endpoint only redirects after container authentication (`getUserPrincipal() != null`), so it is not an unauthenticated trigger; the Javadoc says doLoginEntry is used only by LegacySecurityRealm (deprecated), limiting real-world exposure; the `//host` browser behavior was not runtime-tested and container handling of scheme-relative Location values was not verified; no CVE/patch lookup was performed (not permitted), so it is unconfirmed whether a later upstream fix targets this line.",
+      "id": "jenkins-doLoginEntry-open-redirect",
+      "impact": "Open redirect/phishing from the Jenkins origin; can be chained with credential-harvesting or trusted-origin OAuth/SSO redirect flows. Requires user interaction and (in current code) is primarily on the legacy login-entry path, so severity is limited.",
+      "locations": [
+        {
+          "end_line": 4353,
+          "path": "core/src/main/java/jenkins/model/Jenkins.java",
+          "start_line": 4341
+        },
+        {
+          "end_line": 1655,
+          "path": "core/src/main/java/hudson/Util.java",
+          "start_line": 1649
+        }
+      ],
+      "prerequisites": "Victim must be logged in so that `req.getUserPrincipal() != null`; the path is subject to the root READ check, which most authenticated (and often anonymous) users have; the method is documented as being used by the deprecated LegacySecurityRealm but the URL binding exists on Jenkins for all realms; victim must follow the crafted link.",
+      "root_cause": "The `from` request parameter is validated only with `from.startsWith(\"/\")` before being passed to `rsp.sendRedirect2(from)`. Scheme-relative URLs such as `//evil.example` satisfy that prefix test and are emitted in the Location header as `//evil.example`, which browsers resolve to `https://evil.example`. The rest of the codebase uses `Util.isSafeToRedirectTo` (rejects absolute and scheme-relative URLs) for exactly this purpose (e.g. AuthenticationSuccessHandler, ParametersDefinitionProperty, DirectoryBrowserSupport, ManageJenkinsAction), so this site is an inconsistent outlier.",
+      "title": "Open redirect in Jenkins.doLoginEntry via `from=//host` (startsWith(\"/\") guard bypass instead of Util.isSafeToRedirectTo)",
+      "trace": "GET /loginEntry?from=//evil.example -> doLoginEntry: from = \"//evil.example\"; `from.startsWith(\"/\")` is true and `!from.equals(\"/loginError\")` is true -> rsp.sendRedirect2(\"//evil.example\") -> servlet container writes `Location: //evil.example` -> the browser interprets this as a scheme-relative URL and navigates to the attacker-controlled host, from an origin the user trusts (no Util.isSafeToRedirectTo check).",
+      "unverified": "Whether Jenkins' container (Jetty/Winstone) preserves `//host` verbatim in Location in all deployments; whether instances using modern realms ever dispatch /loginEntry in practice; whether this corresponds to any known CVE/fix; no execution or runtime confirmation.",
+      "weakness_type": "CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"
+    }
+  ],
+  "coverage_summary": "Scope: get_source_scope reports 9,959 visible files (binary-like files refused; 5 MiB per-file limit; 0 excluded by name/symlink). get_relation_scope reports a partial syntactic index over 9,907 files (1,196 Java files; 18 parsed units reported; 52 source files missing from the index; 28,802 unresolved calls), with no control-flow, no data-flow, no semantic resolution and unverified Spring annotations - so index facts were used only for navigation and every cited edge was verified in source text. I reviewed core security packages (hudson.security.*, jenkins.security.* including csrf/apitoken/stapler/seed), the CLI module and CLI commands, ACL/permission model and MANAGE/SYSTEM_READ rollout, plugin manager/update center, FilePath/DirectoryBrowserSupport path handling, console notes, Secret/XStream2 configuration, resource-domain tokens, and administrative monitors, plus grep sweeps for command execution, deserialization, XML parsers, redirects, cookie flags, weak randomness and permission/POST enforcement. Not reviewed: the majority of the ~1,196 Java files and all JS/webapp resources in depth, and runtime behavior. Snapshot contains no test sources, no Jelly views and no binary CA/plugin artifacts (files are documented as omitted/refused), so view-rendering and test-based verification were impossible.",
+  "limitations": [
+    "No runtime execution, build, or dependency verification was performed (not permitted); all conclusions are static.",
+    "The relation index is partial and syntactic only (no data/control flow), and 52 source files are absent from it; absence of an index record is not evidence of absence of code.",
+    "The snapshot excludes tests, Jelly views and binary files (e.g. update-center CA certificates), so UI-layer escaping, view wiring and certificate material could not be inspected.",
+    "No patch/CVE/advisory lookup was allowed, so I could not map the snapshot to a known fixed vulnerability; the submitted candidate is a source-level lead, not a confirmed bug.",
+    "The open-redirect candidate depends on container/browser handling of scheme-relative Location values and on dispatch of /loginEntry outside the legacy realm, neither of which was runtime-confirmed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "hudson.util.Secret.decrypt missing payload-length validation: isValidData accepts `{AQ==}`; Base64 decode yields a 1-byte array so the PAYLOAD_V1 branch reads payload[1..8] and throws an uncaught ArrayIndexOutOfBoundsException (reachable via Secret.fromString, Stapler CONVERT_UTILS String conversion, Secret.ConverterImpl.unmarshal, and ExtendedReadSecretRedaction).",
+      "reason": "Provable crash path, but impact is availability/500 only and most practical triggers require a user who can already submit form/config data (self-DoS); not the strongest security-impact candidate."
+    },
+    {
+      "lead": "ACL.hasCreatePermission2 returning `true` when the deprecated hasCreatePermission is not overridden (fail-open authorization).",
+      "reason": "Appears to be intentional upstream design: callers (ItemGroupMixIn create/copy, View.create) separately check Item.CREATE/View.CREATE, so the method only adds optional per-descriptor granularity; no exploitable path found in core."
+    },
+    {
+      "lead": "AdministrativeMonitor doAct implementations that mutate state without an explicit ADMINISTER check (BuiltInNodeMigration, ApiTokenPropertyDisabledDefault/EnabledNewLegacy, SecurityIsOffMonitor, ControllerExecutors*, HudsonHomeDiskUsageMonitor, PluginWrapperAdministrativeMonitor).",
+      "reason": "All are gated by AdministrativeMonitor.getTarget() -> checkRequiredPermission(), which defaults to Jenkins.ADMINISTER when getRequiredPermission() is not overridden; monitors that do expose themselves to SYSTEM_READ (ReverseProxySetupMonitor, TooManyJobsButNoView, JavaVersionRecommendation, OperatingSystemEndOfLife, ResourceDomainRecommendation, UpdateSiteWarningsMonitor) do perform explicit ADMINISTER checks. No bypass found."
+    },
+    {
+      "lead": "ExtendedReadSecretRedaction/ExtendedReadRedaction masking might be bypassable (secret disclosure to Item.EXTENDED_READ/SystemRead users).",
+      "reason": "The redaction is wired into AbstractItem.writeConfigDotXml, Computer.doConfigDotXml, View.doConfigDotXmlImpl, ItemGroupMixIn.copy and GetJob/GetNode/GetView CLI commands; the regex matches realistic XStream output and Secret.decrypt filters false positives. No reproducible masking gap found; not submitted."
+    },
+    {
+      "lead": "ReverseProxySetupMonitor.getTestForReverseProxySetup(String rest) reflects the user-controlled URL remainder into an error message (potential reflected XSS for SYSTEM_READ users).",
+      "reason": "Could not establish that the container/HttpResponses.errorWithoutStack renders the message as unescaped HTML; all other errorWithoutStack messages in core are plain text, and the endpoint is SYSTEM_READ-gated. Unverified."
+    },
+    {
+      "lead": "Other redirect/authorization sinks checked and found guarded: DirectoryBrowserSupport pattern/path redirect, ParametersDefinitionProperty redirectTo, AuthenticationSuccessHandler, BuildAuthorizationToken, Computer.doConfigDotXml/updateByXml, UpdateCenter doUpgrade/doRestart, PluginManager install/upload, CLI node lifecycle commands (cliConnect/cliDisconnect/cliOffline), Queue.doCancelItem, User token endpoints.",
+      "reason": "Each has an appropriate permission check and/or POST requirement; the CLI @-syntax file-read class (CVE-2024-23897-style) is fixed in this snapshot."
+    }
+  ],
+  "summary": "Reviewed the assigned Jenkins core snapshot (revision 2.504-SNAPSHOT, ~2025-03-25) as a defensive source review. I focused on trust boundaries and attacker-controlled input: HTTP/CLI entry points, authorization (ACL/Item/Computer/Jenkins permissions, the new MANAGE/SYSTEM_READ model), CSRF (CrumbFilter/CrumbIssuers/POST enforcement), secret handling (`Secret`, `ExtendedReadRedaction`, config.xml exposures), path handling (`DirectoryBrowserSupport`, `FilePath`), agent/JNLP and resource-domain token handling, deserialization (XStream/JEP-200, console notes), and redirect handling. The well-known CLI `@`-file-read class is fixed in this snapshot (`CLICommand.ALLOW_AT_SYNTAX` defaults to false and is enforced in `CmdLineParser`/`CLIRegisterer`), and the recent secret-redaction framework (SECURITY-266 follow-up) is fully wired into AbstractItem/Computer/View and the CLI readers. No high-confidence vulnerability was confirmed. The single strongest lead I can defend from source is a remaining open-redirect sink in `Jenkins.doLoginEntry` that ignores the codebase's own `Util.isSafeToRedirectTo` guard; it is a lead, not a confirmed exploit, and several other suspicious spots were checked and rejected with reasons below."
+}

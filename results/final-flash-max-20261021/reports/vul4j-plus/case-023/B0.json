@@ -1,0 +1,78 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Fully attacker-controlled: the `callback` query parameter (documented parameter of the servlet) is read directly from the request at HealthCheckExecutorServlet:234 and controls the emitted JSONP wrapper at ResultJsonSerializer:67. The servlet is registered low-level on the OSGi HttpService (HealthCheckExecutorServlet:162) and its own javadoc (line 68) states it is \"not processed by sling ... no authentication required\", so no Sling authentication/authorization gate sits in front of the parameter.",
+      "confidence": "low",
+      "counterevidence_checked": "(a) The module does not validate the callback anywhere — searched for 'callback', 'jsonp', validation helpers and regex patterns in healthcheck-core; the HTML serializer (ResultHtmlSerializer) carefully escapes all dynamic values with StringEscapeUtils, showing the module's authors generally escape output, while the JSONP path is the one unescaped reflective output. (b) No filter/auth wrapper protects the servlet (javadoc line 68 states no authentication; registered with a null HttpContext at line 162). (c) Impact is reduced because the response Content-Type is application/javascript, so direct navigation does not execute the payload in modern browsers; the practical XSS requires the response to be included/interpreted as script, and the default path /system/health is documented as intended to be blocked by external front ends. (d) I could not diff against upstream or consult advisories, so I cannot confirm whether a callback-name validation check was removed for this exercise or whether Apache still ships this behavior; the default JSONP consumers inside the snapshot (no client-side caller found) were not verified.",
+      "id": "sling-hc-jsonp-callback-injection",
+      "impact": "Reflected script/JSONP injection in an unauthenticated servlet: an attacker can break out of the intended callback identifier and inject arbitrary JavaScript statements into the response body. Where the response is loaded as a script by a browser (same-origin include, or a client executing the JSONP callback), this gives script execution in the context of the site origin (XSS-class impact: session/token theft if content is same-origin rendered, JSONP data hijacking, page defacement), and can also break JSONP consumers by controlling the invoked expression/statements. The endpoint is explicitly intended for load balancers/monitoring and returns internal health detail, so it is often network-reachable.",
+      "locations": [
+        {
+          "end_line": 72,
+          "path": "bundles/extensions/healthcheck/core/src/main/java/org/apache/sling/hc/core/impl/servlet/ResultJsonSerializer.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 235,
+          "path": "bundles/extensions/healthcheck/core/src/main/java/org/apache/sling/hc/core/impl/servlet/HealthCheckExecutorServlet.java",
+          "start_line": 233
+        },
+        {
+          "end_line": 264,
+          "path": "bundles/extensions/healthcheck/core/src/main/java/org/apache/sling/hc/core/impl/servlet/HealthCheckExecutorServlet.java",
+          "start_line": 251
+        }
+      ],
+      "prerequisites": "The Health Check Executor servlet must be active and reachable (default registration path `/system/health`, configurable via `servletPath`, disableable via `disabled`). A request must select JSONP output (`format=jsonp` or `.jsonp` extension). For browser-side script execution, a victim/consumer must load or interpret the `application/javascript` response as a script (e.g., a same-origin <script> include or a client that executes the callback), or the browser must sniff/render the response as HTML (older/non-compliant user agents). Only network reachability of the health endpoint is required for the injection itself.",
+      "root_cause": "HealthCheckExecutorServlet takes the `callback` request parameter without any validation (`StringUtils.defaultIfEmpty(request.getParameter(PARAM_JSONP_CALLBACK.name), JSONP_CALLBACK_DEFAULT)`) and passes it to ResultJsonSerializer, which concatenates it directly into the generated JavaScript (`resultStr = jsonpCallback + \"(\" + result.toString() + \");\"`). There is no allow-list/regex check that the callback is a legal JavaScript identifier anywhere in the healthcheck-core module, so an attacker can supply arbitrary JavaScript/HTML characters that are written verbatim into the response.",
+      "title": "Unvalidated JSONP `callback` parameter concatenated into JavaScript response in Sling Health Check Executor Servlet",
+      "trace": "1) HTTP GET /system/health.jsonp?callback=<attacker string> (or /system/health?format=jsonp&callback=...) reaches HealthCheckExecutorServlet.doGet. 2) Line 234: `jsonpCallback = StringUtils.defaultIfEmpty(request.getParameter(\"callback\"), JSONP_CALLBACK_DEFAULT)` — raw value retained. 3) Line 235: passed to sendJsonResponse(overallResult, executionResults, jsonpCallback, response, includeDebug). 4) Line 261: `jsonSerializer.serialize(...)`; ResultJsonSerializer lines 66-70: if non-blank, `resultStr = jsonpCallback + \"(\" + result.toString() + \");\"`; no validation of jsonpCallback. 5) Lines 262-263: response Content-Type is `application/javascript` and the string is appended directly to the response writer. Result: attacker text is emitted as executable JavaScript/HTML outside the intended identifier position.",
+      "unverified": "Not runtime-confirmed; no exploit executed. I could not confirm (i) the exact version/commit of the snapshot versus upstream, (ii) that a callback validation existed and was removed, (iii) that a deployed instance exposes the health endpoint to an attacker, or (iv) that a specific browser will execute the application/javascript response in the Sling origin. The line-level behavior (raw parameter concatenated into the response) is directly evidenced by the cited source.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation (cross-site scripting) — JSONP callback injection / script content injection"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 4,623 model-visible source files (bundles/, contrib/, launchpad/, installer/, tooling/, testing/, samples/) with 0 files excluded by the >5 MiB, sensitive-name, or symlink filters; only NUL-byte binary detection applies. The snapshot contains main sources and resources only — no src/test or integration-test sources are present, so behavior could not be corroborated against tests. I read the request-facing security choke points in full or in large part: auth/core (AuthUtil, SlingAuthenticator, LoginServlet, form servlet base), auth/form (FormAuthenticationHandler, TokenStore), servlets/get (DefaultGetServlet, RedirectServlet, Json/HTML/Stream renderers), servlets/post (SlingPostServlet, AbstractPostOperation/AbstractCreateOperation/ImportOperation/ModifyOperation, AbstractCopyMoveOperation), servlets/resolver (SlingServletResolver, AbstractResourceCollector), engine (SlingMainServlet, RequestData recursion limits, DefaultErrorHandler), resourceresolver (ResourceResolverImpl path handling, CommonResourceResolverFactoryImpl, MapEntries vanity paths), jcr/resource + contentloader (JcrItemResourceFactory, JcrProviderStateFactory, JsonReader, DefaultContentCreator, XmlReader), extensions/xss (XSSAPIImpl, XSSFilterImpl), security filters (ReferrerFilter, ContentDispositionFilter, StartupFilterImpl), healthcheck core serializers/servlet, and servlets/compat query servlet. Across the remaining tree I ran targeted searches for command execution, deserialization, XML parsing, URL/connection sinks, file I/O, redirected/header sinks, getParameter flows, permission checks, and path-traversal guards. I did not read most of the large vendored/forked code (scripting/jsp Jasper fork, sightly compiler/engine internals, distribution, discovery, mail, dojo/jQuery resources, IDE/tooling, samples) or the many admin-only web-console plugins; those remain only search-sampled.",
+  "limitations": [
+    "No build, deployment, or execution was performed; all findings are static source observations and none were runtime-confirmed.",
+    "No VCS metadata or upstream reference is exposed, so I could not diff the snapshot against a fixed version to determine whether a validation/sanitization step was removed or is simply absent upstream; this materially limits confidence for every candidate.",
+    "The snapshot has no test sources, so expected security behavior could not be inferred from tests.",
+    "The repository is very large and spans many products; coverage was risk-weighted (HTTP-facing entry points, auth, resolution, storage, security filters) and the rest was only text-searched, so an injected or known vulnerability in an unread module cannot be excluded.",
+    "The chosen candidate's browser-level impact depends on how the application/javascript response is consumed and on the health endpoint being reachable; the servlet's own documentation says the default path is intended to be blocked by front-end proxies, and no in-snapshot client invokes the JSONP callback.",
+    "CWE/severity labels are my own classification; no CVE mapping or advisory data was consulted."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HtmlRendererServlet (bundles/servlets/get) prints resource property names/values and resource path/resource type unescaped into a text/html response (printPropertyValue lines 143-162, printResourceInfo lines 103-117) — stored/reflected XSS candidate.",
+      "reason": "Real unescaped-output pattern, but it is enabled-by-default debug rendering that only applies when no application script shadows the .html request; the asymmetric escaping (resource metadata is escaped with StringEscapeUtils while path/type/properties are not) looks like long-standing upstream behavior rather than an isolated injected flaw. Kept as an unconfirmed alternative, not strong enough to displace the chosen candidate."
+    },
+    {
+      "lead": "StreamRendererServlet directory index (renderIndex/renderChild, lines 385-457) writes resource path/child names unescaped into HTML.",
+      "reason": "Requires index rendering, which is disabled by default (DEFAULT_INDEX_PROPERTY=false), and requires a node name containing markup; no attacker-controlled request parameter reaches the sink directly."
+    },
+    {
+      "lead": "FSClassLoaderWebConsole (bundles/commons/fsclassloader) writes `root + file` from the `view` parameter unescaped into HTML (line 382-383) and uses string-concatenated file paths (line 192, 377).",
+      "reason": "The path traversal is blocked by the canonical-path containment check in isValid() (lines 311-323), and the reflected output is inside a Felix web console plugin, which is admin-authenticated."
+    },
+    {
+      "lead": "SlingPostServlet.getRedirectUrl (lines 307-362) blocks URIs with an authority but a backslash form such as `:redirect=/\\evil.com` or `:redirect=\\\\evil.com` may still become a protocol-relative redirect in browsers (open redirect).",
+      "reason": "The code contains explicit redirect-target validation (authority check + REDIRECT_WITH_SCHEME_PATTERN handling) and the bypass is browser-normalization dependent; no direct source-level proof that it is the intended finding. Same caveat applies to AuthUtil.isRedirectValid's `//`/`/../` normalization checks, which also do not treat backslashes."
+    },
+    {
+      "lead": "MapEntries.getVanityPaths builds an admin-resolver JCR-SQL2 query from the request-derived vanity path (lines 866-873).",
+      "reason": "Attacker-controlled quotes are doubled (`replaceAll(\"'\", \"''\")`) and trailing XPath metacharacters are escaped by escapeIllegalXpathSearchChars; I did not find a working injection, and results are limited to sling:VanityPath nodes."
+    },
+    {
+      "lead": "XSSFilterImpl.updateDefaultHandler only installs the policy when defaultHandler is null, so policy file changes are ignored (lines 114-157).",
+      "reason": "This is a policy-refresh functional weakness with no clear attacker-controlled input path; a hardening issue rather than a demonstrated vulnerability."
+    },
+    {
+      "lead": "ResourceResolution.locateInSearchPath (sightly engine) uses a raw startsWith(searchPath) containment check.",
+      "reason": "Default Sling search paths carry a trailing slash ('/apps/', '/libs/'), so sibling-prefix matches like '/apps2' are not within the checked prefix; no concrete bypass demonstrated for default configurations."
+    },
+    {
+      "lead": "ImportOperation/content-loader `security:principals`/`security:acl` JSON handling (DefaultContentCreator createNode/ACL support).",
+      "reason": "Writes execute with the request's JCR session and are subject to Oak/JCR user-management and ACL privileges; I found no missing framework check in the snapshot."
+    }
+  ],
+  "summary": "Scope/coverage: the assigned snapshot is the Apache Sling aggregator (4,623 model-visible files across bundles/, contrib/, launchpad/, installer/, tooling/, testing/, samples/; get_source_scope reports 0 files excluded by the >5 MiB / sensitive-name / symlink filters, and NUL-byte binary detection is applied). Notably the snapshot contains only main sources — no src/test trees exist — so no tests were available to corroborate expected sanitization behavior.\n\nI reviewed attacker-reachable request handling first (auth core/form, servlets get/post/resolver, engine, resource resolver, jcr resource/contentloader, xss, security filters, healthcheck) and then ran targeted searches across the rest of the tree for classic sinks (Runtime.exec/ProcessBuilder, ObjectInputStream, DocumentBuilder/SAX factories, URL/openConnection, file I/O, JCR query building, sendRedirect/setHeader, getParameter-derived paths). One concrete, traceable weakness met my evidence bar; several other candidates had explicit validation or admin-only reachability and are listed as rejected leads.\n\nCandidate (lead, not runtime-confirmed): the Sling Health Check Executor servlet reflects the raw JSONP `callback` request parameter into the JavaScript response. The parameter is taken verbatim in HealthCheckExecutorServlet and concatenated into the output in ResultJsonSerializer with no validation that it is a valid JS identifier; the servlet's own javadoc states it is registered directly on the HttpService with \"no authentication required\". This is a JSONP-callback-injection / reflected script-injection weakness (CWE-79 class). Impact is conditioned by the response content type (`application/javascript`) and by the deployment exposing the health endpoint, so I report it as a medium/low-confidence lead, not a confirmed exploit.\n\nUncertainty: I could not diff against upstream (no VCS metadata is exposed) to confirm whether a callback-validation check existed and was removed, nor can I verify runtime reachability; the strongest counter-evidence is that the endpoint's response type limits classic browser XSS."
+}

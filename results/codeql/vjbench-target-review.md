@@ -1,3 +1,5 @@
+> Historical snapshot. Current CodeQL/B0/P1 statistics are in [the current summary](../summary.md).
+
 # VJBench 42사례 CodeQL 지정 취약점 대조
 
 기준일: 2026-10-08. CodeQL 2.23.2, Java security-extended 쿼리 묶음, build-mode none. P1은 DeepSeek V4.1 Flash Max Top-1의 2026-10-08 정정판을 사용했다.

@@ -1,0 +1,63 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any untrusted XML document parsed with a default XmlMapper/XmlFactory (e.g., XmlMapper.readValue(inputStream/String, type), or XmlFactory.createParser(...)), which is the documented, most common usage. The XML document's DOCTYPE/internal subset and entity declarations are fully attacker-controlled bytes.",
+      "confidence": "medium",
+      "counterevidence_checked": "External general-entity expansion is explicitly disabled by the adjacent line, so classic '&xxe;' file-disclosure XXE is blocked for the default factory; a caller-supplied XMLInputFactory (e.g., XmlMapper(XMLInputFactory)) bypasses this entirely, but that is caller responsibility and not the default path. Woodstox (recommended in the README) may apply default entity-expansion limits, reducing DoS severity; the snapshot has no runtime data. SUPPORT_DTD=false could also change behavior for legitimate documents with DOCTYPE, which may explain why it was omitted; still, omission leaves the documented hardening incomplete.",
+      "id": "xmlfactory-dtd-not-disabled",
+      "impact": "Denial of service via DTD entity expansion (e.g., nested/large internal entity definitions causing exponential or amplified expansion and memory/CPU exhaustion) when parsing untrusted XML; potentially outbound DTD retrieval (SSRF/blind information exposure) for implementations that still fetch the external DTD subset even with external entity references disabled. The code comment shows a security-intent mitigation, but it is incomplete: the usual complete fix is to also set XMLInputFactory.SUPPORT_DTD=false on the default factory (consistent with later upstream hardening of this same block).",
+      "locations": [
+        {
+          "end_line": 116,
+          "path": "src/main/java/com/fasterxml/jackson/dataformat/xml/XmlFactory.java",
+          "start_line": 112
+        },
+        {
+          "end_line": 144,
+          "path": "src/main/java/com/fasterxml/jackson/dataformat/xml/XmlFactory.java",
+          "start_line": 138
+        }
+      ],
+      "prerequisites": "Application parses attacker-influenced XML with the default XmlFactory/XmlMapper (no caller-supplied hardened XMLInputFactory and no explicit SUPPORT_DTD=false). Entity-expansion DoS is most severe with a Stax implementation lacking default expansion limits (e.g., the JDK built-in Stax implementation obtained by XMLInputFactory.newInstance() when Woodstox is absent); with Woodstox, default entity-expansion limits may bound the DoS magnitude. External-DTD-subset retrieval/SSRF impact depends on how the chosen Stax implementation applies IS_SUPPORTING_EXTERNAL_ENTITIES to the external subset.",
+      "root_cause": "In XmlFactory's constructor, the default XMLInputFactory is only hardened for external entity expansion: xmlIn.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, Boolean.FALSE) (lines 112-116, with comment referencing dataformat-xml#190). XMLInputFactory.SUPPORT_DTD is never set to false, so it stays at the StAX implementation default (true). _initFactories() (lines 138-144) only sets IS_COALESCING on input and IS_REPAIRING_NAMESPACES on output, adding no DTD/entity limits. Thus DTD declarations are still parsed and internal entities still expanded by the underlying Stax implementation, and the external DTD subset may still be retrieved depending on the implementation's interpretation of IS_SUPPORTING_EXTERNAL_ENTITIES.",
+      "title": "Default XmlFactory/XmlMapper leaves DTD processing enabled (incomplete XML hardening; entity expansion / DTD-based DoS, implementation-dependent external subset retrieval)",
+      "trace": "new XmlMapper() -> new XmlFactory() -> XmlFactory(ObjectCodec, xpFeatures, xgFeatures, null, null, null) -> xmlIn = XMLInputFactory.newInstance(); xmlIn.setProperty(IS_SUPPORTING_EXTERNAL_ENTITIES, FALSE); (SUPPORT_DTD left true) -> _initFactories(xmlIn, xmlOut) -> XmlFactory._createParser(InputStream/Reader/byte[]/char[]) -> _xmlInputFactory.createXMLStreamReader(...) -> _initializeXmlReader(sr) -> FromXmlParser/XmlTokenStream consume attacker XML. Internal entity expansion happens inside the Stax implementation before/while FromXmlParser sees CHARACTERS events, so no validation in this repository intervenes.",
+      "unverified": "No runtime execution or parser testing was performed. Exact DoS magnitude, whether the JDK Stax implementation vs Woodstox honors IS_SUPPORTING_EXTERNAL_ENTITIES for external DTD subsets, and whether external subset retrieval/SSRF actually occurs with a given deployment's Stax provider remain unverified from source alone.",
+      "weakness_type": "Insufficient hardening of XML parser configuration (CWE-611/CWE-776 class: DTD/entity processing left enabled)"
+    }
+  ],
+  "coverage_summary": "Source scope reported 39 files (33 main Java files + 2 package-info, pom.xml, README.md, .travis.yml, .gitignore); no tests present, no binaries/symlinks/sensitive-path exclusions. Read in full or near-full: XmlFactory, XmlMapper, JacksonXmlModule, JacksonXmlAnnotationIntrospector, XmlAnnotationIntrospector, XmlTypeResolverBuilder, JacksonXmlAnnotationIntrospector-related annotations, all of deser/ (FromXmlParser, XmlTokenStream, XmlReadContext, ElementWrapper, WrapperHandlingDeserializer, XmlBeanDeserializerModifier, XmlTextDeserializer), all of ser/ (ToXmlGenerator, XmlBeanSerializerBase, XmlBeanSerializer, XmlBeanSerializerModifier, XmlBeanPropertyWriter, XmlSerializerProvider, UnwrappingXmlBeanSerializer), util/ (StaxUtil, DefaultXmlPrettyPrinter, TypeUtil, XmlInfo, XmlRootNameLookup, AnnotationUtil), jaxb/XmlJaxbAnnotationIntrospector, poc.json/pom, README. Grepped for reflection/class-loading, runtime/URL/file operations, property configuration, raw writes, integer parsing, and object serialization hooks. Not deeply reviewed: exact semantics of the out-of-scope jackson-core/databind/woodstox dependency internals that determine concrete Stax property behavior.",
+  "limitations": [
+    "No execution, tests, or scanners were run; all conclusions are static source analysis, so the DTD/entity-expansion impact is a lead, not a runtime-confirmed vulnerability.",
+    "The snapshot (2.7.8-SNAPSHOT) has no git history and no tests, so I could not diff against upstream commits or verify which hardening line is the fixed/vulnerable one; the identification of XMLInputFactory.SUPPORT_DTD as the missing control is based on the code comment's stated intent and known StAX defaults.",
+    "Concrete severity depends on the Stax implementation actually deployed (JDK built-in SJSXP vs Woodstox/Aalto), whose behavior around IS_SUPPORTING_EXTERNAL_ENTITIES and external DTD subsets is not visible in this source tree and could not be executed or inspected.",
+    "Dependency versions (jackson-core/annotations/databind 2.7.8, stax2-api 3.1.4, woodstox-core 5.0.2 test-scope) were read from pom.xml but their internal security behavior is outside the assigned source scope."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XmlFactory JDK-serialization support instantiates class names read from the serialized stream (readObject lines 210-216 stores _jdkXmlInFactory/_jdkXmlOutFactory; readResolve lines 185-204 calls Class.forName(name).newInstance()).",
+      "reason": "Real unsafe-reflection pattern, but exploitation requires the attacker to control JDK-serialized bytes of an XmlFactory/ObjectMapper (trusted configuration object in normal use), and this is long-standing upstream serialization behavior rather than an input-processing flaw. Yields arbitrary class initialization/constructor side effects only under a strong serialization-attacker precondition; rejected in favor of the default-path DTD gap."
+    },
+    {
+      "lead": "Caller-supplied XMLInputFactory skips all hardening (XmlFactory(XMLInputFactory), XmlMapper(XMLInputFactory); README shows XMLInputFactory.newFactory() usage), so external entities remain enabled.",
+      "reason": "The hardening is explicitly scoped 'by default' to factories the library creates; the property setting on a user-supplied factory would be surprising. The risk is a misuse/documentation concern with no deviation from intended API semantics; not selected."
+    },
+    {
+      "lead": "Potential unbounded/quadratic string building in XmlTokenStream._collectUntilTag (lines 350-372: text += _xmlReader.getText() across many CHARACTERS/CDATA events).",
+      "reason": "Memory/CPU amplification is plausible with crafted XML split into many text events, but it is incremental quadratic behavior inherent to this upstream implementation, has no sink beyond normal parsing, and is dominated by the DTD/entity-expansion issue."
+    },
+    {
+      "lead": "XmlFactory.hasXMLFormat reads a byte after '<?' without a hasMoreBytes() guard (line 731), and _initializeXmlReader loops while next() != START_ELEMENT without a hasNext() check (lines 647-654).",
+      "reason": "Robustness edge cases (possible exception/infinite-loop behavior on truncated input) rather than clearly attacker-reachable memory-safety or injection issues; format detection is not the default deserialization path and no concrete security impact was established."
+    },
+    {
+      "lead": "ToXmlGenerator.writeRaw* (lines 672-717) and DefaultXmlPrettyPrinter.writeRaw usage emit unescaped output.",
+      "reason": "Raw-write APIs are intentionally unescaped by Jackson design and only affect data the application explicitly passes to them; no attacker-controlled raw path was identified in normal bean serialization."
+    },
+    {
+      "lead": "Polymorphic type handling via XmlTypeResolverBuilder/XmlClassNameIdResolver (class-name type ids; decode/encodeXmlClassName).",
+      "reason": "Unsafe only when default typing is explicitly enabled by the application; that is a databind configuration decision, and the module's transformations (sanitize/decode) do not themselves create a bypass."
+    }
+  ],
+  "summary": "Reviewed jackson-dataformat-xml 2.7.8-SNAPSHOT (39 files, main sources only; no test tree). Traced the XML parsing path from XmlMapper/XmlFactory through XMLInputFactory/XMLStreamReader into FromXmlParser and XmlTokenStream. The strongest source-evidenced security issue is the incomplete default XML hardening in XmlFactory: the default constructor disables only external entity expansion (IS_SUPPORTING_EXTERNAL_ENTITIES=false, per the dataformat-xml#190 comment) but never disables DTD processing (XMLInputFactory.SUPPORT_DTD is left at the StAX implementation default of true). As a result, the default XmlMapper still processes DTDs and expands internal entities, leaving entity-expansion DoS and implementation-dependent DTD retrieval reachable from untrusted XML, which the adjacent comment indicates was intended to be mitigated. All other examined concerns were evaluated and either are upstream-accepted behavior with narrow preconditions or lack attacker-controlled input."
+}

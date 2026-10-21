@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Job ids are supplied by callers of the public job API: Request.setId(String...)/setId(List<String>) in AbstractRequest, JobManager.execute/JobStatusStore.store/remove/getJobStatus. Within this snapshot, ExtensionRequest.getJobId(prefix, extensionId, namespace) (lines 69-80) builds job ids verbatim from an extension id string; extension ids come from user-facing install/plan requests (UI/REST, e.g. the XWiki extension manager) and from remote extension repository descriptors. Extension install/plan jobs store their status automatically, and statuses can be looked up or removed through the job status API, so a user able to make an extension-related job id contain an element '..' controls the traversed path. Remote/clustered job triggering is also part of the API (Request.isRemote()). The final HTTP/script entry points live in xwiki-platform, which is outside this snapshot.",
+      "confidence": "medium",
+      "counterevidence_checked": "URLEncoder does encode '/' and '\\', so an id element cannot smuggle a full relative path in one go; traversal depth is limited only by the number of '..' elements (a single '..' escapes one level). The files written/read have fixed names, so this is not unrestricted arbitrary file read/write. encode(null) is safe (mapped to FOLDER_NULL), and URLEncoder still encodes other dangerous characters. No check exists anywhere between AbstractRequest.setId and getJobFolder that rejects '.', '..', or path separators, and the sibling implementation PathUtils.encode shows the project's own intent to encode '.'. Job ids are influenced by upstream platform code (not raw servlet parameters in this repository); no in-repo REST/script endpoint taking a raw job id was found, and no test/build/scanner run was performed to confirm reachability. The XStream code-execution follow-on is explicitly unproven.",
+      "id": "job-status-store-path-traversal",
+      "impact": "Availability/data integrity: recursive deletion of directories outside the job status store (up to the whole XWiki permanent directory with two '..' elements), destruction of stored data and potential loss of service. Integrity/confidentiality: creation of arbitrary directories and writing/overwriting (and reading back) files with fixed names (status.xml.zip, status.xml, log.xml, log.txt) outside the intended storage root, which can corrupt or plant data consumed by other components. Secondary (unverified) risk: the planted reader path deserializes whatever is at the traversed path with SafeXStream configured without a class whitelist, so in the worst case a planted 'status.xml.zip' could become a deserialization code-execution vector.",
+      "locations": [
+        {
+          "end_line": 225,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/DefaultJobStatusStore.java",
+          "start_line": 208
+        },
+        {
+          "end_line": 357,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/DefaultJobStatusStore.java",
+          "start_line": 341
+        },
+        {
+          "end_line": 380,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/DefaultJobStatusStore.java",
+          "start_line": 362
+        },
+        {
+          "end_line": 488,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/DefaultJobStatusStore.java",
+          "start_line": 449
+        },
+        {
+          "end_line": 108,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/JobStatusSerializer.java",
+          "start_line": 74
+        },
+        {
+          "end_line": 84,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/DefaultJobManagerConfiguration.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 64,
+          "path": "xwiki-commons-core/xwiki-commons-extension/xwiki-commons-extension-api/src/main/java/org/xwiki/extension/internal/PathUtils.java",
+          "start_line": 52
+        }
+      ],
+      "prerequisites": "Ability to influence a job id (list element) used with the job execution/status API, for example via an extension id containing '..' segments, or another platform job whose request id embeds user input; the write/delete primitive additionally requires the JVM process to have filesystem permissions on the parent directories of <permanent-dir>/jobs/status. No special code execution primitive is needed, and no in-repo validation exists between AbstractRequest.setId and getJobFolder.",
+      "root_cause": "DefaultJobStatusStore encodes each job id element with URLEncoder.encode(name, \"UTF-8\") (line 214), which leaves '.' untouched, and getJobFolder() then builds the folder with new File(folder, encode(idElement)) (line 347) without any traversal check. An id element exactly equal to '..' therefore resolves to the parent of the configured store root (JobManagerConfiguration.getStorage() = <permanent-dir>/jobs/status). The resulting folder is used destructively/creatively: remove() calls FileUtils.deleteDirectory(jobFolder) on it (line 459), saveJobStatus() writes status.xml.zip into it after file.mkdirs() (lines 368-373 and JobStatusSerializer.write lines 91-94), loadStatus() reads status.xml[.zip] from it (lines 285-323) and createLoggerTail() creates log files next to it (lines 354-357, 471-488). The same repository hardens the analogous case in PathUtils.encode() (extension module, line 56: .replace(\".\", \"%2E\")), so the missing dot-encoding in the job store is an asymmetry rather than an intrinsic requirement.",
+      "title": "Job id elements containing '..' traverse out of the job status storage (arbitrary directory deletion / out-of-store file write, read and log creation)",
+      "trace": "Request.getId() element '..' -> DefaultJobStatusStore.encode(\"..\") returns '..' (URLEncoder preserves '.') -> getJobFolder() does new File(<store>, \"..\") -> target = parent of <permanent-dir>/jobs/status. Branch 1 (delete): JobStatusStore.remove(id) -> FileUtils.deleteDirectory(target) recursively deletes the parent directory; with id ['..','..'] this is the XWiki permanent directory itself. Branch 2 (write): status serialization (store/storeAsync) -> saveJobStatus -> new File(target, \"status.xml.zip\") -> JobStatusSerializer.write -> file.mkdirs() + Files.move of the XStream XML, i.e. directories are created and a fixed-name file is written outside the store root. Branch 3 (read): getJobStatus -> maybeLoadStatus -> loadStatus(target) reads target/status.xml[.zip] and feeds it to SafeXStream.fromXML (no class whitelist), a secondary, unproven deserialization risk. Branch 4 (logs): createLoggerTail(id, ...) creates log.xml/log.txt under the same traversed folder.",
+      "unverified": "No runtime confirmation; no build, test or scanner execution. The xwiki-platform/rest call sites that let a remote user choose a job id are outside this snapshot, so end-to-end exploitability of the delete/write primitives is inferred from the public API contract and from ExtensionRequest.getJobId usage, not demonstrated. The alleged secondary XStream deserialization escalation was not validated; SafeXStream's lack of a class whitelist is documented in its own TODO comment but writing a valid gadget document through the status serializer was not shown to be feasible.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal'); CWE-73 External Control of File Name or Path"
+    }
+  ],
+  "coverage_summary": "Source scope: 1,390 files (all readable text; binary-like files skipped by policy), and the P1 index reports 1,390/1,390 source files indexed (0 missing, 0 hash mismatches; 9,545 symbols, 18,137 call rows, 17,278 edges) — the index is syntactic navigation only and was not treated as proof of reachability or exploitability. I read source in the job, extension (api/repositories/handlers), xml (XMLUtils, HTML cleaner/filters, Sax2Dom), filter (api, xml, streams), velocity (engine/config/introspection/tools), crypto (cipher/common/password/pkix/store), classloader, script (safe wrappers), websocket, environment, configuration, context, cache, blame, displayer, diff, logging, observation, component and repository-api modules, plus root build/security files. Largest modules (xwiki-commons-tools: xar/spoon/extension Maven plugins, legacy modules, component-default internals, diff-xml details, observation internals) were only surveyed, not exhaustively read.",
+  "limitations": [
+    "No execution of code, tests, builds or scanners; no runtime or exploit confirmation is claimed for any candidate.",
+    "The snapshot contains no test sources, so behavior could not be corroborated by tests.",
+    "Attacker reachability of job ids depends on xwiki-platform/REST callers that are not part of this snapshot, and on deployment configuration (clustering, job status folder permissions).",
+    "The P1 relation index is syntactic/navigation-only; edges and 'security_call' hints were verified against source text and were frequently false positives (e.g. dependency-injection annotations, benign I/O calls).",
+    "Some large areas (xwiki-commons-tools build plugins, legacy modules, component-default, diff-xml, observation internals) were reviewed only at a survey level."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SafeXStream unmarshalling without a class whitelist (xwiki-commons-xstream SafeXStream/SafeReflectionProvider, used by JobStatusSerializer, XStreamFileLoggerTail, extension job history).",
+      "reason": "Real hardening gap (explicit TODO at SafeXStream.initialize lines 83-86 accepts the risk), but it requires an attacker-controlled local file at the exact path being read; no remote vector and no proof that the status serializer can emit a gadget-compatible document. Kept only as a secondary, unproven impact of the path-traversal candidate."
+    },
+    {
+      "lead": "XXE in DefaultExtensionSerializer.getExtensionElement (DocumentBuilderFactory without disallow-doctype-decl / external-entity features).",
+      "reason": "Descriptors passed to it come from local .xed files, cached core descriptors and classpath resources, so attacker control over the parsed XML within this snapshot is weak; not the strongest evidence."
+    },
+    {
+      "lead": "LocalEntityResolver.resolveEntity returns null for unknown entities, letting the XML parser fetch external http/file system IDs (XXE/SSRF, including file disclosure).",
+      "reason": "The class in this snapshot has no in-repo caller; behavior looks intentional for resolving XHTML entities, and exploitation depends on external (xwiki-platform/xwiki-rendering) parsing paths that are out of scope."
+    },
+    {
+      "lead": "DefaultInputSourceReferenceParser / DefaultOutputTargetReferenceParser map unvalidated 'file:' and 'url:' references to arbitrary files/URLs (filter module).",
+      "reason": "This is the documented purpose of the filter API; access control is the caller's responsibility and no script/REST exposure exists in this snapshot."
+    },
+    {
+      "lead": "ExtendedJarURLConnection / JarExtendedURLStreamHandler custom jar handling and temp-file downloading.",
+      "reason": "Downloads are triggered only by URLs chosen by callers; no traversal or SSRF sink reachable from attacker-controlled input inside the snapshot."
+    },
+    {
+      "lead": "PreemptiveAuth uses AuthScope.ANY and could send credentials to any host.",
+      "reason": "The singleton INSTANCE is not referenced anywhere in this snapshot (dead/API-only code)."
+    }
+  ],
+  "summary": "Reviewed the XWiki Commons 13.8-SNAPSHOT source snapshot (1,390 files; the P1 relation index reports all 1,390 files indexed with no missing files, so index coverage equals source coverage). I surveyed the security-sensitive modules (job, extension, xml, filter, velocity, crypto, classloader, script, websocket, environment, configuration, context, cache, logging, diff, blame, displayer, repository-api) and traced attacker-controllable values into filesystem, XML-parsing, deserialization and reflection sinks. The single strongest source-verifiable issue is a path traversal in the job-status store: job id elements are URL-encoded with `URLEncoder`, which preserves `.`, so an id element of `..` escapes the `<permanent-dir>/jobs/status` storage directory; the same folder is then recursively deleted by `remove()`, written to by `saveJobStatus()` (`status.xml.zip`, after `mkdirs()`), read back by `loadStatus()`, and used to create log files. The repository elsewhere already contains the intended hardening (`PathUtils.encode()` explicitly replaces `.` with `%2E`), which highlights the inconsistency. I submitted only this candidate; other leads (XStream without class whitelist, unhardened XML descriptor parsing, LocalEntityResolver's null fallback, filter `file:`/`url:` reference parsing, custom jar URL handling, `PreAuth` scope) are listed as rejected/unconfirmed. No code, tests or scanners were executed and no runtime confirmation is claimed."
+}

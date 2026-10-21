@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated/authorized NiFi user who can create or configure Controller Services (or a processor that references the service) controls the values evaluated into the JNDI environment in JndiJmsConnectionFactoryHandler.createInitialContext(): `java.naming.factory.initial` (JNDI Initial Context Factory Class), `java.naming.provider.url` (JNDI Provider URL, expression-language capable via variable registry), `connection.factory.name` (lookup name, passed verbatim to InitialContext.lookup()), the JNDI / JMS Client Libraries classpath entries, and arbitrary dynamic properties that are copied into the JNDI environment (lines 125-129). All are attacker-chosen strings that reach JDK JNDI APIs.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether a stronger guard exists elsewhere: `connection.factory.name` uses only NON_EMPTY_VALIDATOR (JndiJmsConnectionFactoryProperties.java:62-69) and is passed unfiltered to lookup(); `java.naming.factory.initial` uses only NON_EMPTY_VALIDATOR; dynamic properties are copied into the JNDI environment with VALID-only validation. Checked the documented intent in additionalDetails.html (104-119), which lists the exact allowed schemes and the override property, so the substring acceptance is not a documented feature. Checked that the `instanceof ConnectionFactory` check (JndiJmsConnectionFactoryHandler.java:98-101) happens after lookup() and therefore is not a pre-deserialization guard. Noted: the classic dangerous spellings \"ldap\", \"ldaps\", \"rmi\", \"iiop\", \"dns\" are NOT substrings of the allow-listed schemes, so a *direct* provider-URL bypass with those literals is blocked; the concrete exploit primitive therefore additionally relies on the accept-by-default branch (inputs not matching the \"scheme://...\" pattern), on the attacker-selected initial context factory behavior for substring schemes, or on the separately unvalidated lookup name — this uncertainty is why the finding is submitted as a source-evidence lead, not a confirmed exploit.",
+      "id": "nifi-jms-jndi-scheme-allowlist-bypass",
+      "impact": "Defeat of the JNDI provider-URL restriction intended to prevent untrusted remote JNDI resolution. Where a reachable remote provider (e.g. LDAP/RMI-style naming service, or another scheme accepted by the configured initial context factory) can be reached, the NiFi host may deserialize objects returned by that service, which is a well-known path to remote code execution under the NiFi process account; at minimum it enables SSRF to arbitrary naming-service endpoints, credential exposure (JNDI environment including principal/credentials is sent to the attacker-chosen provider), and disclosure of class/type information.",
+      "locations": [
+        {
+          "end_line": 201,
+          "path": "nifi-nar-bundles/nifi-jms-bundle/nifi-jms-processors/src/main/java/org/apache/nifi/jms/cf/JndiJmsConnectionFactoryProperties.java",
+          "start_line": 127
+        },
+        {
+          "end_line": 60,
+          "path": "nifi-nar-bundles/nifi-jms-bundle/nifi-jms-processors/src/main/java/org/apache/nifi/jms/cf/JndiJmsConnectionFactoryProperties.java",
+          "start_line": 53
+        },
+        {
+          "end_line": 135,
+          "path": "nifi-nar-bundles/nifi-jms-bundle/nifi-jms-processors/src/main/java/org/apache/nifi/jms/cf/JndiJmsConnectionFactoryHandler.java",
+          "start_line": 85
+        },
+        {
+          "end_line": 119,
+          "path": "nifi-nar-bundles/nifi-jms-bundle/nifi-jms-processors/src/main/resources/docs/org.apache.nifi.jms.cf.JndiJmsConnectionFactoryProvider/additionalDetails.html",
+          "start_line": 104
+        }
+      ],
+      "prerequisites": "A user able to configure the JNDI JMS Connection Factory service (or a processor providing attribute values used by its variable-registry expression language), plus reachability from the NiFi host to an attacker-controlled JNDI/LDAP/RMI endpoint. The service must be enabled so that lookupConnectionFactory() runs. Exact exploitability of a given bypass spelling depends on the configured initial context factory and on JDK JNDI URL/provider parsing, which was not runtime-verified here.",
+      "root_cause": "JndiJmsProviderUrlValidator.isSchemeAllowed() iterates the allowed set and tests `allowedScheme.contains(scheme)` instead of `allowedSchemes.contains(scheme)` (equality), so any scheme that is a substring of an allowed scheme (e.g. \"t\", \"s\", \"t3\", \"sl\", \"ud\", \"file\", \"jgroups\", \"vm\") passes validation. In addition, isUrlAllowed() returns `allowed = true` whenever the regex `^([^:]+)://.+$` does not match, so provider URLs that omit the \"//\" form (and other non-matching spellings) are never scheme-checked. The documented contract (additionalDetails.html lines 104-119) and the property description state that only the exact schemes file/jgroups/ssl/t3/t3s/tcp/udp/vm are allowed, and the Java system property override is documented as a space-separated list of schemes, so the code contradicts its own specification.",
+      "title": "Ineffective JNDI provider URL scheme allow-list in JndiJmsConnectionFactoryProvider (substring comparison, plus accept-by-default for non-URL inputs) enables unsafe remote JNDI resolution/deserialization",
+      "trace": "1) PropertyDescriptor JNDI_PROVIDER_URL (JndiJmsConnectionFactoryProperties.java:53-60) is `required(true)`, expression-language scoped, and validated only by JndiJmsProviderUrlValidator. 2) validate() (lines 157-174) delegates to isUrlAllowed() (176-188): if `^([^:]+)://.+$` matches, the captured scheme goes to isSchemeAllowed() (190-201), which accepts when any allow-listed entry *contains* the supplied scheme; if the regex does not match, the URL is accepted with no scheme check. 3) At runtime, JndiJmsConnectionFactoryHandler.createInitialContext() (110-135) copies the attacker-controlled `java.naming.provider.url`, `java.naming.factory.initial`, principal/credentials and every dynamic property into a Hashtable and instantiates `new InitialContext(env)` (line 133) — i.e. an attacker-selected JNDI provider/factory is honored. 4) lookupConnectionFactory() (85-107) calls `initialContext.lookup(factoryName)` (line 91) with the attacker-controlled connection-factory name; only after the lookup returns is the `instanceof ConnectionFactory` check applied (98-101), so any deserialization/object-return side effects of the lookup occur before validation. 5) Result: the allow-list that is supposed to keep remote/untrusted JNDI providers out of reach can be bypassed with accepted spellings, allowing the service to contact an attacker-controlled naming/directory service and to resolve/deserialize objects it returns.",
+      "unverified": "No code was executed and no JDK/JNDI behavior was run; the exact bypass string that provably causes remote resolution for a given JDK version and configured context factory was not determined. Whether the substring comparison is an upstream defect or a deliberately modified line cannot be established from the snapshot alone (no VCS history available in this run). Also unverified: whether NiFi's framework-level authorization/policy checks meaningfully limit who can set these properties beyond the documented 'authenticated and authorized user' assumption.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-184 Incomplete List of Disallowed Inputs (improper restriction of JNDI provider URL)"
+    }
+  ],
+  "coverage_summary": "Review was targeted rather than exhaustive: full line-level reading of the JMS bundle JNDI path (JndiJmsConnectionFactoryProperties.java, JndiJmsConnectionFactoryProvider.java, JndiJmsConnectionFactoryHandler.java, provider documentation), plus broad literal searches across all readable files for high-risk sink families (ObjectInputStream, InitialContext/JNDI lookups, deserialization entry points) and directory/structure reconnaissance of the ~8256-file NiFi 1.22.0 tree. The P1 relation index covers 7984 of 8256 source files (272 missing from the index), is 'partial', has only syntax containment plus name/type/arity call candidates (control flow, data flow and semantic resolution 'not_implemented', 165551 unresolved calls, 3 parse errors, 249 omitted files), and index facts are name-based navigation hints only; no relation-index edge was treated as proof. Large parts of the repository (nifi-framework, nifi-web, standard processors, DBCP/JMS providers beyond the JNDI path, MiNiFi/C2 modules) were not read and are not claimed as reviewed.",
+  "limitations": [
+    "No build, tests, or code execution were performed; all impact reasoning (JNDI provider/URL parsing, deserialization, RCE) is static and unconfirmed.",
+    "The relation index does not implement control flow, data flow, or semantic resolution and has unresolved/omitted files, so absence of an index edge for a code path is not evidence that the path does not exist.",
+    "JDK-internal behavior (InitialContext provider parsing, scheme-to-URL-context-factory resolution, whether a substring scheme or a non-'://' provider URL results in remote resolution) could not be checked against JDK sources in this run.",
+    "No VCS history or patch data is available, so it cannot be determined whether the substring comparison is the original upstream code or an introduced modification.",
+    "Only the JMS JNDI area was reviewed in depth; other plausible surfaces (DBCP/H2 JDBC URL, web/UI endpoints, other processors' path/URL handling) remain uninspected."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "GenericObjectSerDe / ObjectSerDe raw Java deserialization (nifi-asana-processors GenericObjectSerDe.java:38-42; nifi-hbase-processors ObjectSerDe.java:38-42; GetHBase.java:495-499 reads a serialized object from a local file with `new ObjectInputStream(...).readObject()`).",
+      "reason": "Reachable data is either internal state (local serialization file written by the same processor) or data supplied by the flow author, not clearly attacker-controlled across a trust boundary; no source evidence that untrusted remote bytes reach these streams. Rejected as weaker than the JMS/JNDI finding."
+    },
+    {
+      "lead": "RocksDB flow-file repository deserialization of swap-location suffixes (RocksDBFlowFileRepository.java:419-425).",
+      "reason": "The bytes come from the local RocksDB state written by NiFi itself; no demonstrated attacker-controlled write path to that key/value. Not pursued further."
+    },
+    {
+      "lead": "'JNDI / JMS Client Libraries' property permits URL resource types (JndiJmsConnectionFactoryProperties.java:71-81), allowing remote JARs onto the component classpath.",
+      "reason": "Plausible as part of the same CVE-family hardening story, but it is explicit, documented behavior gated on the same configuration privilege, and no evidence of a missing/incorrect check within the snapshot; kept as part of the candidate's context rather than a separate finding."
+    },
+    {
+      "lead": "DBCP connection-pool JDBC URL handling (nifi-dbcp-service) as a driver/URL-based code-execution surface.",
+      "reason": "Not inspected in depth within this run; no concrete source evidence collected, so it is an unverified lead only."
+    }
+  ],
+  "summary": "Apache NiFi 1.22.0 source snapshot (8256 files, ~6500 Java files). The strongest source-supported candidate is in the JMS JNDI Connection Factory support: `JndiJmsProviderUrlValidator` is intended (and documented) to limit the JNDI provider URL to an explicit scheme allow-list, but its scheme test is implemented as `allowedScheme.contains(scheme)`, i.e. the input scheme is accepted whenever it is a *substring* of any allowed scheme (and any input not matching `^([^:]+)://.+$` is accepted outright). This makes the mitigation ineffective, and JNDI lookup of an attacker-supplied name is then performed with an attacker-controlled initial-context factory class and attacker-controlled JNDI environment/dynamic properties, with the `instanceof ConnectionFactory` check occurring only after the (potentially remote, deserializing) `lookup()` call. No runtime confirmation was performed; impact reasoning is based on JDK JNDI semantics and must be treated as a lead."
+}

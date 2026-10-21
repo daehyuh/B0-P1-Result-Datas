@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Unauthenticated HTTP request data: (1) the `graph` query parameter used when part=graph / part=usages / part=counterSummaryPerClass; (2) the `counter` query parameter with action=clear_counter; (3) the `sessionId` query parameter on part=sessions; (4) the `X-Forwarded-For` request header, which MonitoringFilter.putUserInfoInSession stores in the HTTP session as javamelody.remoteAddr and which is later printed without encoding. Graph/counter/sessionId are direct request parameters; X-Forwarded-For is an arbitrary request header.",
+      "confidence": "medium",
+      "counterevidence_checked": "Encoding is attempted at most sinks, so the issue depends on the exact helper: javascriptEncode() is appropriate for genuine JavaScript string contexts (e.g. HtmlCounterReport.writeGraphDetailScript line 378) and htmlEncode() is appropriate for HTML text nodes (it neutralizes <, >, &), which is why ordinary request names/stack traces are safe. The attribute-breakout requires a quote followed by ASCII whitespace (a literal space survives urlEncode, and %09/%0D survive htmlEncode) - a plain <script> value in an attribute is neutralized. normal request names/counter names (http, sql, ...) contain no quotes, so benign traffic is unaffected. The part=sessions and graph reports are administrator views; if the deployment (as recommended) protects /monitoring with authentication, impact depends on a victim with access following a link, and if monitoring is left unauthenticated the attacker can already read the data - the XSS additionally lets the attacker execute script in the origin shared with the monitored application for other logged-in users. The CLEAR_COUNTER action is executed but with a nonexistent counter name it is a no-op, so the message path is still reached.",
+      "id": "javamelody-monitoring-report-xss-context-encoding",
+      "impact": "Script execution in the browser of anyone who views the crafted/poisoned monitoring page, in the origin of the monitored web application. Because the monitoring URL is normally on the application's own origin, the injected script can read non-HttpOnly application cookies and perform same-origin operations, and it can drive the monitoring actions exposed by the page (invalidate sessions, clear counters, read thread/JDBC/JMX/configuration data, etc.). The X-Forwarded-For variant is stored in the session and executes automatically when an administrator opens the session list, without further attacker interaction.",
+      "locations": [
+        {
+          "end_line": 160,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/I18N.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 783,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/HtmlCoreReport.java",
+          "start_line": 737
+        },
+        {
+          "end_line": 320,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/HtmlCoreReport.java",
+          "start_line": 296
+        },
+        {
+          "end_line": 163,
+          "path": "javamelody-core/src/main/java/net/bull/javamelody/HtmlSessionInformationsReport.java",
+          "start_line": 155
+        }
+      ],
+      "prerequisites": "The deployment includes the JavaMelody filter and the monitored webapp is reachable (the bundled web-fragment maps the filter to /*). The monitoring URL must be reachable by the attacker, or by a victim who can be induced to open a crafted monitoring URL (reflected variants). For the stored variant a session must exist (MonitoringFilter only writes the attributes when getSession(false) returns a session) and an administrator must later open part=sessions. The remote collector/server deployment is not needed for the reflected variants. CLEAR_COUNTER does not require javamelody.system-actions-enabled, so the counter/anchor variant works even when system actions are disabled.",
+      "root_cause": "The report layer relies on encoding helpers that are not safe for the context in which they are used. I18N.urlEncode() (I18N.java:142-144) only calls javascriptEncode(), which prepends backslashes before \\\\, \\n, \\\" and ' but leaves the raw quote characters, spaces and tabs in the output; it is then used to build single-quoted HTML attributes (href/value/src). I18N.htmlEncode() (I18N.java:152-160) escapes &, <, > and newline but not quote characters, so it is also unsafe inside attributes. In addition, a few values derived directly from the request are written with no encoding at all: anchorNameForRedirect (the `counter` request parameter, via Action.getContextName()) is concatenated into a single-quoted JavaScript string in HtmlCoreReport.writeMessageIfNotNull (HtmlCoreReport.java:309-313), and the session's remoteAddr - built from the attacker-controlled X-Forwarded-For header in MonitoringFilter.putUserInfoInSession (MonitoringFilter.java:313-323) - is written raw into the sessions table (HtmlSessionInformationsReport.java:158-163). An attacker-supplied value containing a quote plus a whitespace character (e.g. %20/%09) and an event-handler attribute therefore terminates the attribute/string context and injects markup or script that the victim's browser executes in the monitoring origin.",
+      "title": "Reflected/stored XSS in the monitoring HTML reports via contextually incorrect output encoding of attacker-controlled values",
+      "trace": "Reflected graph path: MonitoringFilter.doFilter identifies the monitoring URL -> MonitoringController.doReport reads part=graph and graph (MonitoringController.java:164-168) -> HtmlController.doHtmlPart -> HtmlReport.writeRequestAndGraphDetail(graphName) (HtmlReport.java:219-224) -> HtmlCoreReport.writeRefreshAndPeriodLinks(graphName, \"graph\") writes the value into href='?part=graph&amp;graph=...' through urlEncode (HtmlCoreReport.java:748-749, 772-773); the same value is also placed in <input ... value='...'> by HtmlForms.writeCustomPeriodLink (HtmlCoreReport.java:93) and in HtmlCounterReport.java:110-114. Reflected counter path: MonitoringController.executeActionIfNeeded -> Action.CLEAR_COUNTER (no checkSystemActionsEnabled for this action, Action.java:109) -> Action.getContextName(counterName) returns the raw counter name -> HtmlCoreReport.toHtml(message, anchorNameForRedirect) -> writeMessageIfNotNull concatenates it directly into \"location.href = ... '#\" + anchorNameForRedirect + \"';\" (HtmlCoreReport.java:309-313). Stored path: MonitoringFilter.putUserInfoInSession concatenates httpRequest.getRemoteAddr() + \" forwarded for \" + X-Forwarded-For into the session attribute (MonitoringFilter.java:313-323); SessionInformations.getRemoteAddr returns it; HtmlSessionInformationsReport.writeSession writes it with write() (no HTML encoding) at line 162, and part=sessions renders all sessions to the administrator.",
+      "unverified": "No runtime verification was performed; the exploitability of each sink was derived from reading the source, and the exact upstream fix target (urlEncode, the anchorNameForRedirect insertion, or the remoteAddr rendering) could not be confirmed from this snapshot. The stored variant assumes an application page creates an HTTP session and that an administrator later views the sessions report.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+    }
+  ],
+  "coverage_summary": "Source scope reported 287 files with no over-size, symlink or sensitive-name exclusions and no binary skips. I read the complete core monitoring/collector paths: MonitoringFilter/MonitoringController/CollectorServlet/CollectorServer/CollectorController/Collector, RemoteCollector/LabradorRetriever/TransportFormat/SerializableController, the HTML report classes (HtmlReport, HtmlCoreReport, HtmlCounterReport, HtmlCounterRequestContextReport, HtmlCounterErrorReport, HtmlSessionInformationsReport, HtmlJndiTreeReport, HtmlMBeansReport, HtmlThreadInformationsReport, HtmlJavaInformationsReport, HtmlCacheInformationsReport, HtmlForms, HtmlController, I18N, HttpParameters/HttpCookieManager, Parameters, Action), session handling (SessionListener, SessionInformations), and the PDF controller/report entry points; I skimmed the Swing client, resources/translations and pom/build files. Filter note: the whole assigned tree (287 files) was available; no file filters applied.",
+  "limitations": [
+    "No code was executed and no runtime/servlet-container behavior was verified; all conclusions are static source readings.",
+    "Which of the several unencoded sinks the upstream fix actually targeted (I18N.urlEncode vs. the anchorNameForRedirect JavaScript insertion vs. the X-Forwarded-For value) could not be confirmed from the snapshot; the candidate names the shared root cause and the traced sinks, but this uncertainty remains.",
+    "The JSON/SERIALIZED remote-collector paths and the collector-server deployment flow were read but not exercised; gadget availability on the collector server is unverified.",
+    "Impact of the reflected XSS assumes a victim with access to /monitoring (or a shared origin with the monitored application); the monitoring page's exposure depends on deployment security constraints.",
+    "Swing/PDF modules and static resources were only skimmed, so additional lower-severity findings may exist there."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unsafe deserialization in the optional collector server: CollectorServlet.doPost (no authentication; allowed-addr-pattern is optional) -> CollectorServer.addCollectorApplication -> RemoteCollector.collectForUrl -> LabradorRetriever.read -> TransportFormat.readSerializableFrom, which runs ObjectInputStream.readObject (or XStream fromXML for text/xml) on the HTTP response body returned by the attacker-specified application URL (TransportFormat.java:231-258, LabradorRetriever.java:279-310, CollectorServer.java:258-276, CollectorServlet.java:114-155).",
+      "reason": "Real high-impact lead (possible RCE on the collector server) but not selected as the single candidate: it is the product's documented collector design (the monitored applications are treated as trusted), it needs the separate collector-server deployment plus an attacker-controlled app URL and an available gadget chain, and the Java serialization is not applied to the request body but to a URL the server was told to poll; the XSS has more direct, default-path attacker control. Kept as an unconfirmed secondary lead rather than a second candidate."
+    },
+    {
+      "lead": "JNDI `path` parameter reflected into an href attribute (HtmlJndiTreeReport.java:99-104 uses htmlEncode(), which does not escape single quotes, inside href='?part=jndi&amp;path=...'), with the same weak-encoding pattern also present at HtmlJndiTreeReport.java:75.",
+      "reason": "Not selected: HtmlController.doJndi calls JndiBinding.listBindings(path) before rendering the page, and an arbitrary path containing quotes/whitespace is not a valid JNDI name, so the NamingException aborts the request before the report is written - reachability could not be established from source."
+    },
+    {
+      "lead": "Path traversal in ?resource= handling (MonitoringController.doResource, line 306) and in PdfReport.getFileName / Parameters.getStorageDirectory (application name used in file paths).",
+      "reason": "Not selected: doResource strips all \"..\" before Parameters.getResourcePath, and the classpath resource lookup cannot escape the fixed prefix; the file-name paths rely on a collector application name that is normally administrator-supplied configuration, and the Windows backslash case was not traced to an externally triggerable sink."
+    },
+    {
+      "lead": "JnlpPage embeds the request URL (Host header) and raw Cookie header values into the generated JNLP XML (JnlpPage.java:48, 73-96).",
+      "reason": "Not selected: the crafted response is only launched by the requester's own Java Web Start, so the attacker would primarily attack themselves; no cross-user sink established."
+    },
+    {
+      "lead": "Monitoring endpoints and system actions are accessible without authentication by default (MonitoringFilter.isRequestAllowed only enforces the optional allowed-addr-pattern; Parameters.isSystemActionsEnabled defaults to true).",
+      "reason": "This is a deployment/configuration expectation (the project documents that the monitoring URL should be protected by the application's security constraints), not a code-level authorization defect in this snapshot; also the CLEAR_COUNTER XSS path works regardless."
+    }
+  ],
+  "summary": "Reviewed the JavaMelody snapshot (parent POM version 1.47.0-SNAPSHOT) with emphasis on the web monitoring/collector request paths, HTML/PDF report writers, and encoding helpers. The strongest source-evidenced issue I found is cross-site scripting in the HTML monitoring reports: several attacker-controlled values (request parameters and the X-Forwarded-For header) reach HTML attribute and inline-JavaScript sinks through helpers that do not provide context-appropriate escaping, so quotes/whitespace can break out of the generated markup. I selected that as the single candidate and recorded the other plausible leads (notably unsafe deserialization in the optional collector server) below. No runtime testing was performed; findings are source-level leads only."
+}

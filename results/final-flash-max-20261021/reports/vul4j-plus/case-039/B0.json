@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the HTTP POST parameter form_redirect_uri and can choose an arbitrary external URL (e.g. https://evil.example/phish). The parameter is a plain form field; the login page itself renders it from the session saved request, so no special API access is needed.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the CSRF configuration in login-ui.xml: CSRF is enabled for the uiSecurity chain but with uiCookeCsrfRequestMatcher limited to POST /login.do, POST /oauth/authorize and POST /profile, so not every POST that reaches UaaSavedRequestCache is CSRF-protected; the direct submission of a crafted login form is partly mitigated by that CSRF token, but the session-seeding path and the server-rendered saved-request path are not. Checked that other redirect helpers in the codebase (UaaResetPasswordService, EmailAccountCreationService, EmailInvitationsService, AuthorizePromptNoneEntryPoint) do validate/fall back safely, which shows the codebase normally constrains redirects and that this handler is the outlier. Checked that UaaSavedRequestCache only saves when unauthenticated and when no saved request exists, and that ClientRedirectSavedRequest.doesRequestMatch compares the value to itself rather than validating it, so it provides no protection.",
+      "id": "uaa-open-redirect-form-redirect-uri",
+      "impact": "Persistent post-authentication open redirect: an attacker can send a victim who has just successfully authenticated at the trusted UAA host to an arbitrary attacker-controlled site, enabling phishing, credential/session relay flows and referrer/link leakage. Because the value is stored in the session it also affects non-password flows (autologin, XOAuth callback, account verification), not just the direct login POST.",
+      "locations": [
+        {
+          "end_line": 46,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/web/UaaSavedRequestAwareAuthenticationSuccessHandler.java",
+          "start_line": 34
+        },
+        {
+          "end_line": 85,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/web/UaaSavedRequestCache.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 27,
+          "path": "server/src/main/resources/templates/web/login.html",
+          "start_line": 19
+        },
+        {
+          "end_line": 684,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/login/LoginInfoEndpoint.java",
+          "start_line": 660
+        },
+        {
+          "end_line": 138,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/account/AccountsController.java",
+          "start_line": 132
+        }
+      ],
+      "prerequisites": "Victim must have no existing saved request and must be unauthenticated when the value is planted. Planting can be done by an auto-submitted cross-site POST to a POST target on the uiSecurity chain that is not covered by uiCookeCsrfRequestMatcher (that matcher covers only POST /login.do, POST /oauth/authorize and POST /profile; e.g. POST /login/idp_discovery still reaches UaaSavedRequestCache.doFilter). The victim must then complete a real login (or submit a crafted login form directly, which is partly mitigated by the cookie-based CSRF check on /login.do).",
+      "root_cause": "UaaSavedRequestAwareAuthenticationSuccessHandler.determineTargetUrl() returns the request parameter form_redirect_uri verbatim, with no allow-list/registered-redirect validation, and UaaSavedRequestCache stores that same unvalidated parameter into the HTTP session as the 'saved request' (ClientRedirectSavedRequest). The saved value is later echoed into the genuine login form as a hidden field and returned again by the success handler, so a value planted before authentication survives the whole login flow. The repository already contains UaaUrlUtils.isValidRegisteredRedirectUrl(), but the success handler and cache do not use any equivalent check.",
+      "title": "Unvalidated form_redirect_uri enables open redirect after login (saved-request/success-handler path)",
+      "trace": "1) Attacker causes the victim's browser to POST form_redirect_uri=https://evil.example to a /login** POST not covered by the CSRF matcher while unauthenticated. 2) UaaSavedRequestCache.doFilter -> shouldSaveFormRedirectParameter (POST + non-empty param + no existing saved request) -> saveClientRedirect -> session SPRING_SECURITY_SAVED_REQUEST = ClientRedirectSavedRequest(redirectUrl=https://evil.example). 3) Victim opens the genuine login page; login.html renders <input type=hidden name=form_redirect_uri value=${session.SPRING_SECURITY_SAVED_REQUEST.redirectUrl}>. 4) Victim authenticates via the normal form-login (POST /login.do) and the success handler chain AccountSavingAuthenticationSuccessHandler -> UaaSavedRequestAwareAuthenticationSuccessHandler.determineTargetUrl sees request.getParameter(\"form_redirect_uri\") != null and returns it unvalidated. 5) Spring Security issues a 302 Location: https://evil.example. The same stored value is also used as a redirect by LoginInfoEndpoint.performAutologin (lines 660-668), LoginInfoEndpoint.handleXOAuthCallback (676-684) and AccountsController.verifyUser (132-138), each of which returns \"redirect:\" + savedRequest.getRedirectUrl() with no origin/allow-list check.",
+      "unverified": "The reachability conditions (whether a specific deployment allows the chosen POST target through the security chain without CSRF, and the exact SAML/OIDC flows that consume the saved request) were reasoned from configuration and code only; no request was executed and no runtime test was run. It is also possible this behavior is intentional (the value is normally rendered server-side by login.html), so the finding is submitted as a source-supported candidate rather than a confirmed vulnerability.",
+      "weakness_type": "CWE-601 URL Redirection to Untrusted Site ('Open Redirect')"
+    }
+  ],
+  "coverage_summary": "Scope tool reported 980 visible files with no excluded symlinks/sensitive paths/oversized files; the same filters apply to all conditions. I read primary sources in the server module (auth filters, OAuth authorize/token services, token validation/JWT helpers, SAML/OIDC providers, SCIM endpoints and JDBC provisioning, client and zone administration, redirect/cache/CORS utilities) plus key Spring XML security chains and Thymeleaf templates, and sampled the model and login-client modules. I did not read every one of the 980 files; generated resources/CSS, DB migration scripts, the client-lib/samples modules and most model classes were only spot-checked. No tests exist in the snapshot, so no behavioral confirmation is possible.",
+  "limitations": [
+    "Source-only review: no code execution, no tests, no runtime verification; exploitability is inferred from code and configuration.",
+    "Coverage is not exhaustive: utilities, DB migrations, samples and large configuration files (uaa.yml, oauth-endpoints.xml) were only partially inspected.",
+    "Vulnerability datasets often target a specific historical fix; without diffs, upstream history or ground truth I cannot confirm that this candidate matches the intended defect.",
+    "Deployment-specific settings (SAML auto-provisioning, self-service links, zone configuration) affect whether the described paths are reachable."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "LoginSAMLAuthenticationFailureHandler redirects to the saved OAuth request's redirect_uri parameter (server/src/main/java/org/cloudfoundry/identity/uaa/provider/saml/LoginSAMLAuthenticationFailureHandler.java:43-56) without validating it against the client's registered redirect URIs, because the request is saved before /oauth/authorize is processed.",
+      "reason": "Plausible separate open redirect, but it requires a SAML authentication failure (LoginSAMLException) and no token/code is returned to the attacker URL; kept as an unconfirmed related lead rather than a second candidate."
+    },
+    {
+      "lead": "Default CORS configuration resolves to allowed origins/URIs '.*' with credentials=true for XHR requests when uaa.yml has no cors section (uaa/src/main/webapp/WEB-INF/spring-servlet.xml:105-188, CorsFilter.java:333-342).",
+      "reason": "Behavioral impact (credentialed cross-origin GET reads) depends on deployment defaults and appears to be long-standing upstream configuration rather than an injected defect; not enough source-local evidence of an unintended change."
+    },
+    {
+      "lead": "Client-supplied 'authorities' request parameter is parsed as az_attr and embedded into issued tokens without validation (UaaTokenServices.java:679-682, 837-853).",
+      "reason": "Impact depends on downstream resource servers trusting az_attr; no in-repo consumer makes the trust boundary concrete, so this remains a hardening concern."
+    },
+    {
+      "lead": "UaaTokenStore authorization-code SELECT/DELETE statements omit identity_zone_id although INSERT stores it (UaaTokenStore.java:71-74, 125-147).",
+      "reason": "Cross-zone code redemption requires guessing a 10-character random code and a client/user that exists in both zones; no practical exploitation path was established."
+    },
+    {
+      "lead": "SCIM sortBy SQL injection through SimpleSearchQueryConverter ORDER BY concatenation (SimpleSearchQueryConverter.java:149-154).",
+      "reason": "AbstractQueryable.query() calls validateOrderBy(queryConverter.map(sortBy)) before conversion (AbstractQueryable.java:76, 117-140), and the three subclasses pass field whitelists, so the suspected injection is mitigated."
+    }
+  ],
+  "summary": "Reviewed the cloudfoundry/uaa snapshot (gradle version 4.5.5-SNAPSHOT; 980 visible files across server, uaa, model, client-lib and samples; no files excluded by the scope filters, no tests present). I focused on authentication/authorization filters, OAuth token/authorize flows, SAML/OIDC entry points, SCIM endpoints, client/zone administration, redirect handling, JWT/token validation, and SQL construction. One distinct, source-supported candidate is reported: an unvalidated, attacker-suppliable redirect target (`form_redirect_uri`) that is stored in the session by the custom request cache and returned verbatim by the authentication success handler, producing an open redirect after a successful login. Several other leads were examined and are listed as rejected/unconfirmed rather than as additional candidates."
+}

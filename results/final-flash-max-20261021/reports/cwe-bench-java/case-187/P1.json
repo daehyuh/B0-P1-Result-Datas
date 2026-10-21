@@ -1,0 +1,98 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Primary path: an authenticated user with ROLE_ADMIN or project ADMINISTRATION calls PUT /api/projects/{project}/config with arbitrary config entries, e.g. `kylin.engine.spark-conf.spark.driver.extraJavaOptions` (or `spark.yarn.queue`, etc.) containing a quote-breaking shell payload. These entries are stored verbatim in ProjectInstance.overrideKylinProps (ProjectService.updateProjectOverrideKylinProps lines 437-452 -> KylinConfig.trimKVFromMap only trims whitespace; NProjectManager.checkOverrideProps only rejects blank values). Secondary path: an authenticated user with project query permission posts /api/async_query with `spark_queue` set; SQLRequest.sparkQueue has no validation and flows into `kylin.query.async-query.spark-conf.spark.yarn.queue` and NSparkExecutable param `queryQueue` (AsyncQueryJob.submit lines 162-164, 179; getSparkConfigOverride lines 128-131) when `kylin.query.unique-async-query-yarn-queue-enabled=true`.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that (1) checkCommandInjection's regex `` (`[^`]*+`)|(\\$\\([^)]*+) `` does not match single quotes, semicolons, newlines, `&&`, `|` or redirection; (2) appendSparkConf wraps values only in single quotes without escaping embedded quotes; (3) no other escaping/sanitization is applied between project config and the command (KylinConfig.trimKVFromMap trims whitespace only; NProjectManager.checkOverrideProps only rejects blanks; the controller only rejects names in getNonCustomProjectConfigs(), which does not include `kylin.engine.spark-conf.*`); (4) the executed sink is `/bin/bash -c` via ProcessBuilder; (5) the async-query `spark_queue` field has no pattern/size validation; (6) the config path requires an elevated project role, which reduces but does not remove the impact (the same trust boundary as Kylin's documented Spark-conf RCE advisories). I did not execute anything and did not verify which Spring profile/config is active in a real deployment.",
+      "id": "case-187-cand-1",
+      "impact": "Arbitrary OS command execution with the privileges of the Kylin server process on the host that runs spark-submit (metadata/query/loading server). This yields full compromise of that host and of the credentials/configuration it can read, not merely a broken Spark job. A quote-breaking payload such as `x'; <cmd>; echo '` passes checkCommandInjection because it contains neither backticks nor `$(`.",
+      "locations": [
+        {
+          "end_line": 176,
+          "path": "src/spark-project/engine-spark/src/main/java/org/apache/kylin/engine/spark/job/DefaultSparkBuildJobHandler.java",
+          "start_line": 125
+        },
+        {
+          "end_line": 198,
+          "path": "src/spark-project/engine-spark/src/main/java/org/apache/kylin/engine/spark/job/DefaultSparkBuildJobHandler.java",
+          "start_line": 178
+        },
+        {
+          "end_line": 222,
+          "path": "src/spark-project/engine-spark/src/main/java/org/apache/kylin/engine/spark/job/DefaultSparkBuildJobHandler.java",
+          "start_line": 218
+        },
+        {
+          "end_line": 190,
+          "path": "src/core-common/src/main/java/org/apache/kylin/common/util/CliCommandExecutor.java",
+          "start_line": 171
+        },
+        {
+          "end_line": 131,
+          "path": "src/query-service/src/main/java/org/apache/kylin/rest/service/AsyncQueryJob.java",
+          "start_line": 124
+        },
+        {
+          "end_line": 165,
+          "path": "src/query-service/src/main/java/org/apache/kylin/rest/service/AsyncQueryJob.java",
+          "start_line": 158
+        },
+        {
+          "end_line": 66,
+          "path": "src/common-service/src/main/java/org/apache/kylin/rest/request/SQLRequest.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 447,
+          "path": "src/metadata-server/src/main/java/org/apache/kylin/rest/controller/NProjectController.java",
+          "start_line": 433
+        }
+      ],
+      "prerequisites": "Authenticated user: project ADMINISTRATION (or global admin) for the config path, or project query permission plus non-default `kylin.query.unique-async-query-yarn-queue-enabled=true` for the async-query path. A Spark job must then be created/executed (cube build/refresh or async query) so NSparkExecutable.getSparkAppDesc()/AsyncQueryJob.runSparkSubmit() builds and runs the command. Default deployment profiles and runtime DI were not verified; the spark-submit execution path is the default for Hadoop-mode installations, while K8s/micro-service mode may use different launchers.",
+      "root_cause": "DefaultSparkBuildJobHandler.generateSparkCmd() builds a single shell command string from configuration-derived values and executes it through CliCommandExecutor.runNativeCommand() as `/bin/bash -c <cmd>`. Spark conf entries are appended as `--conf '<key>=<value>'` (appendSparkConf) and spark jars/files/job jar are appended unquoted; values are never escaped. Values come from user-editable project overrides (`kylin.engine.spark-conf.*`, `kylin.query.async-query.spark-conf.*`) and, for async queries, from the `spark_queue` request field. The only validation, checkCommandInjection(), only rejects backticks and `$(` patterns, so a value such as `x'; <command>; echo '` closes the single quote and injects a shell command; `;`, newlines, `&&`, `|`, `>` and quotes are not blocked.",
+      "title": "OS command injection in spark-submit command construction via user-controllable Spark configuration",
+      "trace": "PUT /api/projects/{project}/config (NProjectController.updateProjectConfig:436-447 -> ProjectService.updateProjectConfig:1198-1205) or POST /api/async_query (NAsyncQueryController.query:111 -> QueryService.query:237-245) -> ProjectInstance.overrideKylinProps / KylinConfigExt.getAllProperties (KylinConfigExt:74-79) -> KylinConfigBase.getSparkConfigOverride()/getAsyncQuerySparkConfigOverride() = getPropertiesByPrefix(\"kylin.engine.spark-conf.\"/\"kylin.query.async-query.spark-conf.\") (KylinConfigBase:258-262, 1674-1676) -> NSparkExecutable.getSparkConf/getSparkAppDesc (NSparkExecutable:412-428, 467-478) -> SparkAppDescription.sparkConf -> DefaultSparkBuildJobHandler.generateSparkCmd() concatenates `--conf '<k>=<value>'` / unquoted jars/files/job-jar (lines 125-176, 218-222) -> checkCommandInjection() only checks backticks/`$(` (lines 178-198) -> NSparkExecutable.runSparkSubmit -> CliCommandExecutor.execute -> runNativeCommand -> ProcessBuilder(\"/bin/bash\",\"-c\",command) (CliCommandExecutor:176-190).",
+      "unverified": "No runtime confirmation: the deployed Spring profiles, whether project admins can always create jobs, whether `kylin.query.unique-async-query-yarn-queue-enabled` is on, and whether an upstream fix already exists outside this snapshot are unknown. Line numbers refer to this snapshot only. The async-query route additionally depends on QueryContext tagging the request as async and on the job actually reaching runSparkSubmit.",
+      "weakness_type": "CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+    }
+  ],
+  "coverage_summary": "Scope: 4,112 repository-visible files (2,518 Java plus JS/Scala/XML/properties) from the Apache Kylin 5.1.0-SNAPSHOT tree; binary files skipped by the tooling; no test sources are present in the snapshot. I inspected the REST controllers and services for common-server/common-service/metadata-server/query-server/data-loading-server/ops-server/rec-server, the Spring security configurations (kylinSecurity.xml variants and SecurityConfig), the job/spark command execution stack (CliCommandExecutor, NSparkExecutable, DefaultSparkBuildJobHandler, AsyncQueryJob, ShellExecutable), persistence/JDBC stores, file/zip utilities, config plumbing (KylinConfig/KylinConfigExt/ProjectInstance), and the async-profiler and UI-proxy code paths. The P1 relation index was used only for navigation; it reports partial coverage (4,091/4,112 files indexed, 1,515 parsed, 87,453 unresolved calls, 21 files missing), no control/data-flow or semantic resolution, and no Spring runtime verification. I did not exhaustively review every Scala/Spark job, the streaming module, kystudio JavaScript, or all JDBC/recommendation code.",
+  "limitations": [
+    "Static review only: no code was executed, no tests/build were run, and no exploit was attempted; the candidate is a lead, not a confirmed vulnerability.",
+    "Runtime configuration is unknown: which Spring profile/security XML is active, whether micro-service/K8s mode is used, and whether async-query queue support is enabled all affect reachability.",
+    "The P1 index is explicitly partial and syntactic (no data flow, control flow, semantic resolution, or reachability proof); 21 files are not indexed and 87,453 calls are unresolved, so an unindexed path may exist.",
+    "Only one file path per relation edge was verified in source text, so attacker-controlled flows through Scala/Spark code, the JavaScript frontend, or generated/serialized configuration were not fully traced.",
+    "I could not verify whether the same issue was already fixed in a later upstream commit outside this snapshot, and I did not inspect sibling benchmark cases."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Arbitrary local file read via POST /api/system/metadata_backup_tmp_file -> FileService.getMetadataBackupFromTmpPath(tmpFilePath,fileSize) (src/common-service/.../FileService.java:67-77, src/common-server/.../NSystemController.java:206-216). Request-supplied path is opened directly; only an equality check on file length guards it, and the length-mismatch FileNotFoundException discloses the real length, so a two-step request can read any readable file.",
+      "reason": "Strong alternate lead, but the endpoint appears designed as an internal node-to-node RPC (also invoked by FileService.downloadMetadataBackTmpFile) and is `permitAll` only in the `sandbox` profile; in the testing/ldap/custom Spring profiles it is authenticated. The attacker normally needs to know/obtain each file's size, and the impact is information disclosure rather than code execution, so it was not selected over the command-injection candidate."
+    },
+    {
+      "lead": "SSRF with response reflection in SparderUIService.proxyToServer (src/query-service/.../SparderUIService.java:81-151): the `server` request parameter or base64 `server` cookie is concatenated into a URL and fetched with RestTemplate while forwarding the caller's headers, and the response body/headers are relayed.",
+      "reason": "Only reachable when RouteService.needRoute() is true (kylin.multi-tenant.enabled=true and resource groups enabled) and checkAcl() only enforces global admin when kylin.query.engine.spark-ui-acl.enabled=true (default false). Real SSRF in that mode, but deployment-conditional and lower impact than RCE; left as unconfirmed alternate lead."
+    },
+    {
+      "lead": "Async-profiler `params` passthrough: /api/jobs/profile/{start,dump}_project and /api/query/profile/* pass a request `params` string into AsyncProfilerTool.start/dump -> native AsyncProfiler.execute(...) (src/data-loading-service/.../BuildAsyncProfileHelper.java:52-94, src/spark-project/spark-common/.../AsyncProfilerTool.scala:44-65, AsyncProfiler.java:115-120).",
+      "reason": "All four job/profile handlers call JobService.setResponseLanguage(), which calls aclEvaluate.checkIsGlobalAdmin(), and the query-side handlers explicitly check global admin, so only a global admin can reach it; async-profiler's command language mainly allows profiling options/file output (arbitrary-file-write of profiler output at most), so RCE was not established from source."
+    },
+    {
+      "lead": "Zip-slip prefix-check bypass in ZipFileUtils.decompressZipFile (src/core-common/.../ZipFileUtils.java:42-63): the normalized entry path is checked with startsWith(normalizedTargetDir) but extracted with Paths.get(targetDir, entry.getName()), so a sibling directory name sharing the prefix could pass.",
+      "reason": "The only in-repo caller is the CLI tool IpObfuscator (src/tool/.../IpObfuscator.java:210); no HTTP-reachable path was found, so it was not selected."
+    },
+    {
+      "lead": "Missing authorization on ProjectService.updateJdbcConfig (src/common-service/.../ProjectService.java:1214-1234) exposed by NProjectController.updateJdbcConfig (lines 480-488): any authenticated user can overwrite a project's `kylin.source.jdbc.*` connection URL/driver, `kylin.query.pushdown.runner-class-name` and `kylin.source.jdbc.connector-class-name`, unlike the @PreAuthorize-protected sibling updateProjectConfig/updateJdbcInfo.",
+      "reason": "Looks like a genuine access-control anomaly (possible JDBC-URL/driver or CLASS-loading abuse chain), but turning it into concrete RCE depended on further class-path/gadget assumptions that I could not verify statically; kept as an unconfirmed alternate lead rather than the single candidate."
+    },
+    {
+      "lead": "ProjectService.generateTempKeytab (src/common-service/.../ProjectService.java:1183-1196) builds a file name from the request-supplied Kerberos principal (`new File(kylinConfHome, principal + \"_tmp.keytab\")`) and writes attacker-uploaded bytes there.",
+      "reason": "Requires project ADMINISTRATION, the fixed `_tmp.keytab` suffix limits traversal targets, and no execution of the written file was traced; not selected."
+    },
+    {
+      "lead": "Java deserialization sinks SerializeUtil.deserialize (used by AbstractKylinCache response deserialization) and KryoUtils.deserialize (dimension dictionary values), plus FeignRpcException.parseException.",
+      "reason": "Inputs are cache/storage-internal rather than directly request-controlled in the code paths reviewed; exploiting them would need a separate cache- or data-plane write primitive, so no concrete attacker path was established."
+    }
+  ],
+  "summary": "Apache Kylin 5.1.0-SNAPSHOT (Java, 4,112 visible files; JS frontend included). I traced attacker-controlled data into shell/file/network sinks and selected one candidate: shell command injection while constructing the `spark-submit` command line from user-editable Spark/Kylin configuration. Configuration values (project-level `kylin.engine.spark-conf.*`, `kylin.query.async-query.spark-conf.*`, and the async-query request field `spark_queue`) are concatenated into a `/bin/bash -c` command without escaping single quotes or other shell metacharacters; the only guard, `checkCommandInjection`, is a blocklist of backticks and `$( ... )` that does not match `'`, `;`, newlines, `&&`, `|`, etc. A project administrator (or a query user when `kylin.query.unique-async-query-yarn-queue-enabled=true`) can therefore obtain OS command execution as the Kylin process user when a build/async-query Spark job is submitted. Other suspicious areas (arbitrary file read via `/api/system/metadata_backup_tmp_file`, SSRF in the Sparder UI proxy, async-profiler `params` passthrough, the ZipFileUtils prefix check, and an unannotated `updateJdbcConfig`) are listed as rejected/alternate leads rather than additional candidates."
+}

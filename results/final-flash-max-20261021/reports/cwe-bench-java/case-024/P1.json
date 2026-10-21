@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the archive being extracted: the entry type/flag (tar LF_SYMLINK, zip unix-mode symlink), the link name (arbitrary absolute or `..`-relative path), and the entry mode/timestamp. `TarUnArchiver` passes `te.getLinkName()` and `AbstractZipUnArchiver` passes `zipFile.getUnixSymlink(ze)` directly to extractFile with no filtering or re-mapping.",
+      "confidence": "medium",
+      "counterevidence_checked": "The canonical-path check at AbstractUnArchiver.java:344-353 does prevent a *later entry in the same extraction* from writing content through the planted link: Java's getCanonicalFile() resolves existing symlinks (including the final component) before the startsWith comparison, so a subsequent entry whose path traverses the link is rejected with 'Entry is outside of the target directory'. Therefore arbitrary *content* write via a single archive is not demonstrated in-repo; the concrete in-repo effect is the unchecked link creation plus the subsequent setLastModified/chmod calls following the newly created link. Whether chmod follows the link depends on plexus-io's AttributeUtils.chmod (dependency not present in this snapshot) - File.setLastModified definitely follows links. No runtime execution was performed; these are source-level conclusions. Ordinary traversal (`..`, absolute names) is handled by the canonical check and was not reported as a separate issue.",
+      "id": "case-024-cand-1",
+      "impact": "Untrusted archive content can (a) cause the modification time - and probably the permissions, depending on plexus-io's chmod implementation - of arbitrary existing files outside the extraction directory when the extracting process is privileged (e.g. root in build containers), and (b) plant links inside the destination that redirect any later link-following write/copy outside the destination (arbitrary file overwrite). This defeats the containment guarantee the canonical-path check is meant to provide for archive entries.",
+      "locations": [
+        {
+          "end_line": 396,
+          "path": "src/main/java/org/codehaus/plexus/archiver/AbstractUnArchiver.java",
+          "start_line": 328
+        },
+        {
+          "end_line": 121,
+          "path": "src/main/java/org/codehaus/plexus/archiver/tar/TarUnArchiver.java",
+          "start_line": 113
+        },
+        {
+          "end_line": 179,
+          "path": "src/main/java/org/codehaus/plexus/archiver/zip/AbstractZipUnArchiver.java",
+          "start_line": 168
+        },
+        {
+          "end_line": 209,
+          "path": "src/main/java/org/codehaus/plexus/archiver/zip/AbstractZipUnArchiver.java",
+          "start_line": 200
+        }
+      ],
+      "prerequisites": "The victim extracts an untrusted tar/zip with TarUnArchiver/ZipUnArchiver (or a call path that delegates to them) into a writable destination directory, and the process must have permission to create a symlink at the entry path (canonical check passes because the entry path itself, e.g. `link`, is inside the destination). For the metadata effect, the link target (e.g. /etc/... or a build-script path) must exist and be writable by the extraction process (typical for root-run CI/build containers). For content overwrite through the planted link, a second write operation that follows links into the same directory is required.",
+      "root_cause": "AbstractUnArchiver.extractFile() creates symlinks from untrusted entry metadata without validating the target: `SymlinkUtils.createSymbolicLink( targetFileName, new File( symlinkDestination ) )` (line 371) is reached with `symlinkDestination` taken verbatim from the archive (`TarArchiveEntry.getLinkName()` / `ZipFile.getUnixSymlink()`). The containment guard in the same method (lines 344-353) canonicalizes `targetFileName` before the link is created, so it constrains only the entry path, never the link destination. After creation, the code follows the new link: `targetFileName.setLastModified( entryDate.getTime() )` (line 385) and `ArchiveEntryUtils.chmod( targetFileName, mode )` (lines 387-390) both operate through the link, reaching files outside the destination directory.",
+      "title": "Archive-controlled symlink entries are extracted without validating the link target, so link-following operations escape the destination directory",
+      "trace": "1) TarUnArchiver.execute loop (TarUnArchiver.java:113-121) or AbstractZipUnArchiver.execute loop (AbstractZipUnArchiver.java:191-217) reads an entry; for tar `isSymbolicLink()` the link name is passed as `symlinkDestination`, for zip `resolveSymlink()` returns `getUnixSymlink(ze)`. 2) AbstractUnArchiver.extractFile (328-353) applies fileMappers, computes `targetFileName = FileUtils.resolveFile(dir, entryName)` and enforces `canonicalDestPath.startsWith(canonicalDirPath)` - at this moment the link does not exist, so the target path is never resolved/validated. 3) Line 369-371 creates the link at the checked path with the unchecked destination. 4) Line 385 calls `File.setLastModified` and lines 387-390 call `ArchiveEntryUtils.chmod` on the link path; both follow the link (java.io.File/`AttributeUtils.chmod` operate on the resolved target), so they modify a file outside the destination. 5) The planted link also remains inside the extraction directory; any later code that writes through a path under it (another extraction into the same directory, or DirectoryArchiver.copyFile which has no containment check, DirectoryArchiver.java:91-106 and 150) writes outside the destination.",
+      "unverified": "Exploitability of metadata modification depends on extraction privileges and on plexus-io 3.4.1 SymlinkUtils.createSymbolicLink / AttributeUtils.chmod semantics (whether replacement of existing paths is attempted and whether chmod follows links). The content-write impact requires a subsequent link-following write by another component (e.g. DirectoryArchiver, which lacks any containment check) or extraction pass. I did not confirm that this corresponds to a specific upstream fix; no patch/CVE data was consulted.",
+      "weakness_type": "CWE-59 Improper Link Resolution ('link following') leading to out-of-directory file access; CWE-22 path traversal"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 432 visible files (0 excluded, no missing/unparsed Java files at the index level; 2 parse errors are reported by get_relation_scope). I read the main extraction stack in full (AbstractUnArchiver, TarUnArchiver, AbstractZipUnArchiver, ZipUnArchiver, TarFile/TarResource/TarSymlinkResource), the archive-creation stack (AbstractArchiver, AbstractZipArchiver, ConcurrentJarCreator and helpers, TarArchiver, JarArchiver/Manifest/JdkManifestFactory, WarArchiver), the directory/compressor paths (DirectoryArchiver, gzip/zstd/bzip2/xz/snappy unarchivers, Streams, ResourceUtils, ArchiveEntryUtils), zip/archiver helper classes (ByteArrayOutputStream, OffloadingOutputStream, DeferredScatterOutputStream, AddedDirs, ZipResource/ZipSymlinkResource, both PlexusIoZipFileResourceCollection variants), resource wrappers, manager and diags classes, interfaces, pom.xml, README/ReleaseNotes and .github config. The relation index was used for navigation only (syntactic symbols/calls, no data flow, no SAST) and every candidate edge was re-verified against source text. The jira/*.json dump is untrusted legacy issue data and was used only for context; no ground-truth/patch data was consulted.",
+  "limitations": [
+    "No test sources are present in the snapshot, so upstream regression/security tests could not be used to confirm the intended weakness or its fix commit.",
+    "Dependencies that implement part of the behavior are not in the snapshot: plexus-io 3.4.1 (SymlinkUtils.createSymbolicLink, AttributeUtils.chmod, path attribute handling) and plexus-utils 3.5.1 (FileUtils.resolveFile). Their exact semantics were reasoned about from call sites only.",
+    "No code was executed and no archive was crafted; all conclusions are static, and the P1 relation index provides no control/data-flow, reachability, or exploitability proof (syntactic candidates only; 2 files had parse errors).",
+    "Not every one of the 144 Java files was read line-by-line: small compressor/wrapper/resource-collection classes, the Archiver/UnArchiver interfaces, diags helpers and release metadata were reviewed only cursorily, so an injected or obscure issue in those areas cannot be fully excluded.",
+    "Java getCanonicalFile() symlink-resolution behavior on the extraction platform (including dangling-link and Windows cases) was assumed from JDK semantics rather than verified at runtime, which is why the same-archive write-through counterevidence is stated but not experimentally settled."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DirectoryArchiver.execute()/copyFile() build output paths from archive-derived resource names without any canonical containment check (`fileName = destDir + File.separator + fileName`, then Files.newOutputStream via ResourceUtils.copyFile; symlink destinations are also created unchecked at lines 95-106).",
+      "reason": "Plausible (arbitrary write when addArchivedFileSet() is used with an untrusted archive) but not selected: DirectoryArchiver is a less central, caller-dependent path, and I could not establish attacker control over its inputs from repository code alone, so it is a secondary unconfirmed lead rather than the single strongest candidate."
+    },
+    {
+      "lead": "Archive creation emits entry names that can be absolute or contain '..' (AbstractZipArchiver.addResources/zipFile, TarArchiver.tarFile vPath handling), which could produce traversal archives.",
+      "reason": "The entry names come from the API caller's addFile/addFileSet inputs, not from an untrusted archive; no security boundary is crossed by the library itself, so this is not a source-evidenced vulnerability."
+    },
+    {
+      "lead": "PlexusIoVirtualFileResource.isSymbolicLink() calls getAttributes().isSymbolicLink() while getAttributes() always returns null (PlexusIoVirtualFileResource.java:97-119).",
+      "reason": "Latent NullPointerException, but the only concrete subclass (PlexusIoVirtualSymlinkResource) overrides isSymbolicLink(), so no reachable security impact was demonstrated; at most a robustness issue."
+    },
+    {
+      "lead": "Zip-extraction output-size guard (maxOutputSize) uses BoundedInputStream(in, remainingSpace + 1) with default Long.MAX_VALUE; and extractFile swallows FileNotFoundException.",
+      "reason": "No exploitable overflow/limit bypass found: the default+1 overflows to Long.MIN_VALUE which disables the bound, but that only matches the documented default of 'unlimited'; remaining issues are DoS hardening, not a distinct vulnerability."
+    },
+    {
+      "lead": "getManifest()/Manifest parsing of manifest files (line folding, warnings) and JarArchiver Class-Path/index handling.",
+      "reason": "Inputs are build-configured manifest files/addressed jars rather than an untrusted network boundary reachable in this snapshot; no concrete security impact could be substantiated from the source."
+    }
+  ],
+  "summary": "Snapshot is the released source tree of plexus-archiver 4.7.1 (pom.xml version 4.7.1; src/main only, no test sources). The main trust boundary is archive extraction: TarUnArchiver and AbstractZipUnArchiver both funnel every entry into AbstractUnArchiver.extractFile, which resolves the entry name under the destination directory and enforces a canonical-path containment check. I reviewed the extraction path, archive/writer paths (AbstractZipArchiver, TarArchiver, JarArchiver/Manifest, DirectoryArchiver, zip helpers, compressors, manager), and configuration/build files. The strongest source-supported issue is the handling of attacker-supplied symbolic-link entries in AbstractUnArchiver.extractFile: the link destination comes straight from the archive and is never constrained, and the containment check is performed before the link exists, so the subsequent setLastModified/chmod calls follow the freshly created link to its target outside the destination directory. One candidate is submitted; DirectoryArchiver's unguarded copy path is noted as an unconfirmed secondary lead, and several other flagged patterns were rejected for lack of evidence of a concrete security impact."
+}

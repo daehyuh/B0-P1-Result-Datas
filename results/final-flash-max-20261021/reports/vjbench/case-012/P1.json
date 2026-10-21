@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The ephemeral/public DH value is attacker-controlled whenever a peer supplies it: in DHIES/IES decryption the encoded V bytes are read by DHIESPublicKeyParser (fixed-width big-endian y) and passed to new DHPublicKeyParameters(y, dhParams); the same constructor is reachable from any untrusted peer key delivered through the light-weight API. TLS is not affected because TlsDHUtils.validateDHPublicKey applies its own range check (lines 484-495).",
+      "confidence": "medium",
+      "counterevidence_checked": "The constructor is not completely unvalidated (subgroup test exists when q is present), and the 1.56 release notes state DH keys are validated 'where parameters allow it'; TLS calls TlsDHUtils.validateDHPublicKey which does enforce Y in [2, p-2], so the TLS path is protected and the gap is specific to the light-weight DH/DHIES path. DSAPublicKeyParameters and ECPublicKeyParameters have stronger checks, indicating the intended invariant. DHBasicAgreement correctly rejects mismatched parameters. Exploitability is application-dependent (only if the peer key is attacker-controlled and the derived value is relied upon); no runtime execution was performed to confirm an end-to-end attack.",
+      "id": "cand-012-dh-pubkey-validation",
+      "impact": "The attacker forces a known shared secret for the key agreement. Any derived session/MAC keys are known to the attacker, defeating confidentiality and integrity of that exchange: the attacker can create DHIES ciphertexts the victim accepts and can predict/derive the keys the victim believes are secret. Where the derived value is used as an authentication or session key, this enables impersonation/decryption of subsequent traffic.",
+      "locations": [
+        {
+          "end_line": 34,
+          "path": "core/src/main/java/org/bouncycastle/crypto/params/DHPublicKeyParameters.java",
+          "start_line": 10
+        },
+        {
+          "end_line": 31,
+          "path": "core/src/main/java/org/bouncycastle/crypto/parsers/DHIESPublicKeyParser.java",
+          "start_line": 23
+        },
+        {
+          "end_line": 70,
+          "path": "core/src/main/java/org/bouncycastle/crypto/agreement/DHBasicAgreement.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 38,
+          "path": "core/src/main/java/org/bouncycastle/crypto/params/DSAPublicKeyParameters.java",
+          "start_line": 22
+        }
+      ],
+      "prerequisites": "An application uses the light-weight DHIES/IES (IESEngine with DHBasicAgreement and DHIESPublicKeyParser) or DHBasicAgreement directly with a peer-controlled public key. For y = 1 acceptance the DHParameters must carry q (standard groups do); when q is null the equal-mod-p test is skipped entirely and y = 0 is also accepted. No special privileges are needed; the trigger is a crafted ciphertext/key encoding.",
+      "root_cause": "DHPublicKeyParameters.validate() only performs the subgroup test y^q mod p == 1 when q is present and never enforces 1 < y < p-1. Consequently y = 1 (and, when q is null, arbitrary values such as 0) are accepted as valid DH public keys. DHBasicAgreement.calculateAgreement() then computes the shared secret Z = y^x mod p without rejecting degenerate results, so Z is 0 or 1 — a constant the attacker knows. DHIESPublicKeyParser feeds attacker-chosen bytes straight into this constructor.",
+      "title": "DH public-key validation accepts y = 1 (missing range check), letting an attacker force a known DH/IES shared secret",
+      "trace": "Attacker crafts DHIES ciphertext V||C||T with V encoding y = 1 (or y = 0 when q is null) -> IESEngine.processBlock -> keyParser.readKey -> DHIESPublicKeyParser.readKey (lines 23-31) -> new DHPublicKeyParameters(1, dhParams) -> validate() sees 1^q mod p == 1 and accepts -> agree.init(privParam); agree.calculateAgreement(pubParam) -> DHBasicAgreement returns 1^x mod p = 1 (or 0^x = 0) -> BigIntegers.asUnsignedByteArray(...,Z), KDFParameters(Z, derivationV), kdf.generateBytes(...) derive K1/K2 that the attacker can compute -> attacker-produced MAC T verifies and the recipient accepts the attacker's ciphertext/derived key as genuine.",
+      "unverified": "Exact upstream fix commit/CVE mapping is unverified offline; the assessment that later Bouncy Castle versions add a y-range check to DHPublicKeyParameters is based on source recollection, not on inspected patched code in this snapshot. Whether typical callers use DHParameters with q (making y = 1 pass) versus q = null (making any y pass) was not exhaustively traced across all consumers.",
+      "weakness_type": "Improper public-key validation / small-subgroup (known-key) attack — CWE-345, CWE-20"
+    }
+  ],
+  "coverage_summary": "Source scope: 3,203 model-visible files (3,065 Java; binary-likes filtered by NUL detection, no symlinks/sensitive-name exclusions). Relation index covers 3,200 files / 3,065 parsed Java files with 3 omitted, and is explicitly partial: syntax only, no control/data-flow, no semantic resolution, no runtime reachability (32,839 unresolved calls). I read source in the core crypto encodings/signers/agreements/params/engines/parsers packages, prov JCE RSA/DSA wiring and keystore MAC checks, TLS DH utilities/RSA utils, and the pg/cms RSA unwrapping wiring, and cross-checked every candidate against the actual text (index edges used only for navigation). I did not exhaustively review the pqc module, OpenPGP protocol internals, PKIX/CMS certificate and signature processing, ASN.1 parser edge cases, DTLS/renegotiation state machines, the mail module, or the j2me/jdk1.1-1.3-1.4 duplicate trees; no coverage claims are made for those areas.",
+  "limitations": [
+    "Relation index is partial and syntactic: no data-flow, semantic type resolution, or runtime reachability; candidate reachability arguments are based on reading call sites, not execution.",
+    "No code was executed and no tests/scanners were run, so the finding is a source-level lead, not a runtime-confirmed vulnerability.",
+    "Exact CVE/fix-commit association could not be verified offline; the snapshot's version label (v1.56b) and dated files were used only as context.",
+    "Several parallel/stale source trees (j2me, jdk1.1/1.3/1.4) contain older variants of reviewed classes (e.g., an older PKCS1Encoding with explicit side-channel TODOs); findings above refer to the main src/main/java tree, and behavior of builds that select compatibility trees was not assessed.",
+    "Large attacker-facing modules (TLS/DTLS protocol handling, ASN.1/X.509 parsing, PKIX path validation, PGP message processing) were spot-checked rather than exhaustively audited."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "PKCS1Encoding default decode path (pLen == -1) is not constant time and throws distinguishable exceptions ('block incorrect' vs 'block incorrect size'), a potential Bleichenbacher/RSA PKCS#1 v1.5 decryption oracle; reachable from JCE CipherSpi.PKCS1v1_5, pkix BcRSAAsymmetricKeyUnwrapper, and pg BcImplProvider.",
+      "reason": "Real code smell with high impact, but the library deliberately provides constant-time pLen/fallback constructors and TLS already uses the fallback variant; whether this snapshot's intended vulnerability fix targets this file (my recollection associates the fix release with a later branch) could not be verified from source alone, so it remains an unconfirmed lead."
+    },
+    {
+      "lead": "ECDHBasicAgreement/ECDHCBasicAgreement multiply the peer point directly (no ECAlgorithms.cleanPoint) although ECAlgorithms.importPoint exists and throws for foreign curves; a peer ECPoint built on a different curve with matching ECDomainParameters could enable invalid-curve key recovery.",
+      "reason": "Requires the application to construct ECPublicKeyParameters from a point not decoded on the expected curve; ECPublicKeyParameters already validates the point on its own curve, so the practical attack surface is narrow and no attacker-controlled path in this snapshot could be demonstrated from source."
+    },
+    {
+      "lead": "DSASigner.generateSignature lacks r/s == 0 regeneration loops and GOST3410Signer.generateSignature allows k == 0 (only checks k < q), so a pathological k leaks or degenerates the signature.",
+      "reason": "Probability is cryptographically negligible (roughly 2^-qBits) and the code otherwise matches long-standing upstream structure; no evidence this is the fixed issue and impact is not realistically reachable."
+    },
+    {
+      "lead": "ElGamalPublicKeyParameters performs no validation of y at all.",
+      "reason": "Legacy algorithm with no attacker-facing peer-key flow identified in this snapshot and no corroborating evidence of a targeted fix; weaker than the selected DH candidate."
+    }
+  ],
+  "summary": "Reviewed the Bouncy Castle Java snapshot (provider reports v1.56b; release notes end at 1.56; no 2017-dated files), i.e. code in the 1.56→1.57 development window. Focused on attacker-input-exposed crypto code: PKCS#1/OAEP/ISO9796 encodings, DSA/ECDSA/GOST/DSTU/ECNR signers, DH/ECDH/ECDHC/DHAgreement, IES/ECIES/DHIES engines and key parsers, public-key parameter validation, TLS DH handling, and the JCE-based reachability (CipherSpi, DigestSignatureSpi, CMS/PGP unwrappers). Strongest source-supported issue found: DH public-key validation accepts out-of-range y values (notably y = 1, and any y when q is null), so a peer-supplied DHIES/IES ephemeral key can force a fully known DH shared secret; the parser path that consumes attacker bytes builds DHPublicKeyParameters directly. Other plausible leads (PKCS#1 v1.5 decryption oracle in the default decode path, missing re-check of peer EC points in ECDH agreements, missing r/s=0 or k=0 regeneration in DSA/GOST signers) are listed as rejected/unconfirmed rather than separate candidates."
+}

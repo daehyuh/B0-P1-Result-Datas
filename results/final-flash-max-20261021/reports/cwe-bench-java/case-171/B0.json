@@ -1,0 +1,110 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client that can open a TCP connection to the DataNode's normal RPC port (default 6667) fully controls the `TPipeTransferReq` fields (version, request type, body) and the handshake parameter map. Request types and body encodings are public (`PipeRequestType`, `PipeTransferConfigPlanReq`, `ConfigPhysicalPlan` serialization). No credentials are required for HANDSHAKE_CONFIGNODE_V1 or HANDSHAKE_DATANODE_V1; the client can also set `username=root` in a V2 handshake because login is a no-op on the ConfigNode receiver.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked the paths that do enforce authentication: `IoTDBDataNodeReceiver.tryLogin` (lines 414-435) and `executeStatement` (lines 689-738) verify login and call `AuthorityChecker.checkAuthority`, but they are only invoked for HANDSHAKE_DATANODE_V2 and statement payloads, not for HANDSHAKE_CONFIGNODE_*/TRANSFER_CONFIG_* nor for file pieces; the ConfigNode receiver's `needHandshake` only requires a prior (unauthenticated V1) handshake; `IoTDBConfigNodeReceiver.checkPermission` does implement privilege checks, but it trusts the receiver's self-declared `username` (default \"root\"); `BaseAuthorizer`/`LocalFileAuthorizer` correctly treat \"root\" as admin, which is what makes the default identity dangerous; V2 handshake does require a sender clusterId distinct from the receiver and calls `tryLogin`, but the attacker can simply use V1 or declare username=root in V2. No additional login filter exists on the Thrift service (no processor interceptor in `DataNode`/service registration).",
+      "id": "iotdb-pipe-receiver-missing-auth",
+      "impact": "Unauthenticated remote privilege escalation: the attacker can create a user with MANAGE_USER/ALL privileges or reset the built-in root password via an UpdateUser plan, then log in normally and perform any database operation, including `CREATE FUNCTION`/pipe-plugin loading (code execution), data deletion (DropDatabase/DeleteDatabase, SetTTL) and permission changes. The V1 file-transfer path additionally gives an unauthenticated arbitrary file write (attacker-controlled bytes and file name/path), which can be used to overwrite application files or, combined with the UDF/trigger jar loading path, achieve code execution.",
+      "locations": [
+        {
+          "end_line": 2697,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/protocol/thrift/impl/ClientRPCServiceImpl.java",
+          "start_line": 2694
+        },
+        {
+          "end_line": 182,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/pipe/receiver/protocol/thrift/IoTDBDataNodeReceiver.java",
+          "start_line": 162
+        },
+        {
+          "end_line": 325,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/pipe/receiver/protocol/thrift/IoTDBDataNodeReceiver.java",
+          "start_line": 311
+        },
+        {
+          "end_line": 571,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/pipe/receiver/protocol/thrift/IoTDBDataNodeReceiver.java",
+          "start_line": 568
+        },
+        {
+          "end_line": 3160,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/queryengine/plan/execution/config/executor/ClusterConfigTaskExecutor.java",
+          "start_line": 3135
+        },
+        {
+          "end_line": 2262,
+          "path": "iotdb-core/confignode/src/main/java/org/apache/iotdb/confignode/manager/ConfigManager.java",
+          "start_line": 2247
+        },
+        {
+          "end_line": 235,
+          "path": "iotdb-core/confignode/src/main/java/org/apache/iotdb/confignode/manager/pipe/receiver/protocol/IoTDBConfigNodeReceiver.java",
+          "start_line": 199
+        },
+        {
+          "end_line": 341,
+          "path": "iotdb-core/confignode/src/main/java/org/apache/iotdb/confignode/manager/pipe/receiver/protocol/IoTDBConfigNodeReceiver.java",
+          "start_line": 237
+        },
+        {
+          "end_line": 455,
+          "path": "iotdb-core/confignode/src/main/java/org/apache/iotdb/confignode/manager/pipe/receiver/protocol/IoTDBConfigNodeReceiver.java",
+          "start_line": 452
+        },
+        {
+          "end_line": 189,
+          "path": "iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/pipe/receiver/IoTDBFileReceiver.java",
+          "start_line": 94
+        },
+        {
+          "end_line": 404,
+          "path": "iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/pipe/receiver/IoTDBFileReceiver.java",
+          "start_line": 362
+        },
+        {
+          "end_line": 80,
+          "path": "iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/pipe/config/constant/PipeConnectorConstant.java",
+          "start_line": 80
+        }
+      ],
+      "prerequisites": "Network reachability to a DataNode RPC port; default configuration where the built-in admin name is \"root\" (CommonConfig default) and the V1 timestamp precision is guessable (\"ms\"/\"us\"/\"ns\"). One prior handshake request is needed so the receiver directory exists (`needHandshake`); the V1 handshakes require no credentials. Not dependent on non-default options, external plugins, or user interaction.",
+      "root_cause": "The client-facing pipe transfer entry performs no session/login check. `ClientRPCServiceImpl.pipeTransfer` hands any `TPipeTransferReq` straight to the pipe receiver; only HANDSHAKE_DATANODE_V2 (via `tryLogin`) and statement-based payloads establish/verify a login. Config-region requests (HANDSHAKE_CONFIGNODE_* / TRANSFER_CONFIG_PLAN) are forwarded verbatim by the DataNode to the ConfigNode, where `IoTDBConfigNodeReceiver.tryLogin()` is a no-op (\"Login check will be done in the data node receiver\") even though no such check occurs for these request types, and `checkPermission(plan)` evaluates privileges for the receiver's `username` field, which defaults to the admin name \"root\". Independently, HANDSHAKE_DATANODE_V1 carries no credentials and opens an unauthenticated file-transfer session whose remote `fileName` is used unsanitized as `new File(receiverDir, fileName)`.",
+      "title": "Unauthenticated DataNode pipeTransfer RPC executes ConfigNode plans as the default admin and enables attacker-named file writes",
+      "trace": "1) Attacker calls the DataNode's public `pipeTransfer` Thrift method with HANDSHAKE_CONFIGNODE_V1 (type 0); `IoTDBDataNodeReceiver.receive` routes config request types to `handleTransferConfigPlan`, which forwards the raw request to the ConfigNode (`ClusterConfigTaskExecutor` -> `ConfigNodeClient.handleTransferConfigPlan`). 2) On the ConfigNode, `ConfigManager.handleTransferConfigPlan` feeds the request to `IoTDBConfigNodeReceiver`; `handleTransferHandshakeV1` creates the receiver dir while `tryLogin()` returns SUCCESS unconditionally, so the receiver's `username` stays at the default \"root\". 3) Attacker then sends TRANSFER_CONFIG_PLAN (type 200) with a serialized `ConfigPhysicalPlan` body (e.g. CreateUser, UpdateUser for userName=\"root\", GrantUser/GrantRole, DropUser, DeleteDatabase, SetTTL). `IoTDBConfigNodeReceiver.executePlanAndClassifyExceptions` deserializes it, and `checkPermission` asks `configManager.checkUserPrivileges(\"root\", ...)`, which short-circuits to admin -> SUCCESS; `executePlan` then writes the plan through consensus (e.g. `PermissionManager.operatePermission` or `ConsensusManager.write`). 4) The same entry point also accepts HANDSHAKE_DATANODE_V1 (type 1, no credentials): `IoTDBFileReceiver.handleTransferHandshakeV1` only checks timestamp precision and then accepts TRANSFER_TS_FILE_PIECE (type 4), whose remote `fileName` is passed unsanitized to `new File(receiverFileDirWithIdSuffix.get(), fileName)` and written via RandomAccessFile, allowing traversal outside the receiver directory; the pipe-consensus receiver uses the same pattern (`PipeConsensusReceiver` ~line 902).",
+      "unverified": "Not runtime-confirmed: I did not build/start IoTDB or send requests. Serialized plan bodies and the exact request bytes were not exercised, and I could not read the tsfile library or the ANTLR grammar (both external to this snapshot), so the precise V1 handshake body format and any parser-level name validation are inferred from callers. Impact assumes the default admin name \"root\" (or attacker-supplied username=\"root\" through the no-op ConfigNode login); if the operator renamed the admin, the config-plan checks would use a non-admin name, but unauthenticated file-transfer access would still remain.",
+      "weakness_type": "CWE-306 Missing Authentication for Critical Function / CWE-862 Missing Authorization (secondary: CWE-22 path traversal in file receiver)"
+    }
+  ],
+  "coverage_summary": "The snapshot exposes 4,194 text files across iotdb-core (datanode, confignode, node-commons, consensus, metrics, ainode), iotdb-client, iotdb-protocol, integration-test, example, distribution and docker. All `src/test` trees, the ANTLR grammar files, and the tsfile library source are absent; binary-like files are filtered. I inspected the network-facing trust boundaries (Thrift client service and its pipeTransfer path, pipe receivers and config relay, ConfigNode receiver/permission manager, REST auth filter/handlers, local-file authorizer/user managers, UDF/trigger/pipe-plugin loaders, subscription receiver and session client file handling) and searched broadly for command execution, deserialization, SQL concatenation, XXE, SSRF, TLS-verification, and path-construction sinks. Coverage of the storage/query engine internals was sampling-based rather than exhaustive.",
+  "limitations": [
+    "Read-only source review; nothing was compiled, started, or executed, so all impact statements are analytical, not runtime-confirmed.",
+    "The exact V1/V2 handshake and ConfigPhysicalPlan wire encodings were inferred from source readers/writers; the serialization classes are present but no request was constructed or sent.",
+    "Unit-test sources, the SQL grammar, and the Apache TsFile library (ReadWriteIOUtils/Object serialization, TsFile parsing) are outside the snapshot, limiting verification of parser-level validation and of the tsfile serialization helpers.",
+    "No access to CVE/fix metadata, patches, or upstream history, so the mapping of this finding to any specific CVE/CWE identifier is not established.",
+    "Binary-like files and any non-text resources were skipped by the harness filters; generated sources and packaging scripts received only cursory review."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal through UDF/trigger/pipe-plugin names in `ExecutableManager` helpers (`saveTextAsFileUnderTemporaryRoot`, `removeFileUnderLibRoot`, `removeFileUnderTemporaryRoot` concatenate `functionName`/`pluginName` into filesystem paths).",
+      "reason": "Names originate from quoted SQL identifiers, and the ANTLR grammar/lexer sources are not present in this snapshot, so it cannot be established whether '/'/'..' survive parsing ('parseIdentifier' does unwrap backticks and model-name validation is length-only, which makes this plausible but unproven). Kept as an unconfirmed lead rather than the single candidate."
+    },
+    {
+      "lead": "`ConfigTaskVisitor.isUriTrusted` combined with `CommonConfig.trustedUriPattern = Pattern.compile(\"file:.*\")` permits file:// URIs for CREATE FUNCTION/TRIGGER/PIPE PLUGIN/MODEL, i.e. loading local jars and reading local files (RCE for users holding USE_UDF/USE_TRIGGER/USE_MODEL).",
+      "reason": "This is the project's intentional (configurable) trusted-URI hardening for privileged operations; the default 'file:.*' is a hardening gap but requires an account with the relevant privilege and is an admin-configurable policy, so it was not selected as the strongest distinct issue."
+    },
+    {
+      "lead": "Java-deserialization helper `SerializeUtils.deserializeObject/deserializeObjects` calls `ReadWriteIOUtils.readObject`.",
+      "reason": "No callers exist in the snapshot (grep found only the definitions), so there is no reachable untrusted sink to support a finding."
+    },
+    {
+      "lead": "REST `AuthorizationFilter`/`UserCache` caching of Basic credentials and per-thread REST sessions.",
+      "reason": "Re-read the filter and cache: missing/invalid headers abort with 401 before a session is created and only successful logins are cached; no bypass of `AuthorityChecker.checkUser` was identified."
+    },
+    {
+      "lead": "`OpenIdAuthorizer` clock skew (`setAllowedClockSkewSeconds(Long.MAX_VALUE/1000)`), unchecked `realm_access` cast, and openid users being treated as fully privileged.",
+      "reason": "Upstream behavior gated behind the OpenID authorizer provider and a valid signed JWT; real but conditional and not the strongest source-evidenced issue in the default configuration."
+    }
+  ],
+  "summary": "Reviewed the assigned Apache IoTDB 1.3.4-SNAPSHOT tree (4,194 visible files; unit-test trees are absent from the snapshot and binary-like files are filtered). I focused on the network-facing trust boundaries: the DataNode Thrift client service, the pipe receiver entry point (`pipeTransfer`), the DataNode→ConfigNode config-plan relay, the ConfigNode pipe receiver, the REST auth filter, and the core authorizer. The strongest issue found is a missing-authentication chain in the pipe receiver that is reachable on the normal client RPC port: the DataNode dispatches attacker-supplied `TPipeTransferReq` payloads to receivers that do not authenticate the caller, so an unauthenticated client can (a) have arbitrary `ConfigPhysicalPlan`s (e.g. CreateUser/UpdateUser/GrantUser/DeleteDatabase) executed by the ConfigNode with the default admin username \"root\", and (b) open an unauthenticated V1 file-receiver session that writes attacker-named files outside the receiver directory. I could not execute the server, so this is a source-level lead, not a runtime-confirmed finding."
+}

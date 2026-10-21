@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The SASL client response for the JBOSS-DOMAIN-SERVER mechanism contains a login name and a token, both parsed from raw bytes supplied by the connecting peer in DomainServerSaslServer.evaluateResponse() (lines 94-110). The token is fully attacker-controlled; only the login name must correspond to a known managed server name (ServerInventoryImpl.validateServerEvidence lines 746-758).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the token is generated from SecureRandom and is 256 bits (ServerInventoryImpl lines 197-202), which greatly limits practical brute force, and that verification is only performed for principals of already-registered managed servers (servers map lookup, ServerInventoryImpl line 750). Checked that the SASL server completes/erases state and throws on failure (DomainServerSaslServer lines 86-114) so the only observable difference is comparison timing plus fixed protocol work. Verified there is no constant-time helper used anywhere in the snapshot (search for MessageDigest.isEqual/isEqual(/constantTime returned no hits), so this is not a case of a secure comparison being used elsewhere in the same code path. No evidence of rate limiting/lockout in this code path, and the same class also exposes a non-constant-time equals() at line 42.",
+      "id": "case-207-candidate-1",
+      "impact": "A network-positioned attacker who can measure response timing may be able to recover the per-managed-server authentication token by repeated prefix guessing and then authenticate to the host controller as that managed server (JBOSS_DOMAIN_SERVER role), i.e. register/impersonate the server on the domain management channel, receive the domain/server boot model and issue server-scoped operations. Because the token is a 256-bit random value with a 'SAT' prefix, practical full recovery over a network is very difficult and requires a low-noise channel and large sample counts; the concrete security impact is therefore a real but hard-to-exploit secret-disclosure/authentication-integrity weakness rather than a demonstrated compromise.",
+      "locations": [
+        {
+          "end_line": 57,
+          "path": "server/src/main/java/org/jboss/as/server/security/DomainServerCredential.java",
+          "start_line": 41
+        },
+        {
+          "end_line": 114,
+          "path": "server/src/main/java/org/jboss/as/server/security/sasl/DomainServerSaslServer.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 44,
+          "path": "server/src/main/java/org/jboss/as/server/security/sasl/DomainServerSaslServerFactory.java",
+          "start_line": 37
+        },
+        {
+          "end_line": 67,
+          "path": "host-controller/src/main/java/org/jboss/as/host/controller/security/SaslWrappingService.java",
+          "start_line": 50
+        },
+        {
+          "end_line": 758,
+          "path": "host-controller/src/main/java/org/jboss/as/host/controller/ServerInventoryImpl.java",
+          "start_line": 746
+        },
+        {
+          "end_line": 205,
+          "path": "host-controller/src/main/java/org/jboss/as/host/controller/ServerInventoryImpl.java",
+          "start_line": 192
+        }
+      ],
+      "prerequisites": "The attacker must be able to open a connection to a host controller management endpoint that offers the JBOSS-DOMAIN-SERVER SASL mechanism (the mechanism is aggregated into the native/HTTP-upgrade management SASL factories by SaslWrappingService, installed from NativeManagementAddHandler line 77 and HttpManagementAddHandler line 175), and be able to send repeated authentication attempts while measuring response timing. The secret is a 256-bit random token (ServerInventoryImpl.createServerAuthToken lines 197-202), so successful recovery is measurement-intensive; no lockout or rate limiting is present in the authentication path itself.",
+      "root_cause": "DomainServerCredential.verify() compares the managed server's secret token with the token supplied in the attacker-controlled SASL evidence using String.equals(), which returns at the first differing character. The same short-circuiting comparison is used by DomainServerCredential.equals(). No constant-time comparison helper is used anywhere in the repository (no MessageDigest.isEqual / constant-time utility is present), so the number of leading matching characters influences execution time before the authentication failure is generated.",
+      "title": "Non-constant-time comparison of the per-server JBOSS-DOMAIN-SERVER authentication token (timing side channel)",
+      "trace": "1) Client connects to the HC management interface and selects JBOSS-DOMAIN-SERVER; SaslWrappingService.start (lines 50-67) aggregates DomainServerSaslServerFactory into the management SASL factory. 2) DomainServerSaslServer.evaluateResponse parses attacker bytes into loginName/token and builds DomainServerEvidence (lines 94-110). 3) evidenceVerifier (ServerInventoryImpl::validateServerEvidence, lines 746-758) looks up the ManagedServer by the supplied principal and calls Credential.verify(). 4) DomainServerCredential.verify (line 53) does token.equals(suppliedToken); the mismatch position determines how much of the string is compared before returning false, and the caller then throws mechTokenNotVerified() (DomainServerSaslServer lines 112-114). Repeating the exchange with different candidate prefixes yields a remote timing oracle over the secret token.",
+      "unverified": "I did not execute or instrument the SASL exchange, so the actual signal-to-noise of the timing difference over a network was not measured; local/co-located attackers and loopback-like conditions would make the oracle much more usable than remote ones. I also did not confirm against upstream history whether this exact comparison is the seeded change or simply pre-existing upstream code, and I did not audit the external wildfly-elytron SASL plumbing that may add further constant-time or non-constant-time behavior around this callback. The attack's feasibility therefore remains a lead, not a demonstrated exploit.",
+      "weakness_type": "CWE-208 Observable Timing Discrepancy / CWE-385 Covert Timing Channel (non-constant-time comparison of a secret)"
+    }
+  ],
+  "coverage_summary": "Harness filters: 3,383 readable files; 0 files excluded for sensitive names/paths or symlinks, 0 files over the 5 MiB per-file text limit; binary-like files are refused/skipped by the tools. I surveyed the module layout and then used targeted searches plus selective full reads across the security-relevant modules: controller (RBAC/authorizer, operation context, persistence, remote operation handlers, credential references, YAML/XML configuration), server (deployment upload/exploded content/read-content, overlays, module structure parsing, domain-server SASL auth, managed server startup/marshalling, server environment), host-controller (server inventory/auth token handling, registration/domain channel handlers, discovery, git content repository, management add handlers), domain-http (management server, domain API, CORS, logout), domain-management (access-control resources, audit handlers, add-user), deployment-repository (content repo, path security, hash handling), installation-manager, security-manager, elytron subsystem (SSL/SASL/credential stores/expression resolver/transformers), logging, jmx, protocol/remoting, bootable-jar, embedded, and CLI security/deployment handlers. All ZIP-extraction sites found (bootable-jar Main, installation-manager, deployment-repository PathUtil, patching ZipUtils, CLI ArchiveHandler) contain normalize/canonical containment checks; XML parsers found either disable DTD/validation or use XMLInputFactoryUtil; no Runtime.exec/ProcessBuilder path with remote input was found. Coverage is search-and-read based, not an exhaustive line-by-line audit of all 3,383 files.",
+  "limitations": [
+    "No build, tests, dynamic analysis or timing measurements were run; all conclusions are static source observations and the submitted candidate is a lead, not a confirmed vulnerability.",
+    "Large parts of the repository were reviewed by targeted search rather than full reads (notably the ~50 KB XML parser duplicates, the large patching/installation-manager code bases, and testsuite code), so an injected logic change in an unread file cannot be excluded.",
+    "Third-party dependencies (jboss-vfs, Undertow, wildfly-elytron, SnakeYAML, JGit) are not present in the snapshot; behavior relied on by some rejected leads (VFS child-path normalization, SASL plumbing) could not be verified.",
+    "I could not compare against upstream Git history or known CVE fix commits within the allowed tools, so I cannot confirm whether the token comparison is the benchmark's intended vulnerability or pre-existing upstream behavior.",
+    "Practical exploitability of the timing side channel (256-bit random token, network jitter, no local measurement) is unverified and likely difficult; severity should be treated as low-to-medium until measured."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Deployment overlay content path used without explicit '..' validation (server/src/main/java/org/jboss/as/server/deployment/DeploymentOverlayDeploymentUnitProcessor.java lines 75-120; no path validation in DeploymentOverlayContentDefinition/DeploymentOverlayAdd).",
+      "reason": "The path comes from a management model address value and is resolved via jboss-vfs VirtualFile.getChild(); the VFS library (not part of this snapshot) is not available to confirm whether '..'/absolute paths can escape the deployment root, and write access to deployment-overlay resources is already an administrator/deployer-level privilege. Left as unconfirmed rather than submitted."
+    },
+    {
+      "lead": "Server-to-host-controller back connection uses a trust-all X509TrustManager (server/src/main/java/org/jboss/as/server/mgmt/domain/HostControllerConnectionService.java lines 170-198).",
+      "reason": "The comment explicitly documents this as an intentional 'accepting' context for the local host-controller back-channel; the connection identity is subsequently authenticated with the SASL server token. No deviation from the documented design could be established from source alone."
+    },
+    {
+      "lead": "LocalHostControllerRepository.getConfigurationFile / getFile concatenate a peer-supplied relative path without traversal validation (deployment-repository/.../LocalFileRepository.java lines 34-42), reachable from MasterDomainControllerOperationHandlerImpl GetFileOperation (host-controller .../MasterDomainControllerOperationHandlerImpl.java lines 89-108).",
+      "reason": "The caller is an authenticated domain-channel peer with the JBOSS_DOMAIN_SERVER role (AuthorizationRequestHandler in ServerToHostProtocolHandler lines 155-175), i.e. a highly trusted host-controller component; this appears to be the intended trusted-channel design and I could not show a crossing of a meaningful security boundary."
+    },
+    {
+      "lead": "cli ArchiveHandler extracts archives into a temp directory named with java.util.Random (cli/src/main/java/org/jboss/as/cli/handlers/ArchiveHandler.java lines 41, 140-151).",
+      "reason": "Predictable-temp-name/symlink concerns exist, but the command is locally invoked by the CLI user, requires local attacker filesystem access, and the zip-slip path check is present. Lower impact than the submitted lead."
+    },
+    {
+      "lead": "LogFileResourceDefinition.validateFile walks the log directory with FOLLOW_LINKS (logging/src/main/java/org/jboss/as/logging/LogFileResourceDefinition.java lines 341-366), so read-log-file could follow a symlink placed in the log directory.",
+      "reason": "Requires the ability to create a symlink inside the server log directory (local/privileged precondition), and it is a pre-existing upstream pattern; not remotely attacker-controlled in this snapshot."
+    },
+    {
+      "lead": "Host-derived default CORS origin with credentials in CorsUtil/CorsHttpHandler (domain-http/interface .../cors/CorsUtil.java lines 39-60, CorsHttpHandler.java lines 68-92).",
+      "reason": "Cross-origin requests only pass when Origin equals the Host-derived origin; the API additionally rejects OPTIONS preflights and requires JSON/DMR content type, so no concrete cross-origin bypass could be traced."
+    }
+  ],
+  "summary": "Reviewed the WildFly Core 27.0.0.Beta7 source snapshot (3,383 readable files; binary-like files are skipped by the harness, and there are no name/path or symlink exclusions). I focused on the management/security trust boundaries: management HTTP/native endpoints, SASL and domain server authentication, deployment content repository and overlay handling, RBAC constraints, ZIP extraction, expression/credential handling, and audit/logging code. The strongest source-evidenced issue I found is a non-constant-time comparison of the per-server JBOSS-DOMAIN-SERVER authentication token on the host-controller side (attacker-influenced SASL token compared with String.equals), i.e. an observable timing discrepancy/CWE-208. I did not find a clearly injected/obvious logic inversion, path-traversal or deserialization flaw that I could substantiate from this snapshot alone; several suspicious areas are listed as rejected leads. No runtime testing was performed."
+}

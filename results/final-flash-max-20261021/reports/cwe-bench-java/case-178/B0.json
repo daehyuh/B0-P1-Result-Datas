@@ -1,0 +1,73 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated REST user controls the filter JSON fields 'property', 'operator' and 'value' on /v2/entities/{entityName}/search (GET or POST), the sort parameter on /v2/entities/{entityName}, and returnCount for an aggregate count oracle. Property names are attacker-selected and only need to resolve as a metadata property path.",
+      "confidence": "medium",
+      "counterevidence_checked": "The parser does validate that property names exist in metadata and parameter values are bound with setParameter, so this is not JPQL injection. Entity-level READ is checked before query execution. The code explicitly applies attribute security to loaded entities, demonstrating that attribute read restrictions are intended to be enforced by this layer; however, the DataManager/JPQL implementation is external to the snapshot and could theoretically reject predicates on denied attributes, which was not verifiable here.",
+      "id": "restapi-attribute-filter-sort-bypass",
+      "impact": "Information disclosure of attribute-level-protected data: a user can test prefixes/equality/range conditions against hidden attributes, obtain aggregate counts, and infer ordering, reconstructing or narrowing sensitive values (for example password hashes, secrets, personal data) across readable entities. This defeats the explicit attribute read-permission control applied to response serialization.",
+      "locations": [
+        {
+          "end_line": 224,
+          "path": "modules/rest-api/src/com/haulmont/addon/restapi/api/service/filter/RestFilterParser.java",
+          "start_line": 156
+        },
+        {
+          "end_line": 217,
+          "path": "modules/rest-api/src/com/haulmont/addon/restapi/api/service/EntitiesControllerManager.java",
+          "start_line": 186
+        },
+        {
+          "end_line": 371,
+          "path": "modules/rest-api/src/com/haulmont/addon/restapi/api/service/EntitiesControllerManager.java",
+          "start_line": 336
+        },
+        {
+          "end_line": 128,
+          "path": "modules/rest-api/src/com/haulmont/addon/restapi/api/common/RestControllerUtils.java",
+          "start_line": 82
+        }
+      ],
+      "prerequisites": "A valid REST access token for a low-privileged user who has entity READ permission but is denied read access to at least one attribute of that entity, and who can reach the standard entity endpoints (/rest/v2/entities/** is authenticated). No UPDATE or administrative permission is needed.",
+      "root_cause": "The entity endpoints enforce only entity-level READ permission. Search filter property paths in RestFilterParser and sort expressions in EntitiesControllerManager are resolved against metadata and compiled into JPQL without consulting Security.isEntityAttrReadPermitted. Attribute-level security is applied only after data is loaded, by RestControllerUtils.applyAttributesSecurity, so WHERE and ORDER BY predicates still operate on attributes the user is denied permission to read.",
+      "title": "Entity attribute read permissions bypassed through search filters and sort parameters",
+      "trace": "1) GET/POST /rest/v2/entities/{entity}/search supplies a filter such as a startsWith/equality/in predicate or sort parameter targeting a denied attribute. 2) RestFilterParser.parsePropertyCondition resolves the property via metaClass.getPropertyPath and builds a parameterized JPQL predicate; EntitiesControllerManager adds it to the query. EntitiesControllerManager.addOrderBy similarly resolves sort metadata and appends ORDER BY expressions. 3) dataManager.loadList/getCount executes the JPQL, so matching/count/order depends on the denied attribute value. 4) Only afterwards RestControllerUtils.applyAttributesSecurity removes/nullifies the denied attribute and marks it inaccessible in serialization. The response body's returned IDs/rows, X-Total-Count, and ordering therefore form an oracle for values the user must not read.",
+      "unverified": "Runtime behavior of the external CUBA DataManager/security implementation was not inspectable. It is not runtime-confirmed that DataManager does not itself reject filters or sorts on attributes denied by entity attribute permissions; the finding is based on the REST layer's missing check and its explicit post-load attribute stripping.",
+      "weakness_type": "CWE-863 Incorrect Authorization (attribute-level access control bypass)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 150-file snapshot: REST controllers, service/manager classes, filter parser, authentication/OAuth classes, token store, LDAP integration, security checks, Spring/security XML, entity metadata, and build/configuration files. The main effort covered modules/rest-api, modules/core, modules/global, and relevant web/portal configuration. No readable test sources were present. \"Coverage was source-level only; runtime behavior and external CUBA/Spring dependency implementations were not inspectable.\"",
+  "limitations": [
+    "No external CUBA Platform, Spring Security OAuth2, Spring LDAP, or DataManager/EntityImportExportService source was available; checks implemented only inside those libraries could not be reviewed.",
+    "No code, tests, scanners, or exploit payloads were executed, so all candidate status is source-evidence based and not runtime-confirmed.",
+    "The snapshot contains no test directory or dependency binaries, limiting verification of filtering/sorting behavior and import/merge semantics.",
+    "Several potentially interesting areas (LDAP empty-password handling, external grant exposure, persisted-token entity exposure, cluster replication) depend on deployment configuration or external framework behavior and are recorded as unconfirmed leads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflective class loading from user input in /v2/messages/enums/{enumClassName} and /v2/metadata/enums/{enumClassName} (EnumsControllerManager and MessagesControllerManager call Class.forName on the path variable).",
+      "reason": "Direct externally controlled class selection is present, but the snapshot contains no concrete classpath gadget or static-initializer effect establishing code execution; without runtime verification the security impact remains speculative (DoS/unsafe reflection lead)."
+    },
+    {
+      "lead": "Cluster refresh-token revocation bug: TokenStoreRemoveRefreshTokenMsg handler calls removeAccessTokenFromMemory instead of removeRefreshTokenFromMemory in ServerTokenStoreImpl.",
+      "reason": "The typo is clear, but impact is limited to clustered deployments using token replication; it is a revocation robustness issue rather than the strongest demonstrated access-control flaw, so it was not selected."
+    },
+    {
+      "lead": "ExternalOAuthTokenGranter does not check RestApiConfig.getStandardAuthenticationUsers, unlike LdapAuthController.",
+      "reason": "It is not established from the snapshot that the 'external' grant is directly exposed by the OAuth token endpoint; it may be an internal programmatic issuer used by the LDAP controller, which performs the check. Direct attacker reachability is unverified."
+    },
+    {
+      "lead": "LdapAuthController does not reject a null/empty password before calling LdapTemplate.authenticate.",
+      "reason": "This depends on the external Spring LDAP implementation and the LDAP server permitting unauthenticated/anonymous binds; no source-level confirmation is available in the snapshot."
+    },
+    {
+      "lead": "Create entity endpoint may allow an existing entity ID to be submitted and update the row while checking only CREATE permission (EntitiesControllerManager.createResponseInfoEntity).",
+      "reason": "Whether this becomes an update depends on the external EntityImportExportService merge semantics, which are not in the source snapshot; left unconfirmed."
+    },
+    {
+      "lead": "Shipped default OAuth client credentials and fixed demo trusted-client/anonymous values in app properties.",
+      "reason": "These are sample/deployment configuration defaults; exploitation depends on deployments failing to override them and is not an intrinsic source-code authorization flaw on its own."
+    }
+  ],
+  "summary": "The strongest source-backed lead is an attribute-level authorization gap in the generic entity REST API: entity READ is checked, but filter and sort property paths are validated only against metadata, not against per-attribute read permissions. Because unauthorized attributes are cleared only after entities are loaded, predicates and ordering are evaluated against hidden data, creating predicate/count/order oracles. One candidate is submitted; other suspicious areas are recorded as unconfirmed rejected leads."
+}

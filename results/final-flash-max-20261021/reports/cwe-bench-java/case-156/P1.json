@@ -1,0 +1,78 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker fully controls the raw CSW XML POST body (GetRecords with resultType=\"validate\"), including DOCTYPE/ENTITY declarations and entity references placed in schema-valid string elements. CSW is reachable anonymously under the default filter chains (services.properties does not restrict the csw service).",
+      "confidence": "medium",
+      "counterevidence_checked": "The first parse in CSWXmlReader (line 46) applies EntityResolverProvider.getEntityResolver(); its default PreventLocalEntityResolver blocks local file access (and the exception text \"Entity resolution disallowed\" is handled elsewhere in the codebase, e.g., GetMapKvpRequestReader), which likely blocks file:// entities end-to-end; http(s) entity resolution is intentionally allowed for schema validation, so SSRF alone may be viewed as accepted behavior - the response reflection of fetched content is the part not justified by that design. Acknowledgment is only produced for resultType=validate. GeoServer's GeoServerURLChecker/URLCheckers gate is never consulted on this path, so the configured URL allow-list does not mitigate it. No code was executed; runtime behavior of the first parser for file: entities and the exact FreeMarker/CSW deployment were not verified.",
+      "id": "csw-acknowledgement-xxe-ssrf",
+      "impact": "Unauthenticated server-side request forgery that bypasses GeoServer's URL-check subsystem, with the fetched HTTP response body reflected back to the attacker (internal service/metadata read, e.g., cloud metadata endpoints or internal admin APIs), plus blind internal port scanning/timing. If the file: entity restriction of the first parser can be bypassed (or xmlExternalEntitiesEnabled is on), the same path yields local file disclosure into the response.",
+      "locations": [
+        {
+          "end_line": 134,
+          "path": "src/extension/csw/core/src/main/java/org/geoserver/csw/response/AcknowledgementTransformer.java",
+          "start_line": 101
+        },
+        {
+          "end_line": 96,
+          "path": "src/extension/csw/core/src/main/java/org/geoserver/csw/response/AbstractRecordsResponse.java",
+          "start_line": 91
+        },
+        {
+          "end_line": 39,
+          "path": "src/extension/csw/core/src/main/java/org/geoserver/csw/xml/v2_0_2/CSWRecordingXmlReader.java",
+          "start_line": 34
+        },
+        {
+          "end_line": 53,
+          "path": "src/extension/csw/core/src/main/java/org/geoserver/csw/xml/v2_0_2/CSWXmlReader.java",
+          "start_line": 41
+        }
+      ],
+      "prerequisites": "1) CSW extension deployed/enabled (a standard GeoServer extension, not part of gs-main by itself). 2) CSW request is an XML POST using resultType=validate so AbstractRecordsResponse routes to the Acknowledgement transformer. 3) For entity resolution: the first (hardened) parse must succeed, so http(s) entity URLs are the reliable case (PreventLocalEntityResolver allows http(s) but blocks file:); the target host must be reachable from the GeoServer JVM. 4) The response is emitted by GeoServer (no additional privileges needed).",
+      "root_cause": "AcknowledgementTransformer re-parses the raw POSTed CSW request with a default, unhardened DocumentBuilderFactory (no EntityResolver, no DTD/external-entity restrictions) and then serializes that DOM into the csw:Acknowledgement response. The parser used here differs from the hardened parser used to read the request (CSWXmlReader sets the EntityResolverProvider resolver, which allows http(s) entity resolution by default), and it does not consult GeoServer's URL-check subsystem, so external entities are fetched and their content is embedded in the response.",
+      "title": "XXE/SSRF with response reflection in CSW Acknowledgement (GetRecords resultType=validate)",
+      "trace": "POST /geoserver/csw (application/xml) with a CSW GetRecords body carrying a DOCTYPE-declared external entity referenced in a string element -> OWS Dispatcher -> CSWRecordingXmlReader.read (line 36) stores the verbatim request text in RECORDED_REQUEST and parses it once with CSWXmlReader's EntityResolverProvider-protected parser -> service executes -> AbstractRecordsResponse.write sees ResultType.VALIDATE (lines 91-93) and calls transformAcknowledgement -> AcknowledgementTransformer.encodePostEcho (lines 101-107) -> parseAsXML (lines 119-134) re-parses the raw text with DocumentBuilderFactory.newInstance()/newDocumentBuilder() with no entity resolver -> external entity is resolved (http/https; file: depending on the earlier parse) -> dumpAsXML (lines 109-117) transforms the DOM into csw:Acknowledgement/csw:EchoedRequest, so the fetched content is returned to the requester.",
+      "unverified": "Exact runtime behavior of EntityResolverProvider/PreventLocalEntityResolver for file: systemIds (throw vs empty replacement), whether the CSW extension was enabled in the deployment, and whether any container-level JAXP external-access hardening applies. No build/test execution; inference is source-level only.",
+      "weakness_type": "CWE-611 (Improper Restriction of XML External Entity Reference) leading to CWE-918 (SSRF) / information disclosure"
+    }
+  ],
+  "coverage_summary": "Scope: 8,758 model-visible files (GeoServer 2.26.2, GeoTools 32.2). P1 relation scope: index is partial - 8,466/8,758 files indexed, 5,711 Java files parsed, 2 parse errors, 292 files missing from index, 294 omitted files, 164,587 unresolved calls; no control-flow, data-flow, or semantic resolution. I read/search-reviewed core modules (src/main, src/rest, src/restconfig, src/ows, src/wms, src/wfs, src/platform, src/security) plus targeted reviews of extensions/community modules (csw, authkey, wps, importer, taskmanager, backup-restore, monitor, features-templating, params-extractor, jsr/oauth2 areas) focusing on request handling, XML parsing, URL/file access, authorization filters and output encoding. I expressly did not review every community module or every UI page.",
+  "limitations": [
+    "No code, tests, scanners, or exploit payloads were executed; findings are source-level inferences only.",
+    "The P1 index provides syntax/navigation candidates only (no data-flow, no reachability, no semantic resolution); every candidate was checked against source text, but inter-procedural runtime behavior remains unverified.",
+    "Non-Java resources are incompletely represented in the snapshot: no .ftl templates are present, so GetFeatureInfo/KML/template rendering paths (and the FreeMarker hardening files) could not be fully reviewed; docs and data-directory defaults (e.g., urlchecks.xml, rest.properties in deployed data dirs) may differ from the templates in this tree.",
+    "Whether the CSW/WPS/authkey extensions are installed and how the runtime data directory configures URL checks and the file sandbox were not verifiable offline.",
+    "Only one candidate could be submitted per the review cap; the rejected leads above are unconfirmed and were not fully traced end-to-end."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "REST store upload external/url methods can read local files / fetch URLs (RESTUtils.handleEXTERNALUpload lines 181-202; IOUtils.upload lines 525-536) with no FileAccessManager sandbox check",
+      "reason": "Real missing-control asymmetry, but the REST API is ADMIN-only under the default rest.properties, the file sandbox is not enabled by default, and the URL method is at least filtered by URLCheckers; exfiltration of non-ZIP local files is indirect. Lower impact/evidence than the submitted lead."
+    },
+    {
+      "lead": "WPS RemoteRequestInputProvider reads file:// URLs (openFileURL, lines 253-262) with only a URLCheckers check",
+      "reason": "Module-scoped, and I could not confirm a WPS process that returns the input content to the client, so exfiltration is speculative."
+    },
+    {
+      "lead": "CSV formula injection in WFS CSV output (CSVOutputFormat.prepCSVField lines 384-397 does not neutralize leading =,+,-,@)",
+      "reason": "Definite missing hardening but client-side/exploitation requires a victim opening the file with a spreadsheet and data the attacker controls; lower server-side impact."
+    },
+    {
+      "lead": "Authkey GeoServerRestRoleService builds JsonPath expressions and REST URLs by string substitution of the username (lines 221-226)",
+      "reason": "Injection-shaped, but the username must also authenticate, so role escalation via a valid account is not clearly reachable; the remote service contract is unknown."
+    },
+    {
+      "lead": "GeoServerHomePage/other Wicket pages rendering unescaped model strings (setEscapeModelStrings(false))",
+      "reason": "Checked each occurrence in-tree: dynamic values are escaped with StringEscapeUtils.escapeHtml4 or are static/i18n, so no reachable stored XSS found there."
+    },
+    {
+      "lead": "XStream/JMS-cluster XML deserialization sinks and XStreamPersister",
+      "reason": "SecureXStream whitelist (NoTypePermission.NONE plus explicit types) is in place, and JMS handlers require broker/channel access."
+    },
+    {
+      "lead": "Path traversal in REST resource API / store uploads",
+      "reason": "Filesystem ResourceStore.get applies Paths.valid which rejects dot-dot components; leading-slash handling does not escape the base directory via java.io.File(parent, child)."
+    }
+  ],
+  "summary": "Reviewed the GeoServer 2.26.2 source snapshot (8,758 files; P1 relation index parsed 5,711 Java files with syntax-only edges, no data-flow/CFG). The strongest source-evidenced lead is an XML external-entity / SSRF issue in the CSW extension: the EchoedRequest re-parse in AcknowledgementTransformer uses a completely unhardened DocumentBuilderFactory on the raw attacker-supplied CSW POST body and then serializes the parsed DOM (with expanded entities) into the response. Other inspected areas (Wicket pages, REST resource paths, XStream whitelist, sandbox enforcer, URL checks) were either hardened in this snapshot or exploitable only under non-default configurations, and are listed as rejected/uncertain leads."
+}

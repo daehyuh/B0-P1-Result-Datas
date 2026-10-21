@@ -1,0 +1,94 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker fully controls the HTTP `Cookie` header, i.e. the `ratpack_session_N` and `ratpack_lat_N` values that `ClientSideSessionStore.readCookies/getCookieStorage/deserialize` concatenate, Base64-decode and verify. The only barrier is HMAC-SHA1 over the payload keyed with the default `System.currentTimeMillis()/10000` string; the attacker can obtain a valid (ciphertext, MAC) pair from a cookie issued to them and brute-force the key offline over plausible process/config-creation times (search space is ~8,640 keys per day of possible start time, still small over years, each candidate costing one HMAC).",
+      "confidence": "medium",
+      "counterevidence_checked": "The MAC is computed encrypt-then-MAC over the ciphertext (correct order), and `ByteBufUtil.equals` requires equal readable lengths, so naive tampering without the key fails. The module javadoc/example shows `setSecretToken(\"your token for signing\")`, so an application that explicitly sets a strong token (or a custom safe `SessionSerializer`/`JavaSessionSerializer`) is not exposed by default and has reduced deserialization impact. The default (server-side) `SessionModule` store keeps data in memory keyed by random UUID session IDs, so this issue is specific to the cookie-based store. The time-based token is not known without effort; the attack requires an offline brute-force over plausible app-start times using a captured cookie pair, which I did not run/confirm.",
+      "id": "ratpack-clientside-session-predictable-mac-key",
+      "impact": "Session forgery and tampering: arbitrary values for every session key, authentication/authorization flags, or pac4j `UserProfile` objects can be injected, and the `ratpack_lat` timestamp can be set far in the future to defeat the 24h inactivity check. Because the resulting bytes are Java-deserialized with `ObjectInputStream.readObject()` before type validation, an attacker who forges a valid cookie can trigger deserialization gadget chains present on the server classpath, i.e. remote code execution, or at minimum disrupt/own session state.",
+      "locations": [
+        {
+          "end_line": 34,
+          "path": "ratpack-session/src/main/java/ratpack/session/clientside/ClientSideSessionConfig.java",
+          "start_line": 24
+        },
+        {
+          "end_line": 141,
+          "path": "ratpack-session/src/main/java/ratpack/session/clientside/ClientSideSessionModule.java",
+          "start_line": 127
+        },
+        {
+          "end_line": 118,
+          "path": "ratpack-session/src/main/java/ratpack/session/clientside/internal/ClientSideSessionStore.java",
+          "start_line": 109
+        },
+        {
+          "end_line": 166,
+          "path": "ratpack-session/src/main/java/ratpack/session/clientside/internal/ClientSideSessionStore.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 261,
+          "path": "ratpack-session/src/main/java/ratpack/session/clientside/internal/ClientSideSessionStore.java",
+          "start_line": 223
+        },
+        {
+          "end_line": 216,
+          "path": "ratpack-session/src/main/java/ratpack/session/SessionModule.java",
+          "start_line": 208
+        },
+        {
+          "end_line": 190,
+          "path": "ratpack-session/src/main/java/ratpack/session/internal/DefaultSession.java",
+          "start_line": 158
+        },
+        {
+          "end_line": 41,
+          "path": "ratpack-session/src/main/java/ratpack/session/internal/JavaBuiltinSessionSerializer.java",
+          "start_line": 33
+        }
+      ],
+      "prerequisites": "Application registers `ClientSideSessionModule` (after `SessionModule`) and does not call `setSecretToken(...)`, which is the documented default path; the attacker can receive/observe one session cookie pair to brute-force the key offline. For the RCE impact, a deserialization gadget usable with the app's classpath must be present; otherwise the attacker can still forge/tamper session contents. If `secretKey` is also set, the payload is AES-encrypted, but its key is also the attacker-known/brute-forced token-derived secret after forgery, so it does not add protection once the MAC key is recovered.",
+      "root_cause": "`ClientSideSessionConfig` initializes `secretToken` to `Long.toString(System.currentTimeMillis() / 10000)`, a low-entropy, time-derived value; `ClientSideSessionModule.signer(...)` uses those bytes directly as the HMAC key with no minimum length/entropy validation, and `crypto(...)` returns `NoCrypto` whenever `secretKey` is unset, so only the weak HMAC protects the cookie. `ClientSideSessionStore.load/deserialize` treats the signed cookie contents as session bytes, and `DefaultSession.hydrate` feeds those bytes to `JavaBuiltinSessionSerializer`, whose `ObjectInputStream.readObject()` executes gadget deserialization before the `type.isInstance` check.",
+      "title": "Predictable default client-side session signing key enables cookie forgery and Java deserialization of attacker-controlled session data",
+      "trace": "1) `ClientSideSessionConfig` line 29 sets the default token from wall-clock time; line 78-89 expose it with no validation. 2) `ClientSideSessionModule.signer` (lines 129-131) turns it into the HMAC `SecretKeySpec`; `crypto` (lines 136-141) yields `NoCrypto` unless the user set `secretKey`, so cookies are signed-but-not-encrypted. 3) `ClientSideSessionStore.load` (109-118) deserializes the `ratpack_lat` cookie in `isValid` (136-166) and the session cookies in `deserialize` (223-261); `deserialize` concatenates attacker cookie values, splits on ':', Base64-decodes, recomputes the MAC with the weak key (`signer.sign`) and compares with `ByteBufUtil.equals`; on match it decrypts (identity by default) and returns the bytes. 4) `DefaultSession.getData` -> `hydrate` (158-190) passes those bytes to the bound `defaultSerializer`; `SessionModule` binds `JavaBuiltinSessionSerializer`. 5) `JavaBuiltinSessionSerializer.deserialize` (33-41) calls `ObjectInputStream.readObject()` on the attacker bytes and only checks the type afterwards, so a gadget executes during the read. 6) `DefaultSession.Data.get` (262-283) likewise deserializes stored entry bytes with the default serializer, so any session read also reaches the sink.",
+      "unverified": "No runtime test was executed (read-only review); the offline key brute-force, the exact feasible search window, and the availability of a working gadget chain on a given application classpath were not verified. Some dependencies (Netty/Groovy/Jackson) are outside the reviewed source and were not audited.",
+      "weakness_type": "Use of a predictable default secret for MAC over client-controlled data (CWE-330/CWE-798), leading to session forgery and unsafe Java native deserialization (CWE-502)"
+    }
+  ],
+  "coverage_summary": "947 repository-relative files were in scope (get_source_scope reports 0 excluded by path/symlink/size filters; no NUL-skipped files were reported during searches). The snapshot contains only main sources for the listed modules — `src/test` trees are absent (e.g. ratpack-core/src/test and ratpack-session/src/test list empty), and there is no VCS history. I read in detail: ratpack-session (client-side store/crypto/signer/config, DefaultSession, serializers, stores), ratpack-core file/path handling (FileSystemBinding, FileHandler, FileRenderer, ResponseTransmitter, path binders), request/response/cookie/header handling, error handlers, config/SSL, jackson/gson parsers, health checks, and the Groovy/Handlebars/Thymeleaf template loaders; searched for deserialization (ObjectInputStream), crypto, file/path resolution, redirects, script execution, SQL, and reflection sinks. Build scripts, JS/CSS assets, perf, gradle-plugin, site, and several integration modules (rx/rx2/reactor/hystrix/newrelic/metrics/rocker/retrofit/lazybones/spring-boot/consul) were only skimmed.",
+  "limitations": [
+    "Static review only: no code was executed, no tests run, no exploit payloads built, and no runtime confirmation was possible.",
+    "The repository snapshot has no test sources and no git history, so I could not compare against upstream fixes or identify intentionally introduced changes.",
+    "The brute-force feasibility of the time-derived default token, the achievable session-forgery impact, and gadget availability on a real classpath are unverified.",
+    "Dependency versions (Netty, Groovy, Jackson, pac4j, SnakeYAML, H2, etc. pinned in gradle/dependencies.gradle) and their own CVEs were not audited.",
+    "Large portions of ratpack-gradle, ratpack-site, the manual, JS assets, and several integration modules were not exhaustively read, so additional issues could exist there."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "`CachingTemplateResolver.doLoad` resolves `templatesDir.resolve(key)` without normalize/prefix check (unlike TextTemplateRenderingEngine, Handlebars and Thymeleaf loaders that use `FileSystemBinding.file`), allowing `../` template paths.",
+      "reason": "Reachable only if the application passes attacker-controlled data as the MarkupTemplate name; the library API's template name is normally developer-supplied, so direct attacker control is not demonstrated."
+    },
+    {
+      "lead": "`InferringPublicAddress` trusts `Host`, `X-Forwarded-Host` and `X-Forwarded-Proto` (used by default when no publicAddress is configured), which can yield host-header-injection/open-redirect in responses built from `PublicAddress`.",
+      "reason": "Impact depends on application code redirecting to/echoing the inferred address; no default handler in the reviewed sources turns a user-controlled path into such a redirect. DefaultRedirector only uses the inferred host when the app chooses to redirect, and Netty blocks header CRLF injection."
+    },
+    {
+      "lead": "`ratpack-remote` `RemoteControlHandler`/`RatpackReceiver` execute arbitrary Groovy closures sent over HTTP without authentication (effective RCE).",
+      "reason": "The module is opt-in (`RemoteControl.handlerDecorator()` must be registered explicitly) and is documented test/development tooling; no default wiring was found that exposes it."
+    },
+    {
+      "lead": "Path traversal in `FileHandler` via percent-decoded `..` segments or symlinks (the constructor even carries a 'TODO - validate the path isn't escaping up with ../').",
+      "reason": "`DefaultFileSystemBinding.file` normalizes and verifies `startsWith(binding)` after the single decode, so `..` escapes return 404; the request path is decoded only once. Symlinks inside the base dir are followed, but that is not attacker-creatable in the reviewed code."
+    },
+    {
+      "lead": "Session fixation via `CookieBasedSessionId` accepting any client-supplied JSESSIONID and never rotating it on privilege change.",
+      "reason": "Ratpack only reads the cookie; there is no reviewed primitive that lets an attacker set a victim's cookie (e.g. URL-based session ID), and stores are keyed by the session ID, so a concrete fixation exploit was not established."
+    },
+    {
+      "lead": "Insecure Java session deserialization as a standalone issue (`JavaBuiltinSessionSerializer` / `DefaultSession.SerializedForm`).",
+      "reason": "Same root cause chain as the selected candidate (the cookie store is what exposes attacker bytes to it); kept as amplifier, not a separate candidate."
+    }
+  ],
+  "summary": "Reviewed the Ratpack 1.7.5-SNAPSHOT source tree (947 files, main sources only). The strongest candidate is the cookie-based (\"client side\") session stack: its default MAC secret is derived from `System.currentTimeMillis()/10000`, so a client can guess/brute-force it offline from a captured own cookie, then forge `ratpack_session_*`/`ratpack_lat_*` cookies. The forged bytes are decrypted (identity by default) and passed to the default Java-serialization `SessionSerializer`, which calls `ObjectInputStream.readObject()` on them before any type check — enabling session data/authorization tampering and, with a gadget class on the classpath, remote code execution. Other plausible leads (MarkupTemplate loader path traversal, Host/X-Forwarded-Host trust in `InferringPublicAddress`, opt-in `ratpack-remote` command execution, FileHandler traversal) were rejected or downgraded as app-dependent or by-design."
+}

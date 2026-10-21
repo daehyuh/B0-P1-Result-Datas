@@ -1,0 +1,64 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client opens a TCP connection to a Netty endpoint with SniHandler in the pipeline and sends a TLS record whose handshake header declares a 24-bit ClientHello length (up to 0xFFFFFF, ~16.7 MB) that does not fit in the first record. The record length is only 16 bits, so the handshake-length field is the attacker-controlled value that drives the allocation.",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched the whole snapshot for 'maxClientHelloLength' (no matches) and for any other ClientHello/handshake-size limit in the SSL handlers (none found). Verified the allocation is reached only on the fragmented-handshake path, but that path is trivially reachable with two TLS records, and packetLength only bounds a single record (max 64 KB), not handshakeLength. SniHandler in this snapshot simply delegates to AbstractSniHandler and adds no size restriction. No runtime test was executed, so per-connection allocation behavior under a configured allocator and the exact OOM threshold were not confirmed.",
+      "id": "netty-sni-unbounded-clienthello-allocation",
+      "impact": "Remote denial of service (memory exhaustion) against TLS servers that use SniHandler with default settings; each connection can pin up to ~16 MB of allocator memory before any valid ClientHello is completed.",
+      "locations": [
+        {
+          "end_line": 148,
+          "path": "handler/src/main/java/io/netty/handler/ssl/AbstractSniHandler.java",
+          "start_line": 121
+        },
+        {
+          "end_line": 142,
+          "path": "handler/src/main/java/io/netty/handler/ssl/AbstractSniHandler.java",
+          "start_line": 137
+        }
+      ],
+      "prerequisites": "Server uses io.netty.handler.ssl.SniHandler/AbstractSniHandler (directly or via SniHandler-mapped SslContexts) with default configuration; attacker can make TCP connections and send crafted TLS records; connection data can be sent slowly/partially so the allocated buffer is held while more data is awaited. Pooled/direct allocator memory is consumed per connection.",
+      "root_cause": "AbstractSniHandler.decode derives handshakeLength from three attacker-supplied bytes (in.getUnsignedMedium(...)) and, when the ClientHello spans more than one TLS record, allocates ctx.alloc().buffer(handshakeLength) and retains it on the connection without validating it against any configured maximum (no maxClientHelloLength exists anywhere in this snapshot).",
+      "title": "Unbounded ClientHello buffer allocation in AbstractSniHandler (attacker-controlled handshake length)",
+      "trace": "AbstractSniHandler.decode (line 60+) parses the record header; for a TLS handshake record it reads the 16-bit record length (lines 91-92). If the declared handshake does not fit in that record, it reads the 24-bit handshakeLength via in.getUnsignedMedium (lines 123-124) and, when handshakeLength + 4 + 5 > packetLength, executes `handshakeBuffer = ctx.alloc().buffer(handshakeLength)` (lines 137-142). The buffer is retained in the handler field until sufficient handshake bytes arrive (or the channel is closed), so an attacker can make many connections each force an allocation of up to ~16 MB while sending almost no data, causing process memory exhaustion/DoS. Upstream later fixed this class of issue by bounding the ClientHello/handshake length (a configurable maximum); no such bound exists in this snapshot.",
+      "unverified": "The finding was not runtime-confirmed. Exploitability depends on allocator configuration (buffer type/maxCapacity) and on the attacker being able to hold connections open; the tree's provenance/CVE mapping was not established, so this is submitted as the strongest source-evidenced lead rather than a confirmed vulnerability.",
+      "weakness_type": "CWE-789 Memory Allocation with Excessive Size Value / CWE-400 Uncontrolled Resource Consumption"
+    }
+  ],
+  "coverage_summary": "Coverage: harness reported 1,851 model-visible source files (parity with the P1 condition); tests are not included in the snapshot, so verification by test names was impossible. I inventoried the tree, confirmed the module/version layout (Netty 5.0.0.Final-SNAPSHOT, late-2019 master-equivalent content), and read or searched the principal network-facing code: codec-http (HttpObjectDecoder, DefaultHttpHeaders, HttpHeadersEncoder, HttpContentEncoder, HttpUtil, multipart, websocketx), codec-haproxy, codec/compression (zlib/JZlib/Bzip2/LZ4/Snappy/FastLZ), handler/ssl (AbstractSniHandler, SniHandler presence, SslHandler-related paths by search), codec-xml, serialization classes, codec-dns/resolver samples, and example HTTP file server. Coverage is not exhaustive: buffer/, transport/, remaining codec-* modules (mqtt, redis, memcache, socks, stomp), HTTP/2 internals, and native C code were only sampled/search-inspected, not fully read; no code was executed, so all findings are source-evidence leads.",
+  "limitations": [
+    "No build or runtime execution; no dynamic confirmation of any candidate (per instructions).",
+    "Test sources are absent from the snapshot, so behavioral intent could not be cross-checked against unit tests.",
+    "The exact repository commit/CVE mapping for this snapshot is unknown; the version string (5.0.0.Final-SNAPSHOT) suggests a frozen Netty master branch (~late 2019), which limits correlation with later security advisories.",
+    "Binary-like files and any path outside the 1,851 visible files were not inspected; large modules (e.g., transport, buffer, parts of HTTP/2 and native C) were sampled rather than exhaustively reviewed.",
+    "The single-candidate cap means other plausible but weaker issues (listed as rejected leads) were not developed further."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Zlib decompression memory amplification in JZlibDecoder/JdkZlibDecoder (heapBuffer(inputLength << 1), ensureWritable(getRemaining() << 1)) — matches CVE-2020-11612 timeframe",
+      "reason": "Allocation is proportional to the compressed input already received; the decompression-bomb path is partially mitigated by inflater.needsInput() loop exit. I could not pin the exact unbounded mechanism (and therefore the concrete amplification bound) from source alone, so it is a weaker lead than the SNI allocation."
+    },
+    {
+      "lead": "AbstractDiskHttpData.createTempFile uses File.createTempFile without restricting permissions (Netty CVE-2021-21290)",
+      "reason": "Real hardening gap, but impact is local information disclosure only and requires a local attacker plus a disk-backed multipart factory/umask permitting world-read; lower severity and needs environment assumptions."
+    },
+    {
+      "lead": "HttpPostMultipartRequestDecoder accumulates undecodedChunk without a bound (later CVE-2024-29025 class)",
+      "reason": "Genuine unbounded buffering, but it requires HTTP multipart decoding in a pipeline without aggregation limits; the decoder is application-selected and the impact overlaps with general request-size configuration, so evidence is less specific than the SNI allocation."
+    },
+    {
+      "lead": "DefaultHttpHeaders value validation permits obs-fold style CR/LF followed by SP/HT in header values",
+      "reason": "Behavioral/spec-interpretation issue that may enable header injection in proxy chains, but the source alone does not demonstrate a concrete sink; it may be intentional RFC 7230 obs-fold support, so it was not selected."
+    },
+    {
+      "lead": "HttpUtil.getContentLength uses only the first Content-Length value (multiple Content-Length / TE+CL smuggling class, CVE-2021-21409 family)",
+      "reason": "The decoder does not reject conflicting Content-Length values, but demonstrating smuggling requires a downstream/intermediary that chooses differently; no such peer is present in the snapshot, so this remains an unconfirmed lead."
+    },
+    {
+      "lead": "HAProxyMessageDecoder, Bzip2 decoders, and codec-xml XmlDecoder resource/validation concerns",
+      "reason": "Inspected but found no equally concrete attacker-controlled allocation/validation failure with clear impact in this snapshot; the Bzip2 block-size bounds checks and HAProxy header-size limits appeared present."
+    }
+  ],
+  "summary": "Reviewed the Netty 5.0.0.Final-SNAPSHOT source snapshot (1,851 model-visible files; no test trees, binary-like files skipped by the harness, no sensitive-path exclusions reported). This is a ~late-2019 Netty master tree. I traced attacker-controlled length fields through the TLS SNI path, the HTTP/1 and HTTP/2 codecs, compression decoders, multipart handling, and the HAProxy/XML/serialization codecs. One candidate met the evidence bar: an unbounded, attacker-controlled buffer allocation in AbstractSniHandler (the ClientHello handshake length is a 24-bit value taken directly from the peer and passed to ctx.alloc().buffer(...) with no maximum), which enables remote memory-exhaustion DoS against servers using SniHandler. Several other plausible issues were examined and rejected or left as unconfirmed leads because their mechanisms/impact were weaker or less certain from source alone."
+}

@@ -1,0 +1,93 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker supplies the ZIP archive. The 0x756E (ASi) extra-field id, its declared length, and its content (including the 4-byte link-length field and the CRC-32 that is verified at lines 270-281) are all attacker-controlled; the attacker can compute a matching CRC over their own bytes, so the CRC check is not a barrier. The field is parsed by default: ExtraFieldUtils registers AsiExtraField in its static registry (ExtraFieldUtils.java lines 41-57), and ZipArchiveInputStream.getNextZipEntry (line 315) / ZipFile.readCentralDirectoryEntry (line 797) feed local and central extra data into ZipArchiveEntry.setExtra/setCentralDirectoryExtra, which parse in BEST_EFFORT mode.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that ZipExtraField parsing of malformed known fields is otherwise hardened: ExtraFieldUtils.parse advances by WORD+length so a zero length cannot loop; Zip64ExtendedInformationExtraField, X5455_ExtendedTimestamp, X7875_NewUnix, AbstractUnicodeExtraField and JarMarker all perform minimal/dynamic length checks before use, and the strong-encryption fields (X0017) contain assertMinimalLength/assertDynamicLengthFits guards (consistent with the 1.19 release description: malformed extra fields become UnrecognizedExtraField and strong-encryption fields throw ZipException instead of ArrayIndexOutOfBoundsException) - so the missing guard in AsiExtraField is an outlier, not the design. Verified ExtraFieldUtils.fillExtraField catches only ArrayIndexOutOfBoundsException and BEST_EFFORT catches only ZipException, so the failure mode is not silently converted; verified AsiExtraField is registered by default (ExtraFieldUtils static block). Confirmed the allocation happens before the existing link-length check. Not verified: whether the upstream 1.19/1.20 fix for this code is the benchmark's target commit; no tests or git history are present in the snapshot to confirm the intended patch; runtime confirmation was not performed (source-only review).",
+      "id": "case-008-cand-1",
+      "impact": "Denial of service against any application that opens untrusted ZIP archives (web upload scanners, build/dependency tooling, log processors, mail gateways). Variant A: an unchecked NegativeArraySizeException escapes ZipFile's constructor and ZipArchiveInputStream.getNextEntry, which declare IOException, so defensive catch(IOException) blocks do not handle it and the parsing thread/task fails (uncaught runtime exception; repeated requests = repeated failures). Variant B: a single small crafted field triggers an allocation of up to ~2 GiB before validation, which can exhaust the JVM heap in constrained or concurrent deployments and raise OutOfMemoryError. No memory-corruption, code-execution, or cross-tenant read is claimed.",
+      "locations": [
+        {
+          "end_line": 301,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/AsiExtraField.java",
+          "start_line": 266
+        },
+        {
+          "end_line": 297,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/AsiExtraField.java",
+          "start_line": 283
+        },
+        {
+          "end_line": 333,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ExtraFieldUtils.java",
+          "start_line": 320
+        },
+        {
+          "end_line": 684,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveEntry.java",
+          "start_line": 674
+        },
+        {
+          "end_line": 1207,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveEntry.java",
+          "start_line": 1193
+        },
+        {
+          "end_line": 315,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java",
+          "start_line": 313
+        },
+        {
+          "end_line": 797,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipFile.java",
+          "start_line": 795
+        }
+      ],
+      "prerequisites": "Victim code parses an untrusted ZIP through ZipFile or ZipArchiveInputStream (also user code calling ZipArchiveEntry#setExtra/setCentralDirectoryExtra, or getExtraFields(...) on such an entry). Small extra field (id 0x756E) present in the local file header and/or central directory. Variant A (unchecked exception): declared extra-field length 1..3 => new byte[length - WORD] has a negative size. Variant B (memory amplification): declared length >= 4 with a large link-length field (e.g. 0x7FFFFFFF) => ~2 GiB allocation attempted before the length-consistency check; success depends on available heap, high-concurrency/repeat parsing makes exhaustion more likely. No authentication or archive validity beyond a computable CRC-32 is required.",
+      "root_cause": "AsiExtraField.parseFromLocalFileData (invoked for both local-file-header and central-directory extra data) uses two attacker-controlled values without validating them against the available data first: (1) at line 271 it allocates new byte[length - WORD] before checking length (length 0..3 => negative size), and (2) at line 285 it allocates new byte[(int) ZipLong.getValue(tmp, 2)] using a 32-bit link-length field read straight from the extra field data; the sanity check linkArray.length > tmp.length - 10 is only performed at line 291, i.e. after the allocation has already been attempted. The enclosing parsing path, ExtraFieldUtils.fillExtraField (lines 320-333), only maps ArrayIndexOutOfBoundsException to ZipException, and ZipArchiveEntry.ExtraFieldParsingMode.BEST_EFFORT.fillAndMakeUnrecognizedOnError (lines 1193-1207) only catches ZipException, so NegativeArraySizeException and OutOfMemoryError propagate.",
+      "title": "Crafted ZIP extra field (ASi, 0x756E) causes unbounded allocation / unchecked NegativeArraySizeException in AsiExtraField parsing",
+      "trace": "ZipFile constructor -> populateFromCentralDirectory -> readCentralDirectoryEntry -> ze.setCentralDirectoryExtra(cdExtraData) (ZipFile.java:797) -> ZipArchiveEntry.setCentralDirectoryExtra (lines 700-707) -> ExtraFieldUtils.parse(data,false,ExtraFieldParsingMode.BEST_EFFORT) -> BEST_EFFORT.fillAndMakeUnrecognizedOnError (line 1118) -> ExtraFieldUtils.fillExtraField (line 320) -> AsiExtraField.parseFromCentralDirectoryData (line 308) -> parseFromLocalFileData (line 267). Same for streaming: ZipArchiveInputStream.getNextZipEntry -> current.entry.setExtra(extraData) (line 315) -> ZipArchiveEntry.setExtra (line 675) -> ... -> AsiExtraField.parseFromLocalFileData. Inside the method: line 270 reads the CRC; line 271 allocates tmp = new byte[length - WORD] (negative if length < 4); line 285 allocates new byte[(int) ZipLong.getValue(tmp, 2)] with no bound versus tmp.length before line 291's check; nothing in the call chain converts NegativeArraySizeException/OutOfMemoryError into a checked IOException.",
+      "unverified": "No runtime reproduction was performed. The exact victim heap/JVM configuration needed for the OutOfMemoryError variant is unverified (it is configuration-dependent; the NegativeArraySizeException variant is unconditional for a 1..3 byte ASi field). Whether this specific defect corresponds to the fix commit this snapshot precedes (a 2019 1.19-era change) is inferred from source context only, not proven; the snapshot contains no tests or VCS metadata.",
+      "weakness_type": "CWE-770 Allocation of Resources Without Limits or Throttling / CWE-20 (unvalidated length) leading to DoS (also CWE-129-style missing length validation)"
+    }
+  ],
+  "coverage_summary": "Source scope reported 270 model-visible files, no exclusions other than binary-like files (none encountered as skipped in the searches I ran). I read the build/pom/changes/site metadata and deeply reviewed the archive readers (zip: ZipFile, ZipArchiveInputStream, ZipArchiveEntry, ExtraFieldUtils and all registered extra fields including X0017/X000A/X5455/X7875/Zip64/Asi; tar: TarArchiveInputStream, TarUtils, TarArchiveEntry; sevenz: SevenZFile, Folder, Coders, AES decoder, Archive/Folder; dump, cpio, arj, ar) and the compressor readers (bzip2, deflate64 HuffmanDecoder, gzip, lz4 framed/block, lz77 support, lzw/Z, snappy framed/raw, xz/lzma, pack200, zstd/brotli wrappers) plus utilities (IOUtils, ExtraFieldUtils, ByteUtils, BitInputStream, MultiReadOnlySeekableByteChannel, BoundedInputStream). The repository contains no test sources or VCS metadata, so fix-commit provenance could not be confirmed from the snapshot.",
+  "limitations": [
+    "No tests, changelog entry or git history for the subsequent fix is present in the snapshot, so I could not confirm which single change this snapshot precedes; the candidate is selected on source evidence plus 1.19 release context, not on the ground-truth patch.",
+    "Source-only review: no compilation, execution, fuzzing or exploit payloads were used, and no runtime confirmation of the OOM/NegativeArraySizeException behavior was performed.",
+    "Impact of the memory-amplification variant depends on JVM heap sizing and request concurrency; only the unchecked-exception variant is unconditional for a 1..3 byte ASi field.",
+    "Several other plausible but later-fixed issues (7z, tar PAX, dump, 2024-era all reported as leads) were intentionally not submitted because the repository version indicates the fix this snapshot precedes was released in the 1.19 timeframe.",
+    "I could not inspect excluded/nonexistent directories or sibling conditions; only the assigned 270-file source snapshot was used."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SevenZFile resource-exhaustion primitives: readSubStreamsInfo accumulates folder.numUnpackSubStreams into an int (long -> int overflow at SevenZFile.java:678-686, then new long[totalUnpackStreams]); readEncodedHeader allocates new byte[(int)folder.getUnpackSize()] (line 551); small crafted 7z inputs can request multi-hundred-MB/GiB arrays.",
+      "reason": "Real unattended allocations, but assertFitsIntoInt already bounds them to Integer.MAX_VALUE and the surrounding 7z hardening pattern (assertFitsIntoInt, 'Total output streams can't be 0') indicates this area was already being fixed before this snapshot; the published 7z OOM/infinite-loop advisories date from 2021 (1.21.0), so it is unlikely to be the fix this 1.19-SNAPSHOT precedes. Left unconfirmed rather than reported as the single candidate."
+    },
+    {
+      "lead": "Folder.getOrderedCoders (Folder.java:54-63) walks bindPairs without cycle detection: crafted bind pairs can make the codec list grow forever (denial of service).",
+      "reason": "Plausible infinite loop, but this matches the later 7z 'construction of the list of codecs' advisory (2021-era) rather than a 1.19 fix; also requires the victim to build a decoder stack for the crafted folder."
+    },
+    {
+      "lead": "TarArchiveInputStream.parsePaxHeaders (lines 482-534): restLen = len - read is used directly for new byte[restLen]; a short crafted PAX entry can request a huge allocation or provoke NegativeArraySizeException (length field parsed with unchecked int overflow).",
+      "reason": "Genuine unvalidated length, but this is the same PAX-header resource-consumption area addressed by the later 2023 tar DoS fix; not consistent with the 1.19-SNAPSHOT window, so treated as an unconfirmed secondary lead."
+    },
+    {
+      "lead": "DumpArchiveInputStream.readDirectoryEntry (lines 351-356): the loop increments i by a record length read from the archive; reclen == 0 (or very small) makes the directory-entry loop non-progressing.",
+      "reason": "Attacker-controlled infinite loop is real in the snapshot, but the corresponding public fix is 2024-era; the snapshot clearly predates it, so it cannot be the fix this snapshot precedes."
+    },
+    {
+      "lead": "X0017_StrongEncryptionHeader.parseCentralDirectoryFormat (lines 321-325): comment-only nested loop bounded by rcount (unsigned 32-bit from the archive) and hashSize (up to 65535) can spin for up to ~2.8e14 iterations from a 16-byte extra field.",
+      "reason": "Cannot confirm the JIT does not elide the allocation-free/non-side-effecting loop, and the distinctive commented-out body appears to persist in later upstream code, so it is likely not the fixed issue; kept as an unconfirmed lead rather than the candidate."
+    },
+    {
+      "lead": "MultiReadOnlySeekableByteChannel.read (lines 62-91, new in 1.19) can spin if a wrapped channel returns 0 without advancing, and returns -1 for zero bytes read.",
+      "reason": "The wrapped channels and their behavior are supplied by the API caller, not by attacker-controlled archive bytes, so attacker control is weak; no clear security impact established."
+    },
+    {
+      "lead": "ZipFile/ZipArchiveInputStream stored-entry data-descriptor handling (readStored/readStoredEntry/bufferContainsSignature).",
+      "reason": "Looks like the already-applied 1.19 hardening (COMPRESS-482/483 are documented in the snapshot's changes.xml and the sanity checks are present), so it is counterevidence against a stored-entry candidate rather than a finding."
+    }
+  ],
+  "summary": "Reviewed the Apache Commons Compress 1.19-SNAPSHOT source tree (270 files; main sources, site docs, changes). Trace focus: attacker-controlled archive/extra-field lengths feeding allocations and loops in the ZIP reader (ZipFile, ZipArchiveInputStream, ZipArchiveEntry, ExtraFieldUtils, all registered ZipExtraField classes), plus the tar/7z/dump/compressor readers. The strongest source-evidenced issue is in ZIP extra-field parsing: AsiExtraField.parseFromLocalFileData performs attacker-controlled allocations before any length validation, and the surrounding BEST_EFFORT parsing path only converts ZipException/ArrayIndexOutOfBoundsException, so the failure surfaces as an unchecked NegativeArraySizeException or an OutOfMemoryError from a tiny crafted archive. Other candidate areas (7z allocations/loops, tar PAX sizes, dump directory-entry loop, X0017 loop) are described as rejected/unconfirmed leads."
+}

@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The XML document content itself. It reaches the unhardened parser through (a) the public API `Configuration.addMapping(InputStream)` (AbstractConfigurationImpl.addMapping stores any caller-supplied stream, later parsed by XmlMetaDataProvider -> MappingXmlParser.parse -> XmlParserHelper.createXmlEventReader), and (b) `META-INF/validation.xml` / XML mapping resources resolved via the thread-context or user-provided external ClassLoader (`HibernateValidatorConfiguration.externalClassLoader`) or from an untrusted classpath/location. Applications that accept user-uploaded JARs, user-supplied configuration files, or otherwise shuttle third-party XML into `addMapping` expose this path.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that no hardening exists anywhere in the XML package (searched setProperty/setFeature/SUPPORT_DTD/DTD in engine/src/main/.../internal/xml/** - only an unrelated setter matched). Checked that the XMLInputFactory is built with `XMLInputFactory.newInstance()` with no properties at line 57. Checked that the parsed streams really are externally supplied: addMapping(InputStream) is public and accepts arbitrary streams; validation.xml is loaded through TCCL/user class loader. Checked that CloseIgnoringInputStream only affects close(), not entity resolution. Checked that the XSDs themselves (loadSchema/NewSchema/SchemaFactory) are classpath resources, so schema loading is not the attacker-controlled input, but the document passed to `Validator.validate(StreamSource)` is, so it is a secondary surface of the same root cause. Verified the repository predates the upstream hardening of this class (version 6.1.0-SNAPSHOT, changelog top 6.1.0.Alpha6, no DTD/XXE-related code or changelog entry anywhere).",
+      "id": "case-106-xxe-xmlparserhelper",
+      "impact": "Confidentiality: local file disclosure (e.g., file:// entities expanded into parsed element text). Network: server-side request forgery via external DTD/entity URIs resolved at bootstrap/configuration time. Availability: entity-expansion/DTD denial of service. This is a parser-level flaw affecting every XML entry point of the library rather than a single caller.",
+      "locations": [
+        {
+          "end_line": 96,
+          "path": "engine/src/main/java/org/hibernate/validator/internal/xml/XmlParserHelper.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 117,
+          "path": "engine/src/main/java/org/hibernate/validator/internal/xml/mapping/MappingXmlParser.java",
+          "start_line": 98
+        },
+        {
+          "end_line": 101,
+          "path": "engine/src/main/java/org/hibernate/validator/internal/xml/config/ValidationXmlParser.java",
+          "start_line": 85
+        },
+        {
+          "end_line": 262,
+          "path": "engine/src/main/java/org/hibernate/validator/internal/engine/AbstractConfigurationImpl.java",
+          "start_line": 256
+        }
+      ],
+      "prerequisites": "A deployment that lets attacker-influenced XML reach Hibernate Validator's configuration/parsing API (e.g., `addMapping(InputStream)` called with untrusted bytes), or that allows an attacker to supply/alter `META-INF/validation.xml` or a mapping resource loaded through the TCCL/external class loader. No special privileges are needed by the attacker beyond control of that XML input.",
+      "root_cause": "XmlParserHelper creates the parser with provider defaults: `private final XMLInputFactory xmlInputFactory = XMLInputFactory.newInstance();` (line 57) and returns `xmlInputFactory.createXMLEventReader(xmlStream)` (lines 89-96). No `XMLInputFactory.SUPPORT_DTD=false` / `IS_SUPPORTING_EXTERNAL_ENTITIES=false` (nor FEATURE_SECURE_PROCESSING / ACCESS_EXTERNAL_* restrictions) is ever set anywhere in engine/src/main/java/org/hibernate/validator/internal/xml/**, so DTD processing and external entity resolution remain enabled for every XML stream parsed by the library. The same untrusted stream is also passed to a default `Validator.validate(new StreamSource(...))` (MappingXmlParser lines 116-117, ValidationXmlParser lines 96-97), another unhardened XML parse surface of the same root cause.",
+      "title": "XXE via unhardened XMLInputFactory in XmlParserHelper when parsing validation/mapping XML",
+      "trace": "AbstractConfigurationImpl.addMapping(InputStream) (lines 256-262) -> ValidationBootstrapParameters.addMapping (line 115) -> XmlMetaDataProvider constructor (lines 39-46) -> MappingXmlParser.parse (line 102: `xmlParserHelper.createXmlEventReader(\"constraint mapping file\", ...)`) -> XmlParserHelper.createXmlEventReader (lines 89-96) -> default XMLInputFactory (line 57). Similarly, AbstractConfigurationImpl.getBootstrapConfiguration (line 465) -> ValidationXmlParser.parseValidationXml (lines 87 and 101 call createXmlEventReader) -> same factory. Because DTD/external-entity support is left at provider defaults, a document can declare external entities/DTDs; the parser fetches the referenced URI (outbound request / local file) and expands entity references into element text consumed by the StAX builders.",
+      "unverified": "Not runtime-confirmed. Exact JDK/JAXP provider defaults for the deployed runtime were assumed (documented StAX defaults are DTD support and external entities enabled; the repo sets neither property), and the concrete application path that supplies attacker-controlled XML was not observed in this source snapshot. The candidate is a lead, not a confirmed exploit; the untrusted-XML prerequisite is deployment dependent.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Reviewed 928 visible files (all files are source; no tests, no git history, binaries skipped by the tool filters). Deep-read: XML bootstrap/mapping parsing (XmlParserHelper, MappingXmlParser, ValidationXmlParser, XmlMetaDataProvider, AbstractConfigurationImpl.addMapping), message interpolation and EL (AbstractMessageInterpolator, ResourceBundle/ParameterMessageInterpolator, ElTermResolver, RootResolver, SimpleELContext, parser package, InterpolationHelper), built-in validators (Pattern, SafeHtml, URL, DomainNameUtil, ModCheck family, UniqueElements, ScriptAssert), resource loading (PlatformResourceBundleLocator), class loading/reflection privileged actions, and configuration wiring. Searched repository-wide for command execution, JNDI, sockets, URL/file I/O, serialization, crypto, system properties/environment, XML factories, and reflection sinks; no stronger externally triggerable sink was found. Coverage limits: annotation-processor and cdi internals only skimmed; very large engine files (ValidatorImpl, ConstraintHelper, Log, TypeHelper) read selectively; dependency libraries (jsoup, EL implementations, JDKs) not inspectable in this run.",
+  "limitations": [
+    "No test sources are present in the snapshot, so behavior could not be corroborated by tests or fixtures.",
+    "No git metadata or upstream reference copy is available, so a direct diff against the fixed revision was not possible; version identification relies on pom (6.1.0-SNAPSHOT) and changelog (top entry 6.1.0.Alpha6, 19-07-2019).",
+    "No code was executed and no parser payloads were tested; JDK StAX/JAXP default DTD and external-entity behavior is based on documented defaults, not runtime observation.",
+    "Third-party runtime pieces (JAXP/StAX provider implementation, EL implementation, jsoup) are not part of the snapshot and were not inspected.",
+    "Some large engine classes (ValidatorImpl ~60KB, ConstraintHelper ~45KB, Log ~59KB) were reviewed selectively rather than line by line.",
+    "The concrete application deployment that feeds untrusted XML into Configuration.addMapping or an untrusted class path is not visible in this repository, so the attacker-control prerequisite remains deployment dependent."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "EL injection through constraint-violation message interpolation (ElTermResolver / AbstractMessageInterpolator / ParameterTermResolver): message parameters or app-built templates containing `${...}` are evaluated by the default ResourceBundleMessageInterpolator.",
+      "reason": "This is the documented/default interpolation behavior at this commit, messages are contractually trusted, and escaping helpers (InterpolationHelper.escapeMessageParameter) are already applied where built-in validators inject annotation attributes (PatternValidator, AbstractScriptAssertValidator). No missing check could be pinned to a single localized root cause, so it is weaker and less certain than the XML issue; kept as an unconfirmed alternative."
+    },
+    {
+      "lead": "Class loading/instantiation of attacker-influenced class names from XML configuration (ClassLoadingHelper, LoadClass, NewInstance, ValidatorFactoryConfigurationHelper).",
+      "reason": "Class names come from Hibernate Validator configuration files, which are part of the trusted configuration boundary; using them to load classes is intended design, not an externally triggerable flaw without a separate XML-input compromise."
+    },
+    {
+      "lead": "SchemaFactory in XmlParserHelper.loadSchema / NewSchema created without ACCESS_EXTERNAL_DTD/ACCESS_EXTERNAL_SCHEMA restrictions.",
+      "reason": "The schema URL is a fixed classpath resource resolved by Hibernate Validator's own class loader, not attacker-controlled input; folded into the main candidate only as part of the same XML trust boundary."
+    },
+    {
+      "lead": "ConcurrentReferenceHashMap.readObject deserialization.",
+      "reason": "This is a JDK-derived collection implementation with no observed path that deserializes attacker-controlled data into it; no untrusted deserialization entry point found."
+    },
+    {
+      "lead": "SafeHtmlValidator / jsoup whitespace or whitelist bypass.",
+      "reason": "The validator uses Jsoup Cleaner.isValid correctly with the configured whitelist; no source-level bypass was identified."
+    }
+  ],
+  "summary": "Snapshot is Hibernate Validator 6.1.0-SNAPSHOT (post-6.1.0.Alpha6, Jul 2019): 928 visible source files across engine, cdi, annotation-processor, performance, test-utils, tck-runner and build modules; no test trees, no git metadata. I reviewed the XML bootstrap/mapping parsing chain, message interpolation/EL handling, class loading/reflection, resource-bundle loading, built-in validators, CDI integration and configuration APIs. The strongest source-evidenced issue is that all XML that Hibernate Validator parses (META-INF/validation.xml and constraint-mapping streams accepted by the public Configuration.addMapping(InputStream)) is fed to a default, unhardened StAX XMLInputFactory (and to a default JAXP Validator), so DTDs and external entities are processed: classic XXE (file disclosure, SSRF, entity-expansion DoS) when an application passes attacker-influenced XML to these public/configuration entry points. No runtime exploitation was performed."
+}

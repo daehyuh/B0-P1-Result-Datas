@@ -1,0 +1,93 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The processed stream is fully attacker-controlled, as assumed by XStream's own threat model (security.html: 'manipulating the processed input stream'). With an XStream instance configured with BinaryStreamDriver (a documented driver, BinaryStreamDriver.java) the attacker controls the raw token stream, including a long run of TYPE_MAP_ID_TO_VALUE tokens placed before the root START_NODE token; token bytes are trivially crafted (1 type byte + id bytes + UTF string, ~3-4 bytes per token), so a ~100 KB input can drive tens of thousands of nested readToken() frames. The same input is also accepted through xstream.unmarshal(driver.createReader(input)) and xstream.createObjectInputStream(InputStream).",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) XStream.unmarshal(HierarchicalStreamReader,Object,DataHolder) does catch StackOverflowError and maps it to InputManipulationException (XStream.java:1422-1423) - verified, but it wraps only the marshalling-strategy call, after reader creation; deep XML nesting sent through fromXML(String/Reader) with the default XppDriver is therefore mitigated, which is why this candidate is scoped to the reader-construction path (binary driver) and to the missing fail-safe/nesting bound rather than to the default XML path. (2) Every built-in tree/pull driver's createReader parsing is iterative (DomDriver/DomReader, Dom4JReader, JDomReader, StaxReader, XomDriver, XppDom.build), so no concrete unguarded overflow was found there. (3) The XppReader/StaxReader constructors also call moveDown(), but only a shallow first-token parse occurs, and MXParser/StAX do not process entities, so no attacker-controlled recursion was confirmed there. (4) The recursive readToken() predates 1.2 and is also reached inside the guarded path; only the constructor path is outside the guard. (5) Whether this exact path matches the external advisory/fix for the post-snapshot XStream DoS CVE could not be verified offline (the repository's CVE pages stop at CVE-2022-41966).",
+      "id": "case-052-candidate-1",
+      "impact": "Denial of service: the calling thread is terminated by an unhandled StackOverflowError that the application cannot convert into an XStreamException; repeated crafted requests exhaust/abort request-handling threads and cause service unavailability. No code execution or type-permission bypass is implied: the whitelist still blocks class instantiation, and the impact is limited to availability (consistent with the DoS class of the last XStream CVEs, e.g. CVE-2022-40151/CVE-2022-41966 fixed in this snapshot by the same style of top-level StackOverflowError catch).",
+      "locations": [
+        {
+          "end_line": 184,
+          "path": "xstream/src/java/com/thoughtworks/xstream/io/binary/BinaryStreamReader.java",
+          "start_line": 165
+        },
+        {
+          "end_line": 46,
+          "path": "xstream/src/java/com/thoughtworks/xstream/io/binary/BinaryStreamReader.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 44,
+          "path": "xstream/src/java/com/thoughtworks/xstream/io/binary/BinaryStreamDriver.java",
+          "start_line": 41
+        },
+        {
+          "end_line": 1290,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 1287
+        },
+        {
+          "end_line": 1424,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 1409
+        },
+        {
+          "end_line": 88,
+          "path": "xstream/src/java/com/thoughtworks/xstream/core/TreeUnmarshaller.java",
+          "start_line": 72
+        },
+        {
+          "end_line": 56,
+          "path": "xstream/src/java/com/thoughtworks/xstream/io/HierarchicalStreamReader.java",
+          "start_line": 49
+        }
+      ],
+      "prerequisites": "Application unmarshals untrusted data with an XStream instance using BinaryStreamDriver (e.g. new XStream(new BinaryStreamDriver())). No type permission, class name, or whitelist entry is needed: the recursion happens in the reader layer before any class resolution, so the default SecurityMapper whitelist provides no protection. The default XppDriver path is not affected by this specific vector (see counterevidence).",
+      "root_cause": "XStream bounds neither the nesting depth of the unmarshalled input nor the recursion performed by its readers, and the mitigation for stack exhaustion is incomplete: the only StackOverflowError handling is one catch block inside XStream.unmarshal(HierarchicalStreamReader,Object,DataHolder) (XStream.java:1422-1423), which runs after the reader has already been built. All public entry points build the reader first, outside that catch (e.g. fromXML(InputStream) at XStream.java:1289, createObjectInputStream(InputStream) at 2076). For the binary driver, reader construction itself recursively parses attacker-controlled tokens: BinaryStreamReader's constructor calls moveDown() (BinaryStreamReader.java:43-46), which calls readToken(); readToken() (165-184) recurses once for every consecutive TYPE_MAP_ID_TO_VALUE token (idRegistry.put at 170-171, recursive 'return readToken()' at 172). Recursion depth is therefore linear in attacker-supplied token count, with no counter, depth limit, or fail-safe (HierarchicalStreamReader.getLevel(), added for the still-unmerged fail-safe deserialization feature described in xstream-distribution/src/content/changes.html:41-42, has no call sites).",
+      "title": "Uncontrolled recursion during unmarshalling escapes the sole StackOverflowError guard (BinaryStreamReader token recursion) and can kill the calling thread (DoS)",
+      "trace": "attacker input -> XStream.fromXML(InputStream) [XStream.java:1287-1290] evaluates hierarchicalStreamDriver.createReader(input) BEFORE entering unmarshal's try block -> BinaryStreamDriver.createReader(InputStream) [BinaryStreamDriver.java:42-44] -> new BinaryStreamReader(in) [BinaryStreamReader.java:43-46] -> moveDown() [89-119] -> readToken() [91] -> for each TYPE_MAP_ID_TO_VALUE token: idRegistry.put(...) then recursive readToken() [170-172] -> one Java stack frame per consecutive token -> StackOverflowError is thrown inside the constructor, i.e. outside XStream.unmarshal's only catch (XStream.java:1422-1423) and outside createObjectInputStream's callback try [2074-2077] -> the Error propagates to the caller as an uncaught, non-XStreamException failure. The same recursion pattern is reached during normal moveDown()/moveUp() token slurping, but only the constructor-time occurrence escapes the existing guard.",
+      "unverified": "Not runtime-confirmed (no code executed). The exact ground-truth CVE/patch mapping is unverified because no network, patch, or sibling data is available; the snapshot's own changelog indicates the getLevel()-based 'fail-safe deserialization' hardening (which would address stack exhaustion generally) was still unmerged at this commit, which is the strongest in-repo signal that this snapshot is the vulnerable pre-fix state. Recursion depth needed to overflow depends on the JVM stack size (default -Xss) and the driver in use; the binary-driver constructor path is demonstrated by source reading only, and the precise minimal token count was not measured.",
+      "weakness_type": "CWE-674 Uncontrolled Recursion / CWE-400 Uncontrolled Resource Consumption (stack exhaustion DoS)"
+    }
+  ],
+  "coverage_summary": "Scope/filters: the same source filters applied to B0 and P1; 489 model-visible files (368 core java files under xstream/src/java, plus xstream-builder, xstream-hibernate, xstream-jmh, xstream-its and xstream-distribution docs). The P1 relation index covers 485/489 files, parses 370 java files of 391, reports 1 parse error and 4 files absent from the index (unidentified), with no control-flow, data-flow, semantic resolution, Spring-DI, or runtime-reachability analysis; all index edges were treated as navigation hints and verified against source text. Inspected in depth: XStream.java facade and all unmarshal/fromXML/createObjectInputStream entry points, mapper chain (DefaultMapper, CachingMapper, SecurityMapper, MapperWrapper, DynamicProxyMapper, PackageAliasingMapper, AnnotationMapper, LambdaMapper), all security/TypePermission classes, TreeUnmarshaller/TreeMarshaller and reference unmarshallers, reflection converters (AbstractReflectionConverter, ReflectionConverter, SerializableConverter, ExternalizableConverter, LambdaConverter, PureJavaReflectionProvider, Sun* providers), collection converters, CustomObjectInputStream/OutputStream, SecurityUtils, XStreamer, JVM class-loading helpers, all io/xml and io/binary readers/drivers whose parsers were relevant to stack exhaustion, and the repository CVE/security/changes documentation. Skimmed only: xstream-hibernate converters, jmh benchmarks, RecordConverter, SaxWriter/TraxSource threading and XSLT code, XmlFriendlyNameCoder, DependencyInjectionFactory, tutorial/website pages.",
+  "limitations": [
+    "No code execution, tests, or scanners were run; the candidate is a source-level lead, not a runtime-confirmed vulnerability.",
+    "No network access, upstream diff, patch, or CVE database could be consulted, so the mapping of this candidate to the externally assigned XStream DoS CVE (the next release after this snapshot addressed a stack-overflow DoS, and changes.html:41-42 shows the getLevel()-based fail-safe deserialization was still unmerged here) is inferred, not verified.",
+    "The P1 index omits 4 files, failed to parse 1 java file, and provides no data-flow or reachability proof; unreported code areas were not assumed reviewed.",
+    "The required recursion depth for a StackOverflowError depends on JVM -Xss and driver internals; the binary-token path was derived by reading BinaryStreamReader/BinaryStreamDriver/XStream call order and was not measured.",
+    "xstream-hibernate, jmh, XSLT/SaxWriter threading, RecordConverter, XmlFriendlyNameCoder and the documentation pages were only skimmed; a vulnerability there cannot be ruled out."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE: DomDriver.createDocumentBuilderFactory sets only disallow-doctype-decl (line 136-144), unlike the FAQ's described 'turn off external entities' behavior; StaxDriver/WstxDriver/BEAStaxDriver/SjsxpDriver set only IS_SUPPORTING_EXTERNAL_ENTITIES and no SUPPORT_DTD anywhere in the tree.",
+      "reason": "disallow-doctype-decl=true blocks DOCTYPE processing outright, which prevents external-entity XXE for DomDriver/JDom/JDom2/Dom4J as the FAQ claims; the StAX limitation (parameter entities / implementation-dependent behavior) is explicitly documented in faq.html:867-902 as a known limitation of specific non-default drivers, and the default XppDriver does not process entities. No deviation with a concrete attacker-to-impact path could be evidenced."
+    },
+    {
+      "lead": "XomDriver has no external-entity protection (xstream/src/java/com/thoughtworks/xstream/io/xml/XomDriver.java:102-116).",
+      "reason": "Documented as vulnerable in the same repository (faq.html:900-901: 'XOM ... will explicitly enable external entities'). It is a known, accepted limitation the user must configure around, not a hidden code defect; no fix for it exists in this snapshot's scope."
+    },
+    {
+      "lead": "JavaClassConverter/JavaFieldConverter construct their own raw DefaultMapper (JavaClassConverter.java:40-42, JavaFieldConverter.java:44-46), bypassing SecurityMapper, so <class> element values are loaded via Class.forName without permission checks.",
+      "reason": "Verified that DefaultMapper.realClass uses Class.forName(name, initialize=false, loader) for non-array names (DefaultMapper.java:72-81), so only class loading (no static initialization, no instantiation) occurs; no concrete security impact (no object creation, no permission-gated side effect) could be evidenced, and this matches the upstream design where the security check is applied to the resolved conversion type."
+    },
+    {
+      "lead": "TreeMapConverter/TreeSetConverter never call SecurityUtils.checkForCollectionDoSAttack (only CollectionConverter:114, MapConverter:125, NamedMapConverter:334 do), leaving comparator-driven CPU attacks on sorted collections outside the time limit.",
+      "reason": "The three call sites appear to match the upstream 1.4.19/1.4.20 instrumentation; the comparison costs for TreeMap/TreeSet are covered at least partially by the global XStream.unmarshal StackOverflowError catch and the 20-second collection update limit, and no concrete demonstrated bypass (or upstream deviation) was found. Unconfirmed."
+    },
+    {
+      "lead": "XStreamer.fromXML deserializes an embedded, attacker-controllable XStream instance (XStreamer.java:263-281) under a broad permission list including WildcardTypePermission(true, 'com.thoughtworks.xstream.**') (XStreamer.java:54-71).",
+      "reason": "This is the documented purpose of XStreamer ('self-contained XStream generator'); the attacker can only instantiate types from the fixed PERMISSIONS list plus the default whitelist, and XStreamer is inherently documented as unsafe for untrusted input. No concrete gadget or whitelist bypass was identified, and the entry is explicitly designed/known."
+    },
+    {
+      "lead": "Path.apply pops a FastStack without an emptiness check (Path.java:204-210; FastStack.pop at FastStack.java:50-54), so a reference attribute consisting of many '..' components throws ArrayIndexOutOfBoundsException.",
+      "reason": "The exception is caught by TreeUnmarshaller.convert and wrapped as a ConversionException (TreeUnmarshaller.java:81-84); no availability or integrity impact beyond a normal parse error."
+    },
+    {
+      "lead": "Missing nesting/depth limit in the XML path (default driver) enabling deep-nesting DoS (class of CVE-2022-40151).",
+      "reason": "Deep-nesting stack overflow through the default XppDriver is already converted into InputManipulationException by the StackOverflowError catch at XStream.java:1422-1423, so it is not demonstrably uncaught; only the paths where the overflow occurs outside that catch (folded into the submitted candidate) could be supported by source evidence. The 1.5.0 changelog's unmerged 'fail-safe deserialization' entry (changes.html:41-42) is treated as supporting context, not as a separate finding."
+    }
+  ],
+  "summary": "Reviewed the XStream 1.5.0-SNAPSHOT source tree (489 files; core library 368 files under xstream/src/java plus builder/hibernate/jmh modules and the distribution docs), with emphasis on the deserialization trust boundary: XStream facade entry points, the mapper/security chain, permission classes, TreeUnmarshaller/TreeMarshaller, reference unmarshallers, reflection/serialization converters, and all reader/writer implementations. The snapshot corresponds to a pre-release maintenance state (changes.html \"Upcoming 1.4.x\" lists GHPR #335/#331/#334/#342, all of which are present in code) in which the planned \"fail-safe deserialization\" feature that the changelog says combines the new HierarchicalStreamReader.getLevel() method with GHPR:#91 is NOT yet implemented (getLevel() has no callers anywhere). One candidate is submitted: uncontrolled recursion during unmarshalling with a StackOverflowError guard that does not cover reader construction, concretely reachable through BinaryStreamReader's recursive token reading; this is the strongest source-evidenced residual DoS path in this snapshot. All other checked leads are listed as rejected/unconfirmed."
+}

@@ -1,0 +1,104 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated low-privilege user (role=0 account, creatable by an admin with a limited executor permission list, e.g. permission=\"1\") controls: the job id/group id in /jobinfo/update, /jobinfo/remove, /jobinfo/stop, /jobinfo/start, /jobinfo/trigger (and /jobinfo/add jobInfo.jobGroup plus its glueType/glueSource/executorHandler/executorParam); the job id and full glueSource/glueRemark in /jobcode/save; jobGroup/jobId in /joblog/clearLog, executorAddress/logId in /joblog/logDetailCat; and appname/title/addressType/addressList in /jobgroup/save and /jobgroup/update. None of these values are checked against loginUser.validPermission(jobGroup) (XxlJobUser), and XxlJobServiceImpl.add/update only validate group existence, not ownership.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the endpoints are not merely hidden in the UI: I checked every admin controller for @PermissionLimit and validPermission usage – only read paths (JobLogController.pageList/index, JobCodeController.index) call validPermission, and only UserController uses @PermissionLimit(adminuser=true); PermissionInterceptor only enforces admin role when that annotation is present, otherwise any logged-in user passes. Confirmed the permission model is documented as a product guarantee (doc/XXL-JOB官方文档.md:57-58 and :959-961: normal users hold only assigned executors and related job operation permissions), so the missing checks contradict stated intent rather than a UI-only convention. Confirmed glue source survives to execution (XxlJobTrigger.java:135-137, ExecutorBizImpl.java:100-116, ScriptJobHandler.java:59-82, ScriptUtil.java:76). Considered and did not select the separate default-empty-accessToken leads and the SSRF/XSS leads listed in rejected_leads; they are distinct root causes and/or depend on documented optional configuration, whereas this defect requires no special configuration, only a normal account the product itself supports creating.",
+      "id": "case-056-xxl-job-admin-missing-permission-checks",
+      "impact": "Horizontal and vertical privilege escalation in the scheduling platform: a normal user can read, create, modify, stop, delete and manually trigger jobs in executors they were never granted (data tampering and denial of service on production jobs), kill running executions, delete job/log history, and rewrite GLUE source of arbitrary jobs. Because GLUE (SHELL/PYTHON/GROOVY) source is executed by the executor, the attacker gains arbitrary code execution on every reachable executor node running the target job (core ScriptJobHandler/ScriptUtil path; BEAN executors also expose their registered handlers), typically full compromise of the business application host. Executor-group management also gives the attacker control of scheduling addresses, enabling admin-side SSRF/internal POSTs and routing of job payloads to attacker-controlled endpoints.",
+      "locations": [
+        {
+          "end_line": 143,
+          "path": "xxl-job-admin/src/main/java/com/xxl/job/admin/controller/JobInfoController.java",
+          "start_line": 102
+        },
+        {
+          "end_line": 91,
+          "path": "xxl-job-admin/src/main/java/com/xxl/job/admin/controller/JobInfoController.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 94,
+          "path": "xxl-job-admin/src/main/java/com/xxl/job/admin/controller/JobCodeController.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 131,
+          "path": "xxl-job-admin/src/main/java/com/xxl/job/admin/controller/JobGroupController.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 172,
+          "path": "xxl-job-admin/src/main/java/com/xxl/job/admin/controller/JobGroupController.java",
+          "start_line": 155
+        },
+        {
+          "end_line": 84,
+          "path": "xxl-job-admin/src/main/java/com/xxl/job/admin/controller/JobLogController.java",
+          "start_line": 79
+        },
+        {
+          "end_line": 230,
+          "path": "xxl-job-admin/src/main/java/com/xxl/job/admin/controller/JobLogController.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 54,
+          "path": "xxl-job-admin/src/main/java/com/xxl/job/admin/controller/interceptor/PermissionInterceptor.java",
+          "start_line": 33
+        },
+        {
+          "end_line": 58,
+          "path": "doc/XXL-JOB官方文档.md",
+          "start_line": 57
+        },
+        {
+          "end_line": 961,
+          "path": "doc/XXL-JOB官方文档.md",
+          "start_line": 959
+        }
+      ],
+      "prerequisites": "Attacker possesses any valid non-admin account on the admin web UI (role=0, even with permission restricted to one executor); the admin console is reachable and the target group's executor is online. No admin role, no access token, and no direct network access to executor port 9999 is needed – the admin makes the outbound trigger call.",
+      "root_cause": "xxl-job-admin implements executor-dimension permissions (XxlJobUser.role 0=normal/1=admin, XxlJobUser.permission = allowed executor group ids; JobInfoController.validPermission() at JobInfoController.java:86-91; filterJobGroupByRole() at :66-85). Enforcement is partial: the helper is called only in read paths (JobLogController.pageList :93-94, JobLogController.index via :72-73, JobCodeController.index :45-46), while all state-changing endpoints in JobInfoController (add/update/remove/stop/start/trigger), JobCodeController.save, JobLogController (getJobsByGroup/logDetailCat/logKill/clearLog) and JobGroupController (save/update/remove) take an id/group/glueSource from the request and never check that the logged-in (non-admin) user holds that executor's permission, and never carry @PermissionLimit(adminuser=true) (only UserController has it, and PermissionInterceptor.java:33-54 only enforces admin role when that annotation is present).",
+      "title": "Missing server-side per-executor authorization checks in xxl-job-admin let any normal user operate any job/executor, leading to GLUE code execution on executors",
+      "trace": "1) Authenticate as a role=0 user; POST /jobinfo/pageList returns all jobs regardless of group because pageList (JobInfoController.java:93-100) has no validPermission/filter (only the index page filters groups). 2) POST /jobcode/save?id=<job in another group>&glueSource=<attacker shell/groovy payload> (JobCodeController.java:56-94) – only glueRemark length and job existence are validated; no validPermission call (contrast index at :45-46), and XxlJobInfoMapper.update persists glue_source. 3) POST /jobinfo/trigger?id=<same job>&executorParam=... (JobInfoController.java:132-143) – no validPermission check; JobTriggerPoolHelper.trigger -> XxlJobTrigger.trigger/processTrigger (XxlJobTrigger.java:128-164) builds a TriggerParam carrying glueType/glueSource/glueUpdatetime and sends it via XxlJobScheduler.getExecutorBiz(address) / ExecutorBizClient.run to the registered executor address. 4) On the executor, ExecutorBizImpl.run (ExecutorBizImpl.java:100-116) builds a ScriptJobHandler with the attacker-controlled glueSource; ScriptJobHandler.execute (ScriptJobHandler.java:49-88) writes the script file and ScriptUtil.execToFile (ScriptUtil.java:55-76) runs Runtime.getRuntime().exec([cmd, scriptFile, params]) as the executor OS user, i.e. arbitrary command execution. Separately, /jobgroup/save|update lets the same user set address_type=1 and an arbitrary addressList, which the admin later POSTs JSON to via XxlJobRemotingUtil.postBody (XxlJobRemotingUtil.java:64-95) – attacker-driven outbound request/SSRF and scheduler hijack; /joblog/logKill/:logDetailCat/clearLog allow killing/reading/clearing other groups' logs.",
+      "unverified": "No runtime execution was performed; the exploit chain is inferred from source. I could not inspect git history/patches to confirm the upstream fix commit, so I cannot rule out that the maintainers considered some mutation endpoints intentionally unrestricted. The FreeMarker templates are absent from this snapshot, so server-rendered menu/role gating (which could hide these operations from normal users in the browser) and the exact rendering of log messages could not be inspected; the client-side JS (e.g. jobinfo.index.1.js) shows operations are issued by the browser without role data, so hiding the menu would not remove the server-side exposure.",
+      "weakness_type": "Missing Authorization / Broken Access Control (CWE-862, CWE-269), leading to remote code execution on executor nodes"
+    }
+  ],
+  "coverage_summary": "Full inventory of the 232-file snapshot via get_source_scope/list_files; static filters: binary-like files skipped only when a NUL byte appears in the first 8 KiB, 0 files excluded for size/symlinks/sensitive names, so practically all text sources were visible. Read all admin controllers, interceptors, LoginService/AdminBizImpl/XxlJobServiceImpl, models/DAOs/mapper XML, core trigger/scheduler/server/GLUE/script/log/util classes, sample executors, application properties, SQL schema and relevant documentation sections; searched for PermissionLimit, validPermission, exec/Runtime.exec, ${} in mappers, ObjectInputStream/readObject, and HTML sinks in the bundled JS. The FreeMarker view templates (.ftl) referenced by application.properties are not present in this snapshot, and I did not exhaustively audit every bundled third-party static library (jQuery/Bootstrap/CodeMirror/dataTables/cronGen/echarts) or the Quartz-derived CronExpression for known-vulnerable dependencies.",
+  "limitations": [
+    "No code was executed and no runtime testing was performed; all findings are source-evidence inferences, not runtime-confirmed vulnerabilities.",
+    "No git history, diff, patch or CVE/CWE label was available, so I could not confirm which endpoints maintainers later restricted or which upstream commit fixed them.",
+    "FreeMarker templates are missing from the snapshot, so server-side menu/role rendering and log-detail rendering could not be inspected; the authorization finding is based on server-side controller/interceptor code, which is the actual trust boundary.",
+    "The default-empty accessToken family (unauthenticated admin /api and executor /run RCE) and the executor-address SSRF remain plausible alternate root causes; I judged the missing-authorization defect the strongest unambiguous code-level issue, but this is a judgment call, not a confirmed selection.",
+    "Dependency-version vulnerabilities (Spring 5.2.5, Netty 4.1.48, Groovy 3.0.3, Jackson, MySQL connector, etc.) were not analyzed against advisories (web access disallowed) and are outside the selected candidate."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Default-empty access token leaves the admin open API unauthenticated: xxl.job.accessToken is empty in xxl-job-admin/src/main/resources/application.properties:53, and JobApiController.java:50-54 skips the token check when the configured token is blank, exposing /api/registry, /api/registryRemove and /api/callback (AdminBizImpl.java:44-120) to unauthenticated callers (fake executor registration, removal/DoS of real executors, callback/result forgery and child-job triggering).",
+      "reason": "Real exposure, but the token is documented as optional (doc/XXL-JOB官方文档.md:511-513,1204-1212 explicitly describes '非空时启用' and '关闭安全性校验' as a supported setting), so this is an insecure-default/hardening issue rather than an unambiguous implementation defect; it was kept as an alternate lead and not the single candidate."
+    },
+    {
+      "lead": "Unauthenticated remote code execution on executors through the embedded server: EmbedServer.java:186-190 validates the token only when non-empty, and /run (EmbedServer.java:199-201) accepts a fully attacker-supplied TriggerParam; with glueType=GLUE_SHELL/GLUE_GROOVY the executor writes and executes the supplied source (ExecutorBizImpl.java:77-116, ScriptJobHandler.java:49-88, ScriptUtil.java:76), and sample configs ship an empty accessToken (xxl-job-executor-sample-spring/.../xxl-job-executor.properties:5, springboot application.properties:14).",
+      "reason": "Highest-severity alternate lead, but it requires network reachability to the executor's port 9999 and relies on the same documented optional-accessToken configuration; the code explicitly implements 'token empty = security check disabled', so it is a deployment/defaults problem rather than a missing check in the request-handling logic itself."
+    },
+    {
+      "lead": "Server-side request forgery via caller-supplied executor address: JobLogController.logDetailCat (JobLogController.java:137-157) passes the request parameter executorAddress straight to XxlJobScheduler.getExecutorBiz -> ExecutorBizClient -> XxlJobRemotingUtil.postBody (arbitrary URL, POST); JobInfoController.triggerJob's addressList (JobInfoController.java:132-143 -> XxlJobTrigger.java:64-67) and job-group addressList (JobGroupController.java:60-131) provide similar user-controlled destinations.",
+      "reason": "Requires an authenticated account and produces a mostly blind POST/SRF with a JSON body (response must deserialize as ReturnT/LogResult); plausible but weaker evidence of concrete impact than the missing-authorization chain, and it is largely enabled by the same authorization gap."
+    },
+    {
+      "lead": "Stored/DOM XSS in job log messages: handle_msg is fully attacker-controllable via the callback API (AdminBizImpl.java:99-118) when no token is set, and the log list embeds triggerMsg/handleMsg unescaped into HTML then re-inserts it with jQuery .html() (joblog.index.1.js:141,172,243-244,381).",
+      "reason": "The executable sink is client-side JavaScript and the log-detail FreeMarker templates are missing from this snapshot, so the full render path could not be verified; impact (session actions, not HttpOnly cookie theft) is lower than the selected candidate."
+    },
+    {
+      "lead": "MyBatis ${} usage for executorTimeout/executorFailRetryCount in XxlJobInfoMapper.xml:180-181.",
+      "reason": "The mapped XxlJobInfo fields are primitive ints (XxlJobInfo.java:28-29) bound by Spring MVC, so attacker strings cannot reach the SQL text; not a viable injection."
+    },
+    {
+      "lead": "Unsigned login cookie (LoginService.makeToken/parseToken, LoginService.java:29-41) and MD5 password storage (XxlJobUser, doc/db/tables_xxl_job.sql:115).",
+      "reason": "The cookie is re-validated against the DB (username + md5 password) on every request (LoginService.java:85-104) and is HttpOnly (CookieUtil.java:29-48); forging it requires knowledge of the account's MD5 hash (default hash for admin/123456 is documented) – credential/default-password hardening rather than an independent code vulnerability."
+    }
+  ],
+  "summary": "Reviewed the assigned xxl-job v2.2.0 snapshot (232 files: xxl-job-admin, xxl-job-core, executor samples, mappers, static assets, docs). The strongest source-evidenced issue is a broken-access-control defect in the admin web app: the documented per-executor permission model (\"普通用户仅拥有被分配权限的执行器，及相关任务的操作权限\", doc/XXL-JOB官方文档.md:57-58,959-961) is enforced only on a few read paths, while the job/executor/GLUE/log state-changing endpoints omit both the project's own JobInfoController.validPermission(...) helper and any @PermissionLimit(adminuser=true) annotation. Any authenticated normal user (role=0) can therefore operate jobs and executors outside their assigned permission, including rewriting GLUE source for an arbitrary job and triggering it, which the admin then ships to a real executor where ScriptJobHandler/ScriptUtil executes it – privilege escalation to code execution on executor hosts. Details, rejected leads (default-empty accessToken on admin /api and executor /run, user-controlled executorAddress addressList SSRF, job-log XSS) and limitations are below."
+}

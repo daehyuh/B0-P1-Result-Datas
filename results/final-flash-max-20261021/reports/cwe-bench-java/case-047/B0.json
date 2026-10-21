@@ -1,0 +1,73 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A user able to influence the `path` argument of a `readTrusted` call in the trusted Pipeline (e.g. the trusted Jenkinsfile reads a script whose path derives from a parameter, environment/branch name, or similar untrusted input), plus SCM content control for the repository being resolved. Without that, an attacker with commit access to the SCM revision used for the lightweight read can also place a symlink/relative-path file at the requested path, since the check is absent on these branches and the read is performed against whatever the SCM file system resolves.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that `readTrusted` is intended for use only from trusted scripts, and that a containment check does exist (lines 135-138), showing the authors considered path escape. Checked that in the standalone case a trust check is deliberately skipped for JENKINS-31386, and that the multibranch case compares tip vs trusted file content (lines 176-214), which limits content substitution but not path escape. Checked that the actual `SCMFileSystem`/`FilePath` implementations (Jenkins core, scm-api, git plugin) are not part of this snapshot, so they may themselves reject `..`, absolute paths, or symlinks; `SCMFileSystem.child` is documented as taking a repository-relative path and some implementations do validate it, which is the principal counterevidence.",
+      "id": "candidate-1",
+      "impact": "Disclosure of arbitrary readable files from the Jenkins controller or agent node filesystem (for example credentials/config files) into a build result, and traversal beyond the intended SCM root. The confinement check present in the heavyweight branch demonstrates the intended security boundary, so its absence in the lightweight branches is a plausible trust-boundary gap of the class fixed by Jenkins security advisories for readTrusted.",
+      "locations": [
+        {
+          "end_line": 115,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+          "start_line": 95
+        },
+        {
+          "end_line": 138,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+          "start_line": 135
+        },
+        {
+          "end_line": 187,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+          "start_line": 180
+        },
+        {
+          "end_line": 4,
+          "path": "src/main/resources/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep/help-path.html",
+          "start_line": 1
+        }
+      ],
+      "prerequisites": "Multibranch (or standalone SCM `CpsScmFlowDefinition`) job that runs `readTrusted` and uses the default lightweight checkout (`SCMBinder.USE_HEAVYWEIGHT_CHECKOUT` is off by default, line 65/180-181); an SCM whose `SCMFileSystem` implementation honors `..`/absolute paths or follows symlinks (cannot be verified from the snapshot); build/read access to the job to see the returned content.",
+      "root_cause": "In `ReadTrustedStep.Execution.run()`, the lexical containment check (`file.absolutize()...startsWith(dir... + '/')`) is only performed for the heavyweight case where a `FilePath` is built under the job workspace suffix directory (`dir.child(step.path)`, lines 135-138). The two lightweight branches bypass it entirely: (a) standalone `CpsScmFlowDefinition` jobs call `fs.child(step.path).contentAsString()` on the configured SCM (lines 102-107, with no trust check either), and (b) multibranch jobs call `tipFS.child(step.path).contentAsString()` / `trustedFS.child(step.path).contentAsString()` (lines 180-187). The value of `step.path` is not constrained to a repository-relative path before it is handed to the SCM file system, and the returned content is returned to the Pipeline and echoed into the build log.",
+      "title": "readTrusted lightweight-checkout paths pass attacker-influenced path to SCMFileSystem without the containment check used for workspace checkout",
+      "trace": "Pipeline calls `readTrusted(<path>)` -> `ReadTrustedStep.Execution.run()` -> with no `USE_HEAVYWEIGHT_CHECKOUT`, `SCMFileSystem.of(scmSource, head, trusted)` (or `SCMFileSystem.of(job, standaloneSCM)` in the standalone case) is non-null -> `trustedFS.child(step.path).contentAsString()` executes without the `startsWith(dir + '/')` guard used at lines 135-138 -> the resulting string is returned to the script (`return content`) and the file path is printed to the build log (line 187). A traversal/absolute/symlink path therefore yields file content from outside the repository root, whereas the same path in the heavyweight branch would hit the guard.",
+      "unverified": "Not runtime-confirmed; the snapshot contains no tests and no dependency sources, so it is unverified whether concrete SCMFileSystem implementations normalize/reject `..`, absolute paths, or symlink targets, and whether `FilePath.child`/`absolutize` normalize `..` in the heavyweight path (which would narrow the discrepancy). Also unverified which Jenkins version/plugin combination would exercise these branches in a real deployment.",
+      "weakness_type": "Path traversal / missing file-path confinement leading to arbitrary file read (CWE-22, CWE-200)"
+    }
+  ],
+  "coverage_summary": "Snapshot scope was 34 files (13 main Java classes under src/main/java, resources/messages/help files, pom.xml, README, CHANGELOG, and CI config). I fully read every main Java class except the final 10 lines of SCMVar.java (lines 121-130, pickle factory) and did not read the GitHub workflow files, .mvn/extensions.xml, dependabot config, localized Messages files, or the non-readTrusted help pages. There are no test sources, so behavior of the readTrusted branches could not be cross-checked against tests; dependency sources (Jenkins core FilePath, scm-api SCMFileSystem, SCM plugin file-system implementations) are outside the snapshot and unavailable.",
+  "limitations": [
+    "No tests or historical commits are present in the snapshot, so the finding is a source-level lead, not runtime-confirmed.",
+    "The safety of `SCMFileSystem.child(path)` with `..`, absolute paths, and symlinks is implemented in scm-api/SCM plugins not included in this snapshot; if those implementations reject such paths, the lightweight gap is not exploitable.",
+    "Whether `FilePath.child`/`absolutize` in Jenkins core normalizes `..` could not be verified here; that affects the exact severity of the heavyweight check at lines 135-138.",
+    "SCMVar.java lines 121-130 and several non-security resources/CI files were not read, and no dependency/version-resolution files beyond pom.xml were inspected."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Standalone `CpsScmFlowDefinition` path in ReadTrustedStep (lines 95-115) performs no trust check at all and reads the tip revision.",
+      "reason": "Explicitly intentional per the JENKINS-31386 comment, and the SCM is configured by an administrator; without the confinement gap this is documented behavior, not a distinct vulnerability."
+    },
+    {
+      "lead": "Heavyweight-branch containment check uses string prefix comparison on `absolutize()`d remote paths and does not resolve symlinks created by checkout before `file.readToString()` (lines 135-152, 190-208).",
+      "reason": "Plausible hardening gap, but the check itself is the upstream pattern; a symlink planted in the untrusted revision would also make the tip/trusted content comparison fail and abort (line 212), and exploiting it requires control of the trusted revision. Same root area as the submitted candidate, so not listed separately."
+    },
+    {
+      "lead": "JobPropertyStep.DescriptorImpl.newInstance loads a class name from form data and constructs arbitrary JobProperty descriptors; Execution can mutate job configuration from Pipeline (lines 125-157, 180-207).",
+      "reason": "This is the designed purpose of the `properties` step; the form-binding path requires job configuration permissions, and sandbox access to the step is governed by script-security in other plugins, not evidenced here."
+    },
+    {
+      "lead": "ResolveScmStep binds an arbitrary SCMSource from form data with no permission check and exposes ObserverImpl.isObserving() which throws NoSuchElementException for blank target lists (lines 188-213, 341-343).",
+      "reason": "Binding is performed through administrator-only configuration surfaces and the exception is at most a self-inflicted DoS with no cross-user trust boundary evidence."
+    },
+    {
+      "lead": "WorkflowBranchProjectFactory.getSCMSourceCriteria uses the configured `scriptPath` directly in `probe.stat(scriptPath)` (lines 72-104).",
+      "reason": "The value comes from project configuration; a malicious value would affect only the indexer's file probing for that project, and no sensitive read/return path is demonstrated in this snapshot."
+    },
+    {
+      "lead": "BranchJobProperty.decorateACL only blocks Item.CONFIGURE and non-dead Item.DELETE (lines 64-82).",
+      "reason": "Appears to be the intentional ACL model for branch projects; no bypass of these specific permissions is evident from the snapshot."
+    }
+  ],
+  "summary": "Reviewed the 34-file workflow-multibranch plugin snapshot (all 13 main Java classes, pom.xml, changelog, README, and the readTrusted/resolveScm help resources). The strongest evidence-supported lead is an asymmetric path-confinement check in `readTrusted`: the only containment check in `ReadTrustedStep` applies to the heavyweight workspace checkout path, while both lightweight `SCMFileSystem` code paths (standalone SCM and multibranch trusted-revision read) pass the pipeline-supplied `step.path` directly to `SCMFileSystem.child(...).contentAsString()` with no validation, allowing the returned file content to enter the build result/log if the SCM file system resolves paths outside the repository. No test sources or dependency sources are present in the snapshot, so the SCMFileSystem implementations' own path handling could not be verified."
+}

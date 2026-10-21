@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `p` query parameter of `GET /remoting/download` (middleware dispatcher endpoint, mapped from the `core.controllers` package in remoting-spring.xml) is fully attacker-controlled. The `s` parameter only needs to be a live user session UUID (any authenticated user's own session; the endpoint performs no further authorization). In the default configuration `cuba.download.directories=${cuba.tempDir};${cuba.logDir}` and usual client code passes `?s=<sessionId>&p=<path>` in URLs, so the parameter is part of the intended protocol.",
+      "confidence": "medium",
+      "counterevidence_checked": "Counterevidence: (1) the endpoint does require a valid session UUID in `s`, so it is not fully unauthenticated; (2) `isPermittedDirectory` does restrict the literal string to the configured directories, so blind absolute paths (e.g. `/etc/passwd` with no prefix) are rejected — only traversal via `..` after a valid prefix works; (3) the code style matches the rest of the upstream file, so I cannot prove by diff that this is the benchmark's intended injection rather than a long-standing upstream weakness; (4) the web-tier FileDownloadController for the same name uses file IDs only and is not affected, so this is specific to the middleware controller; (5) no runtime confirmation was performed.",
+      "id": "cand-1",
+      "impact": "Arbitrary file disclosure with the privileges of the middleware JVM user: configuration and property files (including database/JMX credentials in `cuba.confDir`/local.app.properties), logs, keystores, OS files, other tenants' data. File contents are returned by the unauthenticated-at-file-level `/remoting/download` response.",
+      "locations": [
+        {
+          "end_line": 107,
+          "path": "modules/core/src/com/haulmont/cuba/core/controllers/FileDownloadController.java",
+          "start_line": 66
+        },
+        {
+          "end_line": 168,
+          "path": "modules/core/src/com/haulmont/cuba/core/controllers/FileDownloadController.java",
+          "start_line": 140
+        }
+      ],
+      "prerequisites": "Attacker can reach the middleware `/remoting/download` endpoint (public in fast/split CUBA deployments) and possesses/knows a valid user session UUID. The permitted base directory prefix (`cuba.tempDir`/`cuba.logDir`) must be known or guessable (paths are often disclosed by error pages/logs).",
+      "root_cause": "`FileDownloadController.getFile()` takes the raw client-supplied `p` request parameter, URL-decodes it, and validates it only with `isPermittedDirectory()`, which does a literal `filePath.startsWith(configuredDir)` test after replacing backslashes and appending a trailing slash. The path is never canonicalized/normalized and `..` segments are not rejected, so a path such as `<cuba.tempDir>/../../../../etc/passwd` still passes the prefix test and is used to construct the file to read.",
+      "title": "Path traversal in middleware FileDownloadController allows arbitrary file read",
+      "trace": "download() -> getSession() (line 110-123) accepts any live session UUID for `s`; because `p` != null, getFile() is called (line 76-77) -> getFile() line 141 `URLEncodeUtils.decodeUtf8(request.getParameter(\"p\"))` -> isPermittedDirectory() line 154-168 performs only `filePath.startsWith(d)` on the un-normalized string -> line 144 `new File(filePath)` -> line 91 `FileUtils.openInputStream(file)` -> line 93 `IOUtils.copy(is, os)` streams the file content to the HTTP response.",
+      "unverified": "Not runtime-verified. I did not confirm the exact resolvability of `..` on the deployment OS nor that the middleware context is reachable in every deployment mode. Whether this matches the benchmark's ground-truth fix (e.g., canonical-path check) is an assumption.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Worked from get_source_scope (4,462 visible files; binary/NUL files skipped by tools; no files excluded by sensitivity filters). Reviewed core/global/web/portal security code: authentication providers and session creation (LoginPassword, RememberMe, TrustedClient, System, portal), access checkers (brute force, IP mask, client type), UserSession/permission/role evaluation (PermissionsUtils, SecurityImpl, PersistenceSecurityImpl), services (UserManagementService, UserSettingService, UserSessionService, TrustedClientService), controllers (/download, /upload, /log, /health, web FileDownloadController), file storage and FileDescriptor handling, remoting/serialization (HttpServiceExporter, StandardSerialization, KryoSerialization, RemotingServlet), scripting, link handlers/URL routing, JMX console and web-jars handler. Desktop/GUI/web-toolkit UI code was sampled rather than exhaustively reviewed.",
+  "limitations": [
+    "No build, deployment or runtime execution was performed; all conclusions are static and unconfirmed.",
+    "The snapshot contains no unit/integration test sources (only testsupport classes), so behavior could not be cross-checked against tests.",
+    "No upstream/VCS history or patch is available, so I could not verify whether the reviewed code is original, reverted or modified.",
+    "Dependency CVEs (bom.properties, build.gradle) were only spot-checked, not exhaustively matched against vulnerability databases.",
+    "Large GUI/desktop/web-widgets codebases were only partially inspected; additional issues may exist there.",
+    "Reachability of the middleware /remoting endpoints (and thus the practical attack surface of the candidate) depends on deployment topology that is not described by the source alone."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "UserManagementServiceBean.changeUserPassword(UUID,String), generateRememberMeToken(UUID), resetRememberMeTokens()/removeRememberMeTokens(List) perform privileged operations (set any user's password hash, mint a remember-me token for any user, delete remember-me tokens) without any permission or ownership check, while sibling methods (copyAccessGroup, moveUsersToGroup, changePasswordsAtLogon*) do call checkUpdatePermission. A client able to invoke the middleware-exposed `cuba_UserManagementService` (RemoteServicesBeanCreator auto-exports every @Service over HTTP unless cuba.doNotExposeRemoteServices=true) could perform account takeover.",
+      "reason": "Rejected/unconfirmed: self-service password change must work without User:update permission and the server-side gate for self change is the client-driven `checkPassword` call, so the absence of an unconditional check may be intentional; exploitability hinges on the disputable assumption that the middleware remoting endpoint is reachable by an attacker and that GUI-only permission gating is bypassable. The more clearly bounded file-read flow was selected instead."
+    },
+    {
+      "lead": "HttpServiceExporter/StandardSerialization deserialize any RemoteInvocation from the HTTP request body with plain Java serialization and no class allow-list on the default `/remoting/*` endpoints.",
+      "reason": "Rejected: this is the documented Spring HttpInvoker/remoting design of the platform and depends on exposing the middleware endpoint plus a suitable gadget chain; no attacker-controlled sink beyond the framework design was demonstrated in this snapshot."
+    },
+    {
+      "lead": "commons-compress 1.21 declared in modules/global/src/com/haulmont/cuba/bom.properties (used by EntityImportExport ZIP import) predates fixes for known 2023/2024 commons-compress CVEs (e.g., CVE-2023-42503, CVE-2024-25710/25711).",
+      "reason": "Rejected: dependency-version concern without a verified, reachable exploit path in this snapshot; the ZIP import flow only deserializes JSON entries and no DoS/traversal path was traced concretely."
+    },
+    {
+      "lead": "Reflected XSS: CubaApplicationServlet.redirectWithBlankHtmlPage writes the raw request URI and all decoded query parameters into redirect-page-template.html (JS string context) without escaping; prepareErrorHtml renders `exceptionMessage` as HTML when productionMode is false.",
+      "reason": "Rejected: both paths are gated by non-default configuration (`cuba.web.useRedirectWithBlankPageForLinkAction` defaults to false; productionMode must be off for the error page details), so the security impact is conditional and weaker than the file-read flow."
+    },
+    {
+      "lead": "CubaHttpFilter skips all registered HttpRequestFilter beans when the request URI merely `contains` one of the configured bypass strings (/ws/, /dispatch/, /front/).",
+      "reason": "Rejected: the base platform registers no HttpRequestFilter implementations, so no concrete protected resource is bypassed in this snapshot; impact would only appear with add-ons/app code."
+    }
+  ],
+  "summary": "Repository is the CUBA Platform (7.2-SNAPSHOT, ~2025 dependency set). I inspected the security-critical surface: authentication providers (login/password, remember-me, trusted client, portal), permission/role evaluation, session management, servlet/controller endpoints (file download/upload, log download, health), file storage, serialization/remoting, scripting, URL/link handlers and JMX. The strongest source-level issue found is a path traversal in the middleware file download controller: the client-supplied `p` parameter is only checked with a literal string prefix test (`startsWith` against `cuba.download.directories`) and then used directly to open a file, so `..` sequences pass the check and allow reading files outside the permitted directories. A second class of issues (missing authorization checks in `UserManagementServiceBean.changeUserPassword`/`generateRememberMeToken`/`resetRememberMeTokens`) is discussed as a rejected lead because self-service password change is intentionally unprivileged and exploitability depends on remoting/client-tier assumptions."
+}

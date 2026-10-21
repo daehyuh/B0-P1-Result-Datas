@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the bytes of an archive that Jenkins extracts. This is the normal situation for plugins/build steps that unzip a user- or artifact-supplied archive via the public `FilePath.unzip(FilePath)`, `unzipFrom(InputStream)`, `untar(FilePath,...)` or `untarFrom(InputStream,...)` APIs, and for `installIfNecessaryFrom(URL)` (FilePath.java:774-869), which downloads an archive over HTTP(S) and extracts it (`unzipFrom` at line 857 / `readFromTar` via `Unpack` at line 884); an attacker who can supply or tamper with that archive (or MITM/redirect the http source — redirects to arbitrary `Location` are followed at line 810) supplies entry names such as `../../<path>/file` or a symlink entry pointing outside the directory.",
+      "confidence": "medium",
+      "counterevidence_checked": "I checked the surrounding extraction code for any mitigation: `writing(File)` only invokes `FilePathFilter` and does not validate paths; `FilePath.java` contains no `getCanonicalPath`/`getCanonicalFile` usage and no `..` rejection for archive entries; the zip path does not special-case symlinks and the tar path passes `te.getLinkName()` straight to `symlinkTo`; `installIfNecessaryFrom` performs no archive signature/allow-list validation before extraction; `org.apache.tools.zip.ZipEntry`/commons-compress `TarArchiveEntry` return raw entry names (no normalization). By contrast, adjacent code that serves files (`jenkins/util/VirtualFile.FileVF.isIllegalSymlink`, `DirectoryBrowserSupport` `/../` check, `Plugin`/`AssetManager` path filters) does implement containment checks, showing the extraction path is the outlier. I also checked reachability from unauthenticated web endpoints: extraction is not directly exposed as an HTTP endpoint in core, so exploitation depends on a caller (core or plugin) that extracts an attacker-influenced archive; that dependency is why confidence is not high.",
+      "id": "cand-1-filesystem-archive-slip",
+      "impact": "Arbitrary file write (and directory creation) with the privileges of the Jenkins process on the node that performs extraction. This can overwrite Jenkins configuration/plugins/scripts (e.g., items under `$JENKINS_HOME`), agent-side files outside the workspace, or other files writable by the service account, leading to code execution or integrity compromise on master/agent; it also enables denial of service by overwriting/corrupting critical files. On agents, it can defeat the intended workspace boundary and (depending on the environment) enable master-side impacts via persisted data.",
+      "locations": [
+        {
+          "end_line": 624,
+          "path": "core/src/main/java/hudson/FilePath.java",
+          "start_line": 590
+        },
+        {
+          "end_line": 2323,
+          "path": "core/src/main/java/hudson/FilePath.java",
+          "start_line": 2291
+        },
+        {
+          "end_line": 869,
+          "path": "core/src/main/java/hudson/FilePath.java",
+          "start_line": 774
+        }
+      ],
+      "prerequisites": "A reachable code path that extracts an attacker-influenced zip/tar through FilePath (a core/plugin tool installer, workspace snapshot restore, or any build/plugin step that unzips user-supplied archives). The Jenkins process must be able to write the target path (the extraction runs with the Jenkins user's privileges on the machine performing extraction — master for `installIfNecessaryFrom`, or the agent for agent-side extraction).",
+      "root_cause": "`FilePath.unzip(File,File)` (core/src/main/java/hudson/FilePath.java:590-624) and `FilePath.readFromTar(...)` (core/src/main/java/hudson/FilePath.java:2291-2323) build the destination with `new File(dir, e.getName())` / `new File(baseDir, te.getName())` and then call `mkdirs(...)`/`writing(f)`/`IOUtils.copy(...)` without ever verifying that the resolved path stays inside `dir`/`baseDir`. No canonical-path check, no rejection of `..` path segments, and no restriction on tar symlink targets (`new FilePath(f).symlinkTo(te.getLinkName(), ...)`) exists in this class (`getCanonicalPath`/`getCanonicalFile` is never used in FilePath). The only helper that runs before writes, `writing(File f)` (FilePath.java:2906-2915), merely invokes `FilePathFilter` (default allow) and does not normalize or bound the path. Entry names come from the archive (`org.apache.tools.zip.ZipEntry#getName`, `TarArchiveEntry#getName`), which preserve `../`/`..\\` sequences, so `new File(dir, \"../../x\")` escapes.",
+      "title": "Archive extraction in hudson.FilePath does not prevent zip/tar entry path traversal (Zip/Tar Slip) — arbitrary file write",
+      "trace": "archive entry name (attacker-controlled) -> `new File(dir, e.getName())` (FilePath.java:599) or `new File(baseDir, te.getName())` (FilePath.java:2297) -> no containment check -> `mkdirs(f)` / `mkdirs(parent)` + `writing(f)` + `IOUtils.copy(input, writing(f))` (FilePath.java:600-609) or `IOUtils.copy(t, f)` / `symlinkTo(te.getLinkName(),...)` (FilePath.java:2303-2313) -> file/symlink created outside the target directory. Because no canonical-path or `..` validation occurs anywhere in this extraction path, `../` entries either overwrite/create arbitrary files with Jenkins process permissions or create outside-pointing symlinks that subsequent entries write through.",
+      "unverified": "No runtime or unit test was executed (the snapshot contains no test sources) and no exploit payload was built, so exploitation was not confirmed end-to-end. I could not verify which caller first exposes attacker-controlled archives in a given deployment, nor confirm the upstream fix/advisory mapping: the snapshot's POM says 2.73.4-SNAPSHOT while the tree contains 2018-era changes (SafeURLConverter/SECURITY-637, User SECURITY-897 guard, BasicApiTokenHelper), so version/branch metadata appears inconsistent and I could not tie this to a specific CVE/SECURITY id. Whether this is the exact issue the benchmark targets is therefore uncertain; the source evidence that the containment check is absent is direct, but the practical prerequisites require an extraction caller that accepts untrusted archives.",
+      "weakness_type": "CWE-22 Path Traversal (Zip/Tar Slip) leading to arbitrary file write"
+    }
+  ],
+  "coverage_summary": "All 8,938 files visible in the assigned snapshot were in scope for text search (binary/NUL files skipped; no sensitive-path exclusions reported). Only production sources are present (no `src/test` trees). I read the full `hudson.FilePath` extraction routines and their callers/tool installers, `jenkins/model/Jenkins.java` request handlers, `hudson/security/*` (ACL, CSRF, security realms), `jenkins/security/*` (tokens, S2M filters), `hudson/model/*` request handlers (items, runs, queue, views, users, computers, update/download), `hudson/console` deserialization, `jenkins/util/VirtualFile`/`JSONSignatureValidator`, `hudson/Plugin(Manager)`, and the `cli/` module, plus targeted greps for command execution, file writes, redirects, deserialization, zip/tar extraction, permission/RequirePOST usage, and known SECURITY- references. Review was not an exhaustive line-by-line audit of every remaining file.",
+  "limitations": [
+    "No tests exist in the snapshot, so fix/regression tests that would identify the intended vulnerability could not be inspected.",
+    "No build, execution, or dynamic testing was performed; findings are static source analysis only.",
+    "Version metadata is inconsistent (POM 2.73.4-SNAPSHOT vs. 2018-era code such as SafeURLConverter, the SECURITY-897 guard in User.java, and BasicApiTokenHelper), so the exact commit/branch and the corresponding security advisory could not be pinned down.",
+    "Exploitability of the archive-extraction candidate depends on a caller that extracts attacker-influenced archives; in-core callers (tool installers, workspace restore) and plugin callers were not exhaustively enumerated, and no payload was constructed.",
+    "Only the single strongest candidate was submitted, per the one-candidate limit; other plausible-but-unproven leads were recorded as rejected."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ApiTokenProperty.doChangeToken (core/src/main/java/jenkins/security/ApiTokenProperty.java:182-195) adds a token property on the `p == null` path without an explicit ADMINISTER check (only the existing-property branch calls changeApiToken(), which checks ADMINISTER).",
+      "reason": "The property created is the deterministic legacy token HMAC(API_KEY_SEED, userId) backed by a server-side secret; the caller cannot learn it (getApiToken() hides it from unauthorized users), so no concrete unauthorized-access impact could be traced."
+    },
+    {
+      "lead": "DownloadService.Downloadable.doPostBack writes posted JSON metadata without signature verification (core/src/main/java/hudson/model/DownloadService.java:386-407) and DownloadService.signatureCheck comments warn that unprivileged users could submit spoofed metadata.",
+      "reason": "checkPostBackAccess() (jenkins/model/DownloadSettings.java:81-86) requires Jenkins.ADMINISTER and @RequirePOST is present, so the danger is gated to administrators in this snapshot; no bypass found."
+    },
+    {
+      "lead": "Jenkins.doLoginEntry redirects to the `from` parameter when it merely starts with \"/\" (core/src/main/java/jenkins/model/Jenkins.java:3954-3957), allowing scheme-relative values like //evil.example.",
+      "reason": "This path is only used by the deprecated LegacySecurityRealm and is an open-redirect/UX issue rather than direct compromise; other redirect sites use Util.isSafeToRedirectTo. Impact and evidence are weaker than the archive-write candidate."
+    },
+    {
+      "lead": "Console note / CLI object deserialization paths (hudson/console/AnnotatedLargeText.java:121-123, hudson/console/ConsoleNote.java:257-259, cli Connection.readObject).",
+      "reason": "ConsoleNote uses ObjectInputStreamEx with ClassFilter.DEFAULT and AnnotatedLargeText decrypts server-side-encrypted console annotations before deserializing, so attacker-controlled deserialization was not established."
+    },
+    {
+      "lead": "DirectoryBrowserSupport file serving and FileParameterValue.doDynamic path handling.",
+      "reason": "DirectoryBrowserSupport rejects /../ and VirtualFile enforces real-path containment; FileParameterValue's location comes from the job's parameter name (a configure-level value), so neither yielded a stronger attacker-controlled path traversal than the FilePath extraction issue."
+    }
+  ],
+  "summary": "Reviewed the assigned Jenkins core/CLI snapshot (8,938 production source files; no test sources are present in the snapshot). I traced the strongest plausible issue across files: archive extraction in `hudson.FilePath` performs no containment validation on zip/tar entry names, so an archive whose entries contain `..` (or an archive that first creates a symlink to an outside directory) can write files outside the intended extraction directory. One candidate is submitted; several other suspicious spots were examined and rejected as weaker/unproven."
+}

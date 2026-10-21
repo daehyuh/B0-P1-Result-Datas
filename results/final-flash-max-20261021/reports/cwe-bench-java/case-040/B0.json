@@ -1,0 +1,56 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The gzip+tar byte stream is produced by the pod/container being copied from: the method runs `sh -c \"tar cz - <srcPath> | base64\"` through the exec API (lines 123-131) and treats that stdout as the archive. A malicious or compromised container (or anything able to substitute the container's tar/sh output) can return an arbitrary base64-encoded tar whose entry names contain `../` sequences (and platform-specific separators). The caller only controls the destination root; entry names are entirely attacker-controlled.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the whole file: no sanitization anywhere (searched for canonical/normalize/`..` handling patterns in util, none present). `canReadEntryData` does not check paths. The destination Path itself is caller-supplied/trusted, but that does not constrain entry names. The reverse operation (copyFileToPod) is not affected. Under the benign cooperative-pod assumption the pod's own `tar` emits relative entries, so the flaw is latent and only manifests when the pod payload is adversarial or the stream is tampered with; that prerequisite is realistic for a client library whose Copy API is used to pull files out of workloads. Also considered whether a fix exists elsewhere in the file/module and confirmed there is none. No runtime test or exploit was executed.",
+      "id": "copy-directory-path-traversal",
+      "impact": "Arbitrary file creation/overwrite on the machine running the Kubernetes client, outside the directory the caller chose for the copy operation, with the privileges of the client process. This can corrupt or plant files consumed later by the OS or applications (for example user-level startup/config files), which can in turn lead to code execution or privilege abuse depending on environment; it can also overwrite application data. The pod being copied from is normally the less-trusted side of the trust boundary, and the client host filesystem is the asset being protected.",
+      "locations": [
+        {
+          "end_line": 132,
+          "path": "util/src/main/java/io/kubernetes/client/Copy.java",
+          "start_line": 123
+        },
+        {
+          "end_line": 154,
+          "path": "util/src/main/java/io/kubernetes/client/Copy.java",
+          "start_line": 133
+        }
+      ],
+      "prerequisites": "The application must call Copy.copyDirectoryFromPod(...) (any overload) against a pod/container whose exec output is controlled by an adversary, and the client OS user must have write permission to the resolved target paths. Target paths are bounded by the privileges of the process running the Java client.",
+      "root_cause": "Tar entry names from the exec stream returned by the target pod are used verbatim to construct the local output path: `File f = new File(destination.toFile(), entry.getName())` (Copy.java:140) followed by `FileOutputStream(f)` (Copy.java:150). There is no normalization, no rejection of `..` components, and no canonical-path containment check against `destination`, so archive entries can escape the destination directory.",
+      "title": "Path traversal in Copy.copyDirectoryFromPod allows a malicious pod to write files outside the destination directory",
+      "trace": "1) copyDirectoryFromPod(container) execs `tar cz - <srcPath> | base64` in the pod (Copy.java:123-131). 2) The client decodes Base64 and parses the gzip'd tar with TarArchiveInputStream (Copy.java:131-132). 3) For every entry it takes `entry.getName()` and resolves it against the caller's destination via `new File(destination.toFile(), entry.getName())` (Copy.java:140) with no containment check; `archive.canReadEntryData(entry)` (line 136) only filters unreadable entry types, it does not validate paths. 4) For directories it creates the path with mkdirs() (141-144); for regular files it creates parent directories (146-149) and writes the archive bytes into the resolved file with FileOutputStream (150-153). 5) A tar entry named e.g. `../../<path>` therefore resolves outside `destination` and its content is written there, creating or overwriting any file the client user can write.",
+      "unverified": "No runtime execution or archive was crafted, so the escape is demonstrated by source reading only; commons-compress 1.20 (pom) is not present in the snapshot, and its exact entry-name handling/unpack behavior was not verified locally. The precise intended threat model (whether the project treats a pod's exec output as untrusted) is not stated in the snapshot; no test sources are present to confirm expected hardening.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / Zip-Slip"
+    }
+  ],
+  "coverage_summary": "Reviewed repository-relative main sources across util (all hand-written files, including Copy, Exec, Attach, PortForward, ProtoClient, Yaml, KubeConfig, ClientBuilder, Config, FilePersister, SSLUtils, authenticators, WebSockets/WebSocketStreamHandler, Watch, labels, generic API and options), extended (controller, informer-adjacent, leaderelection, event, workqueue, kubectl, pager), spring annotation processor sources, examples, and root/module poms plus RELEASES.md/CHANGELOG.md/README.md. Generated code was spot-checked rather than read exhaustively: ApiClient SSL trust/hostname settings (ApiClient.java:1286-1350), generated path-parameter escaping in CoreV1Api, JSON/proto/client classes were sampled. The snapshot has no test sources at all.",
+  "limitations": [
+    "Six files were excluded by the harness as sensitive-name/path (get_source_scope: excluded_sensitive_name_or_path=6); the excluded set appears to be the referenced io.kubernetes.client.util.credentials package (AccessTokenAuthentication, Authentication, KubeconfigAuthentication, TokenFileAuthentication, UsernamePasswordAuthentication), so credential handling could not be reviewed and the tree is not fully compilable as shown.",
+    "No test directories exist in the snapshot, so expected-behavior/regression tests for Copy, Yaml and credentials could not be consulted.",
+    "The bulk of the ~900 generated openapi API/model files and the large kubernetes/docs set were only spot-checked (path escaping, SSL settings); a defect in unread generated code cannot be excluded.",
+    "Third-party dependency sources (snakeyaml 1.26, commons-compress 1.20, okhttp, jose4j, guava) are not in the snapshot; conclusions that depend on their internal behavior are based on general knowledge and were not verified locally.",
+    "No code was executed, no tests/scanners were run, and no runtime or exploit validation was performed; the candidate is a source-evidence lead only."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unsafe SnakeYAML deserialization in util/Yaml.java: `CustomConstructor extends org.yaml.snakeyaml.constructor.Constructor` (Yaml.java:323) is instantiated as `new org.yaml.snakeyaml.Yaml(new CustomConstructor(), new CustomRepresenter())` (Yaml.java:464-466) with snakeyaml 1.26 (pom.xml:38), unlike KubeConfig.java:83 which uses SafeConstructor; load/loadAs/loadAll on attacker-supplied YAML could instantiate arbitrary classes and lead to RCE (CWE-502).",
+      "reason": "Source usage is suspicious and the SafeConstructor contrast is real, but the dangerous type-instantiation behavior lives in the SnakeYAML dependency, which is not part of the snapshot, so it could not be verified from local evidence; exploitability also requires a downstream caller that parses untrusted YAML. Not selected as the single candidate because the tar-extraction traversal is fully demonstrable from in-repo source."
+    },
+    {
+      "lead": "OpenIDConnectAuthenticator parses the id_token payload without signature verification (util/.../OpenIDConnectAuthenticator.java:83-101).",
+      "reason": "The code comment (lines 86-94) and design state the token is only a bearer credential to be verified by the API server; the unverified parse is used only for local expiry checks, so no local trust decision is based on unverified claims. Not a vulnerability on the evidence available."
+    },
+    {
+      "lead": "Exec.ExecutionBuilder.makePath concatenates namespace, name and container into the request path/query without URL-encoding (Exec.java:272-297).",
+      "reason": "Only command arguments are encoded; namespace/name/container are not. However no in-repo path feeds attacker-controlled values into these parameters, and pod names/namespaces are API-server-validated, so impact is speculative; lower evidence and impact than the selected candidate."
+    },
+    {
+      "lead": "KubeConfig runs `user.exec.command` from the kubeconfig via ProcessBuilder (KubeConfig.java:299-345).",
+      "reason": "This is the documented client-go exec-credential-plugin behavior; the kubeconfig is trusted local configuration, so treating it as an injection sink would be incorrect on the available evidence."
+    }
+  ],
+  "summary": "Snapshot is kubernetes-client/java at version 9.0.1 (all module poms + root pom agree; generated APIs correspond to the Kubernetes 1.20 era). I inspected the hand-written library code (util, extended, spring, examples) with focused reads on trust-boundary code: Copy/Exec/Attach/PortForward, Yaml, KubeConfig/ClientBuilder/Config, SSLUtils, authenticators, WebSockets, generic API, labels, and spot-checked the generated openapi client (ApiClient SSL/hostname handling, path-parameter escaping in CoreV1Api) and the poms. The single strongest, self-contained issue is the unguarded tar extraction in Copy.copyDirectoryFromPod (CWE-22 path traversal / Zip-Slip): tar entry names produced by the target pod are joined to the caller's destination directory and written with FileOutputStream without any canonicalization or \"..\" containment check, so a malicious/compromised pod can write/overwrite files outside the destination on the machine running the client. Other plausible leads were considered but not selected: unsafe SnakeYAML Constructor in util/Yaml.java (exploitability depends on the SnakeYAML 1.26 implementation, which is not part of the snapshot, and on downstream callers parsing untrusted YAML); intentionally unverified OIDC JWT payload (documented as by-design, token is verified by the API server); unencoded namespace/name/container in Exec.ExecutionBuilder.makePath (no attacker-controlled source in-repo); and kubeconfig exec-credential plugin execution (by design, kubeconfig is trusted local config). No runtime confirmation was performed; findings are source-evidence leads only."
+}

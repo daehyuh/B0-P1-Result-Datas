@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The request URI/path is fully attacker-controlled. A request such as /app/%252e%252e/... is decoded once by the connector into a literal '%2e%2e' segment; when a configured rewrite rule's substitution uses a resolver variable that returns decoded path data (%{REQUEST_PATH}, %{SERVLET_PATH}, %{PATH_INFO}, %{REQUEST_FILENAME}) or a decoding rewrite map (e.g. 'unescape:'), the attacker's literal '%2e%2e' text is placed into the rewrite result, survives normalize() (it is not yet '..'), and is turned into '..' by the final URLDecoder.decode(). The resulting decodedURI (e.g. /ctx/foo/../WEB-INF/web.xml) is mapped without re-normalization.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that simple, configuration-free attacks are blocked: the connector's single percent-decoding plus RequestUtil.normalize() removes literal '..' before the valve sees the URL, and encodeForRewrite() re-encodes attacker '%' as '%25' in the rule input, so a capture-group-only rule ($1) cannot yield '..' after the valve's single final decode. The chain therefore requires a rule/map that reintroduces decoded or freshly-encoded path text (documented features). Also checked that StandardRoot.validate() and AbstractFileResourceSet.file() reject paths that would escape the root ('..' at the start) and apply canonical/case checks, so the impact is bounded to normalization mismatch inside the context, not arbitrary file-system read outside the webapp root. Checked the competing explanations for other recent Tomcat fixes: FileUpload partHeaderSizeMax/fileCountMax are present and wired (MultipartStream.readHeaders + FileItemIteratorImpl.init), HTTP/1.1 and HTTP/2 header/cookie/trailer/overhead limits are present and enforced, FileStore canonicalization is present, RemoteIpValve/RequestFilterValve trust logic matches upstream, and the FORM saved-request/session-id-note code is consistent.",
+      "id": "rewritevalve-decode-after-normalize",
+      "impact": "Bypass of the container's /WEB-INF and /META-INF direct-access protection (disclosure of web.xml, JSP sources, configuration and credentials) and of URL-pattern-based security constraints (constraints are matched against the attacker-influenced, un-normalized decoded path). Where the DefaultServlet is writable or partial PUT is enabled, the same technique can target write/delete operations against resources outside the intended path, which in Tomcat deployments is the classic precursor to code execution via a written JSP.",
+      "locations": [
+        {
+          "end_line": 596,
+          "path": "java/org/apache/catalina/valves/rewrite/RewriteValve.java",
+          "start_line": 539
+        },
+        {
+          "end_line": 664,
+          "path": "java/org/apache/catalina/connector/CoyoteAdapter.java",
+          "start_line": 650
+        },
+        {
+          "end_line": 64,
+          "path": "java/org/apache/catalina/core/StandardContextValve.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 96,
+          "path": "java/org/apache/catalina/valves/rewrite/ResolverImpl.java",
+          "start_line": 80
+        }
+      ],
+      "prerequisites": "A RewriteValve is enabled with at least one rule whose substitution incorporates a decoded-path resolver variable (REQUEST_PATH/SERVLET_PATH/PATH_INFO/REQUEST_FILENAME) or a decoding map such as unescape:; the default rules from the documentation do not by themselves decode attacker data. No authentication is required in the default configuration; if the DefaultServlet is write-enabled (allowPartialPut/readOnly=false) the same traversal may also reach write paths, which is the typical RCE chain in Tomcat (write a JSP/plant content under a sensitive directory).",
+      "root_cause": "In RewriteValve.invoke(), after rewriting, the decoded request URI is constructed from the rewrite result by first normalizing the still-percent-encoded string and only then calling URLDecoder.decode() on it (lines 553-564). Because normalization runs before decoding, sequences such as %2e%2e, %2f or %5c that are not recognized as '.'/'/' at normalize time become '.'/'/' path elements in the final decoded URI. The rewritten requestURI/decodedURI are set as T_CHARS MessageBytes, so the re-entry path CoyoteAdapter.postParseRequest() (invoked through Adapter.prepare() at lines 586-589) takes the non-BYTES branch (CoyoteAdapter.java lines 650-664) which trusts decodedURI as already 'decoded and normalized' and performs no normalization/decoding. The mapper therefore maps the un-normalized decoded path and StandardContextValve.invoke() (lines 58-64) checks that same un-normalized context-relative path for the /WEB-INF//META-INF guard; the resource layer (StandardRoot.validate()/AbstractFileResourceSet.file()) normalizes afterwards, so a path like /foo/../WEB-INF/web.xml passes the container guard but resolves to WEB-INF/web.xml. Attacker-controlled text reaches the substitution through resolver variables that return decoded path data (ResolverImpl.resolve(): REQUEST_PATH, SERVLET_PATH, PATH_INFO at lines 82-85, and REQUEST_FILENAME/PATH_TRANSLATED) or through the unescape rewrite map; such values are inserted into the substitution raw and are not re-encoded by encodeForRewrite() (which only encodes the rule input).",
+      "title": "RewriteValve installs a post-normalization-decoded URI, allowing encoded traversal/separators to survive into mapping and the WEB-INF guard",
+      "trace": "Request '/ctx/%252e%252e/WEB-INF/web.xml' -> CoyoteAdapter.postParseRequest(): URLDecoder.convert() decodes %25 once, decodedURI contains literal '%2e%2e'; normalize() does not treat '%2e%2e' as '..'. -> Mapper maps /ctx; RewriteValve runs as a pipeline Valve; ResolverImpl.resolve(\"REQUEST_PATH\"/\"PATH_INFO\"/\"SERVLET_PATH\") returns the decoded path containing literal '%2e%2e'. -> RewriteValve Step 3: urlStringRewriteEncoded = RequestUtil.normalize(...) leaves '%2e%2e' intact; chunk.append(URLDecoder.decode(urlStringRewriteEncoded, uriCharset)) yields '..' in decodedURI. -> RewriteValve re-invokes connector.getProtocolHandler().getAdapter().prepare() -> CoyoteAdapter.postParseRequest(): undecodedURI.getType()==T_CHARS, so the else branch only calls decodedURI.toChars(); no normalize, no decode. -> Mapper.map() maps the '/foo/../WEB-INF/web.xml'-style decoded path; StandardContextValve checks request.getRequestPathMB() against '/WEB-INF/' and does not match because of the leading '/foo/..'; DefaultServlet then calls resources.getResource(path), StandardRoot.validate() normalizes the path to '/WEB-INF/web.xml' and accepts it, so the protected resource is resolved/served.",
+      "unverified": "Not runtime-confirmed. I could not execute Tomcat, a mapper, or a rule engine, and the repository test directory is absent from the snapshot, so the exploit chain is reconstructed from source only. I could not diff against the upstream fix for the known 2025 rewrite-valve advisory, so I cannot prove this is the exact patched root cause; it is possible that a later normalization/validation step I did not trace (for example inside Mapper or a specific servlet) blocks part of the chain. The requirement for a rewrite rule that feeds decoded-path data into the substitution limits real-world applicability.",
+      "weakness_type": "CWE-22 path traversal / CWE-863 incorrect authorization (security-constraint and /WEB-INF/META-INF guard bypass)"
+    }
+  ],
+  "coverage_summary": "Scope: the full assigned snapshot (get_source_scope reported 2977 files, no sensitive-path or size exclusions, binary files skipped on NUL detection; the snapshot contains no test/ directory). I read or searched the major request-processing and security components: CoyoteAdapter/Request/Response/InputBuffer, Http11Processor/InputBuffer/OutputBuffer and filters, HTTP/2 parser/handler/Stream, AJP processor limits, Catalina Core (ApplicationFilterFactory/FilterUtil, StandardContextValve, NamingContextListener, Dispatcher-related paths), DefaultServlet (including partial PUT/range handling) and WebdavServlet, CGIServlet, RewriteValve + Resolver/RewriteRule/maps, authenticator package (Form/Basic/Digest/AuthenticatorBase/SavedRequest/SingleSignOn), session package (StandardManager/Session/FileStore/PersistentManager/DataSourceStore), webresources (StandardRoot/DirResourceSet/AbstractFileResourceSet), filters (RemoteIp/Cors/Csrf/RestCsrf/RateLimit/HttpHeaderSecurity), realm package (JNDIRealm escaping, DataSourceRealm/DataSourceUserDatabase prepared statements), the internal FileUpload fork, threads/TaskQueue, startup (ExpandWar/ContextConfig/HostConfig), and the bundled manager/host-manager/examples apps at a search level. P1 index used only for navigation: get_relation_scope reported partial index coverage (2881/2977 files indexed, 691 parsed, 96 source files absent, no control/data-flow or semantic resolution, unresolved calls 58455), so index edges were treated as candidates and verified in source where cited. Areas not exhaustively read: Jasper compiler internals, WebSocket frame handling, clusters/Tribes internals, SSL/net endpoint code, jdbc-pool module, and most webapp JSP/HTML content; these were not excluded by any finding, and no vulnerability was substantiated there.",
+  "limitations": [
+    "No code was executed: no build, test, server, rule engine, or reproduction was run, so the candidate is a source-level lead only.",
+    "The snapshot has no test directory and no .git metadata, so I could not diff against the upstream fix or use tests to confirm the patched behavior/root cause.",
+    "The P1 relation index is partial and syntax-only (no data/control flow, no semantic resolution); conclusions were drawn from source text, not index labels.",
+    "Exploitability of the candidate depends on rewrite-rule/map configuration (decoded-path resolver variables or the unescape map); I could not enumerate real-world configurations or prove reachability on a running instance.",
+    "Upstream-comparison checks were based on code reading and familiarity, not on a fetched reference tree; a subtle deviation in an unread file (Jasper, WebSocket, Tribes, SSL/net, jdbc-pool, or webapp content) could not be excluded.",
+    "The exact June-2025 Tomcat 11.0.8 security-fix commit could not be identified from local sources, so this review cannot confirm that the submitted candidate is the intended ground-truth issue rather than a separate latent weakness."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Multipart/FileUpload DoS (many parts or unbounded part headers) in java/org/apache/tomcat/util/http/fileupload",
+      "reason": "The fork already enforces the limits that would be the fix: FileUploadBase.fileCountMax is applied in parseRequest and set by Request.parseParts, and FileUploadBase.DEFAULT_PART_HEADER_SIZE_MAX (512) is wired into MultipartStream.readHeaders via FileItemIteratorImpl.init. No missing enforcement found."
+    },
+    {
+      "lead": "HTTP/2 or HTTP/1.1 resource-exhaustion (PING/SETTINGS/RST/HEADERS/DATA overhead, trailers, chunk extensions, header counts)",
+      "reason": "Http2UpgradeHandler overhead-count handling, maxConcurrentStreams/pruneClosedStreams, HpackDecoder maxHeaderCount/maxHeaderSize, ChunkedInputFilter maxExtensionSize/maxTrailerSize, and the Http11InputBuffer header-size checks are all present and consistent with upstream hardening; no missing limit identified in the time available."
+    },
+    {
+      "lead": "ProxyErrorReportValve server-side fetch (java/org/apache/catalina/valves/ProxyErrorReportValve.java) as SSRF",
+      "reason": "The fetched URL is taken from configuration (error-page location or the ProxyErrorReportValve.properties bundle), and request data is only appended URL-encoded as query parameters; there is no attacker-controlled target selection, so this is admin-controlled behavior, not a boundary crossing."
+    },
+    {
+      "lead": "HostManager/Manager servlets building File paths from request parameters (host name/appBase/deploy paths)",
+      "reason": "These servlets are only reachable with the host-manager/manager roles (admin-equivalent capability) and the code paths match upstream expectations; not an unauthenticated or cross-privilege-boundary issue."
+    },
+    {
+      "lead": "New multiple-path-parameter support (RequestUtil.stripPathParams / CoyoteAdapter.parsePathParameters) enabling session-ID injection or traversal",
+      "reason": "Traced the parsing logic: semicolon segments are stripped before mapping and values are added to the path-parameter map only; attacker ';' characters are percent-encoded by encodeForRewrite before rewrite processing, and session-ID-from-URL handling is unchanged, so no new injection vector was substantiated."
+    },
+    {
+      "lead": "FORM authenticator session handling / 69706 saved-request serialization changes",
+      "reason": "The session-ID CSRF note checks, changeSessionIdOnAuthentication flow, and SavedRequest serialization fields match the hardened upstream behavior; no deviation with security impact was identified."
+    }
+  ],
+  "summary": "Apache Tomcat 11.0.8-dev source snapshot (between 11.0.7, 2025-05-13, and the 11.0.8 dev cycle), including Coyote/Catalina/Jasper/WebSocket, the internal Commons FileUpload fork, the RewriteValve, session/realm/filter code, and the bundled webapps. I reviewed the request path end-to-end (CoyoteAdapter parsing/normalization, Mapper, ContextValve, DefaultServlet/WebDavServlet, RewriteValve and its resolver/substitution machinery), the recently changed areas called out by the in-tree changelog (multipart getParameter behavior, multiple path parameters, rewrite redirect/session handling, FORM saved-request serialization, java:module, RateLimitFilter, CGI WebResource refactor, filters with context-root mappings), the multipart fork limits (partHeaderSizeMax/fileCountMax), HTTP/2 and HTTP/1.1 DoS limits, cookie/header limits, session persistence path handling, and the FileStore canonicalization guard. Most of these matched hardened upstream implementations and did not meet the bar for a candidate. The single strongest source-evidenced lead I could substantiate is in the RewriteValve: after a rewrite it builds the decoded, mapped URI by normalizing the still-encoded URL and only then percent-decoding it, so decoding can reintroduce \".\"/\"..\" and \"/\" separators after normalization; the rewritten URI is installed as a T_CHARS MessageBytes, and the second postParseRequest invoked via Adapter.prepare() takes the T_CHARS branch and performs no further normalization/decoding, so the un-normalized decoded path is used for mapping and for the /WEB-INF//META-INF guard while the resource layer later re-normalizes. This is a lead, not a runtime-confirmed vulnerability; exploitation depends on the rewrite rules/maps configured (decoded-path resolver variables or decoding maps must feed the substitution), which I could not execute or prove."
+}

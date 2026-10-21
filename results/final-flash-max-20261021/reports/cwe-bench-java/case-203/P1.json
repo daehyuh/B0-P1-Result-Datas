@@ -1,0 +1,62 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any remote peer that can send bytes on a channel with an `SslHandler` (a TLS/SSL server accepting connections, or a client connecting to an attacker-controlled endpoint) fully controls the 5-byte record header: content type, version bytes and the 16-bit length field. No authentication or prior handshake state is required to reach the record-length computation (it happens on the first bytes in `decodeJdkCompatible`).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that (a) `decodeJdkCompatible` does validate `packetLength <= readableBytes`, so a crash does not come from under-length buffers on the SslHandler side; (b) `ReferenceCountedOpenSslEngine` re-parses the header and has a `MAX_RECORD_SIZE` rejection — but that rejection sits inside the `packetLengthDataOnly > capacity` branch and `capacity` equals the SslHandler-provided length because `SslHandler.unwrap` allocates `decodeOut` with exactly that length, making it unreachable for this path; (c) the JDK engine path simply propagates engine errors, so the severe impact is specific to the native engine; (d) `SslClientHelloHandler` was separately inspected and its accumulation is bounded by `maxClientHelloLength`, so that is not the lead. The exact native failure mechanism could not be reproduced or proven statically.",
+      "id": "netty-sslhandler-record-length-validation",
+      "impact": "Malformed or oversized TLS records reach the native TLS stack, which per the public 4.1.118-era advisory class (SslHandler not validating packets before passing them to the native SSLEngine) can crash the JVM (native SIGSEGV), giving unauthenticated remote denial of service; second-order effects are connection stalls/memory growth while the handler caches large `packetLength` values. Impact is asserted at source-evidence level only; no runtime crash was observed and none is claimed.",
+      "locations": [
+        {
+          "end_line": 1385,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslHandler.java",
+          "start_line": 1337
+        },
+        {
+          "end_line": 1485,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslHandler.java",
+          "start_line": 1475
+        },
+        {
+          "end_line": 376,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslUtils.java",
+          "start_line": 337
+        },
+        {
+          "end_line": 1227,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 1191
+        }
+      ],
+      "prerequisites": "Channel pipeline contains `io.netty.handler.ssl.SslHandler` (default jdk-compatibility mode, i.e. `jdkCompatibilityMode == true`) using a native `ReferenceCountedOpenSslEngine` (netty-tcnative). The JDK SSLEngine path appears to tolerate oversized records by returning errors/BUFFER_UNDERFLOW, so impact is conditional on the native engine, which is the common high-performance deployment.",
+      "root_cause": "`SslHandler.decodeJdkCompatible` (handler/src/main/java/io/netty/handler/ssl/SslHandler.java:1337-1385) takes `packetLength` from `SslUtils.getEncryptedPacketLength(...)` and only ensures `packetLength <= in.readableBytes()`. `SslUtils.getEncryptedPacketLength` (SslUtils.java:337-358) accepts the raw 16-bit TLS record length (up to 0xFFFF) plus the 5-byte header and also accepts SSLv2-style length encodings (up to 0x7FFF + 2) without any upper bound check against the TLS maximum record size. `this.packetLength` is cached and later `unwrap(ctx, in, packetLength)` slices/allocates exactly that many bytes (SslHandler.java:1475-1485, 205-228) and hands them to the native SSLEngine. The native engine's own sanity check (`ReferenceCountedOpenSslEngine.unwrap`, ReferenceCountedOpenSslEngine.java:1205-1221) is gated behind `packetLengthDataOnly > capacity`, but `capacity` is `len` = the SslHandler-supplied `packetLength` (dst allocated with `length`), so the `> MAX_RECORD_SIZE` rejection is not reachable for records passed through this path; the only remaining guard in the engine is `len < packetLength` (its own header re-parse), which is false by construction, so oversized/malformed records are written into the BIO and passed to the native SSL_read path.",
+      "title": "SslHandler forwards attacker-controlled oversized/malformed TLS records to the SSLEngine without validating the record length (native-engine crash / remote DoS)",
+      "trace": "Channel read -> ByteToMessageDecoder -> SslHandler.decode -> decodeJdkCompatible (SslHandler.java:1422-1431, 1337) -> getEncryptedPacketLength(in, readerIndex, true) (SslUtils.java:316-377) returns e.g. 0xFFFF + 5 with no maximum check -> `this.packetLength` cached / `packetLength > readableBytes` wait loop (SslHandler.java:1367-1371) -> unwrap(ctx, in, packetLength) -> allocate(ctx, length) and engineType.unwrap(handler, packet, length, decodeOut) (SslHandler.java:1475-1485, 203-228) -> ReferenceCountedOpenSslEngine.unwrap -> SslUtils.getEncryptedPacketLength(srcs, offset) (ByteBuffer variant, SslUtils.java:414-488) computes the same length, so `len < packetLength` is false and `packetLengthDataOnly > capacity` is false (capacity == len), so no BUFFER_UNDERFLOW/BUFFER_OVERFLOW is returned -> writeEncryptedData -> SSL.readFromSSL with the oversized/malformed record.",
+      "unverified": "The actual native crash/SEGV was not reproduced (no execution, no tcnative runtime available), and the precise OpenSSL/tcnative failure mechanism is not established from source. It is also not proven that a record length above 2^14 necessarily reaches `SSL.readFromSSL` without an earlier engine error; the claim therefore remains a lead tied to the known SslHandler packet-validation weakness in this release window, not a runtime-confirmed vulnerability.",
+      "weakness_type": "CWE-20 Improper Input Validation (unbounded, attacker-controlled record length; consequence CWE-754/CWE-400 — potential native crash)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 2231-file snapshot scoped by get_source_scope (2231 readable files; only src/main sources — test trees are absent, so no test-based exploitation or regression evidence was available). P1 relation scope covers 2218 files with 13 files missing, syntax-only relations (no control/data flow, no semantic resolution), 60,909 call candidates and 76,115 edges. I concentrated on the externally reachable processing paths: `handler/src/main/java/io/netty/handler/ssl/*` (SslHandler, SslUtils, SslClientHelloHandler, ReferenceCountedOpenSslEngine, Conscrypt engine), `codec/.../compression/Bzip2*.java`, and adjacent codec/core classes; also checked the project layout/poms to fix the snapshot version (4.1.118.Final-SNAPSHOT). I did not exhaustively review all 2058 Java files (e.g. codec-http/http2, DNS resolver, native transports, buffer allocators were only spot-checked).",
+  "limitations": [
+    "No code was executed; no build, test, scanner, or exploit payload was run, so all findings are source-level leads only.",
+    "P1 index capabilities: syntax/name-based relations only — control_flow not implemented, data_flow not implemented, semantic resolution not implemented, Spring/DI and runtime security unverified; 13 source files are missing from the index and unresolved calls (32,461) mean some call edges were not indexed.",
+    "The Java test sources were removed from the snapshot, so the typical fix regression tests (which would confirm the vulnerable behavior) could not be inspected.",
+    "The native crash scenario requires netty-tcnative; its behavior could not be inspected (no native jars/binaries in scope), so the final crash link is unverified.",
+    "Large parts of the repository (HTTP/2, DNS, MQTT/Redis/SMTP codecs, transport implementations, buffer allocator internals) were not deeply reviewed; absence of a reported candidate there is not evidence of absence."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Bzip2Decoder unbounded MTF selector index: `while (reader.readBoolean()) index++;` then `tableMtf.indexToFront(index)` (codec/src/main/java/io/netty/handler/codec/compression/Bzip2Decoder.java:223-227, Bzip2MoveToFrontTable.java:77-83) — an attacker can supply a long run of 1-bits so `index` exceeds the 256-entry MTF array; likewise negative Huffman code lengths from `currLength += ... -1` reach `tableBases[codeLengths[i] + 1]++` and `codeLimits[i]` (Bzip2HuffmanStageDecoder.java:130-154) and an out-of-range selector reaches `codeLimits[currentTable]` (line 185).",
+      "reason": "All of these are Java array-index exceptions reachable from crafted compressed input, i.e. exception-driven connection DoS at most, and no memory corruption or data disclosure is possible in the Java implementation. I could not tie this spot to a specific, version-aligned advisory with source evidence, and the code already contains block-size/length bound checks, so it is a weaker candidate than the SslHandler finding."
+    },
+    {
+      "lead": "SslClientHelloHandler allocates `handshakeBuffer = ctx.alloc().buffer(handshakeLength)` (handler/src/main/java/io/netty/handler/ssl/SslClientHelloHandler.java:140-165) with the client-advertised handshake length.",
+      "reason": "Crucially bounded beforehand by `handshakeLength > maxClientHelloLength` (default 16 MiB per RFC 5246, configurable), and this is the shape of an already-fixed issue (SNI-handler OOM). Not a distinct new vulnerability in this snapshot."
+    },
+    {
+      "lead": "Potential TLS/SSL record-length parsing mismatches between the ByteBuf and ByteBuffer variants of `SslUtils.getEncryptedPacketLength` (probeSSLv2 true vs. implicit probe) that could make SslHandler and the native engine disagree on record boundaries.",
+      "reason": "Step-through of both variants showed they compute the same length for the same bytes apart from the `!probeSSLv2` early return in the ByteBuf variant, which SslHandler never uses with `false`; no exploitable divergence was established."
+    }
+  ],
+  "summary": "Netty 4.1.118.Final-SNAPSHOT source snapshot (2231 files; Java src/main only — test trees were stripped, so no test-based confirmation is possible). Broad review concentrated on the externally reachable decoders in `handler` (TLS), `codec` (Bzip2 and other decompressors), and HTTP/2/HTTP codecs. The single strongest, coherent candidate is in the TLS record handling: `SslHandler.decodeJdkCompatible` derives a packet length directly from the attacker-supplied 5-byte TLS record header, only checks it against bytes buffered so far, and passes the full (up to 0xFFFF + 5 byte) \"record\" to the SSLEngine; the receiving `ReferenceCountedOpenSslEngine` has a `MAX_RECORD_SIZE` guard, but it is unreachable on this path because it is nested inside `packetLengthDataOnly > capacity` while `SslHandler` allocates the destination with exactly `packetLength` capacity. This matches the class of issue fixed in the 4.1.118 security release (SslHandler not validating packets before handing them to the native SSLEngine), but the native crash itself was not reproduced and cannot be proven from source alone. A second, weaker lead (Bzip2 decoder index/code-length validation, exception-only DoS) is noted as an unconfirmed rejected lead."
+}

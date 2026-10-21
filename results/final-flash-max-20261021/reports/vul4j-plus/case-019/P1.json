@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The complete PDF byte stream is attacker-controlled: the `startxref` value and the trailer dictionary entries `/Prev` in the xref table trailer (or in a `/Type /XRef` stream dictionary) are parsed directly from the untrusted file and drive the loop variable. No other privilege is needed beyond delivering a PDF that the application loads with `PDDocument.load()`/`PDFParser.parse()` (the default lenient parser in this snapshot).",
+      "confidence": "medium",
+      "counterevidence_checked": "Looked for an existing guard: `XrefTrailerResolver.setStartxref` has a visited-chain guard, but it is only reached after `parseXref` finishes, so it is not on this path. `checkXRefOffset`/`calculateXRefFixedOffset` could in principle alter `prev`, but they return the same offset when a valid xref table/stream is found at `prev` (the attacker makes this true). `isLenient=false` does not prevent the loop (checkXRefOffset returns its input unchanged). The infinite loop is not needed for a valid document, so no legitimate-PDF false-positive path was found; malformed input normally raises IOException elsewhere but here the same well-formed-looking xref is simply re-read. I did not execute the code, so runtime behavior is not confirmed.",
+      "id": "pdfbox-cosparser-xref-prev-loop",
+      "impact": "Denial of service: a malicious PDF can pin a CPU core (and any thread/job processing it) indefinitely when the document is loaded, e.g. in a server-side PDF processing pipeline. Because the loop precedes object/page parsing, it affects any consumer of the core library, not just text extraction.",
+      "locations": [
+        {
+          "end_line": 311,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdfparser/COSParser.java",
+          "start_line": 198
+        },
+        {
+          "end_line": 1187,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdfparser/COSParser.java",
+          "start_line": 1165
+        },
+        {
+          "end_line": 197,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdfparser/PDFParser.java",
+          "start_line": 185
+        },
+        {
+          "end_line": 263,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdfparser/XrefTrailerResolver.java",
+          "start_line": 242
+        }
+      ],
+      "prerequisites": "Application parses a PDF from an untrusted source (document viewer/service/ingestor). Crafted document must contain an xref table (or xref stream) whose trailer `/Prev` equals its own byte offset, or an A->B->A cycle of xref offsets. Lenient parsing is the default (`isLenient = true`, COSParser.java:125); note the loop also occurs in non-lenient mode because `checkXRefOffset` simply returns the input offset when leniency is disabled (COSParser.java:1168-1171).",
+      "root_cause": "`COSParser.parseXref()` follows the trailer `/Prev` chain with `while (prev > 0)` and reassigns `prev` directly from the parsed, file-controlled trailer value, without recording visited offsets. When `/Prev` points to the current (or any already-parsed) xref offset, `checkXRefOffset(prev)` finds a valid `xref` keyword at `prev` and returns that same offset (COSParser.java:1173-1176), so the loop re-parses the identical bytes forever. The same applies to the xref-stream branch, because `parseXrefObjStream()` returns `dict.getLong(COSName.PREV)` (COSParser.java:330). The sibling `XrefTrailerResolver.setStartxref()` contains a 'sanity check to prevent infinite loops' (XrefTrailerResolver.java:258-262), but it runs only after `parseXref()` has already completed, so it cannot stop this loop.",
+      "title": "Unbounded /Prev xref-chain loop in COSParser.parseXref (crafted-PDF infinite loop / DoS)",
+      "trace": "1) `PDFParser.parse()` (PDFParser.java:235) -> `initialParse()` (PDFParser.java:185-197) -> `parseXref(startXRefOffset)` (line 192). 2) `COSParser.parseXref()` sets `prev = startXrefOffset` and enters `while (prev > 0)` (COSParser.java:209-211). 3) Each iteration seeks to `prev`, parses the xref table and trailer, then `prev = trailer.getInt(COSName.PREV)` (COSParser.java:272); `checkXRefOffset(prev)` (line 276) seeks to `prev`, sees the `xref` keyword (`isString(XREF_TABLE)`), and returns `prev` unchanged (COSParser.java:1173-1176), so `prev` is never reduced. 4) For xref streams the equivalent reassignment comes from `parseXrefObjStream(...)` returning `/Prev` (COSParser.java:287-298 and 330). The loop condition can therefore remain true indefinitely, re-parsing the same bytes and consuming CPU without allocating an exception or terminating.",
+      "unverified": "Not runtime-confirmed (no code execution). The exact crafted PDF layout (self-referential `/Prev` with a valid xref at that offset) was reasoned from source, not reproduced. I could not verify whether upstream PDFBox later added a visited-offset guard in a specific release, nor map this to a specific CVE identifier; the benchmark's ground-truth vulnerability may instead be one of the rejected DoS/OOM leads below.",
+      "weakness_type": "CWE-835 Infinite Loop (uncontrolled resource consumption / DoS)"
+    }
+  ],
+  "coverage_summary": "Scope: 1078 readable files (Apache PDFBox trunk, 2.1.0-SNAPSHOT, modules: pdfbox, fontbox, xmpbox, preflight, tools, debugger, examples, plus build files). No binaries were skipped; no test trees exist in the snapshot, so test-based verification was impossible. I read in full or in detail: pdfparser (COSParser, BaseParser, PDFParser, PDFStreamParser, PDFObjectStreamParser, PDFXrefStreamParser, XrefTrailerResolver, InputStreamSource, RandomAccessSource), core COS classes sampled (COSDictionary, COSName), filters (FlateFilter, Predictor, LZWFilter, RunLengthDecodeFilter, ASCII85InputStream, CCITT area sampled), fontbox CMap parsing, Type1 lexer start, encryption (StandardSecurityHandler large parts, plus SecurityHandler/PublicKeySecurityHandler entry points), FDF/XFA XML hardening, preflight parser limits, and search sweeps for XXE, deserialization, process execution, stream sinks, and loop-guard comments across the whole tree. Relation-index coverage: index reports 1078/1078 files indexed, 0 hash mismatches, 35180 syntactic edges, 379 facts; relations are navigation hints only and were verified against source text where used. Not exhaustively reviewed: most of preflight/validation processes, most of fontbox TrueType/CFF/Type1 internals, rendering/shading and text-stripping paths, tools/debugger GUI code, and many PDModel classes; these are coverage gaps, not cleared areas.",
+  "limitations": [
+    "No code was executed; the candidate is a source-level lead, not a runtime-confirmed vulnerability.",
+    "The repository contains no tests (pdfbox/src/test is absent), so no regression test or corpus could corroborate the behavior.",
+    "CVE/ground-truth attribution was intentionally not consulted; mapping of this defect to a specific CVE or fix release is unverified.",
+    "Large portions of the codebase (TrueType/CFF font programs, preflight validators, rendering and text extraction, PDModel subclasses) were surveyed only selectively; a stronger issue could exist there.",
+    "The relation index provides syntactic/navigation edges only; no data-flow, reachability, or exploitability proof was available from it."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "PDFXrefStreamParser.parse builds `objNums` from the file-controlled `/Size`/`/Index` without a limit (pdfbox/.../pdfparser/PDFXrefStreamParser.java:79-100), allowing a crafted xref stream (e.g. `/Size 2000000000` with no `/Index`) to trigger OutOfMemoryError/time exhaustion.",
+      "reason": "Concrete, but it is a resource-limit/OOM issue rather than an untraced loop; distinct root cause from the submitted candidate and less certain to be the case's ground truth. Recorded as an unconfirmed lead only."
+    },
+    {
+      "lead": "CMapParser hex-string branch writes into a fixed 512-byte `tokenParserByteBuffer` with no bounds check (fontbox/.../cmap/CMapParser.java:42, 503-550): an embedded CMap with a hex string longer than 1024 nibbles causes ArrayIndexOutOfBoundsException while parsing a PDF font.",
+      "reason": "Impact is an uncaught runtime exception (crash) rather than an infinite loop or memory corruption; also requires a specific embedded-CMap path. Not strong enough to displace the primary candidate."
+    },
+    {
+      "lead": "Predictor.decodePredictor computes `rowlength = (columns * bitsPerPixel + 7) / 8` from file-controlled decode parameters without overflow/limit checks (pdfbox/.../filter/Predictor.java:46-50), which can yield NegativeArraySizeException or very large allocations during Flate/LZW decoding.",
+      "reason": "Plausible DoS/exception, but the arithmetic depends on unvalidated `/DecodeParms` values and the practical impact is a thrown exception or a bounded allocation; unconfirmed as the case target."
+    },
+    {
+      "lead": "Examples extract PDF-supplied names to the filesystem without sanitization: `ExtractEmbeddedFiles` writes `new File(filePath + filename)` using the embedded-file name tree key / `/F` name (examples/.../pdmodel/ExtractEmbeddedFiles.java:127-143), and `ExtractTTFFonts` writes `new File(name + \".ttf\")` using the PDF font name (examples/.../ExtractTTFFonts.java:208-211). A crafted PDF could write attacker-named files when these samples are run.",
+      "reason": "Classic path-traversal pattern (CWE-22), but these are sample/example programs explicitly run by a user on a chosen file, not library code on an implicit untrusted-input boundary; no evidence they are the intended vulnerable component."
+    },
+    {
+      "lead": "XML external entity (XXE) exposure in XMP/FDF/XFA parsing.",
+      "reason": "Counterevidence: all three XML parse sites already apply `disallow-doctype-decl`, block external general/parameter entities and external DTD loading, disable XInclude and entity expansion (`XMLUtil.java:60-68`, `PDXFAResource.java:152-161`, `DomXmpParser.java:80-88`). No unhardened XML parse site was found in the assigned files."
+    },
+    {
+      "lead": "Encryption-key length handling uses file-controlled `/Length` without validation (`StandardSecurityHandler.java:186, 673-713`), which can drive out-of-bounds MessageDigest/arraycopy operations.",
+      "reason": "Verified reachable only for malformed encrypted files and produces an exception; the surrounding logic matches the PDF specification and no stronger security impact (e.g. permission bypass) was demonstrated from source."
+    }
+  ],
+  "summary": "Reviewed the Apache PDFBox snapshot (trunk, version 2.1.0-SNAPSHOT, all 1078 readable source files; no test trees are present in the assigned snapshot). I traced attacker-controlled PDF parsing through `PDFParser`/`COSParser`, font/CMap parsing in fontbox, stream filters, XML entry points, and the encryption handler. One concrete candidate stands out: the xref/`/Prev` chain loop in `COSParser.parseXref` has no cycle detection, so a crafted PDF can make `PDDocument.load()` spin forever (CPU-exhaustion DoS). Other plausible leads were examined but not promoted (see rejected leads)."
+}

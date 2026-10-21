@@ -1,0 +1,82 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An attacker who can supply the model/repository URL (for example a user-provided model URL in a serving deployment that calls Criteria.optModelUrls / Repository.newInstance with an http(s) URL that is not an archive file) hosts the repository. The URL is routed to RemoteRepository (RepositoryFactoryImpl.java:90-96). The attacker's metadata.json is fetched and parsed by Gson into Metadata/Artifact/Item; fields `name`, `uri`, `type`, and absent `sha1Hash` are fully attacker-selected (RemoteRepository.java:86-97). Item URIs can also be absolute file:/http: references, so content can be read from local files or internal endpoints.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) ZipUtils.unzip and TarUtils.untar DO reject entry names containing '..' and strip leading separators for archive entries, so classic zip-slip inside extracted archives is blocked on POSIX; that validation does not cover Artifact.Item.name or absolute paths in AbstractRepository.save/download. (2) LocalRepository/SimpleRepository metadata normally comes from local/trusted files, so the issue is specific to untrusted remote repositories; DJL's documented use is that model URLs are chosen by the application. (3) Checksums are verified only when metadata supplies sha1Hash, so a malicious repository can omit it. (4) No source evidence of a name/path validation helper anywhere else in the repository that this call site was expected to use.",
+      "id": "cand-1-artifact-name-path-traversal",
+      "impact": "Arbitrary file write outside the intended cache/extraction directory as the DJL process user (absolute paths work on every platform via Path.resolve; '..' works on Linux/macOS). Depending on deployment this enables overwriting configuration/startup files, planting files into directories later compiled/loaded by DJL (ClassLoaderUtils.compileJavaClass/findImplementation) or otherwise escalating to code execution; combined with the unvalidated absolute item URI it also gives local file read/SSRF-style fetches into files the attacker can influence. Metadata-driven mkdir traversal is also possible via the 'dir' branch.",
+      "locations": [
+        {
+          "end_line": 231,
+          "path": "api/src/main/java/ai/djl/repository/AbstractRepository.java",
+          "start_line": 182
+        },
+        {
+          "end_line": 463,
+          "path": "api/src/main/java/ai/djl/repository/Artifact.java",
+          "start_line": 337
+        },
+        {
+          "end_line": 101,
+          "path": "api/src/main/java/ai/djl/repository/RemoteRepository.java",
+          "start_line": 63
+        },
+        {
+          "end_line": 97,
+          "path": "api/src/main/java/ai/djl/repository/RepositoryFactoryImpl.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 282,
+          "path": "api/src/main/java/ai/djl/repository/MRL.java",
+          "start_line": 277
+        }
+      ],
+      "prerequisites": "Application (library user or serving layer) allows a model/dataset to be loaded from an attacker-influenced non-archive http(s) repository URL; the DJL process can write the target path; checksum field omitted (checksum verification is skipped when item.getSha1Hash() is null, AbstractRepository.java:304-308).",
+      "root_cause": "AbstractRepository.save() resolves the raw, remote-metadata-derived Artifact.Item name against the extraction temp directory without rejecting absolute paths or dot-dot segments (api/src/main/java/ai/djl/repository/AbstractRepository.java:198,204,219,227). Artifact.Item.name/setName/getName perform no validation (api/src/main/java/ai/djl/repository/Artifact.java:337-463), and RemoteRepository.locate() Gson-deserializes metadata.json from the (user-supplied) repository base URI (api/src/main/java/ai/djl/repository/RemoteRepository.java:63-101). AbstractRepository.download() also accepts any absolute item URI, including file: (AbstractRepository.java:182-193).",
+      "title": "Unvalidated metadata-controlled artifact name enables absolute-path/.. file write during repository artifact download",
+      "trace": "Repository.newInstance(name, url) -> RepositoryFactoryImpl.newInstance: non-archive URL => RemoteRepository (RepositoryFactoryImpl.java:90-96) -> MRL.getMetadata/BaseModelLoader.loadModel calls mrl.prepare(artifact, progress) (BaseModelLoader.java:106; MRL.java:277-282) -> AbstractRepository.prepare() creates temp dir under cache and calls download(tmp, baseUri, item) (AbstractRepository.java:123-161) -> AbstractRepository.download() opens item URI (absolute URIs accepted, incl. file:) (AbstractRepository.java:182-193) -> AbstractRepository.save(): `String fileName = item.getName();` then `Path file = tmp.resolve(fileName);` and `Files.copy(pis, file, REPLACE_EXISTING)` (AbstractRepository.java:198,219,227); for 'dir' items `dir = tmp.resolve(fileName)` (line 204). A metadata name such as \"/home/user/.bashrc\" or \"../../../../x\" resolves outside the temp/cache directory, so the downloaded bytes are written to an attacker-chosen path.",
+      "unverified": "No runtime execution or end-to-end exploit was performed; reachability depends on the embedding application exposing attacker-controlled repository URLs (DJL Serving-style model_url), which is outside this snapshot. I could not confirm whether upstream DJL later added a validation patch at this exact location, nor whether the benchmark's reference issue targets this file rather than the image/synset or engine-library paths.",
+      "weakness_type": "CWE-22 Path Traversal (arbitrary file write via untrusted metadata)"
+    }
+  ],
+  "coverage_summary": "Reviewed 1315 visible source files (954 Java parsed; 1295 indexed, 20 source files absent from the relation index). Focus areas read in full or in relevant part: api repository/model-zoo loading, Artifact/Metadata/MRL/RepositoryFactory implementations, AbstractRepository/RemoteRepository/SimpleUrlRepository/LocalRepository/JarRepository/SimpleRepository, ZipUtils/TarUtils, Utils/ClassLoaderUtils/JsonUtils/cuda/Ec2Utils, BaseModel/BaseImageTranslator/ImageFactory/BufferedImageFactory, NDList/NDSerializer/NDManager validateBuffer, engine managers (PyTorch/TensorFlow/ONNXRuntime/LightGBM/XGBoost/TensorRT) and their LibUtils download/load code, extensions (tokenizers, fasttext, sentencepiece, audio, opencv, hadoop, aws-ai, spark Scala, timeseries, tablesaw), basicdataset, model-zoo, djl-zero, examples, plus Gradle/build files, Dockerfiles and GitHub workflows. Relation-index results were used only for navigation and every candidate edge was re-verified against source text; the index is syntactic only (no data flow, control flow or runtime proof).",
+  "limitations": [
+    "Tests are not present in the snapshot, so behavior assertions could not be checked against unit/integration tests.",
+    "The P1 index omits 20 source files and does not implement data/control-flow or semantic resolution; unparsed/non-Java sources (Rust lib.rs, JNI C++, Kotlin/Scala internals, native CMake/patch files) are not fully represented in the index and were only spot-checked.",
+    "No code was executed and no exploit was attempted; all conclusions are static and source-based, and reachability depends on the embedding application (e.g., whether a serving layer lets users choose model repository URLs).",
+    "Because only this snapshot is visible, I cannot confirm whether a later upstream patch changed the cited code, so confidence in this being the benchmark's intended issue is medium."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Sam2ServingTranslator/Sam2Translator: request JSON field image_url is passed to ImageFactory.fromUrl, which accepts http(s) and file: URLs (SSRF/local file read).",
+      "reason": "Real attacker-controlled path exists (request body -> ImageFactory.java:113-128), but the impact is mostly blind SSRF/limited local file parsing, it is arguably intended 'load image from URL' behavior, and no response content is directly reflected; weaker source evidence of a defect than the repository write path."
+    },
+    {
+      "lead": "BaseModel.getArtifact(modelDir.resolve(artifactName)) and BaseImageTranslator SynsetLoader with synsetFileName/synsetUrl from model serving.properties.",
+      "reason": "Traversal/absolute-path read is plausible, but requires a malicious model package rather than a user-supplied URL, and exfiltration is limited to class-label output; treated as an unconfirmed variant of the same trust issue."
+    },
+    {
+      "lead": "ClassLoaderUtils.compileJavaClass/findImplementation and ServingTranslatorFactory/DeferredTranslatorFactory Class.forName(translatorFactory) executing code from a model directory.",
+      "reason": "Arbitrary code execution by design (custom translator/jar/class loading is a documented DJL feature); not a defect with a clear missing validation boundary in this snapshot."
+    },
+    {
+      "lead": "ZipUtils/TarUtils absolute-path handling (leading separator stripped only for File.separatorChar, drive-letter/root-relative names not rejected).",
+      "reason": "The '..' traversal is rejected and escapes only on Windows with root-relative/drive-letter entries; platform-specific and lower impact than the unconditional name resolution in AbstractRepository.save."
+    },
+    {
+      "lead": "Engine LibUtils download code (pytorch/mxnet/tensorflow) writing tmp.resolve(fileName) where fileName comes from remote files.txt.",
+      "reason": "Same missing-validation pattern but the index/URL is the hard-coded trusted publish.djl.ai host, so attacker control is supply-chain/trusted-infrastructure rather than request input."
+    },
+    {
+      "lead": "extensions/aws-ai sagemaker execution_policy.json grants s3:GetObject/PutObject/DeleteObject/ListBucket on arn:aws:s3:::* (overly broad IAM policy).",
+      "reason": "Configuration weakness in an example/template policy, no source-level attacker flow or direct exploit primitive in this snapshot."
+    },
+    {
+      "lead": "Gradle/CI script injection via ${{ github.event.inputs.mode }} in run steps of native_publish/nightly workflows.",
+      "reason": "Requires write access to trigger workflow_dispatch; low impact and not a library-code vulnerability."
+    }
+  ],
+  "summary": "DJL 0.31.0-SNAPSHOT repository review. After reading the core repository/model-loading code, archive utilities, dataset loaders, engine wrappers, tokenizer extension, AWS/Hadoop/Spark extensions, and build/CI config, the strongest source-supported candidate is an unvalidated metadata-controlled file name in the model repository download path: remote metadata.json (attacker-controllable when a model/repository URL is user-supplied, e.g. DJL Serving model_url) is deserialized into Artifact.Item objects whose `name` is used verbatim in `tmp.resolve(name)` before writing downloaded content, with no check for absolute paths or `..` segments. This yields arbitrary file write (and, via item URIs, arbitrary local/internal reads) as the DJL process user. Archive extraction itself (ZipUtils/TarUtils) does contain `..` rejection, so the gap is specifically the artifact-name/value path, not entry names inside archives. No runtime verification was performed; all evidence is source-level."
+}

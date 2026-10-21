@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The token used by `getRoles()` comes directly from untrusted request data: the raw `Authorization: Bearer <JWT>` HTTP header (`AuthenticationDataHttp.getHttpHeader`, used at lines 93-102) or the binary-protocol auth payload (`AuthenticationDataCommand.getCommandData`, lines 87-92). The attacker fully controls the header/payload contents, including the header algorithm field and all claims, because no key or signature check is applied before the claims are consumed.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that with only AuthenticationProviderToken configured, the same raw token is signature-verified during authentication (AuthenticationProviderToken.authenticate -> parser with setSigningKey, lines 136, 200-202) before authorization, so a lone token-only deployment does not expose the bypass; the provider is not the default (`authorizationProvider` defaults to PulsarAuthorizationProvider in ServiceConfiguration line 1105 and WorkerConfig line 390); `isSuperUser` is NOT overridden here, so admin endpoints that call validateSuperUserAccess still require the authenticated role to be a superuser (the forged-role superuser effect applies where checks route through the overridden operations, e.g. validateTenantAdminAccess inside allowTenantOperationAsync). Checked the HTTP/binary original-principal paths (PulsarWebResource.validateOriginalPrincipal, AuthorizationService.allow*OperationAsync 5-arg forms, ServerCnx.invalidOriginalPrincipal and isTopicOperationAllowed) and found they use the authenticated role unless the caller is a configured proxy role, so header spoofing alone did not provide a stronger path. Also checked that all function-worker REST handlers reviewed pass clientAppId/authData and that legacy worker download paths are gated by superuser or tenant-scoped checks.",
+      "id": "PULSAR-MULTIROLES-JWT-UNVERIFIED",
+      "impact": "Authorization bypass / privilege escalation: an authenticated low-privilege principal (or any principal that can satisfy one of the configured non-token authenticators) can have produce/consume/lookup/function/source/sink operations, tenant/namespace/policy administration, and topic-policy operations authorized under arbitrary forged roles, including configured super-user roles for tenant-level checks, and returns the union of permissions of all roles named in the forged token. Depending on the named role this yields cross-tenant access to messages/metadata and administrative control of tenants/namespaces. Secondary defects in the same method: `splitToken[0]/[1]` is indexed without a length check, so a malformed bearer value can raise ArrayIndexOutOfBoundsException, and the string-role result is discarded at line 113, which makes the provider fail closed for ordinary single-string role claims.",
+      "locations": [
+        {
+          "end_line": 67,
+          "path": "pulsar-broker-common/src/main/java/org/apache/pulsar/broker/authorization/MultiRolesTokenAuthorizationProvider.java",
+          "start_line": 64
+        },
+        {
+          "end_line": 126,
+          "path": "pulsar-broker-common/src/main/java/org/apache/pulsar/broker/authorization/MultiRolesTokenAuthorizationProvider.java",
+          "start_line": 84
+        },
+        {
+          "end_line": 153,
+          "path": "pulsar-broker-common/src/main/java/org/apache/pulsar/broker/authorization/MultiRolesTokenAuthorizationProvider.java",
+          "start_line": 128
+        },
+        {
+          "end_line": 252,
+          "path": "pulsar-broker-common/src/main/java/org/apache/pulsar/broker/authorization/MultiRolesTokenAuthorizationProvider.java",
+          "start_line": 161
+        }
+      ],
+      "prerequisites": "Broker (or functions worker) configured with authorizationEnabled=true and `authorizationProvider=org.apache.pulsar.broker.authorization.MultiRolesTokenAuthorizationProvider`; plus an authentication path that authenticates the connection without validating the same bearer token, e.g. TLS client certificates, Athenz, or Kerberos configured as a provider alongside/instead of AuthenticationProviderToken. `AuthenticationService.authenticateHttpRequest` (lines 122-132) tries providers in a loop and ignores individual AuthenticationException failures, then `AuthenticationFilter` stores `new AuthenticationDataHttps(request)` (raw headers included) as the auth data later handed to the authorization provider; a client can also set `X-Pulsar-Auth-Method-Name` to select a non-token provider. Authorization must be reachable for the target tenant/namespace/topic; the target role must exist in the relevant policies (or in superUserRoles for tenant-level checks).",
+      "root_cause": "MultiRolesTokenAuthorizationProvider builds a JWT parser with no signing/validation key (`Jwts.parserBuilder().build()`, line 66) and, in `getRoles()`, splits the caller-supplied token and parses only the unsigned header.payload segment via `parser.parseClaimsJwt(unsignedToken)` (lines 108-111). It then extracts the configured role claim (string or list) and returns those roles without any signature, issuer, audience, or expiry verification. Every overridden authorization entry point (`canProduceAsync`, `canConsumeAsync`, `canLookupAsync`, `allowFunctionOpsAsync`, `allowSourceOpsAsync`, `allowSinkOpsAsync`, `allowTenantOperationAsync`, `allowNamespaceOperationAsync`, `allowNamespacePolicyOperationAsync`, `allowTopicOperationAsync`, `allowTopicPolicyOperationAsync`, lines 128-252) ignores the already-authenticated `role` argument and instead authorizes with the roles taken from this unverified token, returning true when ANY of them is authorized (lines 128-153).",
+      "title": "MultiRolesTokenAuthorizationProvider authorizes requests using unverified JWT role claims",
+      "trace": "1) A caller that can authenticate via a non-token provider (e.g., presents a valid client certificate) sends a request whose Authorization header carries an unsigned/forged JWT naming a privileged `sub` (or configured role claim) instead of a valid signed token. 2) AuthenticationFilter/AuthenticationService authenticates via the certificate provider (token-provider failure is ignored or a non-token method name is selected) and stores the full HTTPS request as AuthenticationDataHttps. 3) The admin/topic authorization path passes that AuthenticationDataSource to AuthorizationService, which invokes the configured provider; MultiRolesTokenAuthorizationProvider's overrides call `authorize(authData, ...)` and `getRoles(authData)`. 4) `getRoles()` re-parses the attacker's JWT header.payload with a keyless parser (`parseClaimsJwt`) and returns the forged role(s). 5) `authorize()` runs `super.<check>(..., forgedRole, authData)` for each forged role and returns true if any role passes, so the request is authorized with the forged role's permissions; for tenant/namespace/policy operations `PulsarAuthorizationProvider.validateTenantAdminAccess` even calls the default `isSuperUser(role,...)`, so naming a configured superUserRole grants superuser-equivalent authorization for those checks. The authenticated client's real role (the `role` parameter passed into the provider) is never used by these overrides.",
+      "unverified": "No code was executed and the target deployment's authentication provider mix is unknown, so the concrete exploit (unsigned bearer token plus a non-token authenticator) was not runtime-confirmed. It was not verified whether this exact provider/issue corresponds to any published advisory, and the snapshot has no git metadata to confirm the exact parent commit. Whether the token's `alg` header value is constrained by jjwt's unsecured-JWT parsing was not executed/confirmed; the signature is not checked either way.",
+      "weakness_type": "CWE-347 Improper Verification of Cryptographic Signature / CWE-863 Incorrect Authorization (authorization bypass)"
+    }
+  ],
+  "coverage_summary": "Scope reported by get_source_scope: 5,473 visible source files (5,482 root files, 9 sensitive-name/path exclusions, 0 symlinks, binaries skipped; same filters for B0/P1). I focused on security-relevant modules: pulsar-broker-common authentication (AuthenticationProviderToken/Basic/Tls/List/Service, AuthenticationData*, AuthTokenUtils), authorization (AuthorizationService, PulsarAuthorizationProvider, MultiRolesTokenAuthorizationProvider, AuthorizationProvider), broker admin auth helpers (PulsarWebResource), binary protocol auth/original-principal handling (ServerCnx), proxy routing/auth (AdminProxyHandler, WebServer, ProxyServiceStarter), WebSocket auth (AbstractWebSocketHandler), function-worker REST authorization (ComponentImpl, FunctionsImpl/SinksImpl/SourcesImpl, WorkerImpl, API resources), and spot checks of package management, SASL/Athenz providers, and token tooling. I did not exhaustively read the large broker service/ledger/client/IO/SQL/Python/C++ areas; coverage is targeted rather than complete.",
+  "limitations": [
+    "No execution, build, tests, or scanners were run; findings are source-review leads only and not runtime-confirmed.",
+    "The snapshot has no .git directory, so the exact commit/date could not be established (approximated from pom dependency versions, versioned docs up to 2.8.2, and blog posts up to 2021-08-18).",
+    "Deployment configurations (authorizationProvider value, authentication provider mix) are unknown; exploitability of the selected candidate depends on MultiRoles being configured together with a non-token authenticator.",
+    "Most of the 5,473 files (broker service internals, managed-ledger, client libraries, connectors, SQL, C++/Python code) were not read in depth, so an unrelated stronger issue could exist outside the inspected areas.",
+    "No external data (CVEs, advisories, patches, sibling runs) was consulted, so no claim is made about correspondence to any published vulnerability.",
+    "The AIOOBE on malformed tokens and the discarded single-role result were not exercised and are described as secondary code-level defects only."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Proxy REST resources /proxy-stats and status registered via WebServer.addRestResources without an AuthenticationFilter (ProxyServiceStarter.addWebServerHandlers lines 226-229, WebServer.addRestResources lines 178-189), exposing stats and POST /proxy-stats/logging/{logLevel} unauthenticated.",
+      "reason": "Real gap but limited impact (statistics disclosure and in-memory log-level change), appears to be long-standing upstream behavior rather than the snapshot-specific weakness; weaker evidence and impact than the selected candidate."
+    },
+    {
+      "lead": "AuthenticationProviderBasic uses non-constant-time String.equals for password/hash comparison and MD5-crypt/apr1 formats (AuthenticationProviderBasic lines 91-99).",
+      "reason": "Timing side channel is impractical here and the code matches upstream design; no direct authorization bypass established."
+    },
+    {
+      "lead": "AuthenticationProviderToken accepts tokens with no exp claim as never-expiring (TokenAuthenticationState lines 344-349).",
+      "reason": "Requires a validly signed token without exp; no signature bypass and no privilege escalation; design/robustness issue, not a distinct vulnerability."
+    },
+    {
+      "lead": "X-Original-Principal / originalPrincipal handling (PulsarWebResource lines 149-179, 252-321; ServerCnx lines 345-399, 811-846; AuthorizationService lines 346-533).",
+      "reason": "Traced the 5-arg authorization overloads: originalRole is only consulted when the authenticated principal is a configured proxy role and both proxy and original roles must pass; non-proxy clients cannot use the header to change the authorized role. No bypass found."
+    },
+    {
+      "lead": "Function-worker legacy package/state endpoints (ComponentImpl.downloadFunction(path) lines 1286-1319, getStreamingOutput 1268-1284, getListOfConnectors 893-900).",
+      "reason": "Download paths are gated by isAuthorizedRole for 4-segment paths or superuser otherwise; connector listing is non-sensitive. No missing authorization check found."
+    },
+    {
+      "lead": "SaslRoleTokenSigner uses SHA-512(secret||message)-style digest, a Weak Random secret and non-constant-time comparison (SaslRoleTokenSigner lines 40-106; AuthenticationProviderSasl line 98).",
+      "reason": "Weak construction, but the secret is per-process and role-token forgery would not obviously cross broker instances; no concrete attacker-controlled path to recover or predict the secret in source."
+    }
+  ],
+  "summary": "This is an Apache Pulsar 2.9.0-SNAPSHOT tree (~Sept–Dec 2021 based on dependencies/docs; no .git metadata available). I reviewed the authentication/authorization core, proxy, WebSocket, function-worker REST layer, and broker admin auth helpers, tracing how attacker-controlled request data reaches authorization decisions. The single strongest source-evidenced issue is in MultiRolesTokenAuthorizationProvider: it derives the roles used for every authorization decision from a JWT whose signature it never verifies (keyless parser + parseClaimsJwt on header.payload only), so it trusts attacker-supplied claims. This is a credible authorization-bypass root cause in deployments that use this provider together with an authenticator that can succeed without validating the same bearer token (e.g., TLS/Athenz/Kerberos as one of the configured providers); with token-only authentication the same token is signature-checked at authentication, which limits the bypass. Several other leads were traced and rejected (proxy-stats no-auth servlets, basic-auth string comparison, no-exp JWT, X-Original-Principal/originalPrincipal handling, function-worker download/connector endpoints). No runtime confirmation was performed."
+}

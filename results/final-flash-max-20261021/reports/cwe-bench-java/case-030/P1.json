@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Fully remote and unauthenticated: the `loc` and `ln` GET query parameters are read via ExternalContext.getRequestParameterMap() (container URL-decodes them), and the resource name comes from the request path info after the `/javax.faces.resource/` marker. Example shape: GET <faces-mapping>/javax.faces.resource/web.xml?loc=../WEB-INF (loc value URL-encoded as needed).",
+      "confidence": "medium",
+      "counterevidence_checked": "1) `isResourceIdentifierExcluded` is applied to the pre-traversal request path only and the default exclude list does not cover .xml/.txt/.jar, so it does not block the read. 2) FacesServlet's /WEB-INF and /META-INF check inspects only the request pathInfo; the traversal is introduced later from the `loc` parameter, so the check is bypassed. 3) No `..`/absolute-path validation exists in ResourceHandlerImpl, ExternalContextResourceLoader, ResourceMetaImpl, BaseResourceHandlerSupport or ServletExternalContextImplBase (searched the snapshot for '\"..\"'/contains(\"..\")/normalize-style checks — none in this flow). 4) Normal (non-malicious) resource serving also relies on getResourcePaths returning null/empty for files, so the traversal request does not fail earlier for that reason. 5) Container-side normalization is required and assumed; ServletContext.getResource* returns null if the path escapes the app root, which bounds the impact to the webapp (this is a disclosure, not proven RCE). 6) No runtime test was performed.",
+      "id": "myfaces-resourcehandler-loc-traversal",
+      "impact": "Remote disclosure of files stored under the web application root, including files under /WEB-INF that the FacesServlet explicitly refuses to route (web.xml, faces-config.xml, other XML/JSON/SQL/config files, packaged JARs) — potential exposure of credentials, datasource/JNDI configuration and application internals. It does not by itself give code execution, and ServletContext normalization generally prevents escaping the webapp root (arbitrary filesystem read is container-dependent). Passing a non-existent directory in `ln` can also trigger an unhandled StringIndexOutOfBoundsException (request-level denial of service).",
+      "locations": [
+        {
+          "end_line": 450,
+          "path": "impl/src/main/java/org/apache/myfaces/application/ResourceHandlerImpl.java",
+          "start_line": 436
+        },
+        {
+          "end_line": 241,
+          "path": "impl/src/main/java/org/apache/myfaces/application/ResourceHandlerImpl.java",
+          "start_line": 132
+        },
+        {
+          "end_line": 325,
+          "path": "impl/src/main/java/org/apache/myfaces/application/ResourceHandlerImpl.java",
+          "start_line": 288
+        },
+        {
+          "end_line": 158,
+          "path": "shared/src/main/java/org/apache/myfaces/shared/resource/ExternalContextResourceLoader.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 109,
+          "path": "shared/src/main/java/org/apache/myfaces/shared/resource/ResourceMetaImpl.java",
+          "start_line": 71
+        },
+        {
+          "end_line": 82,
+          "path": "impl/src/main/java/org/apache/myfaces/application/DefaultResourceHandlerSupport.java",
+          "start_line": 53
+        },
+        {
+          "end_line": 115,
+          "path": "shared/src/main/java/org/apache/myfaces/shared/resource/BaseResourceHandlerSupport.java",
+          "start_line": 68
+        },
+        {
+          "end_line": 160,
+          "path": "api/src/main/java/javax/faces/webapp/FacesServlet.java",
+          "start_line": 144
+        }
+      ],
+      "prerequisites": "A deployed JSF app using the default MyFaces ResourceHandler and DefaultResourceHandlerSupport (ExternalContextResourceLoader with \"/resources\" prefix, standard all-in-one/faces servlet mapping). The targeted file must exist under the web application root and must not end with a RESOURCE_EXCLUDES extension (default `.class .jsp .jspx .properties .xhtml`), so `.xml`, `.txt`, `.json`, `.sql`, `.jar` etc. are reachable. Container must implement standard ServletContext.getResource*/getResourcePaths `..` normalization (Tomcat/Jetty/standard behavior).",
+      "root_cause": "Resource resource path components taken from HTTP request parameters are never sanitized. `ResourceHandlerImpl.getLocalePrefixForLocateResource()` returns the raw `loc` request parameter (and `handleResourceRequest`/`createResource` take the raw `ln` parameter) when the request is a resource request. `deriveResourceMeta()` then concatenates these values into a resource path and stores them in `ResourceMetaImpl`, whose `getResourceIdentifier()` joins localePrefix + '/' + resourceName. `ExternalContextResourceLoader` (prefix \"/resources\") passes that identifier directly to `ExternalContext.getResource*/getResourcePaths`, i.e. `ServletContext.getResource*(\"/resources/../WEB-INF/...\")`, which containers normalize to `/WEB-INF/...`. No `..`, absolute-path or segment validation exists anywhere on this path.",
+      "title": "Path traversal / webapp file disclosure in ResourceHandler via unvalidated 'loc' (and 'ln') request parameters",
+      "trace": "FacesServlet.service (api FacesServlet line 124) rejects only pathInfo starting with /WEB-INF or /META-INF (lines 144-160); a pathInfo of /javax.faces.resource/web.xml passes, isResourceRequest() returns true (ResourceHandlerImpl 404-434) and handleResourceRequest is invoked (line 260). isResourceIdentifierExcluded checks only the request-path suffix (486-505), so `web.xml` is not excluded. resourceName=\"web.xml\" is extracted (294-299); `ln` (line 308) is null. createResource -> getLocalePrefixForLocateResource returns raw `loc` = \"../WEB-INF\" (444-448). deriveResourceMeta(localePrefix=\"../WEB-INF\", libraryName=null): getResourceVersion(\"../WEB-INF/web.xml\") returns null (not a directory), then createResourceMeta(localePrefix,null,null,\"web.xml\",null) (171-177). ExternalContextResourceLoader.getResourceURL builds `getPrefix() + '/' + resourceMeta.getResourceIdentifier()` = \"/resources\" + \"/\" + \"../WEB-INF/web.xml\" (139-146); ResourceMetaImpl.getResourceIdentifier joins localePrefix/resourceName (71-109). ExternalContext -> ServletContext.getResource normalizes the path to \"/WEB-INF/web.xml\" and returns a non-null URL, so the resource is kept (180-187). handleResourceRequest then calls resource.getInputStream() -> ExternalContextResourceLoader.getResourceInputStream(\"/resources/../WEB-INF/web.xml\") (153-158) and pipes the bytes to the client (343-366). The parallel `ln` vector reaches ExternalContextResourceLoader.getLibraryVersion (103-137) with the same missing validation; over an existing directory it tends to throw StringIndexOutOfBoundsException at line 120 (server error) rather than disclose, but it is the same root cause of unvalidated caller-controlled path segments.",
+      "unverified": "Not executed; behavior verified only by source reading. Exact container normalization semantics (Tomcat/Jetty/etc.) and whether access to /WEB-INF via ServletContext.getResource is allowed were not runtime-tested. The precise upstream fix/advisory identifier for this snapshot was not (and per instructions could not be) consulted. The `ln` branch's exact exception/behavior on various containers is inferred from the substring at ExternalContextResourceLoader line 120. Files with excluded extensions remain unreachable via this vector.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / CWE-538 file disclosure"
+    }
+  ],
+  "coverage_summary": "Scope: 1173-file snapshot, all files visible (no sensitivity/size/symlink exclusions reported); P1 relation index covers 1158 files (1032 Java parsed, 0 parse errors, 15 files not indexed, syntax-only relations, no data/control flow). Reviewed in source: api module (FacesServlet, ExternalContext(+Wrapper/helper), Application/ViewHandler/ResourceHandler/NavigationCase, DoubleConverter, _SharedRendererUtils, PreJsf2ExceptionHandlerFactory/ExceptionHandler copies, validator/convert helpers), impl module (ResourceHandlerImpl + DefaultResourceHandlerSupport, ViewHandlerImpl, NavigationHandlerImpl, DefaultRestoreViewSupport/RestoreViewExecutor/LifecycleImpl, Jsp/ServerSide/ClientSide state managers, FaceletViewHandlingStrategy-adjacent classes, DefaultFaceletFactory, SAXCompiler/TagLibraryConfig/ConfigFilesXmlValidationUtils, FacesConfigurator/DefaultAnnotationProvider, ErrorPageWriter/UIDebug, ServletExternalContextImpl(Base), InternalClassLoaderResourceLoader), shared module (StateUtils, MyFacesObjectInputStream, FlashImpl, HTMLEncoder, JavascriptUtils, HtmlJavaScriptUtils, renderers sampled, ExternalContextResourceLoader, ClassLoaderResourceLoader, ResourceImpl/ResourceMetaImpl/ResourceHandlerCache/ResourceLoader, Classpath, ExceptionHandlerImpl), implee6 initializer. Core focus paths (request -> resource/view handling) traced end-to-end. Not exhaustively reviewed: most component renderers/tag handlers, composite-component machinery, JS assets beyond sampling, integration-test webapps, and build/config files.",
+  "limitations": [
+    "No code was executed, no server was started, and no exploit payload was sent; the traversal is demonstrated by source-level path construction and standard ServletContext normalization semantics, not runtime confirmation.",
+    "The P1 relation index is syntax/navigation-only (no data flow, control flow, semantic resolution, or reachability proof); 15 of 1173 source files are missing from it, and its security_call facts are name-based hints only.",
+    "Container-specific behavior (Tomcat/Jetty/WebSphere ServletContext.getResource*/getResourcePaths with '..' and WEB-INF access) was not verified; impact is bounded accordingly and could differ per container.",
+    "Only a subset of the ~1030 Java files was read in detail; component renderers, tag handlers, composite-component internals, JavaScript assets, and build files were not exhaustively reviewed.",
+    "The upstream advisory/JIRA/CVE identifier for this snapshot was not consulted (prohibited), so the finding is described only at the source-evidence level."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Deserialization of view state (StateUtils.reconstruct/getAsObject + MyFacesObjectInputStream, no class whitelist in resolveClass).",
+      "reason": "Client-side state is encrypted with DES and authenticated with HmacSHA1 by default (USE_ENCRYPTION defaults to true; MAC compared over all bytes per MYFACES-2934); server-side state is read from session, not directly from the client. Only exploitable under non-default configuration (e.g. org.apache.myfaces.USE_ENCRYPTION=false or a fixed/weak operator-configured secret), so weaker than the candidate."
+    },
+    {
+      "lead": "XXE: SAXParserFactory/DocumentBuilderFactory/SchemaFactory instances in ConfigFilesXmlValidationUtils, SAXCompiler, TagLibraryConfig, WebXmlParser and the Digester-based faces-config unmarshaller do not disable DTDs/external entities.",
+      "reason": "The parsed XML documents are server-side deployment artifacts (faces-config.xml, *.taglib.xml, web.xml) resolved from the classpath/webapp, not directly attacker-supplied request data; no remote input path to these parsers was found in this snapshot."
+    },
+    {
+      "lead": "SourceCodeServlet (shared/src/main/java/org/apache/myfaces/shared/util/servlet/SourceCodeServlet.java) reads getRealPath(servletPath-derived page) and streams it as text/plain.",
+      "reason": "Development helper that must be explicitly registered by the application; it is not wired in the shipped faces-config/web.xml, so attacker reachability is not established from this snapshot."
+    },
+    {
+      "lead": "UIDebug.debugRequest returns stored debug HTML for the request parameter facelets.ui.DebugOutput with sequential ids (info disclosure/session data exposure).",
+      "reason": "Requires the application to explicitly place <ui:debug> in a view; ids are session-scoped and not secrets, and this is a documented development feature. Lower impact and conditional."
+    },
+    {
+      "lead": "`ln` parameter path traversal in the same resource flow.",
+      "reason": "Same root cause as the submitted candidate and not split out; for existing directories ExternalContextResourceLoader.getLibraryVersion line 120 computes substring(path.length()) on shorter normalized entries and throws StringIndexOutOfBoundsException, so it is mainly a request-level DoS unless a path/naming combination satisfies the arithmetic."
+    }
+  ],
+  "summary": "Reviewed the Apache MyFaces Core 2.0.11 snapshot (1173 files; api/impl/shared/implee6 modules) with emphasis on the HTTP request path, resource handling, view-state handling, and XML parsing. The strongest source-evidenced issue is an unvalidated resource path built from the attacker-controlled `loc` (and also `ln`) request parameter in `ResourceHandlerImpl`, combined with `ExternalContextResourceLoader` prefixing `/resources` and delegating to `ServletContext.getResource*`, which normalizes `..`. Because the framework's own FacesServlet explicitly rejects pathInfo beginning with `/WEB-INF`/`/META-INF` (api FacesServlet lines 144-160), serving a `loc`-traversed path that resolves to `/WEB-INF/...` contradicts the intended protection and discloses webapp-internal files. Other reviewed areas (view-state deserialization/MAC, XXE in config parsers, dev-only SourceCodeServlet, UIDebug) were weaker or required non-default configuration/registration and are noted as rejected leads."
+}

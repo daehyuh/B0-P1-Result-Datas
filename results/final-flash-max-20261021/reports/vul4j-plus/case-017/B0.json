@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote server controls the Location header of a 3xx response; DefaultRedirectStrategy.getLocationURI()/createLocationURI() turns it into a URI and RedirectExec.execute() feeds it to URIUtils.extractHost() to pick the new target/route (redirects are enabled by default). Applications that build HttpGet/HttpPost/RequestBuilder requests from user- or partner-supplied URLs (the common SSRF pattern) provide the same input. No authentication is needed for the redirect vector.",
+      "confidence": "low",
+      "counterevidence_checked": "I looked for a locally injected or clearly exploitable alternative and did not find one. (a) ProtocolExec uses uri.getHost() for the Host header, so a simple extractHost-vs-header mismatch only occurs on the getHost()==null fallback path; (b) java.net.URI rejects many malformed inputs outright (backslash, spaces), so the reachable inputs are the subset that URI parses but does not classify as server-based; (c) the fallback is intentional so that non-standard but resolvable host names (e.g. underscores) still work, i.e. simply deleting it is not a drop-in fix; (d) I could not run Java to enumerate inputs where getHost()==null and a downstream parser disagrees, so the exact malformed-authority string and end-to-end misrouting were not verified at runtime; (e) the snapshot is an older 4.5.x state, and this code lineage was later replaced/hardened upstream (the malformed-authority handling was the subject of a published HttpClient security fix), but I could not consult the fix from within this environment.",
+      "id": "httpclient-uri-authority-host-confusion",
+      "impact": "Target/host confusion: a request can be executed against (routed to or forwarded by a proxy to) a host other than the one the application validated or believed it was contacting. In deployments that rely on URIUtils.extractHost or on the client's chosen target for SSRF/allow-list enforcement, this can bypass the destination restriction and reach internal or attacker-chosen endpoints; proxy-mediated requests can also expose the request and its headers/credentials to an unintended destination. Severity depends on the intermediary's authority parsing and on how the application validates URLs before calling HttpClient.",
+      "locations": [
+        {
+          "end_line": 387,
+          "path": "httpclient/src/main/java/org/apache/http/client/utils/URIUtils.java",
+          "start_line": 333
+        },
+        {
+          "end_line": 100,
+          "path": "httpclient/src/main/java/org/apache/http/impl/client/CloseableHttpClient.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 139,
+          "path": "httpclient/src/main/java/org/apache/http/impl/execchain/RedirectExec.java",
+          "start_line": 134
+        },
+        {
+          "end_line": 161,
+          "path": "httpclient/src/main/java/org/apache/http/impl/execchain/ProtocolExec.java",
+          "start_line": 148
+        }
+      ],
+      "prerequisites": "The request URI must be absolute and carry an authority that java.net.URI does not accept as server-based so that getHost() returns null (e.g. hosts containing characters outside the RFC 2396 hostname grammar), while the remaining raw text is still accepted by extractHost's trimming logic. Impact is strongest when a forwarding proxy or an origin/middlebox parses the same unsanitized authority according to a different rule set, or when the application itself uses URIUtils.extractHost / an allowlist derived from it to decide whether the destination is permitted.",
+      "root_cause": "URIUtils.extractHost falls back to ad-hoc string parsing of the raw authority whenever java.net.URI.getHost() returns null (lines 341-376): it strips everything before the FIRST '@' and everything from the FIRST ':' onward (taking only leading digits as port). It then accepts almost any resulting non-blank string as a host (line 379-381). The parser does not validate that the authority is a well-formed server-based authority, does not reject a second '@', embedded brackets/backslashes/percent-escapes or control characters, and silently truncates instead of failing. Because the same raw authority is written to the wire in proxy mode (URIUtils.rewriteURIForRoute leaves absolute request URIs unchanged when using a proxy) and re-parsed independently by the proxy/server, the client-side target/route host and the actual request destination can diverge. ProtocolExec derives the Host/target independently from uri.getHost() (lines 148-155), so for these malformed authorities one code path uses the ad-hoc value while another treats the URI as having no valid host.",
+      "title": "URIUtils.extractHost accepts malformed/ambiguous authority components and can derive a target host that differs from the host actually used for the request",
+      "trace": "(1) CloseableHttpClient.execute(HttpUriRequest) -> determineTarget() -> URIUtils.extractHost(requestURI) (CloseableHttpClient.java:86-100, URIUtils.java:333-387) chooses the route target. (2) On redirect, RedirectExec.execute() -> URIUtils.extractHost(uri) at RedirectExec.java:135 routes the follow-up request, while DefaultRedirectStrategy.createLocationURI() only lower-cases the host (DefaultRedirectStrategy.java:187-202) and RedirectExec copies the original request headers to the new request (RedirectExec.java:122-128). (3) For URIs with getHost()==null, ProtocolExec.java:152-155 does not use the extracted host (it falls back to request.getTarget()/route target), demonstrating that the two paths treat the same malformed URI differently. (4) In proxy mode URIUtils.rewriteURIForRoute(uri, route) at URIUtils.java:208-228 sends the absolute URI with its raw authority to the proxy, where it is re-parsed.",
+      "unverified": "Runtime confirmation that a specific malformed authority yields getHost()==null in the JVM used and is parsed differently by a proxy/origin; whether the application-level allow-list scenario (not just the client library) is exploitable. I also could not verify against the upstream fix or CVE text, so the mapping of this code path to the published malformed-authority vulnerability remains a reasoned inference from source structure, not a confirmed match.",
+      "weakness_type": "Improper input validation / host confusion in URI authority parsing (CWE-20; SSRF-style request misrouting)"
+    }
+  ],
+  "coverage_summary": "Scope: 612 model-visible files (main sources, deprecated sources, examples, docs, build files). No test sources are present in scope. Read in depth: request execution chain (MainClientExec, MinimalClientExec, ProtocolExec, RedirectExec, RetryExec, ConnectionHolder, HttpResponseProxy), client entry points and config (CloseableHttpClient, InternalHttpClient, HttpClientBuilder defaults), redirect/location handling, URI utilities (URIUtils, URIBuilder, URLEncodedUtils, RequestBuilder, HttpRequestWrapper), TLS verification (DefaultHostnameVerifier, AbstractVerifier, Strict/BrowserCompat/AllowAll/Noop verifiers, SSLConnectionSocketFactory), auth (BasicScheme, DigestScheme, RFC2617Scheme, HttpAuthenticator, AuthenticationStrategyImpl, credentials providers, AuthScope, NTLM/WindowsNegotiate paths), cookie specs and handlers (RFC6265*, DefaultCookieSpec(Provider), BasicDomain/Path/Secure/MaxAge/Expires, Netscape handlers, PublicSuffixDomainFilter/Matcher), routing/pooling (HttpRoute, RouteTracker, Default/SystemDefault/ProxySelector route planners, CPool, PoolingHttpClientConnectionManager), httpclient-cache (CachingExec adjacent policies, key generation, storage, serializers, memcached/ehcache, file resources), httpmime (multipart form/builder, content bodies), httpclient-osgi (PropertiesUtils, credentials provider, proxy activator), and httpclient-win. No execution, build, or external lookups were performed.",
+  "limitations": [
+    "No runtime execution or unit tests; Java URI parsing semantics and proxy behaviour for malformed authorities were reasoned about statically only.",
+    "httpcore/commons-codec/commons-logging sources are external dependencies and were not in scope, so some parsing/validation behaviour (e.g. HttpHost constructor validation, BasicHeaderValueParser) could not be inspected directly.",
+    "No upstream diff or security-fix reference was available in the snapshot (no VCS metadata, no CVE/commit references in-tree), so I could not confirm whether this snapshot is pre- or post-fix for the authority-handling issue.",
+    "Tests are absent from the visible scope, removing a source of behavioural evidence; deprecated sources (java-deprecated) and the largest files (HttpClientBuilder, NTLMEngineImpl, CachingExec) were reviewed selectively rather than line-by-line.",
+    "The candidate is a lead derived from source evidence and the known malformed-authority weakness of this component lineage; it was not confirmed as exploitable or as the intended ground-truth issue."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AbstractVerifier.getDNSSubjectAlts inverted ternary (returns null when DNS SANs exist, empty array when none) at httpclient/src/main/java/org/apache/http/conn/ssl/AbstractVerifier.java:259-271.",
+      "reason": "Real logic oddity, but the method is a deprecated public helper and is not used by the verification paths (AbstractVerifier.verify uses DefaultHostnameVerifier.getSubjectAltNames, and DefaultHostnameVerifier does its own matching), so it has no demonstrated security impact in the default execution path."
+    },
+    {
+      "lead": "Java deserialization of cache entries without an ObjectInputFilter in DefaultHttpCacheEntrySerializer.readFrom and MemcachedCacheEntryImpl.set (ObjectInputStream.readObject on externally stored bytes).",
+      "reason": "Genuine unsafe-deserialization pattern, but it requires the attacker to already control the cache backend (memcached service, ehcache, or file cache contents) and is an intentional trusted-storage design in this module; no attacker-controlled network path to the deserializer was identified in this snapshot."
+    },
+    {
+      "lead": "NetscapeDomainHandler.match uses plain host.endsWith(domain) (httpclient/src/main/java/org/apache/http/impl/cookie/NetscapeDomainHandler.java:109-119), so a cookie for example.com can match notexample.com.",
+      "reason": "Legacy lax behavior is only reachable when the non-default Netscape cookie policy is explicitly selected (the default 'best match'/RFC 6265 policies decorate BasicDomainHandler with PublicSuffixDomainFilter and dot-boundary matching), so the default configuration is not affected."
+    },
+    {
+      "lead": "MultipartEntityBuilder.generateBoundary uses java.util.Random (httpmime/.../MultipartEntityBuilder.java:191-196).",
+      "reason": "Predictable multipart boundary is a hardening weakness rather than a demonstrated vulnerability here; no code path turns boundary prediction into a concrete impact in this library snapshot."
+    },
+    {
+      "lead": "Deprecated SSLSocketFactory / AllowAllHostnameVerifier / NoopHostnameVerifier accept-anything behavior.",
+      "reason": "These classes are opt-in deprecated APIs; the default builder path wires SSLConnectionSocketFactory to DefaultHostnameVerifier with the public suffix matcher (HttpClientBuilder.build, lines ~945-967), so default TLS hostname verification is not weakened."
+    },
+    {
+      "lead": "URIUtils.extractHost is likely reachable from redirects: reviewed RedirectExec/DefaultRedirectStrategy for header/auth leakage on cross-host redirects.",
+      "reason": "Target/proxy auth state is reset when the redirect target host changes (RedirectExec.java:141-156); only user-set headers are copied to the redirect request, which is the documented upstream behavior, so no additional distinct candidate was split out from the reported finding."
+    }
+  ],
+  "summary": "Reviewed the Apache HttpComponents Client 4.5.3-SNAPSHOT source tree (612 model-visible files; no test sources present in scope). I traced the request-execution path (request creation -> target determination -> redirect handling -> route planning -> protocol/request execution), plus TLS hostname verification, cookie specs, auth schemes/credentials, connection-pool/routing code, the caching module, httpmime, httpclient-osgi and httpclient-win. The tree looks like genuine upstream 4.5.x code (no locally injected mutation found), so I selected the strongest genuine weakness supported by source evidence: the ad-hoc parsing of non-server-based URI authority components in URIUtils.extractHost, which can make the client derive a different target/route host than the authority actually denotes for intermediaries that re-parse the same request-target. This is the code path historically associated with the malformed-authority host confusion issue in this component (CVE-2020-13956 lineage). Several other suspicious items were examined and rejected (see rejected_leads). No code was executed and no runtime confirmation was performed."
+}

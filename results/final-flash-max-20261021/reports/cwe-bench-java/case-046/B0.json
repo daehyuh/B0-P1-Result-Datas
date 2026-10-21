@@ -1,0 +1,59 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker needs only local access as any OS account (or the ability to run any process) on a shared build node; no Jenkins permission or job configuration is required to write the file. Shared agents, agents also used by other services, or nodes where a build can leave a background process running are sufficient. The install path is derived from the administrator-configured tool home (preferredLocation), so the file is at a predictable location.",
+      "confidence": "medium",
+      "counterevidence_checked": "HTTPS URLs (download.docker.com/get.docker.com) protect the download in transit; the binary is re-downloaded and the install directory contents deleted when the version/timestamp changes (lines 110-114), but that does not remove the world-writable window; file mode 0777 grants write permission independently of directory ownership, so the tool-home permissions do not compensate. The chmod argument is a literal 0777, not a variable, so there is no ambiguity about intent (execute+write for all). No compensating permission fix exists elsewhere in the visible source.",
+      "id": "docker-tool-installer-world-writable-binary",
+      "impact": "Local privilege escalation / build-tool tampering: arbitrary code execution as the Jenkins node user on subsequent builds, theft of Docker registry and server credentials used by builds, ability to tamper with images pushed by builds (supply-chain impact) or to pivot through the Docker socket. The binary is also fetched without any checksum/signature verification, so integrity rests solely on transport security.",
+      "locations": [
+        {
+          "end_line": 147,
+          "path": "src/main/java/org/jenkinsci/plugins/docker/commons/tools/DockerToolInstaller.java",
+          "start_line": 117
+        },
+        {
+          "end_line": 101,
+          "path": "src/main/java/org/jenkinsci/plugins/docker/commons/tools/DockerTool.java",
+          "start_line": 74
+        }
+      ],
+      "prerequisites": "At least one DockerTool using the 'Download from docker.com' (DockerToolInstaller) installer, installed/used on a node where another OS account or process can write files; Unix-like node (on Windows the chmod emulation is less clear-cut). Chmod executes on every (re)install.",
+      "root_cause": "In performInstallation(), after the Docker CLI is downloaded (raw binary via docker.copyFrom(url) or .tgz via install.installIfNecessaryFrom()) and placed at bin/docker, the code unconditionally calls docker.chmod(0777) (DockerToolInstaller.java:144). That grants read/write/execute on the file to every account on the node, so any local user or process can rewrite the executable that Jenkins runs for subsequent Docker builds.",
+      "title": "DockerToolInstaller installs the Docker CLI executable with mode 0777 (world-writable) on build nodes",
+      "trace": "DockerToolInstaller.performInstallation(): node channel -> FindArch -> getDockerImageUrl(); download to bin/docker (lines 120-142); then docker.chmod(0777) (line 144) -> <install>/bin/docker is world-writable. DockerTool.getExecutable() (lines 74-101) returns <toolHome>/bin/docker, and Docker-based plugins execute that path for later builds. A local attacker who overwrites bin/docker in the window between installation and use gets their code executed as the Jenkins agent user whenever a build invokes the tool, inheriting the build environment, including DOCKER_CONFIG/registry credentials materialized by RegistryKeyMaterialFactory and any other secrets available to that user.",
+      "unverified": "Not runtime-confirmed; I did not verify how commonly tool homes/agents are shared among mutually untrusted OS accounts, nor Windows FilePath.chmod semantics. The repository contains no test or documentation showing the intended mode.",
+      "weakness_type": "CWE-732 Incorrect Permission Assignment for Critical Resource (world-writable executable; also CWE-276)"
+    }
+  ],
+  "coverage_summary": "Coverage: all 31 files exposed to this run were listed; I read all 19 visible Java sources, all 5 visible resources, pom.xml, README, CHANGELOG and repository metadata (.github/release-drafter.yml, .mvn/extensions.xml, .gitignore). No .jelly view files and no test sources were present. The environment's sensitive-name/path filter removed 14 of the 45 source-root files; based on the package layout and Messages.properties references these are the org.jenkinsci.plugins.docker.commons.credentials package and its resources (DockerServerCredentials(+Binding), DockerRegistryToken, KeyMaterial, KeyMaterialContext, KeyMaterialFactory), which could therefore not be reviewed. Assessment is source-only; nothing was executed and no runtime behavior was confirmed.",
+  "limitations": [
+    "The entire .../docker/commons/credentials/ package (14 files, including KeyMaterialFactory.createSecretsDirectory and the Docker server-credential binding) is excluded by the environment's sensitive-name/path filter and was not inspected.",
+    "The DockerFingerprintAction index.jelly/UI rendering is absent from the snapshot, so stored-XSS/escaping questions on the fingerprint page cannot be evaluated.",
+    "No test sources are bundled, so intended behavior/permission assumptions could not be checked against tests.",
+    "Agent-sharing, tool-home ownership, and Windows chmod semantics in real deployments are unknown; candidate remains a lead, not a confirmed vulnerability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "RegistryKeyMaterialFactory passes the registry password as an argv argument: `docker login -u <user> -p` .add(password, true) .add(endpoint) (impl/RegistryKeyMaterialFactory.java:101).",
+      "reason": "Real secret-exposure surface (password visible in /proc/<pid>/cmdline or process listings on the node for the duration of docker login; TODO at line 98 acknowledges --password-stdin), but the value is explicitly masked in Jenkins logs, exposure is transient, and it needs the same local-agent foothold as the selected candidate, so it is the weaker of the two local-exposure issues."
+    },
+    {
+      "lead": "DockerFingerprintAction exposes public methods with no permission check: getFingerprintHash(String), getFingerprint(String), getDockerFacets(String) (fingerprint/DockerFingerprintAction.java:95-124).",
+      "reason": "Plausible missing-permission-check/information-disclosure lead, but I could not establish Stapler reachability of the parameterized methods with only Overall/Read from this snapshot (the rendering index.jelly is not present), and fingerprint/build-usage metadata is low sensitivity; no evidence of a concrete bypass or secret exposure."
+    },
+    {
+      "lead": "RegistryKeyMaterialFactory copies the agent user's ~/.docker/config.json into the build secrets dir but only blacklists 'auths' and 'credsStore' (BLACKLISTED_PROPERTIES, line 54), leaving 'credHelpers' and other keys.",
+      "reason": "Could allow build-time docker to invoke a per-registry credential helper and retrieve the agent user's pre-existing registry credentials, partially defeating the credential-isolation intent of the blacklist; however the config file belongs to the agent user, the behavior depends on Docker's helper semantics, and the surrounding KeyMaterialFactory/KeyMaterial classes are filtered out of this run, so it is unverified."
+    },
+    {
+      "lead": "ServerKeyMaterialFactory materializes client key/cert/CA files into a temp directory created by KeyMaterialFactory.createSecretsDirectory() (impl/ServerKeyMaterialFactory.java:77-96) and deletes them on close().",
+      "reason": "Directory permissions and cleanup semantics live in the excluded credentials/KeyMaterialFactory.java, so I could not verify whether the private key is ever readable by other local users; no conclusion possible from visible evidence."
+    },
+    {
+      "lead": "No integrity verification (checksum/signature) of the downloaded Docker CLI before execution (tools/DockerToolInstaller.java:120-144).",
+      "reason": "Overlaps the selected candidate as a contributing factor; HTTPS protects transport, so this alone is a hardening opportunity rather than an independently evidenced vulnerability."
+    }
+  ],
+  "summary": "Reviewed the visible docker-commons 1.17-SNAPSHOT snapshot: 19 Java files (fingerprint, impl, tools, plugin/extractor), resources, pom/CHANGELOG/README and CI metadata. No prompt-injection or build-script tampering was found in the readable metadata. The strongest source-evidenced issue is that DockerToolInstaller installs the downloaded Docker CLI with mode 0777, making a privileged, build-executed binary world-writable on the node. Secondary leads (docker login password in argv, unchecked public fingerprint accessors, incomplete ~/.docker/config.json blacklist) are weaker or depend on excluded files and are listed as rejected/unconfirmed leads only. The `.../docker/commons/credentials/` package (6 Java files plus resources, 14 files total) is filtered out of this run and could not be inspected; no tests are present in the snapshot. No code was executed and no runtime confirmation was possible."
+}

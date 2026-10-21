@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any client that can speak the RegionServer client RPC protocol controls `CleanupBulkLoadRequest.region` and `CleanupBulkLoadRequest.bulkToken` (and, for the load call, `BulkLoadHFileRequest.familyPaths`). There is no server-side nonce/registry of issued tokens and no containment check, so the path is fully attacker-chosen.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that no token registry/binding exists (`prepareBulkLoad` keeps no state; the token is merely a random path string); that `HRegionServer` always instantiates the manager (HRegionServer.java:1922-1923); that `AccessController.preCleanupBulkLoad` only performs a table-level CREATE check and is a no-op when authorization is disabled; and that no path canonicalization/containment check exists anywhere in the flow. The class Javadoc says the design relies on the staging directory being secret ('the strength of the security lies in the length and randomness of the secret directory'), which shows the client is trusted to echo its own token - but nothing enforces that trust, and the delete runs with the server's credentials. Blast radius is limited to the server account's filesystem permissions.",
+      "id": "hbase-bulkload-unvalidated-client-path",
+      "impact": "A remote client (by default unauthenticated/unauthorized, since authorization is off by default) can make the RegionServer recursively delete arbitrary filesystem paths writable by the HBase service account - e.g., other tables'/namespaces' data under hbase.rootdir, WALs, the shared staging directory, or any other HDFS location the service account owns - a high-impact data-destruction/denial-of-service primitive. The same trust model allows files outside the staging area to be copied/moved into the bulk-load staging area when the requesting user's filesystem permissions allow it.",
+      "locations": [
+        {
+          "end_line": 174,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SecureBulkLoadManager.java",
+          "start_line": 152
+        },
+        {
+          "end_line": 135,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SecureBulkLoadManager.java",
+          "start_line": 121
+        },
+        {
+          "end_line": 305,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SecureBulkLoadManager.java",
+          "start_line": 214
+        },
+        {
+          "end_line": 2465,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java",
+          "start_line": 2450
+        },
+        {
+          "end_line": 2448,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java",
+          "start_line": 2432
+        },
+        {
+          "end_line": 2030,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java",
+          "start_line": 2025
+        }
+      ],
+      "prerequisites": "RegionServer reachable from the attacker; a client can target any open region it names. With `hbase.security.authorization=false` (default) no effective authorization applies because `AccessController.requireAccess` returns early when authorization is disabled; with authorization enabled, a user with CREATE on any table passes `preCleanupBulkLoad` (AccessController.java:2025-2030). The deleted path must be modifiable by the HBase service account's filesystem identity (HDFS ACLs bound the blast radius).",
+      "root_cause": "`SecureBulkLoadManager.cleanupBulkLoad` passes the RPC-supplied `CleanupBulkLoadRequest.getBulkToken()` straight into `fs.delete(path, true)` (SecureBulkLoadManager.java:157-158), where `fs` is the FileSystem created in `start()` under the RegionServer login UGI (SecureBulkLoadManager.java:125). Nothing records tokens issued by `prepareBulkLoad`, and nothing checks that the resolved path is contained in `baseStagingDir` (`<hbase.rootdir>/staging`, line 126). The companion `secureBulkLoadHFiles` reuses the same client-controlled token to build staging paths (`new Path(bulkToken, family)`, line 279) and passes the client-supplied `familyPaths` source paths directly to `region.bulkLoadHFiles(...)` (lines 290-291), so copy/rename operations are not confined to the staging area either.",
+      "title": "RegionServer bulk-load RPC trusts client-supplied bulkToken/paths: recursive delete with server credentials and staging-directory escape",
+      "trace": "Client -> `RSRpcServices.cleanupBulkLoad` (RSRpcServices.java:2450-2464) -> `SecureBulkLoadManager.cleanupBulkLoad` (152-174) -> `fs.delete(new Path(request.getBulkToken()), true)` (157-158) on the server-owned FS instance created at 125. Related flow: `RSRpcServices.prepareBulkLoad` (2432-2448) returns a random token under `baseStagingDir`; `secureBulkLoadHFiles` (214-305) then trusts any token the client sends back (227) and any source path in `familyPaths` (216-219, 290-291).",
+      "unverified": "No build, execution, or live RPC testing was performed, so runtime reachability and HDFS-specific behavior (e.g., deleting root, cross-namespace effects) are unconfirmed; the review cannot prove that no deployment-specific layer (custom coprocessor, HDFS ACL, network isolation) mitigates it. It is also unverified whether later upstream revisions added a containment check, since the snapshot is the only source available.",
+      "weakness_type": "Improper validation of client-controlled filesystem path leading to arbitrary deletion (CWE-73/CWE-22; improper access control)"
+    }
+  ],
+  "coverage_summary": "Source scope: 2,591 readable files (source_root_files=model_visible_files=2591; no over-5MiB/symlink/sensitive-name exclusions). The tree contains only main sources: all `src/test` trees, generated protobuf sources, the `hbase-server` UI template package (`org.apache.hadoop.hbase.tmpl.*`, referenced by MasterStatusServlet/RSStatusServlet) and `hbase-protocol-shaded` protobuf/IDL files are absent, so some first-party code could not be inspected. The P1 relation index reports complete coverage of the files present (2,591 indexed, 0 missing, 0 hash mismatches) but explicitly provides only syntactic navigation (no data-flow/reachability/exploitability proof). I inspected in depth: hbase-server RPC and bulk-load paths (RSRpcServices, MasterRpcServices, SecureBulkLoadManager, LoadIncrementalHFiles), security packages (access/AccessController/AccessChecker/AuthManager, visibility/*, token/*, HBaseSaslRpcServer, ServerRpcConnection), hbase-http servlets/HttpServer filters, hbase-rest resources/filters/client, hbase-thrift ThriftHttpServlet, and ZK/FS/path utilities; plus repository-wide literal searches for command execution, deserialization, XML parsing, path traversal, weak crypto, proxy/impersonation and admin-gating patterns.",
+  "limitations": [
+    "No build, test, or dynamic execution was performed; findings are source-level and not runtime-confirmed.",
+    "The relation index is syntactic only (declarations/calls/containment); it does not prove runtime data flow, reachability, or exploitability, and external/library callees (e.g., com.google.protobuf types, Hadoop ProxyUsers) are not resolvable in it.",
+    "Parts of first-party code are missing from the snapshot (generated protobuf classes, all tests, UI template classes referenced by servlets), so the UI and protocol glue could not be reviewed directly.",
+    "Several large non-security-critical modules/service areas (mapreduce jobs, backup/restore, snapshot internals, IT/examples) were sampled rather than exhaustively audited; a different vulnerability could exist in uninspected code.",
+    "Attribution to a specific CVE or upstream fix commit could not be verified offline; the bulk-load behavior may persist in upstream revisions, and I could not confirm whether a containment check exists in a later version."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Visibility label character validation appears orphaned: `VisibilityLabelsValidator.isValidLabel` (hbase-client) has no callers anywhere in the snapshot (confirmed both by text search and by the relation index: only a CONTAINS edge, no CALLS), and neither `DefaultVisibilityLabelServiceImpl.addLabels` (hbase-server/.../visibility/DefaultVisibilityLabelServiceImpl.java:229-265) nor `VisibilityController.addLabels` (VisibilityController.java:752-802) validates label bytes.",
+      "reason": "Plausible removed-check pattern, but the concrete security impact is weak/ambiguous: labels containing expression operators ('&','|','!','(',')') simply cannot be referenced unambiguously by the expression parser, only label-service admins can add labels, and no confidentiality bypass could be demonstrated from source; rejected as a weaker lead, though it remains the best 'orphaned security helper' signal found."
+    },
+    {
+      "lead": "`CoprocessorWhitelistMasterObserver.validatePath` (hbase-server/.../security/access/CoprocessorWhitelistMasterObserver.java:83-132) uses `FilenameUtils.wildcardMatch` on non-normalized paths, so a configured whitelist containing '*' could match a '..' traversal to a jar outside the intended directory.",
+      "reason": "Requires a wildcard whitelist configuration and table ADMIN privileges; the 'loose match' plus scheme/authority check appears intentional upstream behavior, and no evidence in this snapshot shows it is the case's regression; rejected as unconfirmed."
+    },
+    {
+      "lead": "`LogLevel.Servlet` (hbase-http/.../http/log/LogLevel.java:121-144) reflects the `log`/`level` request parameters into the HTML response without escaping (reflected XSS).",
+      "reason": "Endpoint is gated by `HttpServer.hasAdministratorAccess` (line 105) and the code is the long-standing upstream servlet shape; low impact for an admin-only page; rejected."
+    },
+    {
+      "lead": "`ConfServlet.writeResponse` (hbase-http/.../http/conf/ConfServlet.java:88-97) dumps the full daemon configuration (including password/secret-bearing keys) with no masking; instrumentation access is allowed by default.",
+      "reason": "Documented Hadoop/HBase operational behavior, not a distinct injection/validation defect, and no clear attacker-controlled transformation; rejected."
+    },
+    {
+      "lead": "Sibling bulk-load issues (client-supplied `familyPaths` used as copy/rename sources, and `new Path(bulkToken, family)` staging derivation) in SecureBulkLoadManager.java:214-305.",
+      "reason": "Same root cause as the selected candidate (unvalidated client paths in the bulk-load staging flow) and therefore merged into the single candidate rather than reported separately."
+    }
+  ],
+  "summary": "Reviewed the Apache HBase 3.0.0-SNAPSHOT tree (2,591 readable files; no tests, no generated protobuf, UI template package absent) with emphasis on attacker-reachable server paths: RPC (RSRpcServices/MasterRpcServices), security (AccessController/AuthManager/visibility/token), hbase-http servlets, hbase-rest, hbase-thrift, bulk load, and path/filesystem utilities. The strongest single issue is the bulk-load RPC family: the RegionServer performs filesystem operations with client-supplied paths without binding them to the staging directory, including a recursive delete executed with the server's own FileSystem identity. Other security-relevant code (REST/Thrift 'doAs' proxy checks, XML hardening in RemoteAdmin, CSRF filter, CSRF/admin servlet gating, ACL hooks) matched hardened implementations, and several plausible leads were rejected as low-impact or likely intended behavior."
+}

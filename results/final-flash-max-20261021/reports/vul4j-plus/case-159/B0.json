@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated HTTP/2 client (h2c upgrade or h2 over TLS) fully controls SETTINGS frames, including SETTINGS_INITIAL_WINDOW_SIZE, request URIs and whether to ever send WINDOW_UPDATE. It can request a resource whose response body is larger than the bytes Tomcat has already sent on the stream, then reduce INITIAL_WINDOW_SIZE below the number of bytes already sent on that stream, making the stream's tracked window negative, and then stop sending WINDOW_UPDATE frames.",
+      "confidence": "medium",
+      "counterevidence_checked": "Frame payload sizes are centrally validated (FrameType.check), so malformed SETTINGS are rejected; the initial-window value is only upper-bound validated, and values are unsigned so the client cannot send a negative number directly (the negative window must be produced by reducing the setting after data has been sent - a spec-legal client action per RFC 7540 6.9.2). The connection-level reserve path (Http2UpgradeHandler.java:801-828) does time out based on allocation == 0 and is not affected; doWriteTimeout() exists and would release the thread if reached; the HTTP/2 overhead counter would eventually close very noisy connections but a single SETTINGS frame is far below the threshold and does not mitigate this. I did not find a clamp or explicit lower-bound validation anywhere in the SETTINGS or window-increment path, and no notification is issued while the window remains negative. Exact upstream remediation could not be checked in this environment.",
+      "id": "TOMCAT-HTTP2-NEGATIVE-WINDOW-HANG",
+      "impact": "Remote denial of service: request-processing threads are pinned indefinitely in a wait loop (no stream timeout, no connection close), leading to thread-pool exhaustion and loss of availability for legitimate traffic. No confidentiality/integrity impact is claimed; the effect is repeatable and requires only one SETTINGS frame per stream plus a stalled WINDOW_UPDATE.",
+      "locations": [
+        {
+          "end_line": 306,
+          "path": "java/org/apache/coyote/http2/Stream.java",
+          "start_line": 268
+        },
+        {
+          "end_line": 1477,
+          "path": "java/org/apache/coyote/http2/Http2UpgradeHandler.java",
+          "start_line": 1453
+        },
+        {
+          "end_line": 136,
+          "path": "java/org/apache/coyote/http2/AbstractStream.java",
+          "start_line": 115
+        },
+        {
+          "end_line": 204,
+          "path": "java/org/apache/coyote/http2/ConnectionSettingsBase.java",
+          "start_line": 198
+        },
+        {
+          "end_line": 340,
+          "path": "java/org/apache/coyote/http2/Http2Parser.java",
+          "start_line": 317
+        }
+      ],
+      "prerequisites": "A connector with HTTP/2 enabled (Http2Protocol as UpgradeProtocol; not enabled in the shipped conf/server.xml sample, so it must be configured) and an application endpoint that writes a response body larger than the already-sent byte count. One SETTINGS frame plus one long-running response per stuck stream is sufficient; repeating over many streams (up to maxConcurrentStreams, default 200) and/or connections consumes request-processing threads (default maxThreads 200).",
+      "root_cause": "Flow-control window reductions are applied without a lower bound and the blocking-write wait loop only detects exhaustion when the window is exactly zero. `Http2UpgradeHandler.setting()` applies `diff = (int)(value - oldValue)` from a client SETTINGS_INITIAL_WINDOW_SIZE to every existing Stream (Http2UpgradeHandler.java:1458-1473) and `AbstractStream.incrementWindowSize()` accepts negative results (AbstractStream.java:115-136); only an upper bound is validated (`ConnectionSettingsBase.validateInitialWindowSize`, ConnectionSettingsBase.java:198-204). `Stream.reserveWindowSize()` then loops `while (windowSize < 1)` but after `wait(writeTimeout)` only calls `doWriteTimeout()` when `windowSize == 0` (Stream.java:270-297, especially 284-287). For a negative window the timeout branch is unreachable, so the waiting writer loops on 20 s waits forever instead of timing out and closing the stream. The connection-level equivalent does handle exhaustion (`value[1] == 0` check in Http2UpgradeHandler.reserveWindowSize, Http2UpgradeHandler.java:801-828), so the missing negative-window handling is specific to the stream-level path.",
+      "title": "HTTP/2 negative stream flow-control window causes indefinitely blocked response writes (remote DoS)",
+      "trace": "1) Client negotiates HTTP/2 and issues a request. 2) Tomcat starts writing a body; `StreamOutputBuffer.flush(...)` calls `Stream.reserveWindowSize(reservation, true)` (Stream.java:919-921). 3) Client sends SETTINGS with INITIAL_WINDOW_SIZE = 0 (or any value lower than bytes already sent). Http2Parser.readSettingsFrame -> output.setting (Http2Parser.java:325-337). 4) Http2UpgradeHandler.setting computes a negative diff and calls `stream.incrementWindowSize(diff)` for existing streams (Http2UpgradeHandler.java:1459-1473); AbstractStream.incrementWindowSize has no lower-bound check, so the Stream window becomes negative. 5) The blocked writer is inside `while (windowSize < 1)` in Stream.reserveWindowSize; after `wait(streamWriteTimeout)` (default 20000 ms) it re-reads a negative window, the `windowSize == 0` timeout branch is skipped, and the loop repeats forever while the client withholds WINDOW_UPDATE. 6) Each such stream permanently occupies the thread that is executing the servlet write, so enough streams/connections exhaust the connector thread pool and other requests are denied service; the connection can be held open indefinitely.",
+      "unverified": "No runtime reproduction was performed and no upstream fix/patch was consulted, so it is not confirmed that the accepted upstream fix for this code is the stream-write timeout condition (`== 0` vs `< 1`) rather than a change in Http2UpgradeHandler.setting. The async (write-listener) path returns 0 instead of blocking and was not analyzed for equivalent effects, and the precise number of streams needed to exhaust a configured thread pool was not measured.",
+      "weakness_type": "CWE-835 Loop with Unreachable Exit Condition ('Infinite Loop') / CWE-400 Uncontrolled Resource Consumption (remote denial of service)"
+    }
+  ],
+  "coverage_summary": "Read the repository scope (2799 visible text files: 1821 Java, 179 XML plus properties/docs/config/webapps) and inspected the main security-relevant surfaces: coyote HTTP/2 (Http2Parser, Http2UpgradeHandler/AsyncUpgradeHandler, Stream, AbstractStream, ConnectionSettingsBase, FrameType), HTTP/1.1 and AJP parsing (Http11InputBuffer/Processor, AjpProcessor), request mapping (CoyoteAdapter, Request/Response, webresources traversal checks), authentication/authorization (AuthenticatorBase, Form/Digest/Basic/Spnego, RealmBase.findSecurityConstraints, JNDIRealm/JDBC/DataSource realms, LockOut/JAAS), filters (CORS, CSRF, HttpHeaderSecurity, FailedRequest, RemoteAddr/IP), session management (Request.doGetSession, ManagerBase, StandardSession), CGI/SSI, cluster interceptors (EncryptInterceptor), and manager/host-manager servlets. Verified several historical fixes are present. No test/ directory and no .jsp files exist in the snapshot, so tests and JSP/manager UI sources could not be reviewed.",
+  "limitations": [
+    "No git metadata, patch, changelog-after-snapshot, or upstream source was available, so claims about which exact code the upstream fix touched are inferential and not verified.",
+    "No code was executed and no reproduction was attempted; the HTTP/2 hang is traced from source only.",
+    "Coverage is not file-complete: of 2799 files, only the security-relevant subsets above were read in depth; unexamined areas include most javax.* API stubs, larger Jasper/EL/websocket parsing sources, JMX/beans plumbing, and jdbc-pool/dbcp/fileupload forks.",
+    "JSP files and the test tree are absent from the snapshot, so client-side/presentation and regression-test clues could not be inspected.",
+    "The relationship between this snapshot and the benchmark's ground-truth issue is unconfirmed; the candidate is a lead supported by source evidence, not a confirmed vulnerability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AJP connector accepts arbitrary request attributes without requiring a secret (AjpProcessor.java:696-728 stores any SC_A_REQ_ATTRIBUTE, including javax.servlet.include.*; secret check at 797-820 only runs when requiredSecret is configured).",
+      "reason": "Real weakness in this tree (Ghostcat class of issue, later CVE-2020-1938) but the snapshot's timeframe predates the corresponding fix/report, it requires the AJP port to be reachable, and I could not tie it to the case's ground truth; kept as an unconfirmed lead rather than the selected candidate."
+    },
+    {
+      "lead": "FormAuthenticator stores the authenticated Principal/username/password in the pre-existing session without rotating the session ID (FormAuthenticator.java:274-305).",
+      "reason": "Session-fixation pattern that was remediated only in much later releases; exploitation depends on an attacker being able to plant/obtain the victim's session cookie, and the fix date does not match this snapshot, so it is not the strongest evidence-backed candidate here."
+    },
+    {
+      "lead": "Dangling LocalStrings keys in the HTTP/2 package (e.g. http2Parser.processFrameSettings.invalidPayloadSize, http2Parser.processFramePing.invalidPayloadSize, upgradeHandler.initialWindowSize.invalid) have no Java references.",
+      "reason": "Frame payload-size checks are implemented centrally via FrameType.check, and the other keys are legacy artifacts; unused message keys are not vulnerabilities and no matching removed check could be demonstrated."
+    },
+    {
+      "lead": "Unused message key upgradeHandler.initialWindowSize.invalid suggests a possible removed validation of the HTTP/2 initial window size.",
+      "reason": "The current code validates the setting upper bound in ConnectionSettingsBase.validateInitialWindowSize and rejects invalid values with connectionSettings.windowSizeTooBig; no evidence of a removed security check could be established, so this was not used to support the candidate."
+    },
+    {
+      "lead": "Several SSI/CGI/CORS/DefaultServlet historical issues were checked as candidates (SSI printenv XSS, CGI command-line injection, insecure CORS defaults, DefaultServlet PUT validation).",
+      "reason": "The corresponding safeguards are present (SSIPrintenv.java:44 uses ENCODING_ENTITY; CGIServlet.java:435-441/824-832 enforce cmdLine argument patterns; CorsFilter defaults to no origins and credentials false; DefaultServlet/AbstractFileResourceSet enforce normalized paths), so these are not vulnerabilities in this snapshot."
+    }
+  ],
+  "summary": "Snapshot is the Apache Tomcat 9.0.20-dev source tree (changelog \"in development\", latest documented changes 2019-04-30; highest bug id 63370), containing 2799 visible files (1821 .java). I reviewed structure, config/docs and the security-critical runtime paths (coyote/http2, HTTP/1.1 & AJP parsing, CoyoteAdapter/Request, authenticators/realms, filters, session management, webresources, CGI/SSI, cluster interceptors) and verified that several previously fixed issues are present in fixed form (SSI printenv entity-encoding, CGI cmdLineArgumentsEncoded/Decoded checks, CORS secure defaults, DefaultServlet write-path validation). The strongest source-supported issue is a remote HTTP/2 denial of service in the stream flow-control write path: a client can drive a stream's flow-control window negative via SETTINGS_INITIAL_WINDOW_SIZE and then block a request-processing thread indefinitely because the stream write timeout only triggers at exactly window == 0. Timeline evidence (snapshot early May 2019) is consistent with the HTTP/2 negative-window DoS fixed in the 9.0.20 timeframe, but this could not be confirmed against an upstream patch. Only this one candidate is submitted; other plausible leads are listed as rejected/unconfirmed."
+}

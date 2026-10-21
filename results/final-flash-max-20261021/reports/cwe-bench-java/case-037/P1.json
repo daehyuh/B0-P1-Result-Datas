@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker fully controls the multipart form fields `resumableFilename` (used as the destination path), `resumableIdentifier`, `resumableChunkNumber`, `resumableTotalChunks` and `resumableTotalSize`, plus the content of the uploaded file part(s). No encoding, whitelist, `../` filtering or canonical path containment check is applied to these values before filesystem use. Values such as `resumableFilename=../../../../<existing-dir>/<file>` traverse outside the upload temp directory.",
+      "confidence": "medium",
+      "counterevidence_checked": "Confirmed the flow really reaches the sink: doDSPost detects resumable uploads solely from the presence of `resumableFilename` (lines 250-253) and there is no config gate disabling it; verified the write happens before any submission/bitstream validation; verified no sanitizer is applied on the resumable path even though FileUploadRequest.getFilename exists for the non-resumable path (FileUploadRequest lines 236-246); verified `/submit` is only registered-only protected, not unauthenticated; verified the chunk-assembly precondition (`foundAll && currentSize >= resumableTotalSize`) is attacker-satisfiable with a single chunk; verified no canonical-path or parent-directory containment check anywhere in SubmissionController; verified `File` semantics require existing parent directories (so targets are constrained to writable paths whose ancestors exist). I also checked related flows that turned out to be adequately guarded: BitstreamServlet/RetrieveServlet rely on Bitstream.retrieve()'s READ authorization (Bitstream.java line 586); AdminOnlyFilter enforces isAdmin (lines 64-72); LocalHostRestrictionFilter uses the real remote address.",
+      "id": "case-037-c1",
+      "impact": "Any authenticated (e.g., self-registered) user can create or overwrite arbitrary files with attacker-chosen content anywhere the JSPUI process can write, and can delete files of the form `part<n>` in attacker-chosen existing directories. This breaks the trust boundary between untrusted uploads and server files, enabling configuration tampering, persistence, denial of service, and potentially remote code execution where a writable script/JSP or executables directory is reachable (a common situation when Tomcat runs as the DSpace user that owns the deployed webapps).",
+      "locations": [
+        {
+          "end_line": 1712,
+          "path": "dspace-jspui/src/main/java/org/dspace/app/webui/servlet/SubmissionController.java",
+          "start_line": 1697
+        },
+        {
+          "end_line": 1694,
+          "path": "dspace-jspui/src/main/java/org/dspace/app/webui/servlet/SubmissionController.java",
+          "start_line": 1617
+        },
+        {
+          "end_line": 1612,
+          "path": "dspace-jspui/src/main/java/org/dspace/app/webui/servlet/SubmissionController.java",
+          "start_line": 1571
+        },
+        {
+          "end_line": 111,
+          "path": "dspace-jspui/src/main/java/org/dspace/app/webui/util/FileUploadRequest.java",
+          "start_line": 98
+        },
+        {
+          "end_line": 107,
+          "path": "dspace-jspui/src/main/webapp/WEB-INF/web.xml",
+          "start_line": 104
+        },
+        {
+          "end_line": 737,
+          "path": "dspace-jspui/src/main/webapp/WEB-INF/web.xml",
+          "start_line": 734
+        }
+      ],
+      "prerequisites": "A valid registered session for the JSPUI (`/submit` is protected only by the registered-only filter, web.xml lines 104-107, so any self-registered/authenticated user qualifies), a `multipart/form-data` POST to `/submit` containing a non-empty `resumableFilename` plus the chunk parameters, and an existing destination parent directory (or one created first with GET `/submit?resumableFilename=x&resumableIdentifier=<name>` which causes a one-level `mkdir()`). The web application user must have write permission to the target path. A single-chunk upload is sufficient (`resumableTotalChunks=1`, `resumableTotalSize` <= chunk size) and the chunk directory can also be an already-existing directory reached via `resumableIdentifier` traversal, so the GET step is optional.",
+      "root_cause": "The resumable-upload flow never sanitizes or confines the multipart fields `resumableFilename`, `resumableIdentifier` and `resumableChunkNumber`. In SubmissionController.makeFileFromChunks the parameter `resumableFilename` is taken straight from the request (`String resumableFilename = request.getParameter(\"resumableFilename\");`, line 1701) and concatenated to the configured upload temp directory (`String destFilePath = tmpDir + File.separator + resumableFilename;`, line 1705); that path is passed to `new File(...)`, `destFile.createNewFile()` and `new FileOutputStream(destFile)` (lines 1706/1711/1712), which writes the assembled chunk data to any attacker-chosen target whose parent directories exist. The sibling methods use the same untrusted fields: doPostResumable builds `chunkDirPath = tempDir + File.separator + resumableIdentifier` (line 1654), DoGetResumable mkdirs/deletes using `resumableIdentifier`/`resumableChunkNumber` (lines 1583-1608), and FileUploadRequest writes chunks to `tempDir + File.separator + parameters.get(\"resumableIdentifier\") + File.separator + \"part\" + parameters.get(\"resumableChunkNumber\")` whenever that directory merely exists (lines 98-111). Sanitization exists for ordinary uploads (FileUploadRequest.getFilename, lines 236-246) but is deliberately not applied on the resumable path.",
+      "title": "Path traversal / arbitrary file write via unsanitized resumable-upload parameters in JSPUI SubmissionController (CWE-22/CWE-434)",
+      "trace": "HTTP multipart POST to `/submit` (web.xml 402-404, 734-737) -> RegisteredOnlyFilter authenticates the user (web.xml 104-107) -> SubmissionController.doDSPost wraps the request with FileUploadRequest (lines 243-248), which parses the chunk and writes it under the attacker-influenced chunk path (FileUploadRequest lines 98-111) -> since `resumableFilename` is non-empty (line 251-253) doPostResumable is invoked (line 260) -> doPostResumable verifies the chunks exist under `tempDir/resumableIdentifier` (lines 1650-1673) -> makeFileFromChunks (line 1679) reads `resumableFilename` from the request (line 1701), builds `destFilePath = tmpDir + File.separator + resumableFilename` (line 1705) and writes all chunk content into `destFile` via FileOutputStream (lines 1706-1728), creating or overwriting the file at the traversed location -> the written file is then handed to UploadStep (lines 278-314), but the filesystem write has already occurred and is not rolled back even if the submission step fails. The GET handler DoGetResumable additionally creates and deletes files/directories built from the same unsanitized fields (lines 1583-1608).",
+      "unverified": "No execution, test run or exploit payload was performed. I could not verify the deployed `upload.temp.dir`/`java.io.tmpdir` layout, the actual filesystem permissions of typical installations, whether self-registration is enabled by default in the target instance, or the exact upstream fix/commit that may have addressed this code (the snapshot carries no VCS history or CVE references). The index is syntactic only, so runtime reachability and the interaction with container-level multipart limits are not proven.",
+      "weakness_type": "Path Traversal / Arbitrary File Write (CWE-22, CWE-434)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot (2,286 files; Maven DSpace 5.10) with read-only source tools: dspace-api (media filters, item import/export, submission steps, content/auth internals), dspace-jspui (servlet layer, filters, web.xml, JSPs), dspace-rest, dspace-oai, dspace-rdf, dspace-solr, and parts of dspace-xmlui (login/redirect and administrative aspects). The P1 relation index covered 2,032 of 2,286 files (254 unindexed) with 21,039 symbols; it provides only syntactic call/containment candidates with no control-flow, data-flow or semantic resolution, and its \"security_call\"/config facts are name-based hints, so every candidate was re-verified against source text. The candidate above was confirmed in source end-to-end (filter mapping -> controller -> sink); many unauthenticated JSPUI entry points (handle, bitstream, html, feed, open-search, sitemap, statistics, feedback, register) and the REST/OAI/RDF entry points were skimmed and only the listed weaker leads were noted. dspace-xmlui's full sitemap/aspect surface, dspace-sword/swordv2, dspace-lni (WebDAV) and dspace-services were only spot-checked, and XMLUI/SWORD/LNI authorization behavior remains partially uninspected.",
+  "limitations": [
+    "No code execution, build, tests or scanners were run; all findings are static source observations and are not runtime-confirmed.",
+    "The P1 relation index omits 254 source files and does not implement data flow, control flow or Spring/DI runtime resolution; index records were used only for navigation and were verified against source.",
+    "No VCS history, patch, CVE metadata or ground-truth data is available in the snapshot, so I could not confirm whether a later upstream fix corresponds to this code.",
+    "Deployment-specific facts (filesystem permissions, upload temp directory, self-registration policy, container multipart limits) are unknown and affect exploitability, not the source-level taint.",
+    "dspace-xmlui, dspace-sword/swordv2, dspace-lni and dspace-services were only partially inspected; a different vulnerability may exist in those areas."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ItemImport ZIP extraction without zip-slip guard (dspace-api/src/main/java/org/dspace/app/itemimport/ItemImport.java lines 2019-2081: `new FileOutputStream(zipDir + entry.getName())`).",
+      "reason": "Real traversal-prone code, but the reachable web path (BatchImportServlet) is behind the admin-only filter and the CLI invocation requires local/admin privilege, making it materially weaker than the candidate."
+    },
+    {
+      "lead": "ItemExportArchiveServlet filename handling (lines 44-108) plus ItemExport.getExportDownloadInputStream (lines 1148-1161) building `downloadDir/<userID>/<filename>`.",
+      "reason": "`filename` is only the substring after the last '/' of pathInfo (cannot contain '/'), must match the `*_<currentUserID>.*` pattern in canDownload, and the download directory is derived from the session user, so traversal/overwrite is not demonstrably reachable."
+    },
+    {
+      "lead": "SitemapServlet `map` request parameter used in `new File(sitemapDir, \"sitemap\"+map+ext)` and served via FileInputStream (lines 69-111).",
+      "reason": "Fixed prefix `sitemap` and suffix `.html`/`.xml.gz` plus the need for an existing `sitemap` intermediate directory make arbitrary file read implausible without additional conditions."
+    },
+    {
+      "lead": "DocumentBuilderFactory usages without disallow-doctype/external-entity hardening (RegistryLoader, RegistryImporter, StructBuilder, ItemImport, ItemArchive, XMLUtils, SFXFileReader, RoleIngester, ControlledVocabulary).",
+      "reason": "The inputs I could trace are configuration/administrator-supplied XML files or admin-only ingest packages, not directly attacker-controlled request bodies; could not establish an unauthenticated remote XML source."
+    },
+    {
+      "lead": "REST TokenHolder keeps a global static token->EPerson map with no expiry (dspace-rest/src/main/java/org/dspace/rest/TokenHolder.java).",
+      "reason": "Design weakness rather than a discrete taint-to-sink flaw; no direct attacker-controlled path from an unauthenticated request was traced."
+    },
+    {
+      "lead": "HandleServlet `location` parameter reflected into a redirect URL (lines 740-784).",
+      "reason": "The redirect target is always prefixed with the context path and `/handle/`, so it stays same-origin; not an exploitable open redirect in the code as written."
+    }
+  ],
+  "summary": "DSpace 5.10 snapshot (Maven version 5.10 across modules; JSPUI/XMLUI/REST/OAI/RDF/SWORD/Solr modules present). I traced the request-controlled reachability from the JSPUI `/submit` endpoint into the resumable-upload handling and found that a request parameter is concatenated directly into a filesystem path and written via FileOutputStream with no sanitization or canonical-containment check. This is the strongest source-verified candidate I found; I verified the surrounding call chain, the filter/mapping prerequisites in web.xml, and the absence of any intervening validation, and I rejected several weaker leads (ItemImport zip-slip, item-export filename handling, sitemap parameter, several unconfigured DOM parsers). No code was executed; all conclusions are source-level."
+}

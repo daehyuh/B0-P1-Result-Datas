@@ -1,0 +1,100 @@
+{
+  "model": "deepseek-flash",
+  "settings": {
+    "api_base": "https://api.deepseek.com",
+    "block_id": "d04377133157e28aa84ef340",
+    "case_id": "VUL4J-5",
+    "condition": "P1",
+    "condition_order": [
+      "P1",
+      "B0"
+    ],
+    "execution_mode": "sequential",
+    "experiment_id": "vul4j-vulnerable-only-flash-max-20260925",
+    "max_output_tokens": 4000,
+    "max_seconds": 600,
+    "max_turns": 12,
+    "mining_loop_version": "tool-completion-v11-deepseek-auto-continuation",
+    "model": "deepseek-flash",
+    "oracle_target_present": true,
+    "prompt": "Autonomously review this Java source repository for potential security\nvulnerabilities using the available read-only tools. Do not ask the user questions or summarize\ntool output. Copy exact relative paths from list_files or index results; never invent or prefix a path.\nA file listing or index hint is only navigation; inspect original source and seek\ncounter-evidence before deciding. Trace plausible untrusted input to security-sensitive\noperations where possible, and check relevant guards and configuration. Report at most 10\ncandidates supported by exact source lines, with root cause, preconditions, counter-evidence,\nand missing evidence. Do not assume a vulnerability exists. If source review finds no supported\ncandidate, submit an empty candidate list. Your final action must be submit_findings; natural\nlanguage commentary is not a report. Do not use project names, dataset identifiers, or a guessed\nknown answer as evidence.",
+    "prompt_version": "project-vulnerability-review-v4-grounded-paths",
+    "reasoning_effort": "max",
+    "repetition": 1,
+    "scan_run_id": null,
+    "snapshot_role": "vulnerable",
+    "system_prompt_sha256": "7ba03e3b738c3513398072e62bda7f93aac9ae0aad40fcb49e1669439307485c",
+    "user_prompt_sha256": "d47b227dc4bf27f707ed1ce8ea4f74ebe977fcb23138e49cc31eb7f3339319d8"
+  },
+  "candidates": [
+    {
+      "counter_evidence": [
+        "readDeflated() explicitly converts a -1 read into IOException('Truncated ZIP file') (lines 556-557), so the fully truncated case is detected",
+        "The loop condition also requires inf.needsInput() to be true; once fill() returns -1 the Inflater is not re-supplied, so a conforming Inflater that reports finished() exits via the finished() branch at 550-551"
+      ],
+      "description": "readDeflated() (547-561) calls readFromInflater() and then only handles read <= 0 by testing inf.finished(), inf.needsDictionary() and read == -1; a read value of exactly 0 with an Inflater that still reports needsInput() is returned to the caller unchanged. readFromInflater() (567-587) implements a do/while(read == 0 && inf.needsInput()) loop; when the wrapped stream is exhausted, fill() (778-789) returns -1, readFromInflater returns -1 only via the explicit `else if (l == -1) return -1;`, but when fill() returns 0 (or when inflate() consumes nothing and needsInput() stays true) the loop can re-iterate, and readDeflated treats the resulting 0 as a valid short read. Downstream, skip() (617-631) and ArchiveInputStream.read() callers that loop on 0 or -1 could spin. Root cause is that 'no progress possible' is not distinguished from '0 bytes produced this round' in the truncated/EOF case for this entry type.\n\nThis is reported as a candidate only: the guard chain is partly present (read == -1 is converted to 'Truncated ZIP file' at 556-557), and I did not read the exact caller loop semantics, so infinite re-entry is not proven.",
+      "evidence": [
+        {
+          "end_line": 587,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java",
+          "start_line": 547
+        },
+        {
+          "end_line": 789,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java",
+          "start_line": 778
+        },
+        {
+          "end_line": 631,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java",
+          "start_line": 617
+        }
+      ],
+      "missing_evidence": [
+        "Caller-side loop semantics in ArchiveInputStream.read()/Expander.copy() that would turn a 0 return into an unbounded loop",
+        "A concrete crafted input demonstrating repeated read == 0 with needsInput() true",
+        "Whether java.util.zip.Inflater guarantees finished() becomes true after EOF in this configuration (nowrap=true)"
+      ],
+      "preconditions": [
+        "Attacker supplies a ZIP entry using method DEFLATED whose deflate stream is truncated or crafted so that Inflater.inflate returns 0 while Inflater.needsInput() stays true after the underlying stream reports no more data",
+        "Application reads the entry using ZipArchiveInputStream.read(byte[],int,int) or skip() in a loop that does not itself bound the number of 0/short-return iterations"
+      ],
+      "title": "ZipArchiveInputStream readDeflated/readFromInflater can loop on truncated deflate input (inflater EOF not converted to end-of-entry)"
+    },
+    {
+      "counter_evidence": [
+        "Reads are bounded by the buffer/BUFFER_SIZE and the loop exits with an IOException('Truncated ZIP file') at line 890 when in.read() returns <= 0, so it is not an unbounded loop",
+        "The extra bytes are buffered in memory only (ByteArrayOutputStream at 878); no file-system write or code execution is performed in this method"
+      ],
+      "description": "In bufferContainsSignature() the outer guard at line 926 matches the PK (0x50 0x4B) prefix, and the inner condition at lines 927-928 is meant to accept either a local file header signature (PK\\x03\\x04) or a central directory header signature (PK\\x01\\x02). The second disjunct is written as `buf.array()[i] == CFH[2] && buf.array()[i + 3] == CFH[3]`, i.e. it compares the already-known byte at index i (0x50, the 'P' of the PK prefix) against CFH[2] (0x01) instead of comparing buf.array()[i + 2] to CFH[2]. Because 0x50 != 0x01, that branch is always false. Data descriptor signatures (PK\\x07\\x08, tested at 933-937) and LFH signatures are still detected, so only a following central-directory header is missed. When a STORED entry that uses a data descriptor is immediately followed by the central directory, readStoredEntry()'s while(!done) loop (885-902) never sets done, keeps caching bytes via cacheBytesRead() (961-971), and only terminates when the underlying stream returns r <= 0 and then throws IOException('Truncated ZIP file') at line 890. The observable effect is a rejected/misbehaving archive read (resource consumption while caching plus a spurious error), not code execution; the excess bytes are held in a ByteArrayOutputStream, so memory grows with the archive size.\n\nReported as a latent-defect candidate; the same construct appears in upstream history, and I have no crafted archive or proof of an unbounded condition beyond the documented 'Truncated ZIP file' throw.",
+      "evidence": [
+        {
+          "end_line": 949,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java",
+          "start_line": 920
+        },
+        {
+          "end_line": 905,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java",
+          "start_line": 877
+        },
+        {
+          "end_line": 976,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java",
+          "start_line": 961
+        }
+      ],
+      "missing_evidence": [
+        "Original upstream version comparison to confirm whether the index expression is a deliberate fix elsewhere",
+        "A crafted archive demonstrating the specific misdetection and its impact on the caller",
+        "Whether another detection path (e.g. hitCentralDirectory handling in getNextZipEntry) compensates in practice"
+      ],
+      "preconditions": [
+        "Attacker-supplied ZIP containing a STORED entry that sets the data-descriptor flag and is directly followed by the central directory header",
+        "The consumer enables allowStoredEntriesWithDataDescriptor (constructor at 210-222) so that such entries are read rather than rejected",
+        "Application calls read()/skip() on that entry, driving readStoredEntry()"
+      ],
+      "title": "Mis-indexed central-directory signature test in ZipArchiveInputStream.bufferContainsSignature defeats CDH detection for stored entries with data descriptors"
+    }
+  ]
+}

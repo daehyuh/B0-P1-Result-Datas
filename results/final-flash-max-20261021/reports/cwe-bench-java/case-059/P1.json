@@ -1,0 +1,73 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remote HTTP client: the POST JSON body's \"target\": {\"url\": \"service:jmx:...\", \"user\": ..., \"password\": ...} is parsed in JmxRequest's map constructor (JmxRequest.java:80-83) directly into ProxyTargetConfig. The url string is used unmodified as a JMXServiceURL and handed to JMXConnectorFactory (Jsr160RequestDispatcher.java:100-104). No request parameter, restrictor check, or policy element restricts the destination host/port/scheme.",
+      "confidence": "medium",
+      "counterevidence_checked": "Proxy mode is an intended, documented feature (src/docbkx/proxy.xml; clients explicitly send the target), so this is an intended-functionality-vs-safety issue rather than an accidental bug; Jsr160RequestDispatcher is not enabled in agent/jvm/src/main/resources/default-jolokia-agent.properties (JVM agent must configure dispatcherClasses), and the same Restrictor is applied to MBean operations performed through the proxy. Mitigations documented upstream (access policy, network restrictions, authentication) reduce exposure but no code-level target validation exists in this snapshot. I did not inspect any patch/CVE data and did not execute anything, so the correspondence to a specific upstream fix is unverified.",
+      "id": "jolokia-jsr160-proxy-ssrf",
+      "impact": "The agent acts as an attacker-controlled SSRF/JMX pivot: outbound connections to arbitrary internal hosts/ports from the agent host (reachability and port probing observable through connection errors/timing), use of attacker-chosen credentials against internal JMX services, and access to JMX operations on the remote MBeanServer. Because the agent is a JMX client, deserialization of attacker-controlled JMX/RMI responses can expose it to gadget-chain code execution on the agent host if suitable libraries are on the classpath. Network-based controls that assume the agent only talks to known endpoints are bypassed.",
+      "locations": [
+        {
+          "end_line": 84,
+          "path": "agent/core/src/main/java/org/jolokia/request/JmxRequest.java",
+          "start_line": 74
+        },
+        {
+          "end_line": 57,
+          "path": "agent/core/src/main/java/org/jolokia/request/ProxyTargetConfig.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 105,
+          "path": "agent/jsr160/src/main/java/org/jolokia/jsr160/Jsr160RequestDispatcher.java",
+          "start_line": 73
+        },
+        {
+          "end_line": 141,
+          "path": "agent/jsr160/src/main/java/org/jolokia/jsr160/Jsr160RequestDispatcher.java",
+          "start_line": 139
+        },
+        {
+          "end_line": 376,
+          "path": "agent/core/src/main/java/org/jolokia/backend/BackendManager.java",
+          "start_line": 364
+        },
+        {
+          "end_line": 418,
+          "path": "agent/core/src/main/java/org/jolokia/backend/BackendManager.java",
+          "start_line": 406
+        },
+        {
+          "end_line": 34,
+          "path": "agent/war/src/main/webapp/WEB-INF/web.xml",
+          "start_line": 27
+        }
+      ],
+      "prerequisites": "Attacker can reach the agent over HTTP/HTTPS; a JSR-160 dispatcher is configured. This is the default for the shipped WAR agent (agent/war/src/main/webapp/WEB-INF/web.xml enables org.jolokia.jsr160.Jsr160RequestDispatcher) and is opt-in for the JVM/OSGi agents via dispatcherClasses. Access policy must permit the request type (default is AllowAllRestrictor when no jolokia-access.xml is found) and no authentication may be configured, or the attacker must hold valid credentials. The attacker typically runs/controls an RMI/JMX listener that the agent connects back to.",
+      "root_cause": "A POST request body may contain a \"target\" map whose \"url\" (and optional \"user\"/\"password\") is accepted without any validation of scheme, host, port or allowlist (ProxyTargetConfig only rejects a null url). JmxRequest stores it as targetConfig. BackendManager loads configured RequestDispatchers and Jsr160RequestDispatcher.canHandle() accepts every request that merely carries a target config; dispatchRequest() then builds a JMXServiceURL from the attacker string and calls JMXConnectorFactory.newJMXConnector(url, env) + connect(), i.e. the agent makes an outbound connection to an attacker-selected endpoint.",
+      "title": "Unvalidated JSR-160 proxy target allows SSRF / outbound JMX connections from the agent (default WAR configuration)",
+      "trace": "handlePostRequest -> JmxRequestFactory.createPostRequest -> new JmxRequest(Map, params): target = pMap.get(\"target\"); if (target != null) targetConfig = new ProxyTargetConfig(target) -> BackendManager.callRequestDispatcher iterates requestDispatchers -> Jsr160RequestDispatcher.canHandle(): pJmxRequest.getTargetConfig() != null -> dispatchRequest -> createConnector -> new JMXServiceURL(targetConfig.getUrl()) -> JMXConnectorFactory.newJMXConnector(url, prepareEnv(targetConfig.getEnv())) -> connector.connect() -> MBeanServerConnection used for handler.handleRequest. The remote side's JMX/RMI responses are then unmarshalled by the agent JVM, and the attacker-supplied user/password are sent as connection credentials.",
+      "unverified": "Runtime exploitability (including deserialization RCE) was not tested; whether a given deployment enables the jsr160 dispatcher (default only for the WAR web.xml here) and whether authentication/policy blocks the request are deployment-dependent; exact upstream fix/CVE correspondence and the intended-severity classification were not verified against patches or advisories (out of scope for this run).",
+      "weakness_type": "Server-Side Request Forgery (CWE-918)"
+    }
+  ],
+  "coverage_summary": "Source scope: 397 files visible (260 Java), same filters for B0/P1. P1 relation index: 395/397 files indexed, 2 source files missing from index; syntax-level Java relations only (call/inheritance/containment candidates), no control-flow, no data-flow, no semantic resolution, Spring annotations unverified, build/tests not run. I read the primary HTTP/request path (AgentServlet, JolokiaHttpHandler, HttpRequestHandler, ParsedUri, JmxRequestFactory, JmxRequest, ProxyTargetConfig), backend dispatching (BackendManager, LocalRequestDispatcher, MBeanServerHandler), the JSR-160 dispatcher, restrictor/policy classes (PolicyRestrictor, MBeanAccessChecker, NetworkChecker, CorsChecker, HttpMethodChecker, RequestTypeChecker, IpChecker, AllowAll/DenyAll), agent auth code (OSGi BasicAuthenticator/AuthorizationHeaderParser, JVM UserPassword/ClientCert/Jaas/Delegating/Multi authenticators, KeyStoreUtil, PKCS1Util, JolokiaCipher), conversion/introspection code (StringToObjectConverter, ClassUtil, ObjectToJsonConverter partly), ExecHandler, IoUtil, EscapeUtil, Base64Util, configuration classes (ConfigKey, Configuration, JolokiaServerConfig partially), and relevant config/docs (war web.xml, default-jolokia-agent.properties, proxy/security/protocol docs). I did not exhaustively read the JS client (vendored jQuery), Mule/OSGi/Roo glue, history/debug stores, discovery UDP code, or every converter in depth.",
+  "limitations": [
+    "Static review only: no build, tests, scanners, or runtime execution; no exploit payloads were run.",
+    "P1 index provides syntax-level navigation candidates only (no control/data-flow, no reachability), and 2 source files are missing from it; unreported areas were not reviewed.",
+    "Ground-truth data (CVE/CWE labels, patches, previous outputs) was not inspected, so the exact upstream vulnerability/fix this snapshot corresponds to is unverified.",
+    "Deployment-dependent behavior (which agent type is used, whether jsr160 dispatcher or authentication/policy is configured) determines exploitability of the candidate; the WAR default was verified from web.xml, other agents' defaults were not exhaustively enumerated.",
+    "Impact statements about JMX/RMI response deserialization are reasoned from the JMX client model (JMXConnectorFactory/JMXServiceURL usage) and were not runtime-confirmed; classpath gadget availability is environment-specific."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected XSS: request-controlled mimeType (ConfigKey.MIME_TYPE is global+request settable, default text/plain) combined with unescaped attacker text in error responses (path info, request type name, invalid JSON payload echoed into the JSON error message), plus the JSONP callback parameter written verbatim with Content-Type text/javascript (AgentServlet.sendResponse/sendAllJSON lines 471-511; JolokiaHttpHandler.sendStreamingResponse/sendAllJSON lines 341-379; IoUtil.streamResponseAndClose lines 30-48; error text at HttpRequestHandler.java:258-271 and 329-332; RequestType.java:63-72).",
+      "reason": "Plausible and real (a payload such as a script tag in the path/type plus mimeType=text/html would execute in the agent's origin), but not selected as the single strongest candidate: it requires victim interaction (crafted link/script inclusion), and the callback-only variant executes in the including page's origin (script include), so its impact is lower/less direct than the server-side proxy SSRF. Recorded as an unconfirmed secondary lead, not asserted."
+    },
+    {
+      "lead": "CORS/CSRF posture: with no access policy the AllowAllRestrictor answers any Origin and extractCorsOrigin/handleCorsPreflightRequest reflect it with Access-Control-Allow-Credentials=true (AbstractConstantRestrictor.java:76-78; AgentServlet.java:374-381; HttpRequestHandler.java:154-168, 299-310).",
+      "reason": "This matches documented/upstream behavior for a no-policy deployment (policy CORS rules exist via CorsChecker) and, absent authentication plus a browser victim, is a configuration/hardening concern rather than a distinct exploitable code flaw. Not selected."
+    }
+  ],
+  "summary": "Review of Jolokia 1.4.1-SNAPSHOT (397 files; 260 Java files; version 1.4.0 release + SNAPSHOT bump). I traced the HTTP entry points (AgentServlet, JolokiaHttpHandler, HttpRequestHandler, JmxRequestFactory), request/proxy model (JmxRequest, ProxyTargetConfig), backend dispatcher wiring (BackendManager), the JSR-160 dispatcher, restrictor/policy code (PolicyRestrictor and checkers), agent auth code and docs. The single strongest candidate is the unrestricted JSR-160 proxy target: a POST request can carry an attacker-chosen target URL with attacker-chosen credentials, and the agent will open an outbound JMX/RMI connection to it with no target validation. This is enabled by the shipped WAR agent's default web.xml (dispatcherClasses=org.jolokia.jsr160.Jsr160RequestDispatcher) and by the absence of any allowlist at the request/dispatcher layer. Secondary leads I did not select: (a) reflected XSS via request-controlled mimeType=text/html combined with unescaped error text (path/type/JSON body echoed in error JSON; JSONP callback also written verbatim with text/javascript) — plausible but requires victim interaction and its callback-only form executes in the including page's origin; (b) CORS: AllowAllRestrictor/AbstractConstantRestrictor reflects any Origin with Access-Control-Allow-Credentials=true by default. No test code, patches, or runtime execution were used."
+}

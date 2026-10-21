@@ -1,0 +1,56 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The password itself comes from Jenkins-stored registry credentials (e.g., DockerRegistryToken/UsernamePassword credentials flowing through docker-workflow / the credentials binding), so it is not directly attacker input. Attacker control is over the observation channel: any principal able to see processes on the same build agent (another Jenkins build/user sharing the node, a local OS user, or host process-accounting/audit collectors) can read the credential while `docker login` executes.",
+      "confidence": "medium",
+      "counterevidence_checked": "ArgumentListBuilder.add(password, true) does mask the value in Jenkins console output, so log-based leakage is mitigated; this is the one protection present. The credential is also intentionally materialized into a temporary docker config file on the agent by design (and by ServerKeyMaterialFactory for TLS keys), so an attacker who can read that protected directory during the build may obtain it without the argv leak; the marginal exposure is to observers who see processes but not the secrets directory. The pattern was common at the time and is marked TODO (Docker <17.07 lacked --password-stdin). Verified only by source reading; no runtime reproduction was attempted.",
+      "id": "docker-commons-registry-password-argv",
+      "impact": "Disclosure of Docker registry credentials to a co-located attacker on the agent; the recovered username/password can be reused to authenticate to the registry (pull/push/tamper with images consumed by builds, supply-chain impact) and may persist in host audit/process-accounting logs. The masking flag gives a false sense that the secret is protected.",
+      "locations": [
+        {
+          "end_line": 103,
+          "path": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+          "start_line": 97
+        }
+      ],
+      "prerequisites": "A build uses this materializer with registry credentials on a shared agent (docker-workflow `withDockerRegistry`-style usage). Attacker can list processes or read /proc/<pid>/cmdline on that agent (same OS user, or another user where cmdline is readable), during the network-bound `docker login` window. Agent must not isolate builds/process namespaces. No Jenkins admin rights required.",
+      "root_cause": "RegistryKeyMaterialFactory.materialize() builds `launcher.launch().cmds(new ArgumentListBuilder(dockerExecutable, \"login\", \"-u\", username, \"-p\").add(password, true).add(endpoint))` (RegistryKeyMaterialFactory.java:101). The registry password is supplied as a real process argument; the second parameter `true` to ArgumentListBuilder.add() only masks the value in Jenkins console output. The agent-side docker process therefore carries the plaintext credential in its argv, and the code's own TODO ('on Docker 17.07+ use --password-stdin') documents the safer mechanism.",
+      "title": "Docker registry password exposed on the process command line via `docker login -p` in RegistryKeyMaterialFactory",
+      "trace": "Pipeline/credentials binding calls KeyMaterialFactory.materialize() (RegistryKeyMaterialFactory.materialize, line 75) -> createSecretsDirectory() temp DOCKER_CONFIG is prepared (line 76) -> launcher.launch().cmds(new ArgumentListBuilder(dockerExecutable, \"login\", \"-u\", username, \"-p\").add(password, true).add(endpoint))...join() (lines 99-101) -> the forked docker process argv contains the plaintext password for the duration of the registry round-trip -> a concurrent `ps`/`/proc/<pid>/cmdline` read (or audit record) recovers the victim's registry username/password.",
+      "unverified": "Whether --password-stdin is available/used on target Docker versions; actual agent sharing model and /proc visibility (hidepid, container isolation) at deployment time; whether createSecretsDirectory() applies restrictive permissions (KeyMaterialFactory.java is inside the excluded credentials package and could not be inspected). No runtime confirmation or exploit execution was performed.",
+      "weakness_type": "CWE-214 Invocation of Process Using Visible Sensitive Information / CWE-522 Insufficiently Protected Credentials"
+    }
+  ],
+  "coverage_summary": "Reviewed all 31 model-visible files: 19 Java sources (DockerCommonsPlugin, DockerImageExtractor, 8 fingerprint classes, 7 impl key-material/token classes, DockerTool, DockerToolInstaller), 5 resources (properties/help HTML), and 7 build/meta files (.mvn/extensions.xml, pom.xml, CHANGELOG.md, README.md, .github/release-drafter.yml, .gitignore, LICENSE). The P1 relation index parsed all 19 visible Java files (166 symbols, 318 call sites, 195 edges; 277 unresolved calls) with no control-flow, data-flow, or semantic resolution and no runtime/reachability proof; index facts were used only as navigation hints and every considered candidate was re-checked against source text. 14 source-root files were excluded by the sensitive-name/path filter - apparently the credentials package (KeyMaterial, KeyMaterialFactory, KeyMaterialContext, DockerServerCredentials*/token/binding classes and their resources) - and were not readable. No test files or Jelly view templates are present in the snapshot, so UI-layer behavior and test oracles could not be inspected; dependency/managed-version contents were not audited. No code, builds, or scanners were executed.",
+  "limitations": [
+    "14 files excluded by the sensitive-name/path scope filter (credentials package, including KeyMaterialFactory.createSecretsDirectory and the KeyMaterial close() contract used by the materializers) could not be read, so secret-directory permissions, cleanup guarantees, and credentials-binding behavior are unverified.",
+    "No Jelly/Groovy view templates are present in the snapshot, so any UI-layer issue (stored XSS, missing permission checks on web endpoints) cannot be confirmed or refuted.",
+    "No tests were available or executed; nothing was runtime-confirmed and no exploit payloads were run.",
+    "The P1 index provides only syntactic/navigation candidates with no data-flow, control-flow, semantic resolution, or reachability; call edges and the four 'security_call' facts are hints, not findings.",
+    "Dependency trees (Jenkins core 2.222.4, credentials/credentials-binding, authentication-tokens, pipeline-model-extensions, bom-2.222.x 11) were not inspected for transitive vulnerabilities.",
+    "Exploitability of the submitted candidate depends on deployment specifics (agent sharing model, process visibility, /proc hardening, Docker version supporting --password-stdin) that cannot be evaluated from source alone."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "RegistryKeyMaterialFactory copies the agent user's ~/.docker/config.json into the DOCKER_CONFIG used for `docker login`, blacklisting only {\"auths\", \"credsStore\"} (lines 53-54, 79-95); a retained per-registry \"credHelpers\" entry could cause docker to hand the victim's credentials to an attacker-controlled helper binary (credential theft / arbitrary helper execution) on a shared agent.",
+      "reason": "Distinct root cause from the submitted candidate, and its exploitability depends on docker CLI credential-helper lookup semantics and on an attacker being able to write the agent user's ~/.docker/config.json, neither verifiable from this snapshot; not submitted under the one-candidate cap."
+    },
+    {
+      "lead": "DockerToolInstaller downloads the Docker CLI from download.docker.com/get.docker.com without checksum or signature verification (lines 85, 124, 134) and marks the installed binary world-writable with chmod(0777) (line 144).",
+      "reason": "Integrity/supply-chain hardening rather than a reachable flaw from untrusted input: the URL host is fixed and HTTPS-protected, compromise requires TLS/DNS/download-host compromise or local write access to the shared tool directory; similar to Jenkins core's installIfNecessaryFrom pattern. No concrete attacker path demonstrated."
+    },
+    {
+      "lead": "`version` (admin-configured global tool installer field) is only prefix-validated by a regex and then interpolated wholesale into the download URL (getDockerImageUrl, lines 150-157), allowing path/query characters to influence the download path.",
+      "reason": "Requires Jenkins administrator privileges to set the tool installer; the URL host cannot be changed because the string prefix is fixed. Lower-impact configuration hardening, rejected."
+    },
+    {
+      "lead": "DockerFingerprintAction exposes getFingerprintHash/getFingerprint/getDockerFacets with no visible permission check and can throw IllegalArgumentException on non-64-char image IDs (only IOException is caught).",
+      "reason": "No Jelly views or doXxx endpoints exist in this snapshot (only index.properties), so web reachability is unverifiable; as a RunAction, access is governed by the build/job ACL. Unconfirmed lead."
+    },
+    {
+      "lead": "DockerFingerprints.forDockerInstance persists a caller-supplied image/container `name` into global fingerprints (line 146-147), potentially enabling cross-job data exposure or stored XSS in the fingerprints UI.",
+      "reason": "No view templates are present in the snapshot to verify output escaping, and core fingerprint storage is hash-addressed with escaped XML, so no concrete impact could be established. Unconfirmed lead."
+    }
+  ],
+  "summary": "Reviewed the docker-commons (Jenkins plugin) snapshot: 31 model-visible files (19 Java sources, 5 resources, 7 build/meta files). The plugin exposes no direct remote request-handling code in the inspected files (fingerprint action methods live on a RunAction and are ACL-governed); its security-relevant logic is credential materialization for Docker clients, fingerprint bookkeeping, and the Docker CLI tool installer. The single strongest source-supported candidate is the plaintext Docker registry password passed as a process argument by RegistryKeyMaterialFactory.materialize() when invoking `docker login -p <password>` on the build agent: the ArgumentListBuilder mask suppresses the value only in Jenkins console output, not in the OS process command line, which is readable by co-located processes/users on a shared agent (CWE-214/CWE-522). Other leads (unverified `credHelpers` inheritance from agent-local ~/.docker/config.json, unverified Docker CLI download with no checksum plus chmod 0777, admin-only download-URL interpolation, possible XSS/permission gaps in fingerprint views) were considered but are weaker or unverifiable from this snapshot and are listed as rejected/unconfirmed leads. Nothing was executed or runtime-confirmed."
+}

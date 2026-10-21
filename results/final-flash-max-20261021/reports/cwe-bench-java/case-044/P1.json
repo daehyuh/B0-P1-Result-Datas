@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The scanned HTML content is attacker-controlled (the library's stated purpose is cleansing untrusted HTML from users). Any input that the underlying NekoHTML DOMFragmentParser reports as a ProcessingInstruction node (e.g., '<? ... ?>' markup) drives execution of removePI().",
+      "confidence": "medium",
+      "counterevidence_checked": "removeNode() always removes the node from its parent via parent.removeChild(node) (line 728), so the subsequent getParentNode() call cannot return a non-null parent on that path; the only escape would be if removeNode threw first, which would still be an unhandled failure. The reachability of PI nodes from NekoHTML is the main uncertainty: I could not execute the parser in this read-only review, so I relied on the library's own explicit PI handling and error message 'error.pi.found' to infer that PI nodes occur. Impact is limited to availability/robustness (no XSS shown), and this may be a long-standing upstream wart rather than a newly introduced regression; no patch or upstream diff was available in this run to confirm.",
+      "id": "C1-removePI-npe",
+      "impact": "Malicious or merely unexpected HTML input causes an uncaught runtime exception from the sanitizer instead of the documented safe filter-and-report behavior (error key 'error.pi.found' is generated just before the crash). In a server-side filtering path this is an availability/denial-of-service style failure and may also convert a would-be-sanitized document into an application error. No code execution or script injection is demonstrated from this defect.",
+      "locations": [
+        {
+          "end_line": 690,
+          "path": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+          "start_line": 686
+        },
+        {
+          "end_line": 735,
+          "path": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+          "start_line": 726
+        },
+        {
+          "end_line": 261,
+          "path": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+          "start_line": 259
+        }
+      ],
+      "prerequisites": "Caller uses the DOM scanner path (AntiSamy.scan(taintedHTML[, policy]) -> new AntiSamyDOMScanner(policy).scan()), and the untrusted HTML contains a processing instruction that NekoHTML surfaces as a PI node rather than swallowing/commenting it. No authentication or special policy configuration is required.",
+      "root_cause": "removePI() first calls removeNode(node), which executes parent.removeChild(node) and (if the parent becomes empty and is not an allowed-empty tag) may recursively remove ancestors; the node is therefore detached and node.getParentNode() is null. The immediately following statement unconditionally calls node.getParentNode().removeChild(node), dereferencing that null parent.",
+      "title": "Unhandled NullPointerException in AntiSamyDOMScanner.removePI after double removal of processing-instruction node",
+      "trace": "AntiSamyDOMScanner.scan() parses attacker HTML with DOMFragmentParser into the DocumentFragment (line 154) -> processChildren(dom, 0) (line 159) -> recursiveValidateTag() (line 233) -> 'node instanceof ProcessingInstruction' (line 259) -> removePI(node) (line 260) -> removeNode(node) (line 688) detaches node from its parent (line 728) and may recursively remove now-empty ancestors (lines 730-734) -> 'node.getParentNode().removeChild(node)' (line 689) dereferences the now-null parent -> NullPointerException. scan() only catches SAXException (line 199) and IOException (line 202), and processChildren/recursiveValidateTag declare only ScanException, so the NPE propagates uncaught out of scan() to the application.",
+      "unverified": "Runtime behavior of NekoHTML's DOMFragmentParser for '<?...>' input was not executed; I did not confirm which exact payload produces a ProcessingInstruction node in the resulting fragment, nor whether the NPE is ultimately contained by a caller-side catch. The finding is a source-evidence lead, not a runtime-confirmed vulnerability.",
+      "weakness_type": "Unchecked null dereference leading to unhandled exception / availability impact (CWE-476, DoS)"
+    }
+  ],
+  "coverage_summary": "Source scope: 48 files under the assigned root, all visible; 27 Java files were read in full (DOM/SAX scanners, CSS scanner/handler/validator, Policy/internal policy/model classes, serializers, util classes), pom.xml and README.md were read, and the six policy XML resources were inspected at their security-relevant sections rather than line-by-line; the 12 localization .properties files were only spot-checked (error-message keys). P1 relation index coverage is partial: 42 of 48 files indexed (27 Java parsed, 0 parse errors), 929 syntactic edges/1352 calls with 936 unresolved, and no control-flow, data-flow, semantic resolution, or Spring runtime verification available; the three index 'facts' are name-based navigation hints only and were not treated as findings. No tests or build were executed, and no upstream copy, patch, or history was available for diffing.",
+  "limitations": [
+    "No execution/parse was performed, so NekoHTML's exact emission of ProcessingInstruction nodes for a given payload is inferred, not observed; the candidate's exploitability is therefore unconfirmed.",
+    "Because the snapshot contains no git history or upstream reference, I could not determine whether the removePI() double-removal line is an introduced defect or a long-standing upstream quirk; classification of the root cause as a regression is unverified.",
+    "The P1 index provides only syntax-level navigation (no data flow or reachability), and 6 non-Java files are absent from it; findings were verified against source text, but coverage of runtime call paths and configuration activation is incomplete.",
+    "Policy XML files were reviewed section-wise for dangerous allowances (event handlers, URL/CSS regexes, tag actions) but not exhaustively line-by-line, and parser/serializer library internals (NekoHTML, Xerces serializer, Batik) are outside the snapshot and were not analyzed.",
+    "Localization .properties files and less security-central utility code paths were only skimmed, so additional lower-impact issues there cannot be excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AntiSamyDOMScanner.stripNonValidXMLCharacters() (lines 786-793) uses Matcher.matches() against a single-character pattern, so for any multi-character input containing invalid XML characters the replaceAll() branch is not taken and the input is returned unchanged, making the advertised hardening largely ineffective.",
+      "reason": "The logic defect is real, but the security impact is unproven: NekoHTML is an HTML parser and it is not established that surviving control/NUL characters lead to a sanitizer bypass or a more severe outcome than malformed output; no attacker-to-impact chain could be substantiated from source alone."
+    },
+    {
+      "lead": "MagicSAXFilter.startElement() computes isStyle as \"style\".endsWith(element.localpart) (line 272) instead of comparing the tag name to 'style', so any policy-defined tag whose lowercased local name is a suffix of 'style' (e.g. 'e', 'le', 'tyle') would take the CSS-handling branch.",
+      "reason": "The default policy defines no tag rules with such names, so the branch is effectively unreachable with the shipped policies, and even if reached the CSS scanner still filters content; no concrete exploit path or impact could be shown."
+    },
+    {
+      "lead": "XMLUtil.decode() gates replaceAll() on Matcher.matches() (lines 156-180), so entity decoding only occurs when the whole string is exactly one entity; this affects policy value decoding.",
+      "reason": "Inputs here come from trusted policy XML already parsed by the XML parser (which decodes entities once); no untrusted-input path or security consequence was identified."
+    },
+    {
+      "lead": "Policy include resolution / ExternalCssScanner remote fetches could act as SSRF when embedStyleSheets is enabled or when policy files are attacker-influenced.",
+      "reason": "Requires a non-default policy configuration ('embedStyleSheets' is false in the shipped policies) or control over policy files, which is outside the untrusted-HTML trust boundary; lead rejected on prerequisites."
+    }
+  ],
+  "summary": "Reviewed the AntiSamy (org.owasp.antisamy) snapshot as a defensive source review. All 27 Java files were read (DOM scanner, SAX filter/scanner, CSS scanner/handler/validator, Policy/model classes, serializers, URI/XML/entity utils); the six bundled policy XMLs were inspected at the security-relevant sections (directives, common-regexps, common-attributes, global-tag-attributes, tag rules, css-rules) and appear consistent with the shipped default policy, so no policy-level XSS allowance was identified. One concrete source-level defect stands out: AntiSamyDOMScanner.removePI() calls removeNode(node) (which detaches the node) and then dereferences node.getParentNode(), which is necessarily null at that point, producing an unhandled NullPointerException for HTML containing an XML processing instruction. Other anomalies noticed (effectively no-op stripNonValidXMLCharacters, \"style\".endsWith(...) style check in the SAX filter, decode() using matches()) were treated as weaker/unconfirmed leads rather than additional candidates."
+}

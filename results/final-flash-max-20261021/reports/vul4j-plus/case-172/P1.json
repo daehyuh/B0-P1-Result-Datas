@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker authors a page/HTML e-mail (or any cross-site resource the victim loads) containing a link, `<img>` or `<iframe>` pointing at the Jenkins base URL, e.g. `/script?script=<URL-encoded Groovy>`, `/exit`, `/quietDown`, `/reload`, `/computer/(node)/toggleOffline`, `/computer/(node)/doDelete`. The URL, query string and (for the script console) the entire Groovy payload are attacker-chosen; no Jenkins credentials or crumb are needed, and the browser supplies the victim's session cookie. For the multipart variant, the attacker authors a cross-site `multipart/form-data` body with attacker-chosen text fields (multipart/form-data is a CORS-safelisted content type, so no preflight is involved).",
+      "confidence": "medium",
+      "counterevidence_checked": "Positive controls: the majority of state-changing endpoints in the same tree DO carry `@RequirePOST` (AbstractItem/AbstractProject/Run/View/User doDoDelete, Job/View/User/Computer/ComputerSet doConfigSubmit, doDisable/doEnable, Queue.doCancelItem, PluginWrapper actions, UpdateSite installs, etc.), and `Jenkins.doRestart`/`doSafeRestart` branch on `req.getMethod()`, so the missing method checks in the endpoints listed above are anomalies rather than an accepted policy for those endpoints. `Jenkins.getTarget()` (3590-3617) enforces only Jenkins.READ for non-exempt URLs, which is satisfied by the victim's session and does nothing against CSRF. The design note in DefaultCrumbIssuer (line 121: \"salt just needs to be unique, and it doesn't have to be a secret\") shows the authors rely on the filter being applied to every state-changing request, which the GET and multipart paths defeat. I did NOT count GET-triggered builds (`AbstractProject.doBuild`/`doBuildWithParameters`) as part of the finding because GET build triggering is a long-standing, arguably intentional Jenkins feature. The CLI-invoked callers of these methods (e.g. `@CLIMethod` delete-node/shutdown) call them directly rather than over HTTP, so absence of `@RequirePOST` there is expected and is not evidence of the bug.",
+      "id": "case-172-candidate-1",
+      "impact": "Cross-site request forgery leading to, in the strongest case, remote code execution on the Jenkins controller inside an administrator's session (Groovy via the script console, which can also be used to disable security or exfiltrate secrets); forcibly shutting Jenkins down (`System.exit(0)`) or putting it in quiet-down mode / reloading configuration (availability + config reload); and disabling or deleting build agents (denial of service, disruption of builds). No credentials are needed by the attacker, and the victim only has to load attacker-controlled content.",
+      "locations": [
+        {
+          "end_line": 3387,
+          "path": "core/src/main/java/jenkins/model/Jenkins.java",
+          "start_line": 3361
+        },
+        {
+          "end_line": 3340,
+          "path": "core/src/main/java/jenkins/model/Jenkins.java",
+          "start_line": 3289
+        },
+        {
+          "end_line": 2836,
+          "path": "core/src/main/java/jenkins/model/Jenkins.java",
+          "start_line": 2812
+        },
+        {
+          "end_line": 3053,
+          "path": "core/src/main/java/jenkins/model/Jenkins.java",
+          "start_line": 3030
+        },
+        {
+          "end_line": 1078,
+          "path": "core/src/main/java/hudson/model/Computer.java",
+          "start_line": 1055
+        },
+        {
+          "end_line": 1228,
+          "path": "core/src/main/java/hudson/model/Computer.java",
+          "start_line": 1214
+        },
+        {
+          "end_line": 92,
+          "path": "core/src/main/java/hudson/security/csrf/CrumbFilter.java",
+          "start_line": 45
+        }
+      ],
+      "prerequisites": "Secured Jenkins (so that a victim session/permissions exist) with the crumb issuer enabled (CSRF protection \"on\") — the filter is then only a POST guard. Victim must be lured into issuing the cross-site request while holding: Jenkins.RUN_SCRIPTS for `/script` (admin-equivalent by default), Jenkins.ADMINISTER for `/exit`, `/safeExit`, `/quietDown`, `/cancelQuietDown`, `/reload`, Computer.DISCONNECT/CONNECT or Computer.DELETE for agent operations. Session cookies are sent on cross-site subresource requests at this vintage (no SameSite). The attacker does not need to read any response for the state change / code execution to occur.",
+      "root_cause": "`hudson.security.csrf.CrumbFilter` enforces the crumb only for requests whose method is exactly `POST` (line 55) and additionally exempts multipart bodies (`if (valid || isMultipart(httpRequest))`, line 84) with the comment that multipart requests \"need to be handled by each handler\". Several privileged handlers therefore rely on protection that never runs for them: they neither declare `@RequirePOST` nor test `req.getMethod()`, so a plain GET executes them. This is inconsistent with the surrounding code, where comparable endpoints carry `@RequirePOST` (e.g. AbstractItem.doDoDelete:481-483, AbstractProject.doDoDelete:1874-1876, Run.doDoDelete:1951-1952, View.doDoDelete:949-950, User.doDoDelete:542-543, Job/View/Computer doConfigSubmit, AbstractProject.doDisable/doEnable:2009-2021), and `Jenkins.doRestart`/`doSafeRestart` (3182-3206) explicitly branch on `req.getMethod().equals(\"GET\")` to show a confirmation page first. The omissions are thus individual gaps, not a deliberate \"GET is fine\" design.",
+      "title": "CSRF protection scope mismatch: privileged state-changing endpoints are reachable via GET (and via crumb-exempt multipart POSTs), so ambient-session requests can run scripts / shut down / disable nodes",
+      "trace": "1) Victim's browser requests `GET /script?script=<groovy>` with the Jenkins session cookie. 2) `CrumbFilter.doFilter` (CrumbFilter.java:45-93): method is not POST, so control goes straight to `chain.doFilter` (lines 90-92) — no crumb validation anywhere on the GET path. 3) `Jenkins.doScript` (Jenkins.java:3361-3363) forwards to the private `doScript` (3372-3387), which calls `checkPermission(RUN_SCRIPTS)` (3374) using the *victim's* Authentication from the session, reads `req.getParameter(\"script\")` (3376) and calls `RemotingDiagnostics.executeGroovy(text, MasterComputer.localChannel)` (3379-3380) — arbitrary code on the controller. 4) Same shape elsewhere: `doExit` (3289-3303) reaches `System.exit(0)` on any request carrying ADMINISTER; `doSafeExit` (3310-3340) starts a thread that calls `cleanUp()`/`System.exit(0)`; `doQuietDown`/`doCancelQuietDown` (2812-2836) and `doReload` (3033-3053) have no method check; `Computer.doToggleOffline`/`doChangeOfflineCause` (1055-1078) and `Computer.doDoDelete` (1217-1228) take nodes offline / delete nodes via GET. 5) A second, less certain manifestation of the same filter gap: any POST with `Content-Type: multipart/form-data` bypasses the crumb check (CrumbFilter.java:84). The only core handler that re-validates is `Jenkins.doDoFingerprintCheck` (Jenkins.java:3069-3072, via `CrumbIssuer.validateCrumb(req, MultipartFormDataParser)`, CrumbIssuer.java:130-136); a repository-wide search for `validateCrumb` finds no other core caller, so other multipart-accepting handlers (e.g. PluginManager.doUploadPlugin:716, ParametersDefinitionProperty._doBuild:115-140, AbstractProject.doBuildWithParameters:1839-1848) have no crumb check visible in source.",
+      "unverified": "No runtime execution was performed and no test sources exist in the snapshot, so exploitation is not confirmed at runtime. For the multipart variant I could not verify Stapler's multipart parameter handling (Stapler is an external dependency, not in the tree), so whether a cross-site multipart POST actually reaches e.g. `doConfigSubmit` with attacker-controlled JSON is unproven; the GET-based chains (script console, exit/safeExit, quietDown, reload, agent toggle/delete) do not depend on that assumption. I also could not verify from the snapshot alone whether some of these endpoints were fixed in this exact release window, so the candidate is a source-evidence lead, not a confirmed vulnerability.",
+      "weakness_type": "CWE-352 Cross-Site Request Forgery (missing request-method/anti-forgery enforcement); CWE-749/862 for the script console"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot read-only via list/search/read tools plus the P1 navigation index (`get_relation_scope`: index status complete, 7,649/7,649 files indexed, no SAST oracle, navigation-only). Focus of manual review: core HTTP entry points and their permission/method checks (`jenkins/model/Jenkins.java`, `hudson/model/Computer.java`, `AbstractItem/AbstractProject/Job/Run/View/User/ListView/ParametersDefinitionProperty`, `hudson/model/Api.java`, `DirectoryBrowserSupport`), authentication/CSRF stack (`hudson/security/*`, `hudson/security/csrf/*`, `jenkins/security/*`), CLI (`hudson/cli/*`, option handlers, `CliManagerImpl`, `FullDuplexHttpChannel`, cli-module `CLI/Connection/CliPort`), markup/XSS sanitization (`hudson/markup/*`), update-center/plugin paths (`DownloadService`, `UpdateSite`, `PluginManager`, `JSONSignatureValidator`), and spot checks in `maven-plugin` and `FilePath`. Not reviewed exhaustively: the ~6,400 core files were sampled by security relevance, not read end-to-end; all `.jelly` templates and all test sources are absent from the snapshot; no build, test, or runtime execution was performed and the relation index was used only for navigation.",
+  "limitations": [
+    "No repository tests are present (core/src/test is absent) and no code/tests/scanners were executed; nothing is runtime-confirmed.",
+    "All `.jelly` view templates are missing from the snapshot, so view-layer XSS/CSRF-token rendering could not be inspected; the dataset's ground-truth change could in principle live in a file type that is unavailable here.",
+    "The snapshot carries no VCS metadata, so I could not diff against the parent/child of the presumed fix commit or confirm which release actually contained a fix; version/date reasoning rests on core/pom.xml (1.510-SNAPSHOT) and changelog.html (1.509 in the rc section).",
+    "Third-party dependencies involved in the assessment (Stapler's multipart parameter handling/CrumbIssuer integration, servlet-container default Content-Type and MIME sniffing, remoting Channel deserialization) are not in the tree and could not be inspected.",
+    "Only one candidate may be submitted, so the other plausible-but-unconfirmed leads above are recorded as rejected leads rather than investigated to elimination; coverage of the maven-plugin module and of many large model classes was partial."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected XSS via `hudson/model/Api.java` doXml error paths (lines 137-144): `Messages.Api_NoXPathMatch(xpath)` / `Api_MultipleMatch(xpath,...)` echo the user-supplied `xpath` straight into the response with `rsp.getWriter().print(...)` and no `setContentType` call before it (compared with line 159, where `text/plain` is set for the INSECURE primitive-result path). A payload such as `/api/xml?xpath=//*[@id='<script>…</script>']` can be a syntactically valid, non-matching XPath expression.",
+      "reason": "Impact depends on browser content sniffing when no Content-Type is emitted, and on constructing a valid XPath that also matches the reflection path; I could not confirm that the upstream fixed version escapes or type-sets this output, and `rsp.getResponse().getWriter()` behaviour is container-dependent. Source evidence is real but weaker than the CSRF candidate, so it is left as an unconfirmed lead."
+    },
+    {
+      "lead": "Missing authorization in `hudson/cli/ListChangesCommand.java` (lines 41-82): the comment states \"Loading job for this CLI command requires Item.READ permission\", but the job is resolved by `hudson/cli/handlers/AbstractProjectOptionHandler.parseArguments` (lines 48-63) / `TopLevelItemOptionHandler` (lines 27-42) which call only `Jenkins.getItemByFullName(...)` — a name lookup with no permission check — and `CLICommand.main` (CLICommand.java:221-229) checks only `Jenkins.READ`. `act()` then reads `build.getChangeSet()` without any per-item ACL check.",
+      "reason": "Looks like a genuine information-disclosure/authorization gap (SCM commit messages, authors and paths for jobs the user cannot read, via `java -jar jenkins-cli.jar list-changes JOB`), but impact is metadata disclosure only, I could not confirm this is the specific upstream-fixed issue, and other CLI commands taking the same option handler do perform their own checks, so the root cause may be considered an accepted CLI design. Not strong enough to displace the submitted candidate."
+    },
+    {
+      "lead": "DirectoryBrowserSupport.serveFile redirect via the `pattern`/`path` parameter (lines 137-143) and `Jenkins.doLoginEntry` redirect of `from` values beginning with `/` (lines 2994-2997, protocol-relative `//host` URLs).",
+      "reason": "The `pattern` redirect is guarded by `Util.isAbsoluteUri(pattern)` and the `from` check (`from.startsWith(\"/\")`) is the same code/comment shape found in later Jenkins versions, so these read as long-standing behaviour rather than the snapshot's regression; open-redirect impact is also lower than the submitted candidate."
+    },
+    {
+      "lead": "`hudson/security/csrf/DefaultCrumbIssuer.getClientIP` trusts `X-Forwarded-For` unconditionally (lines 103-115), and the crumb salt is `Jenkins.getLegacyInstanceId()` = digest of the master key, which is also broadcast in cleartext by `UDPBroadcastThread`/`DNSMultiCast`.",
+      "reason": "Forging a crumb still requires the victim's (username, apparent client IP) pair and the attacker cannot set headers on the victim's cross-site requests; the salt is explicitly documented as non-secret, and I could not demonstrate a practical crumb-forgery chain, so this is not submitted as the candidate."
+    }
+  ],
+  "summary": "Scope: full snapshot (7,649 visible files: `core`, `cli`, `maven-plugin`, `war`, packaging) at Jenkins 1.510-SNAPSHOT (post-1.509 branch cut, ~April 2013); test sources and all `.jelly` templates are absent from the snapshot, so review is limited to Java/resources/poms. One candidate is submitted: CSRF protection in this snapshot only covers non-multipart POST requests, while several privileged, state-changing endpoints accept GET (or multipart POSTs that the filter exempts) and perform no crumb check of their own. The most concrete chain is `GET /script?script=<groovy>` executing arbitrary Groovy with the victim's authentication, plus GET-triggered `System.exit`, quiet-down/reload, and build-agent disable/delete. Confidence is medium because exploitation of the multipart variant depends on Stapler's multipart parameter handling (not in the tree) and because the corresponding upstream timestamp/fix could not be confirmed from source; the GET-based chains do not depend on that uncertainty."
+}

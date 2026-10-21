@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The 'request_uri' query parameter (GET, AuthorizationEndpoint.buildGet, line 108) or form field (POST, buildPost line 102) reaching the public endpoint /realms/{realm}/protocol/openid-connect/auth. The value is an arbitrary absolute URL fully controlled by the requester; only a plausible existing 'client_id' for an enabled, non-bearer-only OIDC client is needed, and client_id values are public (exposed on the login/authorization page). No authentication, session, or client secret is required.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked for any URI/authority checks on request_uri: none in parseRequest, in AuthzEndpointRequestObjectParser, or in OIDCAdvancedConfigWrapper.getRequestObjectRequired (which only enforces parameter presence per configuration). The 'redirect_uri' parameter is separately validated via RedirectUtils, but that code is not applied to 'request_uri'. Checked that 'request' + 'request_uri' together are rejected, and that the fetch is not restricted to the client's configured request-object/JWKS URIs. Checked other HttpClientProvider call sites: JWKS URI, sector_identifier_uri and identity-provider import URL are configuration/admin-controlled values, not anonymous request input. Confirmed the sink is a plain GET with no host allow-list or scheme restriction in DefaultHttpClientFactory.get(). No runtime validation was performed.",
+      "id": "kc-ssrf-request-uri",
+      "impact": "Blind SSRF: the Keycloak server can be coerced into issuing HTTP(S) GETs to arbitrary internal/external endpoints, including loopback, RFC1918 hosts, and cloud metadata addresses, enabling internal service reachability/port probing and unwanted interactions with internal HTTP services (e.g., triggering state-changing GET endpoints or basic-auth-less admin interfaces). The fetched body is not reflected to the attacker (it is parsed as a JWT and errors yield a generic invalid_request page), so confidentiality impact is limited, but the trust-boundary violation (CWE-918) is real and unauthenticated.",
+      "locations": [
+        {
+          "end_line": 76,
+          "path": "services/src/main/java/org/keycloak/protocol/oidc/endpoints/request/AuthorizationEndpointRequestParserProcessor.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 107,
+          "path": "services/src/main/java/org/keycloak/connections/httpclient/DefaultHttpClientFactory.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 118,
+          "path": "services/src/main/java/org/keycloak/protocol/oidc/endpoints/AuthorizationEndpoint.java",
+          "start_line": 98
+        }
+      ],
+      "prerequisites": "Realm is enabled and the request passes checkSsl (true on HTTPS deployments or realms with SSL 'none/external'). A valid, enabled OIDC client_id must be supplied so checkClient succeeds. The attacker must not supply the 'request' parameter at the same time (both together are rejected at line 51-53). Alternatively, a client configured with request-object-required values only enforces presence, never the URI. No network position inside the server is needed; the server performs the request itself.",
+      "root_cause": "AuthorizationEndpointRequestParserProcessor takes the client-supplied 'request_uri' and passes it directly to session.getProvider(HttpClientProvider.class).get(...) (lines 49, 70-75). There is no validation that the URI belongs to the client (no comparison against a registered request-object URI, no host/scheme allow-list, no redirect-utils check). The default HttpClientProvider implementation then performs a plain outbound GET: DefaultHttpClientFactory creates `new HttpGet(uri)` and executes it on the shared client (lines 99-107), so Keycloak issues an HTTP(S) request to any attacker-chosen absolute URL.",
+      "title": "Unauthenticated blind SSRF via OIDC 'request_uri' in the authorization endpoint",
+      "trace": "AuthorizationEndpoint.buildGet()/buildPost() -> process(params) (AuthorizationEndpoint.java:105-118) -> AuthorizationEndpointRequestParserProcessor.parseRequest (line 42) -> requestUriParam = requestParams.getFirst(\"request_uri\") (line 49) -> else-if branch (line 70) -> session.getProvider(HttpClientProvider.class).get(requestUriParam) (line 71) -> DefaultHttpClientFactory$1.get(String uri) (lines 99-107): new HttpGet(uri); httpClient.execute(request) -> entity.getContent(). The outbound request is performed before any verification of the fetched document; parsing/verification failures at AuthzEndpointRequestObjectParser only produce a generic 400 (catch at lines 80-84), so the fetch is not gated by the doc being a valid/signed JWT.",
+      "unverified": "No runtime/exploit execution was performed. The precise reach of the SSRF depends on network topology and firewall rules around the Keycloak host; the fetched response is not returned to the caller (blind). I did not verify whether later upstream versions added a request_uri allow-list, since only this snapshot was inspected.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery (SSRF)"
+    }
+  ],
+  "coverage_summary": "Assigned tree: 5,108 files, all visible to the tools (binary-like files unreadable); no files were reported as excluded by name/path. I reviewed OIDC endpoints and request parsing (AuthorizationEndpoint, TokenEndpoint, LogoutEndpoint, request parsers), SAML IdP/broker paths (SamlService, SAMLEndpoint, signature verification utilities), adapter token verification, admin REST resources and fine-grained admin permission evaluators, authenticators (browser/direct-grant/x509/ECP/Docker), action-token framework, JWS/JWE/JWT verification utilities, redirect/URI utilities, LDAP query building, and export/import file handling. The snapshot notably excludes all test sources (*/src/test/**, testsuite/integration-arquillian/tests/**) and all FreeMarker templates (*.ftl), so theme/template XSS and test-encoded expected behavior could not be inspected. Review was source-reading only: no builds, tests, scanners, or exploit execution; the relation index was used only for navigation and every cited edge was verified against source text.",
+  "limitations": [
+    "Only a single candidate may be submitted; the SSRF was selected over several other plausible but weaker or intent-dependent leads (ECP disabled-user handling, admin-only URL import SSRF, form_post escaping, action-token replay).",
+    "No runtime verification, build, or dynamic test was performed; all conclusions are static source analysis, and the SSRF's practical reach depends on deployment network topology.",
+    "The assigned snapshot omits all test sources and FreeMarker templates, so vulnerabilities that live in templates (e.g., login/account themes) or that are only visible through tests are out of scope/uninspected.",
+    "Coverage is not exhaustive across 5,108 files; large modules (authentication, authorization services, model layers, adapters, themes JS) were sampled rather than read line-by-line.",
+    "The relation index is syntactic/navigational only and was not treated as proof of data flow, reachability, or exploitability; index facts were absent for both the candidate and the main rejected lead.",
+    "I could not determine the exact upstream fix commit or CVE associated with this snapshot from the source alone, so the candidate is the strongest issue I could substantiate, not a confirmed match to any particular historical patch."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SAML ECP HTTP Basic authenticator accepts disabled users: services/src/main/java/org/keycloak/protocol/saml/profile/ecp/authenticator/HttpBasicAuthenticator.java (lines 41-46, 61-63) branches on user.isEnabled() but its base userDisabledAction() calls userSuccessAction(), and AuthenticationProcessor.validateUser is not re-run at flow completion, so a disabled account with a valid password appears to obtain a session via the ECP flow (and no brute-force/lockout check exists in this path).",
+      "reason": "Strong anomaly (contradicts its own isEnabled() guard and sibling authenticators), but I could not establish from the snapshot alone that this is unintended rather than long-standing upstream behavior; exploitation also requires knowing the disabled account's password. Kept as the main alternative lead rather than submittable."
+    },
+    {
+      "lead": "Admin-only SSRF: IdentityProvidersResource.fetchFromUrl/import path performs session.getProvider(HttpClientProvider.class).get(fromUrl) on the admin-supplied 'fromUrl' (services/src/main/java/org/keycloak/services/resources/admin/IdentityProvidersResource.java lines 137-139).",
+      "reason": "Requires an authenticated realm-admin with manage-identity-providers; this is largely the intended 'import metadata from URL' feature, so impact/authorization context is much weaker than the unauthenticated request_uri fetch."
+    },
+    {
+      "lead": "OIDC form_post response mode builds the FORM ACTION from redirectUri without HTML-attribute escaping (services/src/main/java/org/keycloak/protocol/oidc/utils/OIDCRedirectUriBuilder.java lines 143-165); hidden-input values are escaped but the action is not.",
+      "reason": "The URI is first validated against client-registered redirect URIs via RedirectUtils; triggering markup injection would require a maliciously registered redirect URI (client configuration access), so it is config-dependent rather than attacker-controlled."
+    },
+    {
+      "lead": "OIDC request object with alg=none is accepted when the client has no request_object signature algorithm configured (services/src/main/java/org/keycloak/protocol/oidc/endpoints/request/AuthzEndpointRequestObjectParser.java lines 48-70).",
+      "reason": "With no signature requirement configured, an unsigned request object carries essentially the same attacker-controlled parameters as the plain query string, so I found no demonstrable privilege or response bypass beyond existing behavior."
+    },
+    {
+      "lead": "AbstractActionTokenHander.canUseTokenRepeatedly defaults to true (services/src/main/java/org/keycloak/authentication/actiontoken/AbstractActionTokenHander.java lines 101-104), so handlers that do not override it (e.g., VerifyEmail) are not invalidated after use.",
+      "reason": "Could not confirm intended default from the snapshot; the only handlers with security-critical single-use semantics (reset credentials, execute actions) override the method, and the interface javadoc is ambiguous. Rejected as insufficiently evidenced."
+    }
+  ],
+  "summary": "Keycloak 4.6.0.Final-SNAPSHOT server snapshot (5,108 files). The strongest source-evidenced issue found is an unauthenticated blind SSRF in the OIDC authorization endpoint: the `request_uri` parameter is fetched server-side via the shared HTTP client without any scheme/host validation or client-side allow-listing. I verified the full path from the public GET/POST handler to the outbound `HttpGet`. Secondary leads (ECP disabled-user behavior, admin-only import-from-URL SSRF, unescaped form_post ACTION) are listed as unconfirmed/rejected. Test sources and FreeMarker templates are absent from the assigned snapshot, limiting coverage of theme/XSS and test-encoded behavior; nothing was executed."
+}

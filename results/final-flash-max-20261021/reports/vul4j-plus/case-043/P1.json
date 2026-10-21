@@ -1,0 +1,78 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the SPARQL XML results document that is parsed. Typical vectors: a malicious/compromised SPARQL endpoint or repository server that the client queries (SPARQLProtocolSession.getTupleQueryResult / RDF4JProtocolSession.getRepositoryList, each of which negotiates application/sparql-results+xml and parses the body), a network attacker against a plain-HTTP endpoint, or any application that feeds untrusted SPARQL XML results (file, stream, URL) into QueryResultIO/SPARQLResultsXMLParser. The document text, including any DOCTYPE/internal DTD and entity references, is fully attacker-controlled.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the boolean branch of the same class and the Rio RDF/XML/TriX parsers do apply the XXE settings (intent and correct pattern exist in-tree), so the tuple omission is an inconsistency rather than an intentional design. Checked that SPARQLResultsXMLParser always calls parseQueryResultInternal(in,false,true), i.e. it always reaches the unhardened branch. Checked that XMLParserSettings defaults are secure but are only consulted by code that actually calls getParserConfig().get(...)/setFeature; the tuple branch has no such calls. Checked that SimpleSAXParser and SPARQLResultsSAXParser add no DTD/entity guard of their own. Checked that JAXP has entity-expansion/size limits that mitigate but do not prevent external entity resolution. Checked whether an alternate hardening existed in XMLReaderFactory or ParserConfig (none found).",
+      "id": "rdf4j-sparqlxml-tuple-xxe",
+      "impact": "XML External Entity injection within the security context of the process using RDF4J: disclosure of local files that the parser process can read (file:// entities embedded into parsed result values), server-side request forgery from the parsing host against internal HTTP/FTP resources (entity SYSTEM URLs), and denial of service via recursive entity expansion (billion-laughs), limited by any JAXP entity-expansion/size limits in effect. Impact is bounded by where the parsed results are surfaced, but file/URL disclosure and SSRF occur as soon as the document is parsed.",
+      "locations": [
+        {
+          "end_line": 211,
+          "path": "queryresultio/sparqlxml/src/main/java/org/eclipse/rdf4j/query/resultio/sparqlxml/AbstractSPARQLXMLParser.java",
+          "start_line": 201
+        },
+        {
+          "end_line": 285,
+          "path": "queryresultio/sparqlxml/src/main/java/org/eclipse/rdf4j/query/resultio/sparqlxml/AbstractSPARQLXMLParser.java",
+          "start_line": 278
+        },
+        {
+          "end_line": 101,
+          "path": "util/src/main/java/org/eclipse/rdf4j/common/xml/XMLReaderFactory.java",
+          "start_line": 36
+        }
+      ],
+      "prerequisites": "Default parser configuration (no CUSTOM_XML_READER set, no override that re-enables the settings) and an XML parser whose defaults allow DOCTYPE and external entities (stock JAXP/Xerces on Java 8/11, where disallow-doctype-decl defaults to false and external-general-entities defaults to true). The application must parse SPARQL XML tuple results from an untrusted source, which is the normal client use case for remote repositories. Note that even in the boolean-first path (AbstractSPARQLXMLParser.parseQueryResult -> parseQueryResultInternal(true, true)), a document containing a DOCTYPE makes the boolean attempt fail and the code then re-parses the same bytes through the unhardened tuple reader.",
+      "root_cause": "AbstractSPARQLXMLParser.parseQueryResultInternal does not apply the parser's compulsory XML security features on the tuple-results path. The boolean path (lines 87-163) creates the XMLReader and then sets every setting returned by getCompulsoryXmlFeatureSettings() (SECURE_PROCESSING, DISALLOW_DOCTYPE_DECL=true, EXTERNAL_GENERAL_ENTITIES=false, EXTERNAL_PARAMETER_ENTITIES=false, lines 278-285) plus the optional settings. The tuple path (lines 201-211) instead calls XMLReaderFactory.createXMLReader() directly, does not apply any of those features (and does not even honour XMLParserSettings.CUSTOM_XML_READER), so the resulting reader keeps the JAXP/Xerces defaults that allow DOCTYPE declarations and external entity resolution. XMLReaderFactory itself (lines 36-101) adds no secure defaults when it builds the reader from the org.xml.sax.driver property, SAXParserFactory or Xerces.",
+      "title": "XXE: SPARQL/XML tuple query results parsed with an XMLReader that does not enforce the compulsory XXE-prevention settings",
+      "trace": "Untrusted results document -> SPARQLProtocolSession.getTupleQueryResult (http/client/.../SPARQLProtocolSession.java lines 723-728 and 760-766) or RDF4JProtocolSession.getTupleQueryResult/getRepositoryList (http/client/.../RDF4JProtocolSession.java lines 204-223) or any caller of QueryResultIO.parseTuple/createTupleParser (queryresultio/api/.../QueryResultIO.java lines 148-176, 289-297) -> TupleQueryResultFormat.SPARQL -> SPARQLResultsXMLParser.parseQueryResult (queryresultio/sparqlxml/.../SPARQLResultsXMLParser.java lines 69-84, calls parseQueryResultInternal(in,false,true)) -> AbstractSPARQLXMLParser.parseQueryResultInternal tuple branch (line 203 XMLReaderFactory.createXMLReader(), no setFeature calls) -> SimpleSAXParser.parse -> external entity/DTD is resolved by the default reader and the expanded content is delivered through SPARQLResultsSAXParser into result values (literal/IRI/bnode).",
+      "unverified": "I could not run the parser or inspect a JDK, so the exact JAXP/Xerces default behaviour on the deployment JDK (external-general-entities resolution, load-external-dtd) was not runtime-confirmed; the code path and missing settings are confirmed from source. Whether a specific application exposes parsed result values to the attacker (needed for reading file content back, though SSRF and DoS do not require it) is deployment-dependent. Whether this is exactly the ground-truth fix target of the review case is unknown; the related unhardened XMLReaderFactory and TransactionReader paths were not treated as separate candidates.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Coverage is based on the 1161 model-visible source files (source_root_files=1161; binary-like files skipped, none excluded by sensitive-path filters). I read or searched the main source of the included modules: model (values/datatypes/util), rio (api, rdfxml, trix, turtle, ntriples, nquads, trig, binary, rdfjson), queryresultio (api, sparqlxml, sparqljson, binary, text), query and query/dawg, queryalgebra-model (federation interfaces only), queryparser (api, serql, sparql skeleton), queryrender, repository (api, contextaware, event, http, manager, sparql), http (protocol transactions, client sessions, HttpClientBuilders), sparqlbuilder, util (io, xml, net, iteration). I focused on XML parser creation/configuration, HTTP response parsing, reflection/deserialization, command execution (none found), zip/file handling, TLS setup and query building. The P1 relation index (1161/1161 files indexed, complete; no SAST oracle) was used only for navigation (e.g. getCompulsoryXmlFeatureSettings call edges, parseQueryResultInternal call sites) and every cited relation was re-verified in source text. Large files (e.g. TurtleParser, ParsedIRI, SPARQL JavaCC parser, writers) were not exhaustively line-reviewed; no test sources exist in the snapshot and no dependency binaries were inspected.",
+  "limitations": [
+    "No execution, parsing, or exploit reproduction was performed; all findings are source-level leads only.",
+    "Default JAXP/Xerces entity-resolution behaviour was not runtime-verified; it depends on the JVM (Java 8/11 default: DOCTYPE and external general entities allowed) and on any JVM-level jaxp.properties overrides.",
+    "The snapshot contains only src/main sources (no tests), so no test-based corroboration of the intended behaviour or of a fix was possible.",
+    "The P1 index is syntactic/navigational and proves neither runtime reachability nor data flow; unparsed or unreported symbols may exist, and no scanner/oracle findings were available.",
+    "Server-side modules (HTTP server, sail/query engine, console/workbench) are not part of this snapshot, so server-side entry points could not be assessed; the candidate is limited to client/library parsing paths visible here.",
+    "Only the single strongest candidate is submitted per review instructions; the rejected leads above are unconfirmed and may still be genuine issues in other contexts."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE via http/protocol/.../TransactionReader (creates SimpleSAXParser with a default, unhardened XMLReader) and TransactionSAXParser",
+      "reason": "Genuine missing hardening, but no in-snapshot caller of TransactionReader could be found (only its own class body/index declaration); reachability is limited to code not present in this snapshot (e.g. server-side integration), so it is a weaker lead than the query-result tuple path."
+    },
+    {
+      "lead": "XXE/SSRF via util/.../common/xml/DocumentUtil (DocumentBuilderFactory without secure processing/external-entity restrictions)",
+      "reason": "No callers of DocumentUtil exist in the snapshot, and it is a generic utility, so no attacker-controlled entry point could be demonstrated in this source set."
+    },
+    {
+      "lead": "Zip Slip in util/.../common/io/ZipUtil.writeEntry (new File(destDir, entry.getName()) without canonical-path validation)",
+      "reason": "writeEntry/extract have no callers in the snapshot (only isZipStream is used by RDFLoader, which parses entries instead of writing files); requires an attacker-supplied zip plus a caller, so evidence of exploitable reachability is weaker."
+    },
+    {
+      "lead": "Whole-repository 'trust all' TLS helper in http/client/.../util/HttpClientBuilders.getSSLTrustAllHttpClientBuilder",
+      "reason": "Intentional, explicitly documented opt-in helper; no caller in the snapshot, and it is not used as a default anywhere in the source reviewed."
+    },
+    {
+      "lead": "Path traversal in repository/manager/.../LocalRepositoryManager.getRepositoryDir/resolvePath (repository ID used directly under baseDir)",
+      "reason": "Repository IDs are administrative/configuration input rather than a remote boundary in this library-only snapshot; also upstream-style behaviour, and no canonical containment check is claimed elsewhere, so impact and attacker model are much weaker than the XXE candidate."
+    },
+    {
+      "lead": "BinaryQueryResultParser format-version check `if (formatVersion > FORMAT_VERSION && formatVersion < 1)` is logically dead (line 119), so unsupported versions are accepted",
+      "reason": "Real logic defect, but in Java it only leads to misinterpretation/robustness problems on malformed input, not memory corruption or data exposure; it does not meet the impact threshold of the XXE candidate."
+    },
+    {
+      "lead": "SPARQL injection in sparqlbuilder RdfLiteral.StringLiteral / SparqlBuilderUtils (values containing quotes or triple quotes are inserted into queries without escaping backslashes/''' sequences)",
+      "reason": "Plausible CWE-74 weakness when applications pass untrusted values as literals, but exploitation is application-dependent and the API is a query-construction helper; the source evidence of a missing-neutralisation boundary is less direct than the unapplied compulsory XXE settings in a parser that consumes attacker-controlled documents."
+    },
+    {
+      "lead": "LinkedHashModel.readObject trusting the serialized size field (unsanitized int used for HashMap/LinkedHashSet sizing)",
+      "reason": "Only reachable through Java deserialization of untrusted byte streams, which is already a dangerous precondition, and the consequence is at most an exception/OOM; not treated as a separate candidate."
+    }
+  ],
+  "summary": "Reviewed the RDF4J 2.5-SNAPSHOT source snapshot (1161 main-source files; modules client, compliance, http/client+protocol, model, query, queryalgebra-model, queryparser, queryrender, repository/*, rio/*, sparqlbuilder, util). No tests are present in the snapshot. I mapped XML parsing surfaces, HTTP client/server response handling, deserialization, zip/file handling and query building. The strongest source-level issue is an XXE gap in the SPARQL/XML tuple query-result parser: AbstractSPARQLXMLParser defines \"compulsory\" XXE-prevention XML features (SECURE_PROCESSING, DISALLOW_DOCTYPE_DECL, EXTERNAL_GENERAL_ENTITIES=false, EXTERNAL_PARAMETER_ENTITIES=false) and applies them in the boolean-result branch, but the tuple-result branch creates a fresh XMLReader from XMLReaderFactory with none of those settings applied. Tuple XML results are the normal path used by QueryResultIO and by SPARQLProtocolSession/RDF4JProtocolSession when parsing responses from remote repositories, so a malicious/untrusted SPARQL XML results document is parsed by a default, permissive JAXP/Xerces reader. Other XML entry points (Rio RDF/XML and TriX) do apply the hardening via XMLReaderBasedParser; the unhardened TransactionReader and DocumentUtil have no callers in this snapshot."
+}

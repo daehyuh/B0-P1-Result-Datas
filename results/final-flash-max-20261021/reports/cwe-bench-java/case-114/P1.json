@@ -1,0 +1,77 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote HTTP client fully controls the {filename} path parameter of GET /jobmanager/logs/:filename (JobManagerCustomLogHeaders URL) and can percent-encode characters such as path separators so that the value reaches the handler intact after router decoding. Flink 1.11 REST endpoints have no authentication/authorization layer by default (only optional SSL/Kerberos transport security), and the handler is registered unconditionally by WebMonitorEndpoint (flink-runtime/.../webmonitor/WebMonitorEndpoint.java:674-692) whenever the log location is configured (WebMonitorUtils.LogFileLocation.find, normally set via the log.file startup property / web.log.path).",
+      "confidence": "medium",
+      "counterevidence_checked": "The analogous TaskManager path is hardened: TaskExecutor.requestFileUploadByName (flink-runtime/.../taskexecutor/TaskExecutor.java:1010-1018) strips directories with new File(logDir, new File(fileName).getName()) before resolving the file, and the TaskManager handler forwards the name through the blob service; only the JobManager-side handler resolves the raw parameter. LogFileNamePathParameter performs no validation, MessagePathParameter is an empty base class, and neither AbstractJobManagerFileHandler nor HandlerUtils contains any canonical-path containment check (no getCanonicalFile). The static-file server (HistoryServerStaticFileServerHandler) does call StaticFileServerHandler.checkFileValidity(file, rootPath, ...), showing the codebase's own containment pattern is applied elsewhere but not to the log handler. The REST router is reachable before any handler logic (RouterHandler only routes), and the endpoint is registered unconditionally in WebMonitorEndpoint. I also confirmed the decoded token is used as-is: HandlerRequest only wraps exceptions from resolveFromString and does not sanitize values.",
+      "id": "flink-jm-log-path-traversal-arbitrary-read",
+      "impact": "Confidentiality breach: unauthenticated remote read of arbitrary local files on the JobManager host with the privileges of the Flink process. Depending on deployment, this can expose cluster credentials (flink-conf.yaml, S3/HDFS/Kafka secrets), Kerberos keytabs, and operating-system files — a serious information-disclosure primitive that can be chained into further compromise.",
+      "locations": [
+        {
+          "end_line": 59,
+          "path": "flink-runtime/src/main/java/org/apache/flink/runtime/rest/handler/cluster/JobManagerCustomLogHandler.java",
+          "start_line": 52
+        },
+        {
+          "end_line": 43,
+          "path": "flink-runtime/src/main/java/org/apache/flink/runtime/rest/messages/LogFileNamePathParameter.java",
+          "start_line": 35
+        },
+        {
+          "end_line": 267,
+          "path": "flink-runtime/src/main/java/org/apache/flink/runtime/rest/handler/router/Router.java",
+          "start_line": 251
+        },
+        {
+          "end_line": 89,
+          "path": "flink-runtime/src/main/java/org/apache/flink/runtime/rest/handler/router/RouterHandler.java",
+          "start_line": 79
+        },
+        {
+          "end_line": 79,
+          "path": "flink-runtime/src/main/java/org/apache/flink/runtime/rest/handler/cluster/AbstractJobManagerFileHandler.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 34,
+          "path": "flink-runtime/src/main/java/org/apache/flink/runtime/rest/messages/cluster/JobManagerCustomLogHeaders.java",
+          "start_line": 32
+        }
+      ],
+      "prerequisites": "JobManager REST endpoint reachable by the attacker (default port 8081, no auth by default); JobManager started normally so that logDir/log.file resolves to a real directory (WebMonitorUtils.LogFileLocation.find); the target file must exist and be readable by the JobManager process user. No authenticated session, user interaction, or prior state is required.",
+      "root_cause": "JobManagerCustomLogHandler.getFile() (flink-runtime/.../rest/handler/cluster/JobManagerCustomLogHandler.java:52-59) builds a file path as new File(logDir, filename) using the raw :filename path parameter, without normalizing, canonicalizing, or verifying that the result stays inside logDir. LogFileNamePathParameter.convertFromString (flink-runtime/.../rest/messages/LogFileNamePathParameter.java:35-43) returns the parameter value unchanged, and the router decodes percent escapes per token after splitting the path (Router.decodePathTokens, flink-runtime/.../rest/handler/router/Router.java:251-267), so percent-encoded '/' characters are converted to real path separators inside the single {filename} token. AbstractJobManagerFileHandler.respondToRequest (flink-runtime/.../rest/handler/cluster/AbstractJobManagerFileHandler.java:58-79) then only checks file.exists() and streams the file content to the client (HandlerUtils.transferFile). There is no intervening validation anywhere between the HTTP path parameter and the filesystem read.",
+      "title": "Path traversal in JobManager custom log handler allows arbitrary local file read via the REST API",
+      "trace": "GET /jobmanager/logs/<encoded-segment> -> RouterHandler.channelRead0 builds QueryStringDecoder(httpRequest.uri()) and calls router.route(method, qsd.path(), qsd.parameters()) (RouterHandler.java:79-89) -> Router.route calls decodePathTokens(path), which splits the path on '/' first and then calls QueryStringDecoder.decodeComponent on each token (Router.java:251-267); because splitting happens before the per-token decoding, an encoded slash remains part of the single {filename} token and decodes to '/' (the in-code comment documents this exact behavior) -> the decoded token is stored in RouteResult.pathParams -> HandlerRequest resolves it through LogFileNamePathParameter.convertFromString (identity) (HandlerRequest.java:65-78) -> JobManagerCustomLogHandler.getFile reads the parameter and returns new File(logDir, filename) (line 57-58); a value containing '../' therefore escapes logDir -> AbstractJobManagerFileHandler.respondToRequest checks only file.exists() and returns HandlerUtils.transferFile(ctx, file, httpRequest), which opens the file and streams its content to the requester (HandlerUtils.java:242+). Impact: disclosure of any file readable by the JobManager process (e.g., cluster configuration files that can contain object-store/DB/Kerberos credentials, keytabs, other tenants' logs, system files such as /etc/passwd).",
+      "unverified": "Static analysis only; no code execution, build, or runtime test. The exact encoding form needed for the request depends on shaded-Netty QueryStringDecoder behavior (whether path() itself decodes percent escapes once more), which is not inspectable in this tree; one of single/double percent-encoding of separators yields a token that is decoded by Router.decodePathTokens into '../', but this was not executed. Deployment conditions (auth/SSL proxies, whether log.file/web.log.path is configured, restart/reachability of the leader) were not validated. The sibling multipart-upload traversal (below) is likewise unverified against the shaded Netty multipart parser.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') — arbitrary file read"
+    }
+  ],
+  "coverage_summary": "Per get_source_scope: 8,757 model-visible files; binary-like files are refused/skipped by NUL-byte detection; 0 excluded by size/sensitive-name/symlink filters; per-file text limit 5 MiB. Per get_relation_scope: the P1 index is partial — 8,624 files indexed, 133 source files not in the index (unparsed/omitted), 6,015 parsed files of 6,349 Java files, 4 parse errors, 164,863 call sites / 85,222 symbols; control flow, data flow and semantic resolution are explicitly not implemented, so index edges were used only for navigation and every cited statement was verified against source text. I reviewed in depth the REST server/handler/router stack (flink-runtime: Router/RouterHandler/Router packages, HandlerRequest/MessagePathParameter/LogFileNamePathParameter, AbstractHandler, AbstractJobManagerFileHandler, JobManagerCustomLogHandler, JobManagerLogFileHandler, JobManagerLogListHandler, TaskManagerCustomLogHandler/AbstractTaskManagerFileHandler, FileUploadHandler/FileUploads, RestServerEndpoint/Configuration, WebMonitorEndpoint, WebMonitorUtils, HandlerUtils) and the web handlers around jar upload/run/delete/list (flink-runtime-web: JarUploadHandler, JarListHandler, JarDeleteHandler, JarHandlerUtils, WebSubmissionExtension, history server handlers, legacy HttpRequestHandler/WebFrontendBootstrap). I sampled but did not exhaustively review flink-core, flink-clients, flink-streaming-*, flink-table, connectors, formats, filesystems, state backends, and the Python/JS/end-to-end trees.",
+  "limitations": [
+    "Static review only: no build, test execution, scanner, or exploit payload was run; no runtime confirmation of any finding.",
+    "The snapshot contains no src/test trees, so no test-level or regression evidence was available to corroborate intended behavior.",
+    "The shaded Netty sources are not part of this tree, so the exact decoding of percent escapes by QueryStringDecoder (for the read path) and multipart filename handling by DiskFileUpload/HttpPostRequestDecoder (for the write path) could not be inspected and remain assumptions based on the surrounding Flink code and public behavior.",
+    "The P1 relation index is partial (133 files missing, 4 parse errors) and has no control/data-flow or semantic resolution; unreported areas were not reviewed, and index labels were not treated as verdicts.",
+    "Only one candidate may be submitted, so the equally plausible multipart-upload arbitrary-file-write traversal (FileUploadHandler) and the jar-id traversal surfaces were not submitted as candidates and remain unconfirmed leads.",
+    "No authentication configuration could be verified at runtime; the 'unauthenticated' characterization relies on Flink 1.11 defaults (no built-in REST authentication; optional SSL/Kerberos only)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Same-class path traversal in the multipart upload pipeline: FileUploadHandler.java:141 uses currentUploadDir.resolve(fileUpload.getFilename()) with the raw multipart Content-Disposition filename and then calls fileUpload.renameTo(dest.toFile()) (lines 132-143), so a crafted filename containing path separators or an absolute path (e.g., '../' sequences) can move attacker-controlled content outside the per-request upload directory before any handler-level validation; JarUploadHandler's .jar/extension check (flink-runtime-web .../JarUploadHandler.java:80-98) runs only after the file has already been moved, and the periodic FileUploads cleanup deletes only the upload directory, not the traversed destination. Root cause type: CWE-22 arbitrary file write/overwrite on the JobManager/TaskManager host (potential later code execution by overwriting configs/scripts/jars), the impact class reported as CVE-2020-17518 for this release.",
+      "reason": "Credible and high impact, but not submitted as a second candidate due to the one-candidate cap, and because its reachability hinges on shaded-Netty multipart parsing details (whether a filename containing slashes/absolute paths is passed through verbatim and whether renameTo/File.move succeeds to the attacker-chosen parent directory) that cannot be verified from this source tree; the sibling read traversal has a fully in-repository evidence chain. Retained as an unconfirmed lead."
+    },
+    {
+      "lead": "Path traversal via the jar id path parameter in JarDeleteHandler (flink-runtime-web .../handlers/JarDeleteHandler.java:72-90, jarDir.resolve(jarId) followed by Files.delete) and in JarHandlerUtils.JarHandlerContext.fromRequest (flink-runtime-web .../handlers/utils/JarHandlerUtils.java:94-95, jarDir.resolve(pathParameter) then PackagedProgram on that file).",
+      "reason": "Plausible additional traversal surface if the jar id can carry decoded separators, but the resulting impact (delete/read of a file that must exist in the jar dir) and the exact reachability were not traced to completion; left unconfirmed and not submitted."
+    },
+    {
+      "lead": "Legacy multipart upload path in flink-runtime-web HttpRequestHandler.java:135-152, which concatenates UUID.randomUUID() + '_' + file.getFilename() under the web tmp dir; WebFrontendBootstrap puts this handler in the HistoryServer web pipeline (HistoryServer.java:249, WebFrontendBootstrap.java:87-91).",
+      "reason": "Same unsanitized-filename pattern, but no upload route appears to be registered in the history-server router and exposure/impact could not be established; listed only as an observational lead."
+    },
+    {
+      "lead": "Java deserialization of uploaded JobGraph bytes in JobSubmitHandler (flink-runtime .../rest/handler/job/JobSubmitHandler.java:119-134 uses ObjectInputStream.readObject on an uploaded file).",
+      "reason": "Not treated as a distinct vulnerability: the REST job-submission API is intentionally able to run arbitrary user code for any client that can submit jobs, so this does not create additional attacker capability beyond the documented (and separately mitigated via optional authentication) job-submission surface."
+    }
+  ],
+  "summary": "Snapshot identified as Apache Flink 1.11.2 (pom.xml 1.11.2; docs/_config.yml version 1.11.2, release-1.11), a source-only tree (8,757 model-visible files; no src/test trees). I inventoried the tree, then focused on the REST/web attack surface (flink-runtime rest handlers, router, upload pipeline; flink-runtime-web handlers/history server), plus sampled runtime/blob/checkpoint/client code. The strongest candidate is an unauthenticated path traversal in the JobManager custom log-file REST handler (GET /jobmanager/logs/{filename}) that turns a URL path parameter into an unconstrained filesystem path: the handler concatenates the raw parameter onto the log directory with new File(logDir, filename), with no normalization/containment check, and the router deliberately percent-decodes each path token after splitting, so an encoded path separator survives inside the single {filename} token and is decoded into \"../../\" before use. Net effect: a remote client that can reach the REST port (no authentication by default in 1.11) can read any file readable by the JobManager process. A closely related, credible same-class issue in the multipart upload pipeline (arbitrary file write) is recorded only as an unconfirmed rejected lead because of the one-candidate cap and because its reachability depends on unverifiable shaded-Netty multipart filename handling. No runtime/build verification was performed; findings are static leads only."
+}

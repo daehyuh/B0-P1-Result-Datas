@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The access token string taken from the HTTP `Authorization: Bearer <token>` header of a request to an HTTP endpoint wired to the file-based OAuth2 authorization mechanism. The value is passed verbatim by the OAuth2 resource-server filter to AccessTokenResolver.resolve(context, token). RFC 6750 token characters (`A-Za-z0-9-._~+/` with optional `=`) permit both `.` and `/`, so a value containing `../..` segments is a syntactically plausible bearer token and reaches the un-normalised `new File(folderPath, token)` sink.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that: the file resolver is documented as 'should only be used for test purpose' and the mechanism is created disabled (Upgrade.java:519-527), so it is not on by default; `new File(parent, child)` does neutralise an absolute child path, so only `..` segments (and symlinks) escape, not `/etc/...`; the OAuth2 filter enforces required scopes and token expiry taken from the same JSON, so a planted file must contain matching fields; the final operations still go through the proxy-authz machinery (InternalProxyAuthzFilter / server-side PROXIED_AUTH + proxy ACI checks), limiting the blast radius; adjacent token resolvers were checked and found not injectable (CtsAccessTokenResolver uses DN.child(\"coreTokenId\", token) whose AVA stores the value as a single escaped RDN; DnTemplate/DN.format and Filter.format escape their substitutions); the DSML servlet's XML handling and the LDAPServerFilter/SASL paths were also reviewed for a stronger remotely-triggerable sink and did not yield one.",
+      "id": "cand-1-file-token-resolver-traversal",
+      "impact": "Filesystem path traversal from an HTTP-controlled string: the server opens and JSON-parses a file of the attacker's choosing outside the intended token directory (arbitrary file read is constrained to JSON-parseable content because of `Json.readJsonLenient`). When a suitable JSON file is available, the attacker-supplied file fully defines the request identity, scope set and expiry, so the request can be authenticated as an arbitrary identity resolvable by the configuration's IdentityMapper (e.g. `uid=<victim>`), i.e. authentication bypass/impersonation against the REST/LDAP gateway. Proxy-Authorization/PROXIED_AUTH checks on the internal connection remain in place at the server, so the achievable privilege level depends on that configuration, but the token-directory trust boundary is clearly broken.",
+      "locations": [
+        {
+          "end_line": 66,
+          "path": "opendj-rest2ldap/src/main/java/org/forgerock/opendj/rest2ldap/authz/FileAccessTokenResolver.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 53,
+          "path": "opendj-server-legacy/src/main/java/org/opends/server/protocols/http/authz/HttpOAuth2FileAuthorizationMechanism.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 275,
+          "path": "opendj-rest2ldap/src/main/java/org/forgerock/opendj/rest2ldap/authz/Authorization.java",
+          "start_line": 244
+        },
+        {
+          "end_line": 104,
+          "path": "opendj-server-legacy/src/main/java/org/opends/server/protocols/http/authz/HttpOAuth2AuthorizationMechanism.java",
+          "start_line": 88
+        },
+        {
+          "end_line": 63,
+          "path": "opendj-maven-plugin/src/main/resources/config/xml/org/forgerock/opendj/server/config/HTTPOauth2FileAuthorizationMechanismConfiguration.xml",
+          "start_line": 45
+        }
+      ],
+      "prerequisites": "(1) An HTTP endpoint (e.g. rest2ldap or admin endpoint) references a `ds-cfg-http-oauth2-file-authorization-mechanism` and that mechanism is enabled with an access-token-directory (the mechanism is created disabled by an upgrade task; the class Javadoc labels it test-purpose, so this is not the default deployment). (2) For the strongest impact, the attacker must be able to point the traversal at a JSON file whose content is attacker-influenced (or otherwise favourable) and that parses with `scope` (string array), `expireTime` (long) and the configured authzid JSON pointer field; writable directories (e.g. temp/shared volumes) or attacker-controlled adjacent JSON artefacts would satisfy this. Without such a file, the primitive is limited to reading/parsing chosen files and distinguishable success/failure behaviour.",
+      "root_cause": "FileAccessTokenResolver.resolve() treats the client-supplied OAuth2 access token as a file name and concatenates it into a path with no confinement check: `new File(folderPath, token)` followed by `new FileInputStream(...)` (lines 49-55). Java's File(parent, child) strips leading separators from an absolute child but does not canonicalise or reject `..` components, so a token such as `../../../../<path>` escapes the configured `ds-cfg-oauth2-access-token-directory`. The file content is parsed as JSON and drives the resulting AccessTokenInfo: `scope`, `expireTime` and the authzid JSON pointer value that Authorization.createSecurityContextInjectionFilter() turns into `u:<value>` / `dn:<value>` in the SecurityContext, which server-legacy's InternalProxyAuthzFilter then resolves to an LDAP entry and uses as the authenticated identity for the request.",
+      "title": "Path traversal in OAuth2 file-based access-token resolver via attacker-controlled Bearer token",
+      "trace": "HTTP request with `Authorization: Bearer ../../../../<path>` -> Authorization.newConditionalOAuth2ResourceServerFilter (opendj-rest2ldap .../authz/Authorization.java:213-254) -> CHF ResourceServerFilter extracts the token and calls the resolver -> FileAccessTokenResolver.resolve (FileAccessTokenResolver.java:49-52) does `new FileInputStream(new File(folderPath, token))` -> `Json.readJsonLenient` parses the chosen file -> `new AccessTokenInfo(accessToken, token, scope, expireTime)` (lines 57-61) -> Authorization.createSecurityContextInjectionFilter (Authorization.java:256-275) writes `u:<authzid-pointer-value>` into the SecurityContext -> HttpOAuth2AuthorizationMechanism chains InternalProxyAuthzFilter (HttpOAuth2AuthorizationMechanism.java:99-104) -> InternalProxyAuthzFilter.filter (lines 68-80) resolves that identity through the configured IdentityMapper and returns an internal connection authenticated as that entry, so subsequent LDAP operations are performed as the identity named in the traversed file.",
+      "unverified": "No runtime test was performed. The exact parsing/normalisation (or rejection) of the `Bearer` header value happens inside the external forgerock-http ResourceServerFilter, which is not part of this snapshot; I verified only that the resolver's contract receives the raw token string. Whether any real deployment enables the file-based OAuth2 mechanism, and whether an attacker can place/choose a JSON file with the required fields, is environment-dependent. Impact of impersonation also depends on the configured identity mapper, proxied-auth privileges and proxy ACIs.",
+      "weakness_type": "CWE-22 Path Traversal (leading to arbitrary JSON file read/parse and potential authentication bypass/impersonation)"
+    }
+  ],
+  "coverage_summary": "Assigned tree: 4,667 model-visible source files; per get_source_scope there were 0 excluded binaries, 0 sensitive-name/symlink exclusions and 0 files over 5 MiB, so filtering did not remove any Java source. Per get_relation_scope the index is partial: 4,608 files indexed, 59 source files missing from the index, 1 parse error, 49,453 symbols/123,748 candidate edges; capabilities are syntax-only (containment, name/arity call and inheritance candidates, annotation-name hints) with control flow, data flow and semantic resolution explicitly not implemented, and no security oracle or findings loaded - no build/test run. I inspected, by targeted reading/search rather than exhaustively: HTTP/REST authorization paths (rest2ldap basic/simple/search/SASL/OAuth2 strategies and resolvers, DN/filter templates, token resolvers; server-legacy HTTP authz mechanisms, AllowDenyFilter, LDAPContextInjectionFilter, AdminEndpoint/Rest2LdapEndpoint), the DSML servlet, backup/restore and all zip-extraction code, JDBC/Cassandra storage backends, the Grizzly LDAP codec/ASN.1/TLS/SASL filters, ACI engine and IP address masks, task classes and their privilege checks, config persistence/permissions, LDIF/URL handling, and packaging scripts/Dockerfiles. Unreviewed or only search-sampled: most of the protocol/ldap and core operation code, replication/changelog, schema, plugin and monitor subsystems, large parts of opendj-core and opendj-config.",
+  "limitations": [
+    "The P1 index has no data-flow/control-flow or semantic resolution, so the header-to-file-open path was established by reading source and API contracts, not by an index-proved flow.",
+    "The Bearer-token extraction/validation before the resolver lives in the external forgerock-http ResourceServerFilter, which is not in this snapshot; I could not verify whether it restricts token characters.",
+    "No builds, tests, scanners or exploits were run (per instructions); impact statements are static-analysis reasoning, and the candidate is an unconfirmed lead.",
+    "59 source files are missing from the relation index and were not systematically enumerated; the repository is ~48 MB of Java and only the areas listed in coverage were read in depth.",
+    "Deployment preconditions (file-based OAuth2 mechanism enabled, attacker ability to influence a JSON file on disk) cannot be verified from the repository snapshot alone."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal / zip-slip during backup restore: BackupManager.BackupArchiveReader.restoreZipEntry does `restoreDir.resolve(zipEntryName)` with no normalisation and `ensureFileCanBeRestored` only creates parent directories; archive integrity (cryptoEngine.check) is verified in restoreArchive only AFTER files have been written (BackupManager.java:1004-1021 vs 1098-1110).",
+      "reason": "Real missing containment check and post-write verification flaw, but exploiting it requires the ability to place a crafted archive (and matching backup info) in a backup directory the server will read, plus a backend-restore task/privilege; attacker control is filesystem/privileged rather than network-remote, so it is weaker than the submitted candidate."
+    },
+    {
+      "lead": "StaticUtils.extractZipArchive writes zip entries as `new File(targetDirectory, entry.getName())` without canonical-path containment (StaticUtils.java:2517-2560).",
+      "reason": "Only reachable from EmbeddedDirectoryServer.setup with an archive supplied by the embedding application/build, not from remote input; local installer/embedded use only."
+    },
+    {
+      "lead": "DSML servlet SOAP/XML parsing: the request body is parsed by a SAAJ MessageFactory (DSMLServlet.java:449) before JAXB unmarshalling; only the error path and the response document use the hardened createSafeXMLReader/createSafeDocument with FEATURE_SECURE_PROCESSING, disallow-doctype-decl and a SafeEntityResolver.",
+      "reason": "The hardened parsing/entity resolver is present for the repository-controlled paths, and the residual XXE risk depends on the JDK/container SAAJ implementation (outside this snapshot); cannot be verified from source alone."
+    },
+    {
+      "lead": "Storage backends build SQL/CQL text from configuration values: jdbc/Storage.java and cassandra/Storage.java concatenate table/keyspace names derived from backend id / db-directory (cassandra Storage.java:156-162 uses a regex typo `[^a-zA-z0-9_]` that leaves backslash/backtick unescaped).",
+      "reason": "Values are administrator-controlled configuration, not attacker-controlled request data; data values are bound via PreparedStatement/bind variables, so no injection from LDAP content was found."
+    },
+    {
+      "lead": "Packaging defaults: Dockerfile sets `ROOT_PASSWORD=${ROOT_PASSWORD:-\"password\"}` (line 11) and run.sh echoes the password to container logs (`echo \"Password set to $PASSWORD\"`, lines 31-32); setup.sh enables `allow-pre-encoded-passwords`.",
+      "reason": "Deployment/packaging hardening issues (default credential, password in logs) rather than an injection or access-control flaw in server code; noted for follow-up, not the strongest source-level candidate."
+    },
+    {
+      "lead": "Tasks without explicit privilege checks (e.g. SetGenerationIdTask keeps the upstream `FIXME -- Do we need any special authorization here?`; InitializeTask/InitializeTargetTask/PurgeConflictsHistoricalTask/ResetChangeNumberTask also have none).",
+      "reason": "Reaching these requires write access to cn=tasks (ACI-controlled administrative configuration), and comparisons show the file-based OAuth2 issue has direct request-level attacker control."
+    },
+    {
+      "lead": "Grizzly LDAP transport / ASN.1 reader: negative/huge length handling in SaslFilter.handleRead (length from `message.getInt()` used unchecked) and LdapCodec length checks.",
+      "reason": "At worst malformed-input handling/DoS; no path to confidentiality/integrity impact was demonstrated and the BER reader has sequence-limit checks."
+    }
+  ],
+  "summary": "Single strongest candidate: a path-traversal / token-directory-escape in the OAuth2 \"file\" access-token resolver (CWE-22), reachable from an HTTP `Authorization: Bearer <token>` header when an endpoint uses the shipped `ds-cfg-http-oauth2-file-authorization-mechanism`. `FileAccessTokenResolver.resolve()` builds the lookup path as `new File(folderPath, token)` and immediately opens it, without normalising the path or checking that it remains inside the configured token directory; the JSON read from that file then supplies `scope`, `expireTime` and the authzid used to build the request's `SecurityContext` (impersonation/authentication-decision impact). Other reviewed leads (backup-restore zip-slip, embedded-setup zip-slip, DSML XML parsing, storage backend identifier handling, Docker defaults) are noted as rejected/unconfirmed below. Per the task, the candidate is a lead, not a runtime-confirmed vulnerability."
+}

@@ -1,0 +1,60 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "No direct remote attacker control of the value itself: it is derived from the quiche_send_info.timespec that the native layer fills for an outgoing packet. Reachability depends on the native JNI layer calling this helper (it is not called from any Java code in this snapshot and QuicheSendInfo is absent from the GraalVM jni-config.json, so I could not verify that any live path uses it).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that no Java code calls getAtNanos (only its definition matches a repo-wide search), and that QuicheSendInfo does not appear in codec-native-quic jni-config.json/reflect-config.json, so JNI use is unverified and the method may be dead code. Confirmed TIMESPEC_OFFSETOF_TV_NSEC is declared but used nowhere. Checked that the value is compared/consumed only via the native layer, so I cannot validate runtime behaviour or impact; no test sources are present in the snapshot.",
+      "id": "cand-1",
+      "impact": "Any scheduling/pacing decision that consumes this value (e.g. deciding when a prepared datagram should be handed to the socket) is computed from a wrong absolute time, so packets can be released earlier/later than quiche intended, degrading packet pacing/timer behaviour. I could not demonstrate a concrete remote exploit (no memory-safety consequence, no attacker-controlled data in the computation, and the helper may be dead code in this snapshot), so the security impact is limited/uncertain and is reported as a defect lead rather than a confirmed exploitable vulnerability.",
+      "locations": [
+        {
+          "end_line": 158,
+          "path": "codec-classes-quic/src/main/java/io/netty/incubator/codec/quic/QuicheSendInfo.java",
+          "start_line": 152
+        },
+        {
+          "end_line": 122,
+          "path": "codec-classes-quic/src/main/java/io/netty/incubator/codec/quic/Quiche.java",
+          "start_line": 118
+        }
+      ],
+      "prerequisites": "A send path that asks this helper for the scheduled send time of a quiche_send_info produced by quiche_conn_send; the timespec must have a non-zero tv_nsec (typical) for the value to differ from the intended result.",
+      "root_cause": "QuicheSendInfo.getAtNanos() is documented to return the quiche_send_info.timespec 'in nanos', so it must combine tv_sec (seconds) with tv_nsec (nanoseconds). Both reads use QUICHE_SEND_INFO_OFFSETOF_AT + TIMESPEC_OFFSETOF_TV_SEC: sec = getPrimitiveValue(..., TIMESPEC_OFFSETOF_TV_SEC, SIZEOF_TIME_T) and nsec = getPrimitiveValue(..., TIMESPEC_OFFSETOF_TV_SEC, SIZEOF_LONG). The second read should use TIMESPEC_OFFSETOF_TV_NSEC (which is defined in Quiche.java but is never referenced anywhere in the repository, showing the intended use site was lost/modified). The returned value is therefore SECONDS.toNanos(tv_sec) + tv_sec instead of SECONDS.toNanos(tv_sec) + tv_nsec.",
+      "title": "QuicheSendInfo.getAtNanos reads nsec from tv_sec (wrong struct offset), yielding incorrect send-time-in-nanos",
+      "trace": "getAtNanos(memory) computes sec from offsetof(timespec.tv_sec) with SIZEOF_TIME_T and nsec from the same offsetof(timespec.tv_sec) with SIZEOF_LONG, then returns TimeUnit.SECONDS.toNanos(sec) + nsec. Because the second read cannot observe tv_nsec, the function returns an epoch-nanos value that is wrong by (tv_sec - tv_nsec) nanoseconds (up to roughly the current epoch seconds, i.e. ~1.7e9 ns ≈ 1.7 s on contemporary systems) instead of representing sec*1e9 + nsec. The intended tv_nsec accessor TIMESPEC_OFFSETOF_TV_NSEC is declared in Quiche.java (lines 121-122) and referenced nowhere else, which corroborates that the offset was changed at this call site.",
+      "unverified": "Whether the native JNI layer invokes QuicheSendInfo.getAtNanos at all, and therefore whether the mis-computed value is ever consumed. Also unverified: the exact upstream text at this line (no diff/history tools available) — the conclusion rests on internal inconsistency (javadoc vs. implementation) plus the unused TIMESPEC_OFFSETOF_TV_NSEC constant. No runtime confirmation was performed (static review only).",
+      "weakness_type": "Off-by-field / wrong struct offset when converting a native timespec (CWE-682 incorrect calculation; potential timing/pacing defect)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 143 model-visible files with no exclusions (no binaries over 5 MiB, no sensitive-name/path or symlink filtering). I listed all files and read all 104 Java sources under codec-classes-quic (some fully, some in bounded chunks covering every method discussed), plus .github workflows/scripts, scripts/, docker compose files, POM files and the GraalVM jni-config/reflect-config/resource-config for the native module. Areas reviewed in depth: packet parsing (QuicHeaderParser, QuicCodecDispatcher), token generation/validation (Insecure/No QuicTokenHandler, QuicheQuicServerCodec), connection-id generation/mapping (Hmac, SecureRandom, QuicheQuicCodec, QuicheQuicServerCodec), TLS callbacks and context/engine/session handling (BoringSSL* callbacks, QuicheQuicSslContext/Engine, QuicClientSessionCache, session-ticket keys), stream/datagram/data send-receive and native memory marshalling (QuicheQuicChannel, QuicheQuicStreamChannel, QuicheRecvInfo, QuicheSendInfo, SockaddrIn), statistics/path-event accessors, and both codec/SSL builders. The native C/Rust JNI and quiche/BoringSSL sources, all test sources and the example package are not present in the snapshot, so any conclusion depending on native call sites or tests is necessarily limited.",
+  "limitations": [
+    "No diff/history/upstream-comparison tooling was available (and web access is prohibited), so deviations from upstream could only be inferred from internal inconsistency; the candidate's status as an injected/real defect is a lead, not confirmed.",
+    "The JNI/native layer (netty_quiche.c, netty_boringssl.c, quiche, BoringSSL) and all tests are outside the snapshot; JNI callback signatures and call sites had to be inferred from jni-config.json and Java-side code.",
+    "I could not verify whether QuicheSendInfo.getAtNanos is ever invoked (no Java callers; QuicheSendInfo absent from the GraalVM JNI/reflection configs), so reachability and practical impact of the selected candidate remain unverified.",
+    "No code was executed, no tests were run, and no reproduction was attempted; all claims are static source-level observations.",
+    "Several lower-impact or unreachable-looking defects (NoQuicTokenHandler default, recvDatagram fall-through, writeWithoutCheckChannelState missing return, QuicTransportError.valueOf mapping, QuicHeaderParser unguarded length reads) were noted but not selected because their security impact or reachability could not be substantiated from the available sources."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "QuicServerCodecBuilder.build() falls back to NoQuicTokenHandler.INSTANCE when no token handler is configured, i.e. QUIC server address validation/Retry is disabled by default (QuicServerCodecBuilder.java lines 44, 204-207; NoQuicTokenHandler.java doc itself warns it 'weaken[s] the security during connection establishment').",
+      "reason": "Live and security-relevant (spoofed-source amplification if it is a deviation), but I have no source-internal proof that this default is wrong; the tokenHandler() javadoc explicitly documents null as 'no tokens', which is consistent with this being the intended default. Without upstream history this cannot be distinguished from intentional design, so it stays an unconfirmed lead rather than the top candidate."
+    },
+    {
+      "lead": "QuicheQuicChannel.recvDatagram() releases datagramBuffer and then falls through to allocHandle.lastBytesRead/incMessagesRead/writerIndex/fireChannelRead on the released buffer when quiche_conn_dgram_recv returns a negative non-DONE value (lines 1881-1899) — a use-after-release bug if that error can occur (missing 'continue').",
+      "reason": "The failing branch looks unreachable in practice: the preceding quiche_conn_dgram_recv_front_len() result is used to size the buffer exactly, so BUFFER_TOO_SHORT should not occur, and an empty queue is handled as QUICHE_ERR_DONE; no attacker-controlled way to reach a negative non-DONE return was identified from the available (Java-only) sources, so impact could not be established."
+    },
+    {
+      "lead": "QuicheQuicStreamChannel.QuicStreamChannelUnsafe.writeWithoutCheckChannelState() fails the promise but does not return after filterMsg() throws UnsupportedOperationException (lines 791-797), so execution continues into write0() with the already-released/unsupported msg (ClassCastException / double handling).",
+      "reason": "Only reachable when the application writes an unsupported message type (local API misuse, not remote input); no attacker-controlled path and no confidentiality/integrity impact identified."
+    },
+    {
+      "lead": "QuicTransportError.valueOf(long) subtracts 0x0100 for any value > 17 (lines 202-211), which maps wire code 0x0100 to NO_ERROR instead of CRYPTO_ERROR and mislabels other crypto-error codes; Quiche's static initializer feeds it 0x0100 (Quiche.java lines 869-872).",
+      "reason": "Clearly suspicious arithmetic, but the only in-repo use is for error labelling of TLS/CRYPTO failures; impact is cosmetic/diagnostic and no security consequence (auth bypass, memory safety, DoS) could be derived, so it was not selected."
+    },
+    {
+      "lead": "QuicHeaderParser.parse() reads dcid/scid length bytes without a preceding checkReadable(), so truncated long-header packets can raise IndexOutOfBoundsException instead of a QuicException (lines 129-139); similarly the Initial-token varint is cast to int (line 161), with the cast value validated by checkReadable and effectively caught by slice().",
+      "reason": "Uncaught runtime exceptions here are caught and debug-logged by QuicheQuicCodec.handleQuicPacket, and no memory-safety or state corruption follows, so this is a robustness issue rather than an evidenced vulnerability."
+    }
+  ],
+  "summary": "Reviewed the 143-file snapshot (netty-incubator-codec-quic 0.0.71.Final-SNAPSHOT). I read all Java sources in codec-classes-quic, the GitHub workflow/scripts, POMs and native-image configs; the JNI/C/Rust sources are not part of the snapshot. Network parsing (QuicHeaderParser), token handling (InsecureQuicTokenHandler/NoQuicTokenHandler), connection-id mapping/dispatch (QuicheQuicCodec, QuicheQuicServerCodec, QuicCodecDispatcher, Hmac), TLS callback paths (certificate/key/verify/session-ticket/SNI), SSL context/engine, stream/datagram send-recv paths and builders were traced. One clear, internally-evidenced defect stood out: QuicheSendInfo.getAtNanos reads the nanoseconds component from the tv_sec offset, contradicting its own javadoc and leaving the purpose-built TIMESPEC_OFFSETOF_TV_NSEC constant completely unused anywhere in the repository. I could not confirm a more severe, attacker-facing flaw, so this is submitted as the single strongest candidate (a lead, not a confirmed vulnerability)."
+}

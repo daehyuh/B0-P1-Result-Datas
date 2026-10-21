@@ -1,0 +1,55 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `resource` argument of the `libraryResource('...')` step is fully controlled by whoever writes the Pipeline (Jenkinsfile), including a sandboxed/untrusted Pipeline running in any job that has loaded at least one shared library. No configuration or admin rights are needed to choose the string.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether any other layer validates the resource name: ResourceStep (no validation), LibraryAdder.findResources (no validation), and no check in LibraryAdder.retrieve/ResourceStep descriptors; no `RequirePOST`/name validation exists on this path. Verified the plugin explicitly performs an equivalent `..` check for `libraryPath` (SCMSourceRetriever PROHIBITED_DOUBLE_DOT), which would be redundant if FilePath canonicalized `..` — evidence that traversal via `..` is effective. Also considered that an attacker needs at least one loaded library (LibrariesAction) for findResources to look at any file, but any library load satisfies this. Jenkins core FilePath source is outside this snapshot, so the exact resolution of `..` could not be confirmed here; if core normalized paths, this finding would not hold. `libraryResource` help text implies resources only, no documented restriction preventing traversal.",
+      "id": "case-045-1",
+      "impact": "Arbitrary file disclosure on the Jenkins controller to a low-privileged Pipeline author. Reading `$JENKINS_HOME/credentials.xml` plus `secrets/master.key`/`secrets/hudson.util.Secret` lets the attacker decrypt stored credentials offline; job config.xml files reveal SCM endpoints/credential IDs, and other controller files may expose further secrets or enable follow-on attacks (e.g., master key material). This breaks the sandbox/credential trust boundary of shared libraries.",
+      "locations": [
+        {
+          "end_line": 266,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/libs/LibraryAdder.java",
+          "start_line": 239
+        },
+        {
+          "end_line": 102,
+          "path": "src/main/java/org/jenkinsci/plugins/workflow/libs/ResourceStep.java",
+          "start_line": 86
+        }
+      ],
+      "prerequisites": "1) Attacker can cause a Pipeline to run whose build has a LibrariesAction, i.e., at least one shared library is loaded (the library itself need not contain a `resources/` directory, since the traversal target is evaluated directly). 2) `libraryResource` is callable from that Pipeline (it is a normal CPS step, usable in sandboxed scripts). 3) The targeted file must exist and be readable by the Jenkins controller process. 4) Jenkins core's FilePath must resolve literal `..` segments rather than canonicalizing them away (not verifiable in this snapshot; see counterevidence/uncertainty).",
+      "root_cause": "The `libraryResource` step passes the user-supplied `resource` string straight into `LibraryAdder.findResources`, which builds the read path by string concatenation: `libs.child(library.name + \"/resources/\" + name)` (LibraryAdder.java:248). There is no normalization, no rejection of `..` or absolute/`/`-prefixed segments, and no check that the resolved path stays under the library `resources/` directory before calling `f.exists()` and `readResource(f, encoding)` (LibraryAdder.java:249-250, 258-266). ResourceStep.Execution.run likewise forwards `step.resource` unchanged (ResourceStep.java:93-94). Because `..` segments are resolved by the underlying (remote) filesystem when the FilePath is read, enough `../` segments escape the build directory and read any file the Jenkins process can read.",
+      "title": "Path traversal in libraryResource lets Pipeline authors read arbitrary controller files",
+      "trace": "ResourceStep.Execution.run (ResourceStep.java:92-94) -> LibraryAdder.findResources(execution, name=user string, encoding) -> run.getAction(LibrariesAction.class) provides loaded library names -> FilePath f = new FilePath(run.getRootDir()).child(\"libs\").child(library.name + \"/resources/\" + name) (LibraryAdder.java:246-248) -> f.exists() (249) -> readResource(f, encoding) -> file.read() + IOUtils.toString / Base64 (258-265) -> contents returned to the Pipeline script (ResourceStep.java:97-101). Example shape (not a weaponized payload): the build root is $JENKINS_HOME/jobs/<job>/builds/<n>, so a resource value containing repeated parent-directory segments can climb to $JENKINS_HOME and read files such as config.xml, credentials.xml, secrets/hudson.util.Secret, or other jobs' config.xml. The same `..` semantics are explicitly guarded against elsewhere in this same plugin for `libraryPath` (SCMSourceRetriever.java:95, 203-205, 246-248), supporting that FilePath does not neutralize `..`.",
+      "unverified": "Not runtime-confirmed. Jenkins-core `hudson.FilePath` (dependency jar, not in snapshot) was not inspected, so whether `child(\"../..\")` + `read()` resolves upward rather than being normalized was not verified in code; the argument rests on the plugin's own defensive `..` pattern and standard FilePath semantics. Also unverified: whether `libraryResource` requires any script approval in a sandboxed Pipeline in the deployment being assessed.",
+      "weakness_type": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') (arbitrary file read via unsanitized resource name)"
+    }
+  ],
+  "coverage_summary": "All 54 readable repository files were enumerated (get_source_scope: 54 source-root files, 0 excluded, no symlinks/binaries). Every main-source Java file was read in full or in the relevant ranges, including LibraryStep, LibraryAdder (all 342 lines), SCMSourceRetriever, SCMRetriever, LibraryConfiguration, LibraryCachingConfiguration, LibraryCachingCleanup, ResourceStep, ClasspathAdder, LibraryDecorator, GlobalLibraries, FolderLibraries, LibraryResolver, LibraryRetriever(+Descriptor), LibraryRecord, LibrariesAction, Library, GrapeHack, GroovyShellDecoratorImpl, WorkflowLibRepository(+Listener/Ssh), UserDefinedGlobalVariable(+List/RepoListener); all resource bundles/help/config.properties and pom.xml/CHANGELOG were inspected for corroborating context. No test sources exist in this snapshot, which limits behavioral confirmation. Binary-like files were skipped by policy and none were needed.",
+  "limitations": [
+    "Jenkins core (hudson.FilePath, IOUtils usage, Stapler routing) is a compiled dependency not present in the snapshot; the decisive `..` resolution behavior of FilePath and the exact HTTP method/CSRF exposure of form-validation endpoints could not be read in source here.",
+    "No tests are included in the assigned snapshot, and no code, build, or scanner was executed, so all behavior statements are static-analysis inferences, not runtime confirmations.",
+    "Line ranges cited for ResourceStep/LibraryAdder cover the vulnerable path but were not validated against a compiled/runtime invocation order in deployed Jenkins.",
+    "Only one candidate is allowed; other leads (doClearCache CSRF/path traversal, cache version/name traversal) are noted as rejected/unconfirmed and were not fully traced to an end-to-end exploit."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "LibraryCachingConfiguration.DescriptorImpl.doClearCache accepts an unvalidated `name` used as a FilePath under the global library cache directory and calls deleteRecursive(); it also lacks @RequirePOST (CSRF), so an attacker-supplied name with `..` could delete arbitrary directories on the controller and a malicious page could trigger deletion by a logged-in admin.",
+      "reason": "Requires Jenkins.ADMINISTER (LibraryCachingConfiguration.java:71) or an admin being CSRF-tricked, so the attacker's privilege/participation requirements are much higher than the libraryResource issue; impact is destructive rather than secret disclosure. Kept as an unconfirmed secondary lead: it is a real missing-hardening point (no POST requirement, no name/path validation) but weaker overall and it shares the same FilePath `..` uncertainty."
+    },
+    {
+      "lead": "Library cache path construction in LibraryAdder.retrieve composes `global-libraries-cache/<name>/<version>` (LibraryAdder.java:156-161) from a script-overridable version (LibraryConfiguration.defaultedVersion allows override by default) and a name that is only trimmed (LibraryConfiguration.doCheckName: \"Currently no character restrictions\"), enabling cache directory writes/deletes outside the cache root.",
+      "reason": "Rejected as the top finding: exploitation needs an admin to enable the optional library-caching feature on a loadable library and (for SCMSourceRetriever) a version value that the SCM can fetch, or a legacy SCMRetriever that ignores the version; the write is also filtered to selected groovy/resource globs. It is a plausible follow-on path-traversal lead but requires more assumptions and is not as directly evidenced as the libraryResource read path."
+    },
+    {
+      "lead": "Inline `library(identifier: ..., retriever: ...)` in a Pipeline lets the script choose the library name/version used for `libs/<name>` and cache directories, bypassing configured names.",
+      "reason": "Rejected: constructing an inline retriever from a sandboxed script normally requires script approval/disallowed constructor calls, and trusted scripts already have effective code execution, so the added privilege gain is unclear from this source alone."
+    },
+    {
+      "lead": "Historical SECURITY-1422-era sandbox-bypass surface in LibraryStep.LoadedClasses (class loader/code-source checks).",
+      "reason": "Rejected: the snapshot already contains the hardening (defining-loader equality and canonicalized `srcUrl` prefix checks at LibraryStep.java:280-300); no concrete bypass was found in the remaining code."
+    }
+  ],
+  "summary": "Reviewed the workflow-cps-global-lib snapshot (54 files, plugin version 2.19+/2.20-era: Jenkins 2.304 baseline, BOM 876.vc43b4c6423b6, library-caching feature present). The strongest source-evidenced issue is an unvalidated path traversal in the `libraryResource` step: attacker-controlled pipeline input is concatenated into a FilePath under the build's `libs/<library>/resources/` directory and read verbatim, allowing a low-privileged user who can run a Pipeline (with any shared library loaded) to read arbitrary files readable by the Jenkins controller process. Alternate state-changing/CSRF and caching-path leads are weaker or require admin participation and are listed as rejected/unconfirmed leads. No code was executed; the key residual uncertainty is the Jenkins-core FilePath behavior for `..` segments (core is not part of this snapshot), though this plugin's own explicit `..` check for `libraryPath` corroborates that `..` is not neutralized by FilePath. This candidate is a lead, not a runtime-confirmed vulnerability."
+}

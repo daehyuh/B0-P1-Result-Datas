@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the content of the project file/stream handed to MPXJ by the consuming application (the library's documented purpose is reading untrusted schedule files). ZIP entry names and entry data are entirely attacker-controlled; Java's ZipInputStream preserves names such as ../ or ../../target/file. The only format requirement is that the stream be at least BUFFER_SIZE (512) bytes and begin with the 2-byte fingerprint 'PK'.",
+      "confidence": "high",
+      "counterevidence_checked": "Searched for path-containment or sanitization logic (getCanonicalPath, normalize, startsWith, literal '../'): none in the extraction path; FileHelper offers only createTempDir/mkdirsQuietly/deleteQuietly, no validation. Confirmed the ZIP branch is the generic universal-reader branch ordered after fixed-magic checks but keyed only on the unique 2-byte 'PK' prefix; no entropy/length restriction beyond BUFFER_SIZE. Confirmed the temp-dir cleanup cannot delete escaped files. Java's File(parent, child) neutralizes absolute child paths but not '..' traversal. No SecurityManager or permission checks in the library. Note: full data-flow/control-flow was not computed by the index and no code was executed.",
+      "id": "zip-slip-inputstreamhelper",
+      "impact": "Arbitrary file creation/overwrite with attacker-controlled content at attacker-influenced paths writable by the MPXJ process (limited by OS permissions and by traversal reachable from the temp dir). This can corrupt or plant configuration/script/startup files, enabling further compromise or code execution in common server-side import/convert deployments, or at minimum data corruption/denial of service. Not runtime-confirmed.",
+      "locations": [
+        {
+          "end_line": 148,
+          "path": "src/main/java/net/sf/mpxj/common/InputStreamHelper.java",
+          "start_line": 115
+        },
+        {
+          "end_line": 107,
+          "path": "src/main/java/net/sf/mpxj/common/InputStreamHelper.java",
+          "start_line": 82
+        },
+        {
+          "end_line": 241,
+          "path": "src/main/java/net/sf/mpxj/reader/UniversalProjectReader.java",
+          "start_line": 238
+        },
+        {
+          "end_line": 517,
+          "path": "src/main/java/net/sf/mpxj/reader/UniversalProjectReader.java",
+          "start_line": 503
+        },
+        {
+          "end_line": 877,
+          "path": "src/main/java/net/sf/mpxj/reader/UniversalProjectReader.java",
+          "start_line": 873
+        },
+        {
+          "end_line": 114,
+          "path": "src/main/java/net/sf/mpxj/common/FileHelper.java",
+          "start_line": 108
+        }
+      ],
+      "prerequisites": "A caller invokes UniversalProjectReader.read/readAll (InputStream, File or filename), directly or via InputStreamHelper.writeZipStreamToTempDir, on attacker-supplied data; the MPXJ/JVM process has write permission on a path reachable via '..' from the temp directory it creates (e.g. files/directories owned by the service account, startup/autostart or deployment locations).",
+      "root_cause": "InputStreamHelper.processZipStream() builds the output path as `new File(dir, entry.getName())` and writes entry bytes via `new FileOutputStream(file)` without canonicalizing the resolved path or verifying it is contained in `dir`. `dir` comes from FileHelper.createTempDir() (java.io.tmpdir). ZIP entry names are fully attacker-controlled and java.util.zip.ZipInputStream does not strip or reject `..` components, so `../` sequences escape the temp directory. The caller (UniversalProjectReader.handleZipFile, lines 503-517) only deletes the temp directory afterwards, so files written outside it persist.",
+      "title": "Zip Slip: unvalidated ZIP entry names allow arbitrary file write outside the extraction temp directory",
+      "trace": "UniversalProjectReader.readInternal(InputStream) (line 147) -> matchesFingerprint(buffer, ZIP_FINGERPRINT) 'PK' (lines 238-241) -> handleZipFile(stream) (line 503) -> InputStreamHelper.writeZipStreamToTempDir(stream) (line 82; line 509) -> processZipStream(dir, inputStream) (line 115) -> `File file = new File(dir, entry.getName())` (line 126) -> parent.mkdirsQuietly (lines 133-137) -> `new FileOutputStream(file)` writes attacker bytes (lines 139-146). No canonical-path/startsWith/normalize check exists on this path. Files written via '..' are outside `dir` and survive the finally { FileHelper.deleteQuietly(dir); } in handleZipFile (line 515).",
+      "unverified": "The vulnerability was verified statically only; no crafted ZIP or runtime execution was performed. Actual write locations and severity depend on the embedding application, JVM user privileges and filesystem layout (java.io.tmpdir location, permissions), which I could not observe. I also could not confirm whether downstream deployments reject such archives before reaching MPXJ.",
+      "weakness_type": "CWE-22 Path Traversal (Zip Slip / arbitrary file write)"
+    }
+  ],
+  "coverage_summary": "Reviewed all 2189 visible files at navigation level (856 Java files, 49.9 MB; relation index reports complete coverage, 0 omitted/unparsed files, 26,615 symbols, 46,046 edges). Deep source review covered InputStreamHelper, FileHelper, UniversalProjectReader, MerlinReader, UnmarshalHelper, the JAXB-based readers' unmarshal call sites, P3PRXFileReader/SureTrakSTXFileReader, and searches for XML parsers, zip handling, file-write sinks, path normalization, SQL construction, and deserialization/exec sinks across src/main/java. docs/apidocs and Ruby binding docs were only sampled; the snapshot contains no test sources, so no test-based corroboration was possible.",
+  "limitations": [
+    "Static review only: no code, build, tests, or exploit payloads were executed; no runtime reachability or exploitability was confirmed.",
+    "The relation index provides syntactic navigation only (calls/containment by name, type, arity); it implements no control-flow or data-flow analysis, and 17,359 call sites are unresolved, so cross-file semantic resolution and indirect/dynamic call paths are incomplete.",
+    "Severity of the selected Zip Slip candidate depends on the embedding application, the JVM user's filesystem permissions and the temp-directory location, none of which are observable from the snapshot.",
+    "The MerlinReader XXE lead was assessed against standard JDK DocumentBuilderFactory defaults but not verified in a specific JDK runtime/configuration.",
+    "Only Java sources were reviewed in depth; documentation, the Ruby wrapper, and generated sources were not exhaustively inspected."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "MerlinReader XXE: m_documentBuilder = DocumentBuilderFactory.newInstance().newDocumentBuilder() (src/main/java/net/sf/mpxj/merlin/MerlinReader.java line 130) parses XML read from the attacker-controlled SQLite column ZTIMEINTERVALS (lines 247/289, getNodeList line 616-619) with no disallow-doctype-decl / external-entity / external-DTD restrictions; all JAXB readers instead use the hardened UnmarshalHelper.createXmlReader() (disallow-doctype-decl), making MerlinReader an outlier. Plausible CWE-611 (SSRF via external DTD, DoS, possible file disclosure through date-parse error messages). Not selected as the single candidate because the file-write primitive has a more direct and unconditional impact; the file-disclosure channel here is indirect.",
+      "reason": "Real, source-verified hardening gap, but deprioritized under the one-candidate cap in favor of the direct arbitrary-file-write primitive; its concrete impact is more environment-dependent (parser/JDK defaults and whether exception messages are surfaced)."
+    },
+    {
+      "lead": "Path traversal in P3PRXFileReader.extractFile (src/main/java/net/sf/mpxj/primavera/p3/P3PRXFileReader.java lines 103-129, `new File(dir, fileNameValue)` -> FileOutputStream) and SureTrakSTXFileReader.extractFile (src/main/java/net/sf/mpxj/primavera/suretrak/SureTrakSTXFileReader.java lines 90-116) using file names read from the untrusted stream.",
+      "reason": "Same weakness family (CWE-22 via archive-internal names) and I intentionally did not split it into additional candidates; reachable from UniversalProjectReader only through narrower self-extracting PRX/STX fingerprints (handleDosExeFile), so it is a weaker precondition than the generic 'PK' ZIP branch."
+    },
+    {
+      "lead": "SQL injection in database readers (Asta/MPD/Merlin/Primavera).",
+      "reason": "Checked MerlinReader.getRows and neighboring readers: queries are fixed strings using PreparedStatement with bound parameters; no attacker-controlled SQL construction was found in the areas inspected."
+    },
+    {
+      "lead": "Java deserialization / command execution sinks.",
+      "reason": "Searched for ObjectInputStream, Runtime.getRuntime, XMLInputFactory: no occurrences in the Java sources."
+    }
+  ],
+  "summary": "MPXJ 8.3.4/8.3.5-SNAPSHOT (Java project-file parsing library, 2189 files, 856 Java). The strongest source-evidenced issue is a Zip Slip / CWE-22 arbitrary-file-write in the ZIP expansion path used by the library's universal reader: any attacker-supplied file/stream beginning with \"PK\" (>=512 bytes) is extracted with zip entry names used unvalidated as filesystem paths, so \"../../...\" entries are written outside the intended temp directory with attacker-controlled content. I also verified a raw DocumentBuilderFactory in MerlinReader (no DOCTYPE/external-entity hardening) and analogous traversal sinks in the P3 PRX and SureTrak STX readers; both are real but were not selected under the one-candidate cap. All observations are static; nothing was executed, and no exploit payloads are included."
+}

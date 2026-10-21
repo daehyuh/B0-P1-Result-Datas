@@ -1,0 +1,110 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated remote client that can open a TCP connection to an AMQP 0-8/0-9/0-9-1 or 0-10 port fully controls the bytes of the connection-start-ok / connection-secure-ok method frames, including the 32-bit length prefix of the 'response' longstr/vbin32 field (and other length-prefixed fields). No credentials or prior protocol state beyond the standard protocol header are required.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the existing frame-size guards: AMQDecoder.decodable() rejects frames whose total body exceeds the negotiated max frame size, and 0-10 ServerInputHandler rejects oversized frames - however both bound only the enclosing frame, while the vulnerable allocations are driven by inner length fields, so they do not mitigate this path. Checked the newer AMQP 1.0 codec (StringTypeConstructor/BinaryTypeConstructor/MapConstructor/ListConstructor) which does call in.hasRemaining(size) before allocating for string/binary values, i.e. the missing validation is specific to the 0-8/0-10 deserializers rather than a global convention. Verified length values above 2^31-1 become negative when cast and throw NegativeArraySizeException (connection-scoped error) rather than allocating, so only lengths <= 0x7FFFFFFF are practically exploitable. Verified the calls are genuinely reachable pre-authentication from client-sent handshake frames. Could not run the broker or an exploit, so actual OOM vs. caught-error behaviour is not runtime-confirmed.",
+      "id": "amqp-0-8-0-10-length-field-unbounded-allocation",
+      "impact": "Remote unauthenticated denial of service: the broker can be driven into excessive heap allocation / OutOfMemoryError with very small requests; if the JVM survives individual OOMs, repeated/parallel requests cause GC thrashing, loss of service, or process instability that affects all vhosts/connections. No confidentiality or integrity impact identified for this issue.",
+      "locations": [
+        {
+          "end_line": 330,
+          "path": "broker-core/src/main/java/org/apache/qpid/server/protocol/v0_8/EncodingUtils.java",
+          "start_line": 316
+        },
+        {
+          "end_line": 244,
+          "path": "broker-core/src/main/java/org/apache/qpid/server/protocol/v0_8/EncodingUtils.java",
+          "start_line": 230
+        },
+        {
+          "end_line": 270,
+          "path": "broker-core/src/main/java/org/apache/qpid/server/protocol/v0_8/EncodingUtils.java",
+          "start_line": 256
+        },
+        {
+          "end_line": 70,
+          "path": "broker-plugins/amqp-0-10-protocol/src/main/java/org/apache/qpid/server/protocol/v0_10/transport/AbstractDecoder.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 177,
+          "path": "broker-plugins/amqp-0-10-protocol/src/main/java/org/apache/qpid/server/protocol/v0_10/transport/AbstractDecoder.java",
+          "start_line": 170
+        },
+        {
+          "end_line": 384,
+          "path": "broker-plugins/amqp-0-10-protocol/src/main/java/org/apache/qpid/server/protocol/v0_10/transport/AbstractDecoder.java",
+          "start_line": 378
+        },
+        {
+          "end_line": 152,
+          "path": "broker-plugins/amqp-0-8-protocol/src/main/java/org/apache/qpid/server/protocol/v0_8/transport/ConnectionStartOkBody.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 104,
+          "path": "broker-plugins/amqp-0-8-protocol/src/main/java/org/apache/qpid/server/protocol/v0_8/transport/ConnectionSecureOkBody.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 251,
+          "path": "broker-plugins/amqp-0-10-protocol/src/main/java/org/apache/qpid/server/protocol/v0_10/transport/ConnectionStartOk.java",
+          "start_line": 246
+        },
+        {
+          "end_line": 141,
+          "path": "broker-plugins/amqp-0-10-protocol/src/main/java/org/apache/qpid/server/protocol/v0_10/transport/ConnectionSecureOk.java",
+          "start_line": 136
+        }
+      ],
+      "prerequisites": "Network reachability to a broker port speaking AMQP 0-8/0-9/0-9-1 or 0-10 (no authentication needed; the affected methods are part of the pre-auth handshake). Attacker supplies a small frame whose embedded length is close to Integer.MAX_VALUE. Impact severity scales with the broker JVM heap and how connection-scoped OutOfMemoryError is handled; repeated connections can multiply memory pressure.",
+      "root_cause": "The 0-8-family and 0-10 deserializers trust 32-bit wire length fields when sizing Java arrays. EncodingUtils.readBytes() reads an unsigned 32-bit length and immediately executes new byte[(int)length] before any check that the remaining buffer contains that many bytes (same pattern in readLongString/readLongstr). The 0-10 AbstractDecoder does the same in get(int) and readVbin32(). The subsequent buffer.get(...) can only fail after the oversized allocation has already been attempted. Values > Integer.MAX_VALUE wrap negative and merely raise NegativeArraySizeException, but every value <= 0x7FFFFFFF produces a real allocation attempt of up to ~2 GiB from a frame that itself is capped at a few hundred/thousand bytes.",
+      "title": "Unauthenticated AMQP 0-8/0-9/0-9-1 and 0-10 length fields drive unbounded heap allocation (DoS)",
+      "trace": "Socket bytes -> AMQPConnection_0_8Impl/ProtocolEngine -> AMQDecoder.decodable() (broker-plugins/amqp-0-8-protocol/.../AMQDecoder.java lines 143-167) validates only total frame body size against the negotiated max frame; processFrame -> ConnectionStartOkBody.process (line 140-143) -> EncodingUtils.readBytes() reads getUnsignedInt() length and performs new byte[(int)length] at line 325 before buffer.get() at line 326 can detect the shortfall. 0-10 path: ServerInputHandler validates only the 16-bit frame size (lines 114-131); ConnectionStartOk.decode() calls dec.readVbin32() (line 250) -> AbstractDecoder.readVbin32() (lines 170-177) -> new byte[(int)readUint32()] with no remaining-bytes check; same for ConnectionSecureOk (line 140) and AbstractDecoder.get/readBytes(Type).",
+      "unverified": "Not runtime-verified (no code execution permitted). Whether a single oversized request reliably terminates the broker depends on JVM heap size and connection-level Error handling; I could not confirm which errors are caught where. I also could not confirm against upstream history whether this is the exact defect targeted by any specific CVE; it is reported because the source evidence (attacker-controlled length, missing validation, pre-auth reachability, unbounded allocation) is direct.",
+      "weakness_type": "CWE-789 Memory Allocation with Excessive Size Value (unbounded allocation leading to denial of service; CWE-770)"
+    }
+  ],
+  "coverage_summary": "Scope: all 2,493 model-visible files of the Apache Qpid Broker-J snapshot (parent pom 8.0.0-SNAPSHOT, model version 7.1); no files were excluded by the scope filters and no unit-test sources are present in the snapshot (the harness exposes none, so verification-by-test was impossible). I inspected the build/POM files and module layout, then focused on: AMQP protocol engines (amqp-0-8, amqp-0-10, amqp-1-0 codecs/framing/message conversion), the HTTP/AMQP management plugins (filters, servlets, controllers, query language, file/logging servlets), the access-control plugin (rule parsing, predicate matching, legacy adapter, caching), authentication providers and SASL negotiators (plain, CRAM-MD5, SCRAM, EXTERNAL, ANONYMOUS, OAuth2), TLS/trust-store/key-store handling, the configuration model (secure attributes, extractConfig, authorization on set/update), the JDBC/BDB/Derby stores (SQL construction, table prefixes), logging/logback file serving, websocket transport, and utility classes (FileHelper, Strings, CommandLineParser, AES encrypter, StringUtil). Coverage was sampling-based, not exhaustive line-by-line.",
+  "limitations": [
+    "No git history, upstream diff, patch, CVE/CWE label, or precomputed source-relation index was available, so I could not mechanically confirm which lines differ from upstream; the finding is based on direct reading of the snapshot.",
+    "No code was executed and no broker was run; exploitability (actual OutOfMemoryError vs. caught Error, heap thresholds, connection-level handling) is reasoned from source only.",
+    "The snapshot contains no test classes and no release notes, so intent/counter-tests could not be consulted; the 2,493-file tree was reviewed by targeted searches and reading rather than full manual coverage, so additional issues may exist in unread files (especially the large AMQP 0-8 AMQChannel/AMQPConnection implementations, the AMQP 1.0 session/link state machines, and the JS management console)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AMQP 1.0 ListConstructor/MapConstructor/ArrayTypeConstructor allocate ArrayList/LinkedHashMap sized by wire-declared element counts (broker-plugins/amqp-1-0-protocol/.../codec/ListConstructor.java 74-88, MapConstructor.java 85-141, ArrayTypeConstructor.java 34-79).",
+      "reason": "Also an unbounded-allocation DoS pattern, but the code already performs byte-size pre-checks (remaining < size) and the same construct was not validated as the root of a specific security fix; kept as an unconfirmed secondary lead rather than a second candidate (same general weakness class, one root cause per submission)."
+    },
+    {
+      "lead": "Management HTTP console has no CSRF token and no Origin/Referer or SameSite controls anywhere in the repository (searches for csrf/sameOrigin/Referer/X-Frame-Options/SameSite return nothing); login flows do not rotate the session id (no changeSessionId in the codebase).",
+      "reason": "Real hardening gaps that could support CSRF/session-fixation abuse, but they are absences rather than traceable code defects and no source-level attacker-controlled sink could be demonstrated; rejected as insufficient evidence for a single strong candidate."
+    },
+    {
+      "lead": "AuthenticationCheckFilter builds a newPrincipals set that removes ManagementConnectionPrincipal but then passes the original 'principals' set to the new Subject (broker-plugins/management-http/.../filter/AuthenticationCheckFilter.java 104-120).",
+      "reason": "Looks like dead-store/sloppy code, but ManagementConnectionPrincipal is only used for log message formatting, so no authorization or data-exposure impact could be shown."
+    },
+    {
+      "lead": "PluginClassProviderAction performs Class.forName(\"org.apache.qpid.server.plugin.\" + user-supplied name) from a management request (management-http/.../PluginClassProviderAction.java 40-57).",
+      "reason": "Prefix is fixed, only Pluggable service lookups follow, and the endpoint is behind management authentication/ACL; no privilege escalation or code-execution primitive demonstrated."
+    },
+    {
+      "lead": "InternalMessage / InternalMessageMetaDataType use ObjectInputStream.readObject on stored message metadata/body (broker-core/.../message/internal/InternalMessage.java 63-92; InternalMessageMetaDataType.java 45-63).",
+      "reason": "Deserialization surface is real, but the bytes originate from the broker's own message store written by broker serializers, not from an unauthenticated remote peer; no attacker-controlled store-write path was identified."
+    },
+    {
+      "lead": "StringUtil.randomAlphaNumericString uses java.util.Random for the generated management-mode password (broker-core/.../util/StringUtil.java 36-61 used by broker/.../Main.java 282-288).",
+      "reason": "Weak RNG for a credential is a genuine hygiene issue, but the attacker cannot observe outputs to recover the seed and the password is only used locally in management mode; too weak to stand as the single candidate."
+    },
+    {
+      "lead": "SiteSpecificTrustStoreImpl downloads and trusts a certificate on first use with an AlwaysTrustManager (broker-core/.../security/SiteSpecificTrustStoreImpl.java 240-281, 339-359).",
+      "reason": "Trust-on-first-use/MITM risk exists, but the site URL is broker-configuration supplied and no unauthenticated attacker-controlled input reaches it."
+    },
+    {
+      "lead": "AESKeyFileEncrypter.decrypt builds an IvParameterSpec from a Base64 value without checking the decoded length is >= 16 (broker-core/.../security/encryption/AESKeyFileEncrypter.java 86-110).",
+      "reason": "Malformed configured secrets cause an IllegalArgumentException only; input is configuration/store controlled, not remote attacker controlled."
+    }
+  ],
+  "summary": "Reviewed the assigned Apache Qpid Broker-J (8.0.0-SNAPSHOT, model version 7.1, 2,493 model-visible files; no unit-test sources present). I traced attacker-controlled AMQP wire data through the 0-8/0-9/0-9-1 and 0-10 protocol stacks into the byte-buffer deserializers. The strongest source-evidenced issue is a pre-authentication memory-exhaustion (allocator-overrun style) flaw: length-prefixed fields inside method frames are converted into Java array allocations of the attacker-declared 32-bit size without ever being validated against the number of bytes actually received. The frame-level max-size checks only bound the total frame body, not these embedded lengths, so a tiny, well-formed frame can request a multi-hundred-megabyte/gigabyte allocation before the subsequent read fails. This affects unauthenticated handshake methods (connection.start-ok / connection.secure-ok) in both the 0-8 family and 0-10 engines. I found no clear injected backdoor/credential/auth-bypass code; several other leads were examined and rejected (listed below)."
+}

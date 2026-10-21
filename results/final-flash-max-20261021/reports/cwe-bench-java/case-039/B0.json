@@ -1,0 +1,121 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated low-privilege user controls the resource API parameters `currentDir`, `name`, `fileName`/`fileSuffix` and the uploaded/online file content. These values are stored as the resource `alias` and `full_name` (ResourcesServiceImpl lines 126, 189/197, 892/901) and are reused verbatim for later path construction. No project-level or admin role is needed to create/upload a resource; the download endpoint (ResourcesController lines 446-460) additionally performs no ownership check on the resource (service method takes no loginUser and never calls hasPerm), so the write happens when the attacker downloads their own resource.",
+      "confidence": "medium",
+      "counterevidence_checked": "All resource endpoints sit behind LoginHandlerInterceptor, so authentication is required (AppConfiguration 103-108); checkResourceUploadStartupState blocks resource operations when resource.storage.type=NONE (ResourcesServiceImpl 924-934, common.properties line 22); online-create requires a suffix from resource.view.suffixs and multipart create requires the uploaded filename suffix to equal the name suffix (ResourcesServiceImpl 562-564, 880-890), which constrains but does not prevent dangerous names/extensions; HadoopUtils strips only a leading '/' and does not normalize '..'; downloadResource has no suffix restriction; copyHdfsToLocal deletes and overwrites an existing destination (HadoopUtils 328-336). The local java.io.File / FileOutputStream path resolution deterministically resolves '..'; HDFS/S3 normalization of '..' in the upload path is the main behavioral uncertainty, and the attacker's own resource guarantees the HDFS source exists for the download.",
+      "id": "DS-RESOURCE-PATH-TRAVERSAL",
+      "impact": "Arbitrary file write with attacker-controlled content on the API server and on worker hosts (subject only to the owning OS user's write permissions and, for online-create, the allowed suffix list), plus path escape/overwrite in HDFS/S3 across tenant directories. Overwriting shell/daemon scripts, sourced env scripts (e.g., conf/*.sh, bin/*.sh), or application config files (*.properties/*.yaml are in the allowed suffix list), or dropping executable content that a workflow/service later runs, provides a practical route to remote code execution and to cross-tenant data destruction. The resource read/download/update endpoints also lack ownership checks, widening disclosure and integrity impact.",
+      "locations": [
+        {
+          "end_line": 156,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/controller/ResourcesController.java",
+          "start_line": 119
+        },
+        {
+          "end_line": 406,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/controller/ResourcesController.java",
+          "start_line": 389
+        },
+        {
+          "end_line": 460,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/controller/ResourcesController.java",
+          "start_line": 446
+        },
+        {
+          "end_line": 150,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 100
+        },
+        {
+          "end_line": 227,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 164
+        },
+        {
+          "end_line": 586,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 556
+        },
+        {
+          "end_line": 922,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 872
+        },
+        {
+          "end_line": 1052,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 1015
+        },
+        {
+          "end_line": 1101,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 1061
+        },
+        {
+          "end_line": 57,
+          "path": "dolphinscheduler-common/src/main/java/org/apache/dolphinscheduler/common/utils/FileUtils.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 561,
+          "path": "dolphinscheduler-common/src/main/java/org/apache/dolphinscheduler/common/utils/HadoopUtils.java",
+          "start_line": 542
+        },
+        {
+          "end_line": 343,
+          "path": "dolphinscheduler-common/src/main/java/org/apache/dolphinscheduler/common/utils/HadoopUtils.java",
+          "start_line": 305
+        },
+        {
+          "end_line": 318,
+          "path": "dolphinscheduler-server/src/main/java/org/apache/dolphinscheduler/server/worker/runner/TaskExecuteThread.java",
+          "start_line": 292
+        },
+        {
+          "end_line": 445,
+          "path": "dolphinscheduler-server/src/main/java/org/apache/dolphinscheduler/server/master/runner/task/BaseTaskProcessor.java",
+          "start_line": 417
+        }
+      ],
+      "prerequisites": "An authenticated, enabled account (any role); resource storage enabled (`resource.storage.type` HDFS or S3; the shipped default is NONE, which disables the resource APIs); for the worker-side write, membership in a project and ability to define/run a task whose resource list references the malicious resource id; a file extension matching the allowed `resource.view.suffixs` list for online-create (e.g., sh/py/js/properties/yaml/yml/conf).",
+      "root_cause": "Resource names, directory prefixes and aliases are accepted without validation and used verbatim to build storage paths. ResourcesServiceImpl builds `fullName = currentDir + \"/\" + name` and stores alias=`name` (createResource, line 189/197; onlineCreateResource, lines 892-901) with no rejection of `..` or path separators. HadoopUtils.getHdfsFileName only strips one leading '/' and concatenates (lines 542-547); FileUtils.getDownloadFilename concatenates the alias into a local path with no basename/normalization (lines 48-57); the worker's TaskExecuteThread.downloadResource concatenates `fullName` into a local exec path (lines 292-318) and HadoopUtils.copyHdfsToLocal writes/overwrites that file (lines 324-343). Because `..` components are resolved by the local filesystem and by HDFS/S3 path handling, the restricted roots (tenant resource dir, task exec dir, `/tmp/dolphinscheduler/download/<ts>`) are escaped.",
+      "title": "Path traversal in resource center names/aliases enables arbitrary file write on API and worker nodes",
+      "trace": "1) Attacker calls POST /dolphinscheduler/resources (createResource) with currentDir=/ and name=../../../../opt/dolphinscheduler/conf/dolphinscheduler_env.sh, or POST /online-create with fileName=../../../../tmp/x and suffix=sh; verifyResource only checks existence and parent-id ownership, never name characters (ResourcesServiceImpl 113-122, 183-194, 894-897). 2) fullName/alias are persisted (line 197 / 901) and the content is written to HDFS through HadoopUtils.getHdfsFileName, which merely removes one leading '/' and concatenates (HadoopUtils 542-547; upload 556-586; uploadContentToHdfs 1015-1052) - the HDFS path escapes the tenant resource directory. 3) GET /resources/{id}/download calls ResourcesServiceImpl.downloadResource: localFileName = FileUtils.getDownloadFilename(resource.getAlias()) (line 1096) where getDownloadFilename does simple string concatenation (FileUtils 48-57); HadoopUtils.copyHdfsToLocal then writes/overwrites the resolved local path (HadoopUtils 324-343), giving arbitrary file write on the API host with attacker-chosen content. 4) For worker nodes: BaseTaskProcessor.getResourceFullNames maps the malicious resource `full_name` to its tenant code and ships it in the task context (lines 417-445, line 439); TaskExecuteThread.downloadResource builds `execLocalPath + File.separator + fullName` (line 309) and writes the attacker's content there, escaping the sandboxed task execution directory to any path writable by the worker process.",
+      "unverified": "Behavior of Hadoop Path FileSystem copyFromLocalFile/copyToLocalFile with '..' components for HDFS/S3 was not executed; the exact worker-vs-tenant OS user and writable target paths on a real deployment were not measured; no runtime reproduction or exploitation was attempted; resource APIs are only reachable when resource storage is configured; the UI may impose client-side name restrictions that a direct API call bypasses.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Reviewed the 1,430-file snapshot through targeted searches and bounded reads across the API controllers/services (resources, datasource, alert plugin/group, environment, logger, process definition/instance, executor, users, monitor), DAO mappers and entities, common utilities (FileUtils, HadoopUtils, JSONUtils, HttpUtils, OSUtils), remote/Netty codec, task plugins (shell/sql/command executor, datax), alert plugins (email/script/feign), and the Python gateway. MyBatis mappers were checked for `${}` injection (only internal `${alias}` fragments); no Java native deserialization was found; JSON mappers do not enable default typing. Coverage is search-driven rather than a line-by-line audit of every file; the Vue UI, docs and binary assets were not exhaustively reviewed.",
+  "limitations": [
+    "No code execution, tests, or scanners were run; findings are source-evidence leads only.",
+    "Hadoop/S3 Path handling of '..' components was not verified at runtime, so the HDFS-side escape is less certain than the local filesystem writes.",
+    "Resource APIs require resource.storage.type != NONE, so deployments without HDFS/S3 resource storage are not affected by that path.",
+    "The snapshot contains no Java test sources to corroborate intended permission/normalization behavior.",
+    "The Vue UI and non-Java assets were only sampled, not fully reviewed.",
+    "The py4j gateway and alert-plugin authorization issues were not fully traced through deployment scripts; they remain unconfirmed rejected leads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unauthenticated py4j Python gateway (PythonGatewayServer.run creates a py4j GatewayServer with a null auth token, default bind 0.0.0.0:25333, exposing JVM reflection)",
+      "reason": "Genuine hardening/design concern with severe potential impact, but the optional python-gateway-server must be deployed and reachable, and the RCE relies on py4j protocol semantics rather than a source-visible unsafe data flow; treated as a suspicious API/design lead rather than the strongest source-evidenced candidate."
+    },
+    {
+      "lead": "AlertPluginInstanceServiceImpl.create/update/delete/get/queryAll perform no admin check while listPaging does (AlertPluginInstanceServiceImpl lines 79-183)",
+      "reason": "Real authorization inconsistency allowing any authenticated user to read/modify alert-plugin credentials (SMTP passwords, tokens) and delete instances; RCE via the script alert plugin needs an existing bound script instance/alert-group path, so it is a weaker and more conditional chain than the traversal finding."
+    },
+    {
+      "lead": "DataSourceServiceImpl.queryDataSource(id) and connectionTest(id) lack ownership checks (DataSourceServiceImpl lines 192-210, 395-446)",
+      "reason": "IDOR exposes datasource host/port/database/user metadata, but the DTO built by the datasource processors does not copy the stored password (e.g., MysqlDatasourceProcessor.createDatasourceParamDTO lines 56-72), so impact is limited to metadata disclosure/SSRF-style connection testing."
+    },
+    {
+      "lead": "Legacy LoggerController GET /log/detail and /log/download-log ignore project permission (LoggerServiceImpl lines 100-127)",
+      "reason": "Any authenticated user can read task logs by enumerating taskInstanceId; plausible IDOR but lower impact than the file-write finding, and the newer project-scoped endpoints do enforce checkProjectAndAuth."
+    },
+    {
+      "lead": "ResourcesServiceImpl.readResource/updateResourceContent/downloadResource/queryResource do not check resource ownership",
+      "reason": "Same code area and genuinely missing authorization (attacker can read or modify other users' resource files, potentially altering scripts executed by their workflows), but it was kept as supporting context rather than a second candidate; the submitted candidate focuses on the single path-traversal root cause."
+    }
+  ],
+  "summary": "Apache DolphinScheduler 2.0.5 snapshot reviewed (Java backend, DAO/mappers, task/alert/datasource plugins, remote module, Python gateway, Vue UI). The strongest source-evidenced issue is a path-traversal flaw in the resource center: user-supplied `currentDir`/`name` (and the derived resource alias/fullName) are never validated or normalized, yet they are concatenated into HDFS paths and into local filesystem paths that are written by the API server (download) and by worker nodes (resource download before task execution). This yields arbitrary file write with attacker-controlled content on API/worker hosts, plus HDFS path escape across tenants; it can be leveraged to overwrite executables/scripts/configuration (e.g., `*.sh`, `*.properties`, `*.yaml`) and reach code execution. Missing ownership checks on resource read/download/modify (and several other authorization gaps) were reviewed as separate, weaker leads and are not submitted as additional candidates."
+}

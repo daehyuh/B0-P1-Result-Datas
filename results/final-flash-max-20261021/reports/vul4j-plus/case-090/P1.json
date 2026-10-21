@@ -1,0 +1,63 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The UPDATE_GLOBAL_WHITE_ADDRS_CONFIG request header supplies both `aclFileFullPath` and `globalWhiteAddrs`; the broker passes them unmodified to AccessValidator.updateGlobalWhiteAddrsConfig and then to PlainPermissionManager.updateGlobalWhiteAddrsConfig (AdminBrokerProcessor lines 407-413). No server-side canonicalization or file-type validation is effective because of the inverted condition.",
+      "confidence": "medium",
+      "counterevidence_checked": "A `startsWith(fileHome)` guard exists, but it is a raw string-prefix check with no path normalization, so it is both bypassable via `..` and overly broad for sibling paths sharing the prefix. The target must exist and must not be a directory (lines 486-490), and a target that fails YAML parsing (or throws in getYamlDataObject) aborts before writing (AclException propagates to the AdminBrokerProcessor catch at lines 426-431), which limits which files can be overwritten. The write runs as the broker user, so filesystem permissions bound the impact, and no command-execution sink is reachable from this path directly. The method is intended for admin tooling (tools UpdateGlobalWhiteAddrSubCommand passes a `.yml` path), which explains the existence of the check, but does not explain the inverted operator. No runtime test or build was executed; the decompiled/read behavior of FileWriter/rename is standard JDK semantics.",
+      "id": "acl-global-white-addrs-file-validation",
+      "impact": "Remote, targeted file overwrite (truncation and replacement) of any existing YAML-parseable file whose path string starts with rocketmq.home, executed with the broker process user's privileges; capability to rewrite ACL files, including the global whitelist, and thereby bypass ACL for attacker-chosen IPs (e.g. `*`) once the watcher reloads; corruption of unrelated configuration/data files under the RocketMQ home; and a functional denial for legitimate `.yaml` ACL files, which the inverted condition always rejects.",
+      "locations": [
+        {
+          "end_line": 511,
+          "path": "acl/src/main/java/org/apache/rocketmq/acl/plain/PlainPermissionManager.java",
+          "start_line": 476
+        },
+        {
+          "end_line": 500,
+          "path": "acl/src/main/java/org/apache/rocketmq/acl/plain/PlainPermissionManager.java",
+          "start_line": 492
+        },
+        {
+          "end_line": 275,
+          "path": "acl/src/main/java/org/apache/rocketmq/acl/common/AclUtils.java",
+          "start_line": 235
+        },
+        {
+          "end_line": 434,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java",
+          "start_line": 402
+        },
+        {
+          "end_line": 47,
+          "path": "common/src/main/java/org/apache/rocketmq/common/protocol/header/UpdateGlobalWhiteAddrsConfigRequestHeader.java",
+          "start_line": 23
+        }
+      ],
+      "prerequisites": "Network access to the broker remoting port (default 10911; 10909 fast port). With aclEnable=false (default, BrokerController.initialAcl lines 502-506), no credentials are required. With ACL enabled, the request code is not in Permission.ADMIN_CODE (acl/src/main/java/org/apache/rocketmq/acl/common/Permission.java lines 33-46), and checkPerm returns early because no resource-permission map is built for this code, so any authenticated non-admin account qualifies. The chosen target must already exist, not be a directory, share the unnormalized `fileHome` prefix, and parse as a YAML mapping (or be empty).",
+      "root_cause": "In PlainPermissionManager.updateGlobalWhiteAddrsConfig(List<String>, String) the guard at line 497 is `if (!fileName.endsWith(\".yml\") && fileName.endsWith(\".yaml\"))`. This is an incorrect negation: it rejects legitimate `.yaml` ACL files and accepts every other file name. The only other path restriction is a raw string-prefix check `fileName.startsWith(fileHome)` (line 492), with no normalization/real-path resolution, so `..` segments or a shared prefix are not caught. The function then parses the target as YAML and overwrites it via AclUtils.writeDataObject (new PrintWriter(new FileWriter(path))), so any existing non-directory file under the rocketmq.home string prefix that parses as a YAML mapping (empty files parse to null and are also accepted) is rewritten with attacker-influenced YAML content containing the caller-supplied globalWhiteRemoteAddresses list.",
+      "title": "Inverted file-type validation in ACL global-white-address update allows targeted overwrite of non-ACL files under ROCKETMQ_HOME",
+      "trace": "RequestCode.UPDATE_GLOBAL_WHITE_ADDRS_CONFIG (53) -> AdminBrokerProcessor.updateGlobalWhiteAddrsConfig (lines 402-434) -> PlainAccessValidator.updateGlobalWhiteAddrsConfig (lines 172-174) -> PlainPermissionManager.updateGlobalWhiteAddrsConfig (lines 476-511): existence/directory check (486-490), raw prefix check (492-495), inverted suffix check (497-500) -> AclUtils.getYamlDataObject(fileName, Map.class) (AclUtils.java 235-257) -> map.put(AclConstants.CONFIG_GLOBAL_WHITE_ADDRS, globalWhiteAddrsList) (line 508) -> AclUtils.writeDataObject(fileName, ...) (AclUtils.java 259-275) -> FileWriter truncates/overwrites the target. For a `.yml` ACL target, AclFileWatchService reloads the file and PlainPermissionManager.load() installs the new global whitelist in memory; PlainPermissionManager.validate (lines 653-660) returns success for any client IP matching the global whitelist without signature or permission checks, i.e., an authentication/authorization bypass for the chosen IP.",
+      "unverified": "Whether a given deployment exposes the broker port and has a suitable existing YAML-parseable file under rocketmq.home; exact upstream intended operator (the sibling code getAllAclFiles uses `endsWith(\".yml\") || endsWith(\".yaml\")`, and the log message says 'is not a ACL configuration file', both consistent with the intended check being `!(... || ...)`); no runtime confirmation of the ACL-reload bypass timing.",
+      "weakness_type": "CWE-73 External Control of File Name or Path; CWE-20 Improper Input Validation (also CWE-863 missing authorization on the same request path)"
+    }
+  ],
+  "coverage_summary": "The scope tool reports 875 model-visible files under the assigned root with no sensitive-name, size, symlink, or binary exclusions; the P1 relation index reports the same 875 files indexed (0 missing, 0 hash mismatches; 11,930 symbols, 28,271 edges, 373 facts), with no tests, build execution, SAST oracle, data-flow, or reachability proof. I read and traced the ACL stack (AclUtils, PlainPermissionManager, PlainAccessValidator, Permission, RemoteAddressStrategyFactory, PlainAccessResource), the namesrv request processor/controller, the broker AdminBrokerProcessor update/ACL handlers and BrokerController ACL wiring, remoting protocol decode/encode (NettyDecoder, RemotingCommand), and common Configuration/MixAll. The snapshot contains no test sources (the test module listed in pom.xml has no files), so no test-based corroboration exists.",
+  "limitations": [
+    "No code, build, tests, or scanners were executed; all conclusions are static source reading, and no finding is runtime-confirmed.",
+    "Cannot diff against upstream or fixed revisions, so I could not prove which of the several plausible defects the snapshot was captured before; the chosen candidate is based on internal inconsistency and reachability only.",
+    "Only spot-checked store/CommitLog, client/MQClientAPIImpl, TLS, DLedger, filter, tools, and example modules; findings there would be additional to this review.",
+    "The P1 index is syntactic/navigational only (no control/data-flow or exploitability proof), and its facts carry no security verdict; index coverage of the file set is complete but does not substitute for semantic review of unread code.",
+    "Impact of the candidate depends on deployment details (broker port exposure, ACL setting, filesystem layout/permissions) that cannot be verified from source alone."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unauthenticated configuration update on NameServer/Broker: DefaultRequestProcessor.updateConfig (namesrv, lines 557-590) and AdminBrokerProcessor.updateBrokerConfig (broker, lines 518-552) apply attacker-supplied Properties via Configuration.update (common Configuration.java 175-217) -> MixAll.properties2Object (MixAll.java 322-360). On the NameServer no ACL hook is ever registered (NamesrvController has no AccessValidator), and NamesrvConfig.configStorePath is used as the persist path (NamesrvController lines 69-73; Configuration.getStorePath 146-169; MixAll.string2File 146-180), so a single request can set configStorePath and write a properties file to an arbitrary path, with newline injection possible through Java properties `\\n` escapes. This is the well-known RocketMQ updateConfig class and has high impact, but I did not select it as the candidate because it is the documented administrative API (docs/en/CLITools.md) whose safety rests on network isolation, and the snapshot's version window (4.9.6-SNAPSHOT) is more consistent with the ACL-path fix than with that CVE's fix; kept as an unconfirmed alternative lead.",
+      "reason": "Plausible and high impact, but the source shows an intended admin API lacking a guard rather than an unambiguous defect; not selected to respect the one-candidate limit."
+    },
+    {
+      "lead": "Privilege escalation through ACL-management requests: Permission.ADMIN_CODE (acl/.../Permission.java lines 33-46) omits UPDATE_AND_CREATE_ACL_CONFIG, DELETE_ACL_CONFIG and UPDATE_GLOBAL_WHITE_ADDRS_CONFIG, and PlainPermissionManager.checkPerm (lines 578-593) returns early when the request produces no resource-permission map. A valid non-admin ACL user could therefore create an admin account (AdminBrokerProcessor lines 325-365, request header admin=true) or whitelist itself, i.e., bypass ACL when aclEnable=true.",
+      "reason": "Requires ACL enabled plus a valid low-privileged credential, and I could not verify from the snapshot alone whether the omission is unintended (the docs only name UPDATE_AND_CREATE_TOPIC-style requests as admin). Left as an unconfirmed lead."
+    }
+  ],
+  "summary": "Reviewed the RocketMQ 4.9.6-SNAPSHOT source snapshot (875 model-visible files, main sources only — no test module is present, and no code/build was executed). I traced security-relevant paths in acl, namesrv, broker processors, remoting protocol decode, and common configuration/MixAll. The single strongest source-evidenced candidate is the broken validation in the ACL \"global white address\" update path (`PlainPermissionManager.updateGlobalWhiteAddrsConfig`), which lets a remote caller steer the update into non-ACL files and mis-rejects legitimate `.yaml` ACL files. Stronger-impact-but-less-crisp leads (unauthenticated UPDATE_NAMESRV_CONFIG/UPDATE_BROKER_CONFIG property update, and missing admin codes for ACL management requests) are recorded as rejected/unconfirmed leads, not as additional candidates."
+}

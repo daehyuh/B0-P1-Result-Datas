@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Full control of the XML/JSON document passed to `fromXML`/`unmarshal`: element names, the `class`/`resolves-to` system attributes (read in HierarchicalStreams.readClassAttribute), field names and values, and nested objects. The attacker therefore chooses which class names XStream resolves through the Mapper and which field values/object graphs are fed into the instantiated classes.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that `java.beans.EventHandler`, `.*$LazyIterator` and `javax.crypto.*` are denied and are evaluated before the ANY permission (SecurityMapper.addPermission inserts at index 0; NoPermission throws), so the classic EventHandler+ProcessBuilder dynamic-proxy chain from CVE-2013-7285 is blocked and cannot be used as-is. Verified AbstractReflectionConverter line 448 rejects values not assignable to the declared field type for normal fields. Checked the strict helper `XStream.setupDefaultSecurity` (XStream.java:662-747): it exists but is opt-in (a default `new XStream()` never calls it) and still whitelists File/URL/Path hierarchies, which are themselves later issue areas. Confirmed DomDriver disallows DOCTYPE and disables entity expansion (DomDriver.java:141-162) and StandardStaxDriver/SjsxpDriver set IS_SUPPORTING_EXTERNAL_ENTITIES=false, so the default XML path is not trivially XXE-exploitable; no stronger code-execution path was found elsewhere (see rejected leads).",
+      "id": "xstream-default-any-type-deserialization",
+      "impact": "Untrusted data can force construction and initialization of arbitrary classes and execution of their deserialization hooks (readObject/readResolve) in the application's JVM. Depending on the classpath this enables remote code/shell-command execution through known deserialization gadget chains, outbound network requests (SSRF/DNS) or file operations performed by gadget classes, and denial of service - the same impact class the project's own documentation attributes to unmarshalling with an uninitialized security framework. No payload or end-to-end exploit was executed as part of this review.",
+      "locations": [
+        {
+          "end_line": 649,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 639
+        },
+        {
+          "end_line": 78,
+          "path": "xstream/src/java/com/thoughtworks/xstream/mapper/SecurityMapper.java",
+          "start_line": 64
+        },
+        {
+          "end_line": 23,
+          "path": "xstream/src/java/com/thoughtworks/xstream/security/AnyTypePermission.java",
+          "start_line": 19
+        },
+        {
+          "end_line": 34,
+          "path": "xstream/src/java/com/thoughtworks/xstream/core/util/HierarchicalStreams.java",
+          "start_line": 25
+        },
+        {
+          "end_line": 279,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/reflection/AbstractReflectionConverter.java",
+          "start_line": 274
+        },
+        {
+          "end_line": 444,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/reflection/SerializableConverter.java",
+          "start_line": 428
+        }
+      ],
+      "prerequisites": "Application (or library) deserializes untrusted data with a default-configured XStream instance (no explicit `setupDefaultSecurity`/allowlist), which is the common usage the library warns about; Java reflection is not blocked by a SecurityManager; the runtime classpath contains at least one class with dangerous deserialization side effects (the JDK alone provides multiple such classes, and application dependencies add more). The exact gadget depends on the JDK/classpath of the consuming application; the 1.4.7+ EventHandler name denial removes the oldest documented chain but is exact-name based, so subclasses/alternate handler or gadget classes are not covered.",
+      "root_cause": "`XStream.setupSecurity()` installs the permissive `AnyTypePermission.ANY` and only denies `java.beans.EventHandler`, class names matching `.*\\$LazyIterator`, and `javax.crypto.*` (XStream.java:639-649). `SecurityMapper.realClass()` (mapper/SecurityMapper.java:64-78) is the only gate between XML-supplied class names and the converter/reflection machinery, and because the ANY permission is evaluated after the few NoPermission denials, practically every class on the classpath is accepted. Converters then instantiate it (`AbstractReflectionConverter.instantiateNewInstance`, lines 569-582; `unmarshal`, lines 274-279) with field population, `readResolve` invocation, and - through `SerializableConverter.doUnmarshal` lines 428-444 - execution of the chosen class's own `readObject(ObjectInputStream)`. The repo itself documents the resulting exposure (`security.html` lines 52-76; `changes.html` lines 31-37 state the upcoming release addresses 'an arbitrary execution of commands when unmarshalling for XStream instances with uninitialized security framework') and `XStream.unmarshal` (lines 1396-1404) only prints a warning ('using predefined black list on your own risk') instead of enforcing a safe default.",
+      "title": "Default XStream security setup allows arbitrary attacker-named types to be instantiated during XML unmarshalling (incomplete denylist) leading to deserialization gadget code execution",
+      "trace": "XStream.unmarshal (XStream.java:1396-1404) -> MarshallingStrategy -> TreeUnmarshaller.start (core/TreeUnmarshaller.java:131-140) -> HierarchicalStreams.readClassType (core/util/HierarchicalStreams.java:25-34) -> Mapper.realClass -> SecurityMapper.realClass (mapper/SecurityMapper.java:70-78) -> AnyTypePermission.ANY allows an arbitrary class -> converter lookup -> AbstractReflectionConverter.instantiateNewInstance (converters/reflection/AbstractReflectionConverter.java:569-582) creates the attacker-named instance and doUnmarshal/callReadResolve (lines 274-279) populates fields and runs readResolve; for Serializable types SerializableConverter.doUnmarshal (converters/reflection/SerializableConverter.java:428-444) resolves the attacker-specified type and calls its readObject via reflection. Collection converters additionally perform attacker-influenced map/set operations (e.g. MapConverter.putCurrentEntryIntoMap, converters/collections/MapConverter.java:103-108) that invoke hashCode/equals/compareTo on the injected objects. The only obstacles are the three deny rules at XStream.java:644-646 (ExplicitTypePermission.java:44-52, RegExpTypePermission.java:30-38), which leave the great majority of JDK gadget classes permitted.",
+      "unverified": "No code, test or exploit was executed (execution prohibited), so no end-to-end gadget chain was runtime-confirmed; the concrete gadget classes live in the runtime JDK/libraries, not in this repository, and only the library-side enabler is visible in source. The snapshot contains no test sources, and no fixed version is available in this run to diff against, so the exact set of types upstream considered the vulnerability cannot be confirmed from the snapshot alone. The assessment assumes a default `new XStream()` (or equivalent ANY-permission configuration) is used on untrusted input.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (with CWE-184 Incomplete Blacklist / improper input type validation)"
+    }
+  ],
+  "coverage_summary": "Scope contained 486 model-visible files (no excluded sensitive/symlink/binary files; same filters for B0/P1). I read the core security path end-to-end (XStream setupSecurity/setupDefaultSecurity/unmarshal, SecurityMapper, AnyTypePermission/ExplicitTypePermission/RegExpTypePermission/NoPermission, HierarchicalStreams, TreeUnmarshaller), the reflection and serialization converters (AbstractReflectionConverter, SerializableConverter, PureJavaReflectionProvider, SunUnsafeReflectionProvider), collection converters, XML/JSON drivers (Xpp, Dom, Stax/StandardStax/Sjsxp, Dom4J, JDom, Xom), the persistence package, the xstream-hibernate module, and the benchmark/JMH tooling, plus the distribution documentation that describes the security posture. Many converter implementations and peripheral utility classes were only sampled rather than read line-by-line.",
+  "limitations": [
+    "No test sources are present in the snapshot (xstream/src/test is absent), so no test-based confirmation was possible.",
+    "No execution, build, or exploit was performed (prohibited); the finding is a source-evidence lead, not a runtime-confirmed vulnerability.",
+    "The concrete gadget classes that turn arbitrary type instantiation into RCE/SSRF are in the JDK/third-party classpath, not in this repository, so exploitability of the candidate depends on the consuming runtime.",
+    "No fixed/patched revision is available in this run, so the exact upstream remediation (which types were added to the denylist in the next release) could not be diffed; the assessment is based solely on the snapshot state (1.4.14-SNAPSHOT).",
+    "Repository documentation (security.html, changes.html) was treated as untrusted context and used only as supporting evidence, not as proof."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SSRF/DNS outbound requests via allowed java.net.URL values (e.g. URL.hashCode/compareTo triggered by map/set conversion).",
+      "reason": "URL is deliberately allowed both by the default path and by setupDefaultSecurity (XStream.java:702) and URLConverter constructs URLs without validation (converters/basic/URLConverter.java:30-34), but an outbound request needs a hashCode/equals/compareTo trigger path in the consuming application; this is a narrower, secondary consequence of the same permissive type configuration and was not selected over the direct arbitrary-type/RCE exposure."
+    },
+    {
+      "lead": "XXE in alternative XML drivers (Dom4JDriver, JDom/JDom2Driver, XomDriver).",
+      "reason": "Driver hardening is delegated to the underlying third-party parser/defaults and is user-chosen; the default driver path (Xpp/XppDom) and the JDK-backed drivers checked (DomDriver, StandardStaxDriver, SjsxpDriver) show DOCTYPE/entity protections. No concrete default-configuration external-entity path was established."
+    },
+    {
+      "lead": "Path traversal / arbitrary file deletion via AbstractFilePersistenceStrategy (remove() calls file.delete(), get/put build paths from keys).",
+      "reason": "FilePersistenceStrategy escapes path separators by default (illegalChars include '/' and '\\\\', FilePersistenceStrategy.java:55, 143-155) and keys are not shown to come from the untrusted XML stream; no attacker-controlled traversal path was traced."
+    },
+    {
+      "lead": "Unescaped benchmark result strings written into HTML by HtmlReporter (potential XSS).",
+      "reason": "Only affects the deprecated local benchmark tool output, not the library or a trust boundary crossing; low impact and not attacker-reachable in normal XStream usage."
+    },
+    {
+      "lead": "PureJavaReflectionProvider.instantiateUsingSerialization uses ObjectInputStream/Class.forName (PureJavaReflectionProvider.java:104-140).",
+      "reason": "The serialized byte stream is generated internally from the class name without attacker-controlled data, so no gadget injection occurs through this path on its own; it only serves to bypass constructors for Serializable types."
+    }
+  ],
+  "summary": "XStream 1.4.14-SNAPSHOT (post-1.4.13). The strongest issue found is the permissive default deserialization configuration: a default `new XStream()` grants `AnyTypePermission.ANY` and installs only a three-entry denylist (java.beans.EventHandler, .*$LazyIterator, javax.crypto.*), so class names taken from attacker-controlled XML are resolved and instantiated almost without restriction. XStream then populates fields, calls `readResolve`, and (via SerializableConverter) invokes attacker-chosen classes' `readObject`, i.e. the same gadget surface as native Java deserialization. This is the documented \"uninitialized security framework\" arbitrary-command-execution class that the snapshot's own changelog says the next maintenance release is meant to address. I selected this single root cause (insufficient default type filtering); other leads (SSRF via allowed java.net.URL, alternative-driver XXE, persistence path handling, benchmark HTML output) were considered and are weaker/unconfirmed."
+}

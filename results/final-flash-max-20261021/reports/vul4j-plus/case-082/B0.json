@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any party who can cause an application using this library to parse YAML it supplies: e.g. Yaml.load(File/String/Reader), Yaml.loadAs(...), Yaml.loadAll(...) applied to user-supplied manifests, or Dynamics.newFromYaml/fromYamlToJson on unstructured content (e.g. custom-resource payloads). The YAML text is the attacker-controlled input and is passed unmodified to the unrestricted SnakeYAML Constructor. No in-repo remote endpoint feeds these APIs directly, so the prerequisite is application-level untrusted YAML.",
+      "confidence": "medium",
+      "counterevidence_checked": "1) KubeConfig uses SafeConstructor, so the codebase demonstrably knows the safe pattern (the unsafe usage is not needed for kubeconfig parsing). 2) In-repo callers of Yaml.load that I could see read local files/classpath resources (@FromYaml) rather than a network source, so exploitability depends on the embedding application; I did not find an in-repo HTTP path that feeds attacker YAML into these APIs. 3) SafeConstructor/CustomConstructor override behavior verified: only IntOrString, byte[] and OffsetDateTime are special-cased; all other nodes delegate to the unsafe super implementation. 4) I could not diff against upstream (no VCS metadata, no tests), so I cannot prove this is a deliberately introduced regression rather than long-standing upstream practice; CVE-2022-1471 is a dependency-level advisory and the fix could alternatively be a snakeyaml/version upgrade.",
+      "id": "unsafe-snakeyaml-constructor",
+      "impact": "If untrusted YAML reaches these APIs, the parser can instantiate arbitrary classes available on the classpath with attacker-chosen constructor arguments; for known SnakeYAML gadget chains this results in remote code execution in the JVM running the client (manifest/config ingestion, controllers, controllers-as-a-service). Even without a full gadget chain, unexpected object instantiation can corrupt application state. Highest-severity class found (RCE/CWE-502) versus path/DoS findings elsewhere in the snapshot.",
+      "locations": [
+        {
+          "end_line": 255,
+          "path": "util/src/main/java/io/kubernetes/client/util/Yaml.java",
+          "start_line": 219
+        },
+        {
+          "end_line": 176,
+          "path": "util/src/main/java/io/kubernetes/client/util/Yaml.java",
+          "start_line": 80
+        },
+        {
+          "end_line": 362,
+          "path": "util/src/main/java/io/kubernetes/client/util/Yaml.java",
+          "start_line": 359
+        },
+        {
+          "end_line": 65,
+          "path": "util/src/main/java/io/kubernetes/client/util/generic/dynamic/Dynamics.java",
+          "start_line": 21
+        },
+        {
+          "end_line": 43,
+          "path": "pom.xml",
+          "start_line": 43
+        }
+      ],
+      "prerequisites": "Application (or the repo's own @FromYaml processor path when its file content is attacker-influenced) parses untrusted YAML through the affected APIs; the gadget class must be present on the classpath (JDK/standard library classes suffice for known SnakeYAML gadget chains); snakeyaml 1.28 remains on the classpath as pinned in pom.xml.",
+      "root_cause": "util/.../Yaml.getSnakeYaml() builds `new org.yaml.snakeyaml.Yaml(new CustomConstructor(), new CustomRepresenter())` where `CustomConstructor extends org.yaml.snakeyaml.constructor.Constructor` (the unrestricted constructor). Its `constructObject` override only special-cases IntOrString/byte[]/OffsetDateTime and delegates everything else to `super.constructObject(node)`, so any global `!!` tag in the input is resolved to a class on the classpath and instantiated, including multi-argument gadget classes (the SnakeYAML < 2.0 issue tracked as CVE-2022-1471). `Dynamics` similarly builds `new Yaml()` (default Constructor) for its YAML-to-JSON helpers. pom.xml pins snakeyaml 1.28, which does not block these tags.",
+      "title": "Unsafe SnakeYAML deserialization: Kubernetes Java client YAML APIs use SnakeYAML Constructor instead of SafeConstructor",
+      "trace": "Yaml.load(String/Reader) -> getSnakeYaml().load(reader) -> org.yaml.snakeyaml.Yaml constructed with CustomConstructor (extends Constructor) -> SnakeYAML resolves the input node's global tag -> CustomConstructor.constructObject calls super.constructObject -> Constructor instantiates the tagged class with attacker-supplied arguments. Same flow via Yaml.loadAs/loadAll and via Dynamics.newFromYaml/fromYamlToJson/fromJsonToYaml (internalYamlCodec = new Yaml()), and the spring KubernetesFromYamlProcessor calls Yaml.load on file content. Counterpoint in-repo: KubeConfig.loadKubeConfig correctly uses `new Yaml(new SafeConstructor())`, so the unsafe usage is an inconsistency rather than a deliberate feature.",
+      "unverified": "No runtime exploitation was attempted and no dependency CVE lookup was performed (offline review). I did not verify which gadget classes are present on the runtime classpath, whether a specific in-repo embedding passes untrusted YAML to Yaml.load/Dynamics, or whether upstream later changed CustomConstructor/`new Yaml()` to SafeConstructor. Whether this matches the case's stored ground truth is unverified; the competing pre-existing issues listed as rejected leads (tar path traversal/command construction in Copy, WebSocket buffer accounting) remain possible ground truths.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data"
+    }
+  ],
+  "coverage_summary": "Reviewed the hand-written code: all of util (api machinery, Exec/Attach/Copy/PortForward/PodLogs/ProtoClient, informer framework, ClientBuilder/KubeConfig/Config/SSLUtils/CSRUtils, Yaml/Dynamics/generic API, OpenIDConnect/Azure/GCP authenticators, monitoring, labels, taints), the extended module (controllers, reconcilers, leaderelection, kubectl helpers, workqueue, events, network), the spring module (informer/reconciler processors, manifest and ConfigMap processors), and the custom-patched generated ApiClient/JSON/auth/Pair/Configuration plus a sample of generated API/model code; also inspected pom.xml, CHANGELOG, CI workflows and examples. Explicitly not covered: the seven sensitive-path/credential files (the io.kubernetes.client.util.credentials implementations are visible only through imports in ClientBuilder/Config), three files over 5 MiB skipped by the tooling, the ~700 generated model classes (spot-checked only), and no test sources exist in the snapshot.",
+  "limitations": [
+    "No diff against upstream is possible (no .git, tests stripped), so I cannot prove any code is an injected regression rather than original upstream behavior.",
+    "The credential implementation files (util/.../credentials, 7 files) are excluded from the readable snapshot; any vulnerability there would be invisible and only inferable from ClientBuilder/Config call sites.",
+    "Three files larger than 5 MiB were excluded from search/read, and generated kubernetes API/model classes (hundreds of files) were only spot-checked for escaping/auth regressions.",
+    "No code execution, dependency scanning, or network lookups were performed; CVE/CWE associations (e.g. SnakeYAML/CVE-2022-1471) are from source-level reasoning, not verified against advisory databases.",
+    "Case ground truth is unknown: several pre-existing candidate weaknesses exist (tar traversal and shell construction in Copy, WebSocket buffer accounting), so the submitted candidate is a prioritized lead, not a confirmed match."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal (Zip Slip) in util/.../Copy.copyDirectoryFromPodAsync: tar entry names from the pod are passed through FilenameUtils.normalize (which preserves leading '..' segments) and joined via `new File(destination.toFile(), normalName)` before FileOutputStream writes, so a malicious pod tar can write outside the destination directory.",
+      "reason": "Real-looking CWE-22 sink with remote input, but the surrounding code (normalize + null check) appears to be long-standing upstream code and I found no local evidence of an intended containment check; kept unconfirmed rather than replacing the higher-impact deserialization candidate."
+    },
+    {
+      "lead": "Command injection in Copy: `sh -c \"cat \" + srcPath`, `sh -c \"tar cz - \" + srcPath`, `sh -c \"ls -F \" + srcPath`, `sh -c \"base64 -d | tar -xmf - -C \" + parentPath` concatenate caller-supplied paths into a shell command executed inside the target container.",
+      "reason": "The path is supplied by the local caller (kubectl cp equivalent design) rather than a remote peer, and the pattern appears intentional upstream; exploitability depends on an application exposing the path argument to untrusted users."
+    },
+    {
+      "lead": "util/.../WebSocketStreamHandler.write uses `remaining -= bytesWritten;` after `bytesWritten += bufferSize;`, so for payloads larger than ~30 MiB `remaining` can go negative, making `new byte[bufferSize + 1]` throw NegativeArraySizeException (or, at exactly 45 MiB, loop sending 1-byte messages until the OkHttp queue closes).",
+      "reason": "Clearly incorrect accounting and a plausible DoS, but the security impact is limited to large write paths (e.g. copyFileToPod) and I could not determine whether the line is upstream or modified; weaker impact than the submitted candidate."
+    },
+    {
+      "lead": "util/.../CSRUtils.waitUntilCertificateSigned returns true from the poll condition even when getCertificate(current) is empty (certRef stays null), so 'wait until signed' returns early with a null certificate.",
+      "reason": "Looks like a functional defect (callers fail later / NPE), no demonstrated security impact."
+    },
+    {
+      "lead": "util/.../taints/Taints.java Effect.NO_EXECUTE returns \"NoExcute\" (typo vs the Kubernetes value \"NoExecute\"), breaking taint matching/creation.",
+      "reason": "Functional-correctness bug with no confidentiality/integrity/availability impact."
+    }
+  ],
+  "summary": "Snapshot is kubernetes-client/java at 12.0.1-SNAPSHOT (post-12.0.0, ~mid-2021) with all test sources stripped and seven credential-path files hidden. I reviewed the hand-written modules (util, extended, spring), the custom-patched generated ApiClient/JSON/auth classes, and the contrib/examples trees, tracing input -> validation -> sensitive operations. The strongest evidence-backed issue is the use of SnakeYAML's unrestricted Constructor for parsing YAML (CWE-502): the library's own YAML APIs instantiate arbitrary classes from `!!` tags, and pom.xml pins snakeyaml 1.28, the version family covered by CVE-2022-1471. The Kubernetes config loader in the same repo correctly uses SafeConstructor, which shows the safe pattern was known but not applied here. This is a lead based on source evidence, not a runtime-confirmed exploit."
+}

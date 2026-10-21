@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Not an input-parsing bug: the vulnerability is created by the launcher's own address rewriting, so the operator is not offered a 'loopback only' default once debug is enabled. The attacker only needs network reachability to the JDWP port (default 9009 per JAVA_DEBUGGER_PORT, 29009 for the second config in the templates). Any network peer that can open a socket to that port can attach as an unauthenticated debugger; JDWP has no authentication or authorization layer.",
+      "confidence": "medium",
+      "counterevidence_checked": "Debug mode is not on by default, so exploitation requires the operator to enable it (still the committed code path for a very common diagnostic flag, and the shipped templates make it work). If debug-options already contain a host:port address, no rewrite happens. When debug is disabled, getDebug() returns an empty list and no JDWP option is emitted. I found no other restriction on the JDWP bind address, no authentication on the debug channel, and no system property/opt-in distinguishing local from remote attach. JDK 8 deployments are also exposed because the port-only form binds all interfaces there. The rewrite is intentional (to satisfy JDK 9+ syntax) but it selects `*` rather than loopback, which is the security-relevant choice.",
+      "id": "payara-jdwp-wildcard-bind",
+      "impact": "Unauthenticated remote code execution in the Payara Server JVM with the privileges of the server OS user whenever debug mode is enabled: read/write of domain configuration and secrets, manipulation or exfiltration of deployed applications and data, and use of the host as a pivot. The debug port also permits suspending the JVM (denial of service).",
+      "locations": [
+        {
+          "end_line": 163,
+          "path": "nucleus/admin/launcher/src/main/java/com/sun/enterprise/admin/launcher/JavaConfig.java",
+          "start_line": 143
+        },
+        {
+          "end_line": 873,
+          "path": "nucleus/admin/launcher/src/main/java/com/sun/enterprise/admin/launcher/GFLauncher.java",
+          "start_line": 868
+        },
+        {
+          "end_line": 666,
+          "path": "nucleus/admin/launcher/src/main/java/com/sun/enterprise/admin/launcher/GFLauncher.java",
+          "start_line": 662
+        },
+        {
+          "end_line": 239,
+          "path": "nucleus/admin/server-mgmt/src/main/java/com/sun/enterprise/admin/servermgmt/cli/StartDomainCommand.java",
+          "start_line": 235
+        },
+        {
+          "end_line": 159,
+          "path": "nucleus/admin/template/src/main/resources/config/domain.xml",
+          "start_line": 159
+        },
+        {
+          "end_line": 312,
+          "path": "nucleus/admin/template/src/main/resources/config/domain.xml",
+          "start_line": 312
+        },
+        {
+          "end_line": 201,
+          "path": "appserver/admin/gf_template/src/main/resources/config/domain.xml",
+          "start_line": 201
+        },
+        {
+          "end_line": 444,
+          "path": "appserver/admin/gf_template/src/main/resources/config/domain.xml",
+          "start_line": 444
+        }
+      ],
+      "prerequisites": "Server (or instance) started with debug enabled - e.g. `asadmin start-domain --debug`, `restart-domain --debug`, or java-config `debug-enabled=true` - using a debug-options value of the shipped form `-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=<port>` or `address=${JAVA_DEBUGGER_PORT}`. A JDK 9+ launcher JVM is needed for the rewrite path (on JDK 8 the port-only form already listens on all interfaces). Network access to the debug port (firewall/segmentation permitting).",
+      "root_cause": "JavaConfig.getDebugOptions() (nucleus/admin/launcher/.../JavaConfig.java:143-163) detects server-mode JDWP options with a port-only address and rewrites them with String.replace(\"address=\", \"address=*:\") (line 158-162) on JDK 9+. This overrides the JDK 9+ default of binding the dt_socket debug agent to loopback, so the debug port is opened on 0.0.0.0. The shipped templates configure JDWP with server=y and a port-only address (e.g. nucleus/admin/template/.../domain.xml:159,312; appserver/admin/gf_template/.../domain.xml:201,444), and GFLauncher adds these options to the JVM command line whenever debug is enabled (GFLauncher.java:221 getDebug()/868-873, 662-666).",
+      "title": "JDWP debug agent is bound to all network interfaces (address=*:<port>) when the server runs in debug mode",
+      "trace": "StartDomainCommand sets the launcher info debug flag (StartDomainCommand.java:239 `info.setDebug(debug)`; also the restart path at ~line 190, and StartLocalInstanceCommand.java:201 for instances). GFLauncher.setup() line 221 assigns `debugOptions = getDebug()`; getDebug() (GFLauncher.java:868-873) returns javaConfig.getDebugOptions() when `info.isDebug() || javaConfig.isDebugEnabled()`. JavaConfig.getDebugOptions() parses the configured options, finds `server=y` and an address without a colon (e.g. `address=9009` or the unresolved JAVA_DEBUGGER_PORT token), and rewrites it to `address=*:<port>` (JavaConfig.java:146-162) before token resolution substitutes the actual port. The resulting single JVM option is appended to the launch command line at GFLauncher.java:666, so the server JVM starts with `-agentlib:jdwp=...server=y,suspend=n,address=*:9009`, exposing the debug agent on all interfaces. An attached debugger can then execute methods/load classes inside the server JVM.",
+      "unverified": "No build, tests, or runtime execution were performed. The exact JDK 9+ socket-bind semantics for `address=*:<port>` vs port-only are taken from documented JDK behaviour, not verified here. I could not confirm whether this specific snapshot/commit is the benchmark's intended ground-truth bug, nor match it to an advisory or patch. Whether deployments in scope actually run the launcher on JDK 9+ was not verified.",
+      "weakness_type": "CWE-1327 Binding to an Unrestricted IP Address / CWE-489 Active Debug Code -> unauthenticated remote code execution via exposed JDWP"
+    }
+  ],
+  "coverage_summary": "Model-visible scope: 11,899 files (~94 MB), Java-dominant (7,121 .java files) Payara Server 5.2022.2 (GlassFish fork) with .github docs, XML/config templates, JSF admin console resources and Maven build files. P1 relation scope is partial: 11,839 files indexed, 60 missing from the index, only 3 files fully parsed with the Java syntax parser, no control-flow or data-flow analysis, semantic resolution not implemented, 181,918 unresolved calls, and annotation facts are name-based only. I inspected in depth: nucleus/admin/launcher (JavaConfig, GFLauncher, GFEmbeddedLauncher), Nucleus start/restart commands, domain/system-property templates, admin-console security (AdminConsoleAuthModule, RestUtil), download servlets/content sources, WoodstockHandler, and sampled the P1 security_call facts and common sink patterns (exec/ProcessBuilder, ObjectInputStream, X509TrustManager, SQL statement building, shell usage). The bulk of the repository (web-core Tomcat fork, security-ee/JACC, JMS, JAX-RS/Jersey, batch, MicroProfile modules, installer, distributions) was sampled, not exhaustively reviewed.",
+  "limitations": [
+    "No build, tests, static analyzer, or runtime execution was performed; all conclusions are source-text based.",
+    "The P1 index covers 11,839 of 11,899 files with syntax-level relations only; 60 files are missing and no data/control-flow or semantic resolution exists, so reachability of the JDWP path and absence of other sinks outside reviewed areas cannot be proven from the index.",
+    "I could not compare this snapshot against upstream Payara history or advisories (no external access), so I cannot confirm whether the JDWP all-interface binding is the intended ground-truth issue or whether a later fix changed it.",
+    "JDK behaviour for `address=*:<port>` (listen on all interfaces) vs port-only (loopback on JDK 9+) is taken from documented semantics, not verified in this environment.",
+    "Only a small fraction of the 7,121 Java files was read in full; other high-impact vulnerabilities may exist outside the reviewed paths."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "TLS certificate validation disabled (all-trusting X509TrustManager) in appserver/load-balancer/admin/src/main/java/org/glassfish/loadbalancer/admin/cli/connection/ConnectionManager.java:139-166",
+      "reason": "Pre-existing GlassFish admin-CLI code that talks to an operator-configured load balancer; requires administrative invocation, has limited impact, and no untrusted network input was traced into it."
+    },
+    {
+      "lead": "Arbitrary file deletion handler WoodstockHandler.deleteFileFromTempDir (appserver/admingui/core/src/main/java/org/glassfish/admingui/handlers/WoodstockHandler.java:104-129) deletes any existing path passed as handler input",
+      "reason": "Admin-console JSF handler used in the upload flow; reaching it requires an authenticated admin session that already has deployment/code-execution power, and handler input provenance from requests was not established."
+    },
+    {
+      "lead": "Admin console download content sources (LogFilesContentSource.java:88-105, LogViewerContentSource.java:84-95) forward the client-supplied `restUrl` parameter into server-side REST calls (possible SSRF/credential forwarding)",
+      "reason": "Authenticated admin-console proxy pattern; target URL selection is part of the console design and no unauthenticated or cross-privilege impact was demonstrated."
+    },
+    {
+      "lead": "String-concatenated SQL in jBatch persistence managers (e.g. OraclePersistenceManager.java:307-353, MySqlPersistenceManager.java, PostgresPersistenceManager.java)",
+      "reason": "Concatenated values are schema/table identifiers derived from deployment/configuration rather than remote user input; no attacker-controlled path was traced."
+    },
+    {
+      "lead": "Other JDWP occurrences: hardcoded address=9009 in embedded server templates (appserver/extras/embedded/all|web/src/main/resources/config/domain.xml:198/191) and address=1323 in nucleus/core/kernel/.../RestartServer.java:384-388",
+      "reason": "Same root-cause family as the selected candidate (debug agent exposure); kept as one root cause rather than split into separate candidates."
+    }
+  ],
+  "summary": "Reviewed the Payara Server 5.2022.2 snapshot (11,899 model-visible files, ~94 MB, Java-dominant GlassFish-derived codebase; 7,121 Java files). The strongest source-supported issue is in the Nucleus server launcher: when debug mode is enabled (e.g. `asadmin start-domain --debug` or java-config `debug-enabled=true`), `JavaConfig.getDebugOptions()` deliberately rewrites a port-only JDWP address into `address=*:<port>` for JDK 9+, and `GFLauncher` puts those options on the server JVM command line. The result is an unauthenticated JDWP debug agent listening on every network interface, which an attached debugger can use to invoke arbitrary methods / load classes in the server JVM (remote code execution as the server process). I inspected this flow end to end in source (start commands -> launcher -> JavaConfig -> command line -> domain templates) and checked for bind-address, authentication or opt-in restrictions; none exist in the reviewed code. Other suspicious spots (trust-all TLS trust manager in the load-balancer admin CLI, arbitrary temp-file deletion handler, `restUrl` proxy parameters in admin console download content sources, SQL string concatenation in jBatch persistence managers) were weaker, pre-existing/administrative, or not clearly attacker-controlled, and are listed as rejected leads rather than additional candidates. No runtime/build verification was performed; this is a lead, not a confirmed vulnerability."
+}

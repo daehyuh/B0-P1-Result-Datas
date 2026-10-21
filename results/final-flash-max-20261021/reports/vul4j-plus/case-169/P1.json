@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any untrusted document parsed through Tika's default parser graph: e.g., PUT /tika (or /unpack, /meta, /rmeta) to tika-server with a crafted XLSX whose xl/worksheets/sheet*.xml part begins with a DOCTYPE declaring an external entity (SYSTEM file:///etc/passwd or http://internal/), or an equivalent XML/SVG/OOXML document. The parser and the sheet part bytes are fully attacker-controlled; no special configuration is needed beyond accepting uploaded documents.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked for mitigations: (1) many parseSAX callers (XMLParser, OdfParser, OOXML decorators, DIF/Epub/IWork, XmlRootExtractor, Tesseract hOCR) pass OfflineContentHandler, which as a DefaultHandler is installed as EntityResolver and returns an empty stream, so external-entity reads are blocked on those paths - the plain application/xml route is therefore largely mitigated for file reads; (2) the DOM path is hardened (getDocumentBuilderFactory sets expandEntityReferences=false, external-general/parameter-entities=false, load-external-dtd=false, plus an ignoring resolver on getDocumentBuilder), and StAX sets IGNORING_STAX_ENTITY_RESOLVER, so I did not claim those paths; (3) getXMLReader() does set the ignoring resolver, but no parser in this snapshot uses it for parsing; (4) trySetXercesSecurityManager tries to cap entity expansion, but it silently swallows failures and is skipped for the JDK's built-in Xerces class name (commented out), so it is not a reliable DOCTYPE/external-entity control; (5) no build/test execution or runtime confirmation is possible in this review, so exploitability of the POI handler route (whether resolved entity characters are emitted as cell text) is inferred, not proven. I also verified that the CVE-2018-1335 command-injection mitigations (ALLOWABLE_HEADER_CHARS + checkTrustWorthy + language regex + ProcessBuilder list args) are present, and that TikaCLI/UnpackerResource filename sanitization is present, so those were rejected.",
+      "id": "tika-xxe-pooled-sax",
+      "impact": "Server-side request forgery / local file disclosure when Tika runs on untrusted input (tika-server is explicitly designed for remote parsing): reads of local files reachable by the Tika process (e.g., credentials/config files) and HTTP(S) requests to internal services, plus denial of service via entity expansion. On a public tika-server deployment this is pre-auth information disclosure/SSRF.",
+      "locations": [
+        {
+          "end_line": 152,
+          "path": "tika-core/src/main/java/org/apache/tika/utils/XMLReaderUtils.java",
+          "start_line": 142
+        },
+        {
+          "end_line": 186,
+          "path": "tika-core/src/main/java/org/apache/tika/utils/XMLReaderUtils.java",
+          "start_line": 168
+        },
+        {
+          "end_line": 344,
+          "path": "tika-core/src/main/java/org/apache/tika/utils/XMLReaderUtils.java",
+          "start_line": 333
+        },
+        {
+          "end_line": 168,
+          "path": "tika-core/src/main/java/org/apache/tika/parser/ParseContext.java",
+          "start_line": 148
+        },
+        {
+          "end_line": 360,
+          "path": "tika-parsers/src/main/java/org/apache/tika/parser/microsoft/ooxml/XSSFExcelExtractorDecorator.java",
+          "start_line": 339
+        },
+        {
+          "end_line": 585,
+          "path": "tika-parsers/src/main/java/org/apache/tika/parser/microsoft/ooxml/XSSFExcelExtractorDecorator.java",
+          "start_line": 525
+        }
+      ],
+      "prerequisites": "Tika parses attacker-supplied documents with the default parser set (tika-server or any embedder). The parse context must not contain an application-supplied SAXParser/DocumentBuilder override. For the XLSX route POI must accept the crafted package (its OPCPackage/zip container is parseable), and the entity must be referenced inside a worksheet element whose character data is forwarded (e.g., an inline/shared string cell). For the file-read variant the server OS must permit reading the referenced path. No authentication or non-default flag is required (unlike the fileUrl feature).",
+      "root_cause": "XMLReaderUtils.getSAXParserFactory() enables only XMLConstants.FEATURE_SECURE_PROCESSING and never disables DOCTYPE processing, external general/parameter entities, or external DTD loading. XMLReaderUtils.getSAXParser()/parseSAX() then hand out pooled javax.xml.parsers.SAXParser instances and call parser.parse(is, handler) without installing the IGNORING_SAX_ENTITY_RESOLVER that getXMLReader() sets (XMLReaderUtils.java:92-96,117-126,142-152,333-344). ParseContext.getSAXParserFactory() has the identical gap (ParseContext.java:148-168). Because javax.xml.parsers.SAXParser.parse(InputStream, DefaultHandler) registers the passed DefaultHandler as ContentHandler/EntityResolver/DTDHandler/ErrorHandler, protection is accidental: it only exists when the caller wraps its handler in OfflineContentHandler (whose resolveEntity returns an empty stream). The XSSF worksheet path does not: XSSFExcelExtractorDecorator.processSheet() calls XMLReaderUtils.parseSAX(sheetInputStream, handler, parseContext) with XSSFSheetInterestingPartsCapturer, which extends DefaultHandler and does not override resolveEntity (returns null → parser default resolution), while the sheet XML comes from the attacker-supplied XLSX package. NetworkParser/TeeContentHandler has the same property (CLI --network only).",
+      "title": "XXE: pooled SAX parsers are built without DTD/external-entity restrictions or an ignoring EntityResolver; attacker-supplied XLSX/XML can trigger external entity resolution",
+      "trace": "Crafted XLSX -> OOXMLParser -> XSSFExcelExtractorDecorator.getXHTML() iterates sheets -> processSheet() (line 351) -> XMLReaderUtils.parseSAX(sheetInputStream, handler, parseContext) (XMLReaderUtils.java:333) -> context.get(SAXParser.class) is null on tika-server (fillParseContext only sets TesseractOCRConfig/PDFParserConfig/Parser), so acquireSAXParser() returns a pooled parser built by getSAXParser() -> parser.parse(is, handler): the handler XSSFSheetInterestingPartsCapturer extends DefaultHandler and does not override resolveEntity, so the JDK/Xerces parser installs it as EntityResolver, whose default resolveEntity returns null -> parser performs default resolution of the DOCTYPE/external entity systemId (file:// or http(s)://) -> resolved characters are forwarded through XSSFSheetInterestingPartsCapturer.characters() into XSSFSheetXMLHandler and thus into extracted text; even where content is not emitted, the outbound read/SSRF happens. The same pooled parsers also accept internal entity declarations, enabling entity-expansion (billion-laughs style) load on XMLParser/XmlRootExtractor paths, bounded only by whatever entity-expansion limit the runtime honors (trySetXercesSecurityManager attempts 4096, but silently no-ops if the xerces SecurityManager class/property is unavailable).",
+      "unverified": "The exact upstream fix/CVE mapping for this snapshot cannot be confirmed from source alone (the fix could equally be adding disallow-doctype-decl in getSAXParserFactory or wrapping the XSSF handler). It is unverified whether the deployed JDK's FEATURE_SECURE_PROCESSING also restricts external access, whether POI's XSSFSheetXMLHandler emits resolved entity characters into extracted text (the read/SSRF occurs before that point regardless), and whether the entity-expansion-limit property is honored at runtime. No code was executed and no exploit was attempted.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (with CWE-776 entity-expansion exposure)"
+    }
+  ],
+  "coverage_summary": "Scope: 814 model-visible files (source_root_files=814); the P1 relation index reports 814/814 files indexed, 0 missing, no SAST/findings loaded, and explicitly does not prove reachability or data flow. I used both raw text search and the index (find_symbols/trace_relations/facts) for navigation only. I read and traced code mainly in tika-core (XMLReaderUtils, ParseContext, OfflineContentHandler/ContentHandlerDecorator/TeeContentHandler, TikaInputStream, NetworkParser, MimeTypesReader), tika-server resources (TikaResource, UnpackerResource, Metadata/RecursiveMetadata/Detector/Translate resources, TikaServerCli, URLEnabledInputStreamFactory, writers), tika-parsers hotspots (xml package, OOXML decorators incl. XSSF/XSSFB/XPS/Word2006ML, ODF, pkg/PackageParser, ocr/TesseractOCR, external/geo/tf parsers), and tika-app TikaCLI. I did not exhaustively read all ~300 tika-parsers format handlers (chm, image, font, iptc, geoinfo, hdf/grib, etc.) or third-party dependency internals (POI, PDFBox, commons-compress, ROME); those are unverified areas. No tests, builds, or scanners were executed.",
+  "limitations": [
+    "No runtime execution, dependency source, or test suite was available, so every conclusion is static and unconfirmed; the P1 index contains navigation hints only and does not establish reachability or data flow.",
+    "The snapshot's exact upstream commit cannot be identified (CHANGES.txt still lists 'Release 1.19 ???' with 2.0.0-SNAPSHOT; dependency versions suggest ~Aug-Oct 2018), so mapping to a specific CVE/fix is inferred and uncertain.",
+    "Behavior of the JDK SAX stack (whether FEATURE_SECURE_PROCESSING restricts external access, whether SAXParser.parse(DefaultHandler) installs the handler as EntityResolver, and whether the entityExpansionLimit property is honored) is based on knowledge of JAXP rather than executable verification.",
+    "POI/XSSFSheetXMLHandler behavior on entity content was not verified; whether resolved entity text is surfaced in extracted output is uncertain, even though the external resolution itself occurs in the Tika-controlled parser.",
+    "Many tika-parsers format handlers and bundled dependency versions were searched but not read line-by-line, so a different, stronger vulnerability could exist outside the reviewed hotspots."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "fileUrl header SSRF/local file read in tika-server (URLEnabledInputStreamFactory + TikaResource.getInputStream)",
+      "reason": "Feature is off by default and requires both --enableFileUrl and --enableUnsecureFeatures with an explicit warning; it is the documented CVE-2015-3271 behavior, not a new defect."
+    },
+    {
+      "lead": "OS command injection via TesseractOCR/ExternalParser/GDAL configuration or X-Tika-OCR headers",
+      "reason": "The CVE-2018-1335 mitigations are present (ALLOWABLE_HEADER_CHARS validation, checkTrustWorthy rejection of 'trusted' setters, TesseractOCRConfig.setLanguage regex), commands use ProcessBuilder/Runtime.exec with argument arrays (no shell), and the remaining attacker-settable strings are used as executable paths or environment values, not interpolated into a shell line."
+    },
+    {
+      "lead": "Zip Slip / directory traversal when extracting embedded resources (TikaCLI -z / --extract-dir and tika-server /unpack)",
+      "reason": "Both paths apply FilenameUtils.normalize, fall back to FilenameUtils.getName when normalization fails, and strip leading C:/, ~/ or / prefixes before writing (TikaCLI.java:1087-1121, UnpackerResource.java:248-268)."
+    },
+    {
+      "lead": "Memory-exhaustion DoS via archive/embedded-resource expansion (PackageParser, SevenZFile, UnpackerResource ByteArrayOutputStream copies)",
+      "reason": "Tika intentionally streams/parses embedded resources with no size cap; it is a resource-limit weakness rather than a clearly attacker-triggered defect with a specific source-level guard missing, so it is a weaker lead than the XXE path."
+    },
+    {
+      "lead": "Java deserialization via ForkObjectInputStream/ObjectInputStream in tika-core fork package",
+      "reason": "Used only over the parent/child fork process pipes that Tika itself creates; not reachable from attacker-supplied documents or HTTP input."
+    },
+    {
+      "lead": "SSRF/credential exposure through configured outbound REST parsers (GeoGazetteerClient, TensorflowREST*, Grobid/NER servers) and translators",
+      "reason": "Remote base URIs come from administrator configuration or classpath properties, not from document content, so attacker control of the destination URL is not demonstrated."
+    }
+  ],
+  "summary": "Tika 2.0.0-SNAPSHOT (1.19-era, ~late 2018) source review. I focused on the shared XML-parsing surface, tika-server resources, external-process parsers, and extract-to-disk writers. The strongest distinct issue is an XML External Entity (XXE) / DTD-processing gap in Tika's shared SAX parsing utilities: the pooled SAX parsers are created with only FEATURE_SECURE_PROCESSING (no disallow-doctype-decl, no external-general-entities=false, no load-external-dtd=false) and never install the IGNORING_SAX_ENTITY_RESOLVER that getXMLReader() uses, so entity resolution depends entirely on whether each caller happens to pass an OfflineContentHandler (which SAXParser.parse() installs as EntityResolver). Most callers do, but one attacker-facing XLSX path does not: XSSFExcelExtractorDecorator.processSheet passes a handler that inherits DefaultHandler.resolveEntity() (returns null → default resolution) while parsing worksheet XML from an untrusted file. Crafted XLSX/XML can therefore cause file:// reads or http(s) fetches and internal entity-expansion load. This is a lead, not runtime-confirmed."
+}

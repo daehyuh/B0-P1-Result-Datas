@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The bind pairs, packed-stream indices, coder count and coder layout are all read from the attacker-supplied 7z archive (SevenZFile.readFolder: readUint64 for numCoders, numBindPairs = totalOutStreams-1, each BindPair.inIndex/outIndex). No signature, password or trusted input is needed; the archive just has to be a syntactically plausible 7z file whose header (or encoded header folder) contains a cyclic bind-pair chain.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that normal, well-formed archives terminate (bind pairs of valid archives form a chain), that readFolder rejects totalOutStreams == 0 and totalInStreams < numBindPairs (SevenZFile.java:677-691), and that the loop is not bounded by an input byte counter. I confirmed the repeated-index case is not rejected by readFolder; I also noted that some malformed bind-pair indices instead cause ArrayIndexOutOfBoundsException (an unchecked exception, not a hang) and that coders[current] bounds are not validated. No runtime execution was performed; this is a source-level lead only.",
+      "id": "case-007-7z-coder-cycle",
+      "impact": "Denial of service: opening or iterating a crafted 7z archive never returns, consuming CPU indefinitely and growing a LinkedList without bound until an OutOfMemoryError; affects any service that parses untrusted 7z files (the loop can trigger during SevenZFile construction when the header is encoded).",
+      "locations": [
+        {
+          "end_line": 63,
+          "path": "src/main/java/org/apache/commons/compress/archivers/sevenz/Folder.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 439,
+          "path": "src/main/java/org/apache/commons/compress/archivers/sevenz/SevenZFile.java",
+          "start_line": 433
+        },
+        {
+          "end_line": 1036,
+          "path": "src/main/java/org/apache/commons/compress/archivers/sevenz/SevenZFile.java",
+          "start_line": 1026
+        },
+        {
+          "end_line": 710,
+          "path": "src/main/java/org/apache/commons/compress/archivers/sevenz/SevenZFile.java",
+          "start_line": 636
+        }
+      ],
+      "prerequisites": "Application opens an untrusted 7z archive with SevenZFile (constructor parsing an encoded header, or getNextEntry() reaching a folder). The crafted header must produce a bind-pair chain that re-enters a previously visited stream; because numBindPairs = totalOutStreams-1, this is achieved with repeated/ambiguous inIndex (or outIndex) values among the bind pairs, which readFolder does not reject. Not a memory-safety bug; impact is availability of the consuming process/thread.",
+      "root_cause": "Folder.getOrderedCoders() follows the bind-pair chain starting from packedStreams[0] with `while (current != -1) { l.addLast(coders[current]); current = pair != -1 ? (int) bindPairs[pair].inIndex : -1; }` and never checks that the chain terminates or that a coder/input index has already been visited. SevenZFile.readFolder() reads the bind pairs (inIndex/outIndex) straight from the archive header and only validates `totalOutStreams != 0` and `totalInStreams >= numBindPairs`; it does not require bind-pair indices to be unique, in range, or to form an acyclic chain. An archive whose bind pairs form a cycle (e.g. four simple coders with pairs out(0)->in(1), out(1)->in(2), out(2)->in(1) and packed stream 0) makes findBindPairForOutStream() return to the same input index forever, so the loop adds coders without bound.",
+      "title": "Crafted 7z bind-pair chain causes infinite loop / unbounded memory growth in SevenZFile folder decoding",
+      "trace": "SevenZFile(File/SeekableByteChannel) -> readHeaders() -> (kEncodedHeader) readEncodedHeader() -> archive.folders[0] -> Folder.getOrderedCoders() [Folder.java:433-439] ; or getNextEntry() -> buildDecodingStream() -> buildDecoderStack() -> folder.getOrderedCoders() [SevenZFile.java:1026-1036]. readFolder() [SevenZFile.java:636-710] populates coders/bindPairs from header bytes. getOrderedCoders() loops `while (current != -1)` with `current = bindPairs[pair].inIndex`; a cycle makes it loop forever, appending to the LinkedList `l` on each iteration (unbounded heap growth until OOM/hang).",
+      "unverified": "Not runtime-confirmed. I could not execute the library or craft/run an archive. The exact set of bind-pair values that passes all earlier header checks while forming a cycle is reasoned from the source (duplicate inIndex values among bind pairs) but not empirically validated. I could not consult upstream patches/CVE labels, so I cannot confirm whether this is the same root cause as any specific Commons Compress advisory (the code is consistent with the known family of 7z DoS advisories affecting 1.18, e.g. crafted-7z infinite-loop/OOM reports).",
+      "weakness_type": "CWE-835 Loop with Unreachable Exit Condition ('Infinite Loop'); DoS"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 264-file snap",
+  "limitations": [
+    "Source-only, read-only review: no code execution, no archive crafting, no runtime confirmation; all findings are unverified leads.",
+    "The snapshot contains 264 files (src/main, src/site, build files) with no test sources, which limited cross-checking against expected parser behavior.",
+    "Only the archive/compressor input-parsing paths were reviewed in depth (SevenZFile/Folder/Coders, DumpArchiveInputStream/TapeInputStream, ZipFile/ZipArchiveInputStream partially, CpioArchiveInputStream, Pack200CompressorInputStream, IOUtils, Expander).",
+    "Large portions of the tree were not exhaustively audited in this run: zip extra-field classes, bzip2/BlockSort codecs, LZ4/Snappy/Zstd/Brotli/XZ/Deflate64 codecs, scatter/gather output code, changes/site docs, and build configuration.",
+    "No web/upstream/CVE/ground-truth lookups were permitted, so I could not map the candidate to a specific advisory identifier or patch; version-range reasoning is based only on the in-repo pom version (1.18-SNAPSHOT) and changes.xml (last entry 2018-08-09).",
+    "Whether a given crafted header actually passes all preceding 7z header checks and reaches the cyclic bind-pair case was reasoned from source, not empirically validated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DumpArchiveInputStream.readDirectoryEntry() loop `for (int i = 0; i < datalen - 8 && i < size - 8; i += reclen)` where reclen is read from archive bytes (DumpArchiveUtil.convert16(blockBuffer, i+4), DumpArchiveInputStream.java:351-395): reclen == 0 makes the loop spin forever and repeatedly inserts pending entries into `queue` (CVE-2024-25710-style hang/OOM).",
+      "reason": "Genuine and strongly evidenced, but not selected: only one candidate may be submitted, and this dump-file path is (a) a different root cause from the 7z finding and (b) associated with an advisory range (later releases) that does not include this 1.18-SNAPSHOT source state. Listed here as an unconfirmed alternative lead rather than an additional candidate."
+    },
+    {
+      "lead": "SevenZFile header parsing allocates arrays sized directly from 7z header fields: `new byte[nextHeaderSizeInt]` (SevenZFile.java:344), `new byte[(int) propertySize]` in readArchiveProperties (SevenZFile.java:414), `new byte[(int) propertiesSize]` in readFolder (SevenZFile.java:664), `new byte[(int)(size - 1)]` for names (SevenZFile.java:786), and `new byte[(int) folder.getUnpackSize()]` in readEncodedHeader (SevenZFile.java:444). Large declared sizes can force multi-GB allocations (or NegativeArraySizeException) from very small inputs.",
+      "reason": "Plausible memory-exhaustion DoS (same family as later 7z OOM advisories) but the impact depends on JVM heap limits and a single allocation attempt rather than a guaranteed hang; weaker and less specific source evidence than the coder-cycle loop, so it was not chosen as the single candidate."
+    },
+    {
+      "lead": "CpioArchiveInputStream.readCString((int) namesize) allocates `new byte[length - 1]` (CpioArchiveInputStream.java:459-464) from an 8-hex-digit attacker field (up to 0xFFFFFFFF), giving NegativeArraySizeException for values > 2^31 and very large allocations for large positive values.",
+      "reason": "Real robustness/DoS concern but no assignment/validation gap in the parsing itself is tied to a project security advisory; also the array is allocated only once per entry, so impact is less than the infinite-loop findings. Rejected as not the strongest candidate."
+    },
+    {
+      "lead": "Pack200CompressorInputStream caches the full unpacker output in memory via streamBridge (Pack200CompressorInputStream.java:169-192) with no size/ratio limit (CVE-2024-26308-style OOM).",
+      "reason": "The allocation behavior occurs inside the JDK Pack200 unpacker and the in-memory StreamBridge; source evidence in this repository is indirect (no attacker-controlled length arithmetic here), and it is a different root cause from the selected candidate. Left unconfirmed."
+    },
+    {
+      "lead": "ArjArchiveInputStream uses `new byte[firstHeaderSize - 1]` (ArjArchiveInputStream.java:166, 222) where firstHeaderSize is an unsigned byte read from the stream; value 0 yields NegativeArraySizeException, and extended-header loops (lines 249-262) accumulate attacker-sized byte arrays.",
+      "reason": "Unchecked-exception/robustness issue rather than a demonstrated security-impacting vulnerability; not selected given the one-candidate limit."
+    },
+    {
+      "lead": "Map of 2021 ZIP/7z OOM and infinite-loop advisories (crafted-entry-count/extra-field/size-driven allocations in ZipFile/ZipArchiveInputStream) that may also exist in this snapshot.",
+      "reason": "I did not locate a specific, source-evidenced ZIP root cause matching those advisories within the review budget; the ZipArchiveInputStream CVE-2018-11771 EOF handling (hitCentralDirectory, currentEntryHasOutstandingBytes, drainCurrentEntryData) appears already present, so I did not claim a zip finding."
+    }
+  ],
+  "summary": "Reviewed the Apache Commons Compress 1.18-SNAPSHOT source tree (264 files, main sources only; no tests in snapshot). The snapshot post-dates the COMPRESS-463 / CVE-2018-11771 ZipArchiveInputStream EOF fix (hitCentralDirectory, currentEntryHasOutstandingBytes, drainCurrentEntryData are present). The single strongest source-evidenced issue I found is an attacker-triggerable infinite loop in 7z folder/coder resolution: Folder.getOrderedCoders() walks bind pairs without any cycle/duplicate-index validation, so a crafted 7z header whose bind-pair chain re-enters an already-visited input stream spins forever while growing a LinkedList (hang + heap growth / DoS). Traceability is direct: bind pairs and packed stream indices are read from the untrusted header in SevenZFile.readFolder(), and getOrderedCoders() is invoked from readEncodedHeader() (during SevenZFile construction for archives with an encoded header) and from buildDecoderStack() (getNextEntry). I selected this one candidate and list the other real-looking DoS leads as rejected/unconfirmed because only one candidate may be submitted."
+}

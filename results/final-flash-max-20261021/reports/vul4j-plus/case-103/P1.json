@@ -1,0 +1,96 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Filter values are attacker-controlled strings. They arrive either (a) from a crafted DataSetLookup sent over the Errai @Remote RPC DataSetLookupServices.lookupDataSet(DataSetLookup) (interface DataSetLookupServices.java:27-35; server impl DataSetLookupServicesImpl.java:75-84 -> DataSetManagerImpl.java:136-158 with no validation), or (b) from a stored dashboard/displayer definition: DisplayerSettings/DataSetLookup are round-tripped through JSON (DisplayerSettingsJSONMarshaller, DataSetLookupJSONMarshaller.parseCoreFunctionParameters at lines 422-432) and the displayer sends the settings' lookup to the server on render (AbstractDisplayer.lookupDataSet paths). CoreFunctionFilter parameters are an untyped List (CoreFunctionFilter.java:57-75), and user-typed text (e.g. TextParameterEditor/MultipleTextParameterEditor) or dashboard JSON strings end up there. Example benign-looking payload class: a single quoted value that closes the literal, e.g. \"x' OR '1'='1\" or a UNION/boolean/time-based SELECT; group-interval names (SQLDataSetProvider.java:907-951) are also passed as strings into the same IN/BETWEEN builders.",
+      "confidence": "medium",
+      "counterevidence_checked": "Column identifiers are validated against the data set metadata before use (_columnFromMetadata/_assertColumnExists, SQLDataSetProvider.java:584-597), so the column-name vector is constrained; the value vector is not. Numeric and Date parameters cannot carry quotes (getNumberParameterSQL/getDateParameterSQL), but any label/text filter parameter or interval name can. Caching could hide the SQL path, but cacheEnabled is false by default and rows > cacheMaxRows still forces SQL execution. No escaping/parameterization exists in the module (searched 'escape' and 'PreparedStatement' - no matches; the only executors are Statement-based). No server-side authorization or input validation was found on the lookup services in this snapshot (no @RolesAllowed/SecurityCheck anywhere); the standalone web.xml applies only the container 'admin' role to the whole app, which limits who can reach the service in that packaging but is not enforced in the reusable backend modules.",
+      "id": "dashbuilder-sql-lookup-filter-injection",
+      "impact": "Arbitrary SQL executed against the JDBC data source configured for the data set, with that data source's privileges. Practical impact includes reading arbitrary tables/columns via UNION or boolean/time-based inference (confidentiality breach beyond the intended data set), bypassing the application's intended column/row filters, denial of service via expensive queries, and data modification/stacked statements where the JDBC driver permits them. The flaw is reachable from a stored dashboard definition (malicious author -> payload executed server-side when any user opens the dashboard) as well as from a direct lookup RPC, i.e. it crosses the caller/data-owner privilege boundary.",
+      "locations": [
+        {
+          "end_line": 549,
+          "path": "dashbuilder-backend/dashbuilder-dataset-sql/src/main/java/org/dashbuilder/dataprovider/sql/dialect/DefaultDialect.java",
+          "start_line": 431
+        },
+        {
+          "end_line": 556,
+          "path": "dashbuilder-backend/dashbuilder-dataset-sql/src/main/java/org/dashbuilder/dataprovider/sql/SQLDataSetProvider.java",
+          "start_line": 461
+        },
+        {
+          "end_line": 682,
+          "path": "dashbuilder-backend/dashbuilder-dataset-sql/src/main/java/org/dashbuilder/dataprovider/sql/SQLDataSetProvider.java",
+          "start_line": 674
+        },
+        {
+          "end_line": 184,
+          "path": "dashbuilder-backend/dashbuilder-dataset-sql/src/main/java/org/dashbuilder/dataprovider/sql/model/Select.java",
+          "start_line": 181
+        },
+        {
+          "end_line": 82,
+          "path": "dashbuilder-backend/dashbuilder-dataset-sql/src/main/java/org/dashbuilder/dataprovider/sql/JDBCUtils.java",
+          "start_line": 72
+        },
+        {
+          "end_line": 84,
+          "path": "dashbuilder-backend/dashbuilder-services/src/main/java/org/dashbuilder/dataset/service/DataSetLookupServicesImpl.java",
+          "start_line": 75
+        },
+        {
+          "end_line": 158,
+          "path": "dashbuilder-backend/dashbuilder-dataset-core/src/main/java/org/dashbuilder/dataset/DataSetManagerImpl.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 42,
+          "path": "dashbuilder-shared/dashbuilder-services-api/src/main/java/org/dashbuilder/dataset/service/DataSetLookupServices.java",
+          "start_line": 27
+        },
+        {
+          "end_line": 75,
+          "path": "dashbuilder-shared/dashbuilder-dataset-api/src/main/java/org/dashbuilder/dataset/filter/CoreFunctionFilter.java",
+          "start_line": 57
+        }
+      ],
+      "prerequisites": "A deployed Dashbuilder instance with at least one SQL data set (SQLDataSetDef with a dataSource/dbSQL) whose filters are executed server-side (cacheEnabled defaults to false, DataSetDef.java:62, so filters normally reach the database; even with cache, rows > cacheMaxRows force the SQL path, SQLDataSetProvider.java:210-231). The attacker needs the ability to reach the Errai bus/DataSetLookupServices (authenticated dashboard user; the shipped standalone distributions restrict the app to the 'admin' role in web.xml, but the backend modules are reusable/embeddable and the service itself performs no authorization check), plus knowledge of the data set UUID/column IDs (metadata/list services are exposed to clients).",
+      "root_cause": "DefaultDialect renders string parameters as \"'\" + param + \"'\" with no quote escaping (DefaultDialect.java:546-549, used by getParameterSQL at 518-530 and by all condition builders at 431-516), and column names are emitted raw (getColumnNameSQL, 342-345). SQLDataSetProvider converts client-supplied DataSetLookup filters and group-interval selections directly into CoreCondition values without validation (SQLDataSetProvider.java:461-466, 468-556, 674-682; interval names at 907-951), the statement is serialized by Select.getSQL/fetch (Select.java:148-162, 181-184), and executed with connection.createStatement().executeQuery(sql) (JDBCUtils.java:72-82) - no PreparedStatement or escaping exists anywhere in the module (a search for 'escape' in dashbuilder-dataset-sql returns no matches).",
+      "title": "SQL injection via unescaped DataSetLookup filter parameters in SQL data-set provider dialect",
+      "trace": "1) DataSetLookupServicesImpl.lookupDataSet(DataSetLookup) (lines 75-84) passes the client object straight to DataSetManagerImpl.lookupDataSet (lines 136-158), which resolves the registered SQLDataSetDef and calls SQLDataSetProvider.lookupDataSet (lines 201-236). 2) _lookupDataSet/ LookupProcessor.run collects lookup.getOperationList(DataSetFilter.class) and calls _appendFilterBy (lines 674-682). 3) _createCondition (468-556) maps CoreFunctionFilter params (and selected interval names, 907-951) to Column.equalsTo/in/like/between conditions with the raw values. 4) DefaultDialect.getConditionSQL -> e.g. getIsEqualsToConditionSQL (431-439) -> getParameterSQL (518-530) -> getStringParameterSQL (546-549) returns \"'\" + param + \"'\" with no escaping. 5) Select.getSQL()/fetch() (148-162, 181-184) passes the concatenated string to JDBCUtils.executeQuery (72-82), which executes it with connection.createStatement().executeQuery(sql). Result: attacker text is parsed as SQL syntax in the WHERE clause of the data-source query.",
+      "unverified": "No exploit was executed and no runtime confirmation exists. Whether an unauthenticated or low-privileged user can reach the Errai bus in a given deployment was not runtime-verified (the bundled web.xml requires the admin role for *.erraiBus). Exact database-side impact (stacked statements, file/OS interactions) depends on the JDBC driver and data-source privileges, which were not tested. The stored-dashboard delivery path was traced at source level (JSON marshalling + displayer lookup) but not executed end to end.",
+      "weakness_type": "SQL Injection (CWE-89) - string concatenation of untrusted filter values into SQL, executed via Statement"
+    }
+  ],
+  "coverage_summary": "Scope: all 1340 model-visible files in the snapshot (get_source_scope: no exclusions beyond binary/NUL handling; relation index: 1340/1340 indexed, no missing files, syntactic navigation only). Reviewed with source text verification: backend dataset modules (dataset-core, dataset-sql incl. all dialect classes and SQL model classes, dataset-csv, dataset-cdi, dataset-services, dataset-elasticsearch entry points), shared dataset API (filters, lookup, definitions, JSON marshallers), services API, webapp web.xml/deployer/command server, distro web.xml/README, and sampled client modules (displayer/AbstractDisplayer, DataSetHandler, filter editors, DisplayerGwtExprEval, dataset client services). Not reviewed line-by-line: the vendored dashbuilder-hibernate-validator copy, most of the GWT renderer/widget code, ElasticSearch jest serializer/deserializer internals, i18n/property files, and build/assembly files beyond their security-relevant settings.",
+  "limitations": [
+    "Static review only: no code was built, run, scanned, or exploited; no runtime reachability or exploitability is confirmed.",
+    "The relation index is syntactic/navigation-only (calls/containment/inheritance candidates); it does not prove control/data flow, and every relation cited here was re-verified against source text.",
+    "Errai RPC marshalling of DataSetLookup/CoreFunctionFilter objects and the exact wire-level reachability of the lookup services were inferred from source (@Remote/@Service interfaces) and not exercised.",
+    "Database-side impact (e.g. stacked statements, file/OS functions) depends on the JDBC driver and data source privileges, which were not inspected or tested.",
+    "In the shipped standalone web.xml the whole application (including *.erraiBus) is restricted to the container 'admin' role, which reduces the privilege-escalation severity in those distributions; the reusable modules/redeployments may differ.",
+    "Several modules (renderers, ElasticSearch internals, vendored validation library) were only spot-checked, so additional issues there remain uninspected rather than cleared."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CSV data-set provider honors attacker-supplied fileURL/filePath from a client-provided CSVDataSetDef through the remote lookupDataSet(DataSetDef, DataSetLookup) overload (CSVParser.java:109-120 uses new URL(url).openStream() and new FileInputStream(new File(path))); DataSetLookupServicesImpl.java:86-99 casts/uses the client object without validation, enabling SSRF (http://internal/...) and local text-file disclosure (file:///etc/passwd, attacker-chosen separator/quote chars in the definition).",
+      "reason": "Plausible and serious, but it relies on the same RPC trust boundary and on the (unverified) absence of container/Errai-level restrictions for that overload; the SQL-injection candidate has a cleaner, unambiguous 'missing escaping' root cause with an explicit execution sink. Not selected as it is a separate root cause and listing it as a second candidate is forbidden."
+    },
+    {
+      "lead": "BeanDataSetProvider.lookupGenerator instantiates any class name supplied in BeanDataSetDef.generatorClass via Class.forName(...).newInstance() (BeanDataSetProvider.java:61-69), reachable with a client-supplied BeanDataSetDef.",
+      "reason": "Arbitrary class instantiation requires a suitable classpath gadget to escalate beyond side effects/DoS; no concrete gadget or reachable dangerous class was identified in the snapshot, so the security impact is unproven."
+    },
+    {
+      "lead": "Client-side DisplayerGwtExprEval runs native eval(expr) with only a keyword blocklist (DisplayerGwtExprEval.java:22, 49-52), and valueExpression is parsed from JSON (DisplayerSettingsJSONMarshaller).",
+      "reason": "The blocklist is bypassable (e.g. top['docu'+'ment'], new Function(...)), but the impact is confined to the victim's browser and the end-to-end path from a stored, shared dashboard definition to another user's browser was not fully traced in this snapshot; weaker source evidence than the server-side injection."
+    },
+    {
+      "lead": "CommandServer opens an unauthenticated TCP ServerSocket (default port 10000) and fires CDI CommandEvent for every line received (dashbuilder-webapp/.../command/CommandServer.java:56-70).",
+      "reason": "No in-repository consumer of CommandEvent was found, so no security-relevant action could be demonstrated; the socket may be a leftover debug facility with no exploitable effect in this snapshot."
+    },
+    {
+      "lead": "DefaultDialect.getColumnNameSQL returns column identifiers unquoted/unescaped (DefaultDialect.java:342-345) and SQLDataSetDef.dbSQL/dbTable/dbSchema are concatenated into statements.",
+      "reason": "Column IDs are validated against data-set metadata before reaching SQL in the lookup path, and dbSQL is a documented authoring feature; no additional distinct exploit path was confirmed beyond the selected injection."
+    }
+  ],
+  "summary": "Review of the Dashbuilder 0.5.0-SNAPSHOT source tree (1340 files; java-syntax relation index covers all 1340 files with 0 omissions, but is navigation-only). The strongest distinct issue found is a server-side SQL injection in the SQL data-set provider: filter values and interval names supplied through a DataSetLookup are interpolated unescaped into SQL text and executed with a plain java.sql.Statement. One candidate is submitted; several other plausible leads (CSV URL/file SSRF+LFI via the client-supplied DataSetDef RPC overload, BeanDataSetProvider reflective instantiation, client-side eval blocklist, unauthenticated CommandServer socket) are recorded as unconfirmed rejected leads."
+}

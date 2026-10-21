@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the request URL / query string / path parameters that are copied into exception messages. For an unmatched path the message contains the request URI (percent-encoded form as supplied by the container's getRequestURL(), so browser execution requires the payload to be decoded by a container/proxy or to travel through a path that uses the decoded value); for a parameter-conversion failure on a matched resource, PathParamInjector/QueryParamInjector convert the failure into a 404 NotFoundException whose message contains the raw, decoded parameter value, and SynchronousDispatcher's fallback message uses getUri().getPath() (decoded). The attacker also chooses the link a victim follows.",
+      "confidence": "medium",
+      "counterevidence_checked": "The escaping filter does exist and correctly escapes '/', '<', '>', '&', '\"', \"'\" for status 400 text/html String entities, which shows the 400 path is intentionally mitigated; I verified it is not invoked for other statuses. The unmatched-path message uses getRequestUri() (URI built from the raw/encoded request string in ServletUtil.extractUriInfo / ResteasyUriInfo.processUris), so a plain %3Cscript%3E payload stays percent-encoded and will not execute in a normal browser - this is the main limitation and it is why the decoded-value parameter paths and the SynchronousDispatcher.getUri().getPath() message are cited. StringParameterInjector URL-encodes the value in several branches (_encode, lines 719-761), but the paramConverter/unmarshaller/delegate branches (685-709) do not, and PathParamInjector/QueryParamInjector turn those into 404 text/html responses. MediaType-valued messages (e.g. NoMessageBodyWriterFoundFailure, 500) were checked and cannot carry '<'/'>' because MediaTypeHeaderDelegate.isValid rejects them. The registration of MessageSanitizerContainerResponseFilter cannot be verified in this snapshot because all META-INF/services/javax.ws.rs.ext.Providers files were removed from the snapshot; if the filter were absent, the same unescaped-output issue applies to 400 as well. No runtime verification was performed.",
+      "id": "resteasy-errorpage-html-escape-gap",
+      "impact": "Reflected cross-site scripting in the origin of the JAX-RS application (session/cookie theft, request forgery in the victim's authenticated context, UI redressing) for any deployment that exposes the default error handling; the same unescaped text/html path also applies to other statuses produced through the Failure branch. Because the escaping control exists and is applied to 400 responses, this is a concrete missing-validation bug on outputs, not merely a hardening suggestion.",
+      "locations": [
+        {
+          "end_line": 219,
+          "path": "resteasy-core/src/main/java/org/jboss/resteasy/core/ExceptionHandler.java",
+          "start_line": 215
+        },
+        {
+          "end_line": 257,
+          "path": "resteasy-core/src/main/java/org/jboss/resteasy/core/ExceptionHandler.java",
+          "start_line": 233
+        },
+        {
+          "end_line": 52,
+          "path": "resteasy-core/src/main/java/org/jboss/resteasy/plugins/interceptors/MessageSanitizerContainerResponseFilter.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 70,
+          "path": "resteasy-core/src/main/java/org/jboss/resteasy/core/registry/ClassNode.java",
+          "start_line": 70
+        },
+        {
+          "end_line": 152,
+          "path": "resteasy-core/src/main/java/org/jboss/resteasy/core/registry/SegmentNode.java",
+          "start_line": 152
+        },
+        {
+          "end_line": 334,
+          "path": "resteasy-core/src/main/java/org/jboss/resteasy/core/SynchronousDispatcher.java",
+          "start_line": 330
+        },
+        {
+          "end_line": 709,
+          "path": "resteasy-core/src/main/java/org/jboss/resteasy/core/StringParameterInjector.java",
+          "start_line": 685
+        }
+      ],
+      "prerequisites": "A deployment of resteasy-core (no custom exception mapper for NotFoundException/BadRequestException and no custom response filter that re-escapes or replaces text/html error entities). Browser exploitation of a decoded payload additionally requires either an application-declared ParamConverter/StringParameterUnmarshaller on a path or query parameter (conversion failure paths that pass the raw value), or a container/proxy that presents a decoded request URI in getRequestURI/getPath. The 404 branch (ExceptionHandler lines 233-240) is reached for every unmatched path, which makes the flaw broadly reachable even with encoded input.",
+      "root_cause": "RESTEasy maps exception messages to response entities with Content-Type text/html for client errors (400 and 404) and for other failures, but the only built-in output-escaping control, MessageSanitizerContainerResponseFilter, runs exclusively when the response status equals 400 (HttpResponseCodes.SC_BAD_REQUEST). Therefore any message that reaches the client with a status other than 400 - in particular 404 NotFoundException messages - is emitted without HTML escaping. The message strings themselves are built from request data: ClassNode/SegmentNode build \"Could not find resource for full path: \" + request.getUri().getRequestUri(); SynchronousDispatcher builds \"Unable to find JAX-RS resource associated with path: \" + request.getUri().getPath() (the decoded path); PathParamInjector/QueryParamInjector/MatrixParamInjector rethrow StringParameterInjector conversion failures as NotFoundException (404) whose message embeds the parameter value, and three branches of StringParameterInjector.retrieveValue pass the raw decoded value (the other branches apply URLEncoder, showing the encoding was intended as a safeguard).",
+      "title": "Reflected XSS: request-derived exception messages are returned as text/html but only HTML-escaped for HTTP 400",
+      "trace": "(1) GET request for a path/parameter that either does not match a resource or fails parameter conversion. (2) SynchronousDispatcher.getInvoker -> ResourceMethodRegistry.getResourceInvoker -> ClassNode.match/SegmentNode.match throw new NotFoundException(Messages.MESSAGES.couldNotFindResourceForFullPath(request.getUri().getRequestUri())) (ClassNode:70, SegmentNode:152), or PathParamInjector/QueryParamInjector/MatrixParamInjector throw NotFoundException via throwProcessingException (PathParamInjector:52-56, QueryParamInjector:43-47, StringParameterInjector:685-709). (3) SynchronousDispatcher.execute catches the exception and calls ExceptionHandler.handleException -> handleClientErrorException, which for status 400 or 404 rebuilds the response with builder.type(MediaType.TEXT_HTML).entity(e.getMessage()) (ExceptionHandler:233-240; the no-response branch is 254-257; generic failures are 215-219). (4) The response filters run; MessageSanitizerContainerResponseFilter returns without doing anything unless responseContext.getStatus() == 400 (line 43), so a 404 (or any non-400) text/html body containing the attacker-influenced message is written verbatim. (5) The browser of a user who follows the crafted URL renders the returned body as HTML, executing attacker markup if the message carries decoded/executable content.",
+      "unverified": "No runtime confirmation. Whether a given container/proxy provides a decoded request URI, and whether a specific application declares a ParamConverter/unmarshaller (the strongest decoded-payload vector), were not verified. The exact upstream fix location for this class of issue (filter status scope vs. ExceptionHandler content type/escaping) cannot be determined from this snapshot, and it cannot be proven that the sanitizer filter is actually registered in a given deployment (service-registration files are absent from the snapshot). Some message paths were inferred from code reading rather than observed responses.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation (reflected Cross-Site Scripting)"
+    }
+  ],
+  "coverage_summary": "Source scope reported 1,153 model-visible files (no size/symlink/sensitive-name exclusions); the P1 relation index also reports 1,153 indexed files with no missing files, no build/test execution, no SAST oracle, and explicitly non-exhaustive syntactic relations only. Read/deeply inspected: resteasy-core request pipeline (SynchronousDispatcher, ExceptionHandler, ResourceMethodInvoker, registry ClassNode/SegmentNode/RootNode/RootClassNode, parameter injectors, MessageSanitizer filter, GZIP interceptor, DocumentProvider, SourceProvider, DataSourceProvider/FileProvider/FileRangeWriter, MediaTypeHeaderDelegate/NewCookieHeaderDelegate, ServletUtil/HttpServletInputMessage, ServletContainerDispatcher, ResteasyUriInfo, AsynchronousDispatcher, ProviderFactory), providers (jackson2 ResteasyJackson2Provider/WhiteListPolymorphicTypeValidatorBuilder/Jackson2JsonpInterceptor/PatchMethodFilter, jaxb AbstractJAXBProvider/SecureUnmarshaller, multipart Mime4JWorkaround/MultipartInputImpl, json-p/jsonb, resteasy-html View/Redirect, validator), security (jose-jwt AESCBC/RSA1_5/RSADecrypter/HMACProvider/JWSInput, resteasy-crypto DKIMSignature), resteasy-cache, resteasy-client engines (URLConnectionEngine, ManualClosingApacheHttpClient43Engine, ClientHttpEngineBuilder43, JettyClientEngine), server adapters (netty4, vertx, jdk-http BasicAuthFilter, undertow), resteasy-jsapi, resteasy-links, resteasy-spring/spring-web, resteasy-stats, resteasy-wadl headers. Not inspected line-by-line: the majority of the 1,153 files (e.g. full resteasy-spring internals, guice/cdi modules, most providers' writer methods, i18n Messages/LogMessages bodies, pom/docbook content). All src/test trees and all META-INF/services provider-registration files are absent from this snapshot, so test- or registration-based verification was impossible.",
+  "limitations": [
+    "No code was executed, no build/tests/scanners were run, and no runtime behavior was observed; all conclusions are source-text inferences.",
+    "The snapshot contains no src/test files and no META-INF/services/javax.ws.rs.ext.Providers files, so I could not verify built-in provider/filter registration (including whether MessageSanitizerContainerResponseFilter is registered) or confirm behavior with tests.",
+    "The relation index is navigational only (syntactic calls/containment/facts); no complete data flow, reachability or taint proof is available, and I did not rely on its labels as verdicts.",
+    "For the submitted candidate, browser-exploitable payloads depend on a decoded value reaching the message (application ParamConverter/StringParameterUnmarshaller usage, or a container/proxy that exposes a decoded URI); the default unmatched-path message uses the percent-encoded request URI.",
+    "I could not determine from this snapshot which upstream change (if any) later addressed the error-path escaping or the JSON-Patch filter behaviour, so the candidate remains a lead rather than a confirmed vulnerability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DataSourceProvider (resteasy-core/.../providers/DataSourceProvider.java:111), FileProvider (lines 71/83) and Mime4JWorkaround (line 119) use File.createTempFile for request/upload data - the classic 'insecure temporary file' issue (CWE-377/CWE-378, matches CVE-2023-0482).",
+      "reason": "This is a real weakness but local-only (a co-located OS user with read access, default temp dir/umask) and looks like the 'suspicious API / hardening opportunity' the review prompt warns about; the snapshot version (4.6.0-SNAPSHOT) does not correspond to the version line where that CVE was fixed, so I could not establish it as this snapshot's fix target."
+    },
+    {
+      "lead": "SourceProvider.writeTo (resteasy-core/.../providers/SourceProvider.java:81) creates a SAX XMLReader via SAXParserFactory.newInstance() without disabling external entities and identity-transforms StreamSource data to the response, while DocumentProvider/AbstractJAXBProvider/SecureUnmarshaller are hardened - a plausible XXE sink.",
+      "reason": "Reachable only when an application serializes a StreamSource built from untrusted XML; the standard request-matching path does not feed untrusted input into this writer. Unconfirmed whether external entity resolution is enabled in the target JVM, and I found no fix-linked evidence in this snapshot."
+    },
+    {
+      "lead": "PatchMethodFilter (providers/jackson2/.../PatchMethodFilter.java:121) invokes the target GET method through ResourceMethodInvoker.invokeDryRun, which bypasses that method's ContainerRequestFilter[] (invokeOnTargetDryRun vs. invokeOnTarget at ResourceMethodInvoker.java:412-451), including RoleBasedSecurityFilter (@RolesAllowed/@DenyAll) and validation, and returns the GET representation in the PATCH response.",
+      "reason": "A concrete logic gap, but exploitation requires an application whose GET and PATCH methods carry different security constraints (GET stricter than PATCH), which I could not establish as a supported/expected attack scenario, and I found no CVE/fix reference tying it to this snapshot."
+    },
+    {
+      "lead": "Jackson2JsonpInterceptor (providers/jackson2/.../Jackson2JsonpInterceptor.java:162-181, 194-211) concatenates the raw 'callback' query parameter into a JavaScript response without validating it (XSS/JSONP injection).",
+      "reason": "The interceptor is disabled by default (resteasy.jsonp.enable must be true and the provider explicitly registered), which makes it an opt-in, documented dangerous feature rather than the snapshot's primary issue."
+    },
+    {
+      "lead": "Client redirect handling: URLConnectionEngine.executeRequest (line 198) enables HttpURLConnection automatic redirects for GET and copies all request headers (Authorization/Cookie) via commitHeaders, and JettyClientEngine (lines 133-135) leaves redirects enabled unless jersey.config.client.followRedirects is explicitly FALSE; the default Apache engine has followRedirects=false.",
+      "reason": "Only affects applications that explicitly choose those engines or enable redirects; whether the JDK/Jetty forward credentials across hosts could not be verified from this source snapshot, so the credential-leak/SSRF claim remains unconfirmed."
+    },
+    {
+      "lead": "SerializableProvider, InfinispanCache CacheEntry.readObject, Class.forName/newInstance in microprofile-client configuration code, Runtime.getRuntime usage in NettyJaxrsServer, and the general catalog of security_call hints from the relation index.",
+      "reason": "SerializableProvider and the Infinispan cache entry are opt-in/persistence mechanisms with documented risk; the reflection uses configuration-controlled class names (not request data); the Runtime call is a CPU-count call. These are name-based 'suspicious API' pointers, not demonstrated vulnerabilities."
+    }
+  ],
+  "summary": "This is the RESTEasy JAX-RS repository at version 4.6.0-SNAPSHOT (code-only snapshot: all src/test trees and all extensionless META-INF/services provider-registration files are absent). I reviewed the request/response pipeline, providers, security modules, cache, client engines and server adapters. The strongest source-evidenced issue I found is that RESTEasy renders error/exception messages as text/html for 400, 404 and other failures while the built-in HTML-escaping response filter only sanitizes status 400, so messages that contain request-derived text can be returned as unescaped HTML (reflected XSS class, CWE-79). Several other plausible-looking items were examined and rejected or left unconfirmed (insecure temp files, SourceProvider XML parsing without external-entity hardening, JSONP callback concatenation, client redirect behaviour, a JSON-Patch filter that invokes the GET method without its request filters). No code was executed and no runtime exploitation was attempted; all statements are source-level."
+}

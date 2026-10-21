@@ -1,0 +1,110 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any unauthenticated remote or adjacent client that can open a TCP connection to the host's SOAPMonitorPort (default 5001, bound to all interfaces by new ServerSocket(port)) controls the entire byte stream read by ObjectInputStream on the server side; no credentials, SOAP request, or applet handshake is required (SOAPMonitorConstants defines only type/id/port constants, no auth token).",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified there is no authentication, handshake, source-IP restriction or object allowlist in the accept/connection path (SOAPMonitorService 176-262; SOAPMonitorConstants has no auth constant). Verified the servlet is actually active and not merely declared: web.xml declares it with an init-param port and load-on-startup 100 and maps /SOAPMonitor, and axis-war/pom.xml depends on axis-rt-soapmonitor so the class is packaged. Verified the docs conflict (install.xml 438 'By default, the SOAP Monitor is not enabled'; i18n.properties 51-54 declares it disabled by default and says to uncomment web.xml declarations), which is why I treat the active listener as a configuration/privilege-assumption fault rather than an intended feature. Also checked and set aside the other high-value sinks: AdminService remote deployment is gated by Admin.verifyHostAllowed() (Admin.java 171-207, localhost-only unless enableRemoteAdmin is explicitly true; MC_REMOTE_ADDR comes from req.getRemoteAddr()), XXE is blocked (DefaultEntityResolver returns an empty InputSource; DeserializationContext.startDTD throws), and JSSESocketFactory.create() calls verifyHostName() after the handshake (lines 210-215, 225-269), so the CVE-2012-5784/CVE-2014-3596 fix is present. No runtime/test execution was performed.",
+      "id": "axis-soapmonitor-deserialization",
+      "impact": "Unauthenticated network deserialization of attacker-controlled Java objects in the Axis server JVM (CWE-502): potentially remote code execution where a gadget chain exists on the classpath, otherwise forced class loading/instantiation, resource exhaustion and denial of service. The persistent connection list also leaks the content of all monitored SOAP requests/responses to any client that connects to the monitor port, and pre-authentication connections consume threads/memory (unbounded accept loop).",
+      "locations": [
+        {
+          "end_line": 119,
+          "path": "axis-rt-soapmonitor/src/main/java/org/apache/axis/monitor/SOAPMonitorService.java",
+          "start_line": 93
+        },
+        {
+          "end_line": 190,
+          "path": "axis-rt-soapmonitor/src/main/java/org/apache/axis/monitor/SOAPMonitorService.java",
+          "start_line": 176
+        },
+        {
+          "end_line": 222,
+          "path": "axis-rt-soapmonitor/src/main/java/org/apache/axis/monitor/SOAPMonitorService.java",
+          "start_line": 205
+        },
+        {
+          "end_line": 242,
+          "path": "axis-rt-soapmonitor/src/main/java/org/apache/axis/monitor/SOAPMonitorService.java",
+          "start_line": 237
+        },
+        {
+          "end_line": 292,
+          "path": "axis-rt-soapmonitor/src/main/java/org/apache/axis/monitor/SOAPMonitorService.java",
+          "start_line": 267
+        },
+        {
+          "end_line": 45,
+          "path": "axis-war/src/main/webapp/WEB-INF/web.xml",
+          "start_line": 34
+        },
+        {
+          "end_line": 65,
+          "path": "axis-war/src/main/webapp/WEB-INF/web.xml",
+          "start_line": 62
+        },
+        {
+          "end_line": 49,
+          "path": "axis-war/pom.xml",
+          "start_line": 45
+        },
+        {
+          "end_line": 75,
+          "path": "axis-rt-soapmonitor/src/main/java/org/apache/axis/handlers/SOAPMonitorHandler.java",
+          "start_line": 71
+        },
+        {
+          "end_line": 438,
+          "path": "src/site/xdoc/install.xml",
+          "start_line": 434
+        },
+        {
+          "end_line": 54,
+          "path": "axis-war/src/main/resources/i18n.properties",
+          "start_line": 48
+        }
+      ],
+      "prerequisites": "A deployment of the standard axis web application (or any web.xml equivalent) with the SOAPMonitorService servlet active - which the shipped axis-war web.xml provides via load-on-startup 100 and the /SOAPMonitor mapping - and network reachability to the monitor port. For code execution, a Java deserialization gadget chain must be present on the webapp/JVM classpath; without one, the same sink still permits arbitrary object deserialization side effects, memory/CPU exhaustion, and denial of service. Additionally, because every ConnectionThread registers itself in the static 'connections' vector, any connected client receives all SOAP request/response payloads published by SOAPMonitorHandler, even without sending any object.",
+      "root_cause": "SOAPMonitorService.init() creates a ServerSocket (SOAPMonitorPort, default 5001, no bind address) on servlet startup and starts an accept thread; every accepted socket is wrapped by ConnectionThread in a new ObjectInputStream and then read in a loop via in.readObject() with no authentication, handshake, source restriction, or deserialization filtering. The servlet and its /SOAPMonitor mapping are active in the shipped axis-war (load-on-startup 100), and axis-war bundles the axis-rt-soapmonitor runtime, so a standard deployment exposes this sink to any host that can reach the monitor port. The repository's own documentation contradicts this state: install.xml says the SOAP Monitor is not enabled by default and i18n.properties marks it '[disabled by default for security reasons]' and tells users to uncomment declarations in WEB-INF/web.xml, so the active listener is a configuration/privilege-assumption failure as well as an unsafe API.",
+      "title": "Unauthenticated Java deserialization exposed by default through the SOAP Monitor TCP listener",
+      "trace": "Container startup -> load-on-startup 100 invokes SOAPMonitorService.init() -> new ServerSocket(5001) + new Thread(ServerSocketThread) (lines 93-119) -> ServerSocketThread.run() blocks in server_socket.accept() and spawns a ConnectionThread per client (lines 176-190) -> ConnectionThread constructor builds ObjectOutputStream and ObjectInputStream directly on the attacker's socket and adds itself to the shared connections list (lines 205-222) -> run() executes 'while (!closed) { Object o = in.readObject(); }' with no validation (lines 237-242) -> attacker-supplied serialized object graph is deserialized in the server JVM. In parallel, SOAPMonitorHandler.invoke() calls SOAPMonitorService.publishMessage(), whose implementation writes monitored SOAP bodies to every registered ConnectionThread (lines 267-292, handler lines 71-75).",
+      "unverified": "Exploitability of the deserialization sink was not runtime-verified and depends on a gadget chain being available on the deployment classpath (RCE vs. DoS). I could not confirm from the snapshot alone whether the active SOAPMonitorService declaration in axis-war/web.xml reflects upstream intent or a local modification, although the repository's own documentation states the monitor is disabled by default. The exact port exposure also depends on deployment (port 5001 may be firewalled, and containers may differ in class loading of the war). Only main-source files are present in this snapshot (no src/test), so no regression tests could corroborate intended behavior.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (network-exposed, unauthenticated ObjectInputStream)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 1227 model-visible main-source files of the snapshot (905 Java files indexed; 21 source files have no index records; no src/test or build-executed data present). Priority was given to server entry points and security boundaries: axis-war web.xml/poms, AxisServlet/AxisServletBase, Admin/AdminServlet/AdminClient, providers (JavaProvider/RPCProvider/MsgProvider), WSDD deployment classes, security handlers/providers, HTTP transports and socket factories, JWS, attachments, XMLUtils/DeserializationContext, SOAP monitor and soapmonitor client/applet, JMS/mail transports, and codegen/Ant build tooling. The P1 relation index (syntax-level calls/containment only; no data/control flow or semantic resolution) was used solely for navigation, and its deserialization/security_call hints were verified in source text. Coverage limitations: tests and generated content were not available or deeply inspected; no runtime, scanner, or exploit execution was performed; findings are static-source conclusions and a candidate is a lead, not a confirmed vulnerability.",
+  "limitations": [
+    "No runtime, build, test, or exploit execution was performed; RCE via deserialization remains unproven and depends on classpath gadgets.",
+    "The P1 index does not implement control flow, data flow, or semantic resolution; 21 source files are absent from it, so unreported areas were not assumed reviewed.",
+    "The default server-config.wsdd and other .wsdd resources are not present in the model-visible snapshot, so the AdminService deployment and default options could not be inspected.",
+    "src/test content is absent from the snapshot, so no regression tests or expected-behavior checks could be consulted.",
+    "It cannot be fully determined from this snapshot alone whether the active SOAPMonitorService declaration in axis-war/web.xml is upstream intent or a local modification; the repository's own docs/i18n claim the monitor is disabled by default.",
+    "Only the strongest candidate is reported per the one-candidate cap; rejected leads were not exhaustively proven safe."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AdminService remote WSDD deployment / RCE (CVE-2019-0227-style) via /services/AdminService",
+      "reason": "Admin.process() calls verifyHostAllowed() before any deployment handling (Admin.java 137-164, 171-207), and the check denies non-local callers unless the Admin service option enableRemoteAdmin is explicitly true; MC_REMOTE_ADDR is populated from req.getRemoteAddr() in AxisServlet.createMessageContext (line 949). Exploitation requires a non-default configuration or a reverse proxy that makes remote clients appear local, so evidence for a vulnerability in the default configuration is weaker than for the SOAP Monitor listener. Also, the default server-config.wsdd is not part of this snapshot, so the deployed AdminService cannot be inspected here."
+    },
+    {
+      "lead": "HTTPS proxy CONNECT validation bypass in JSSESocketFactory (lines 192-193)",
+      "reason": "The condition requires the proxy reply to start with both 'HTTP/1.0 200' and 'HTTP/1.1 200' (logically impossible), so a non-200 tunnel response is never rejected. However the security impact is limited: hostname verification is still performed on the peer certificate at line 214, and a malicious proxy can already observe the tunnel; the flaw mainly degrades client error handling. This may also be genuine upstream code rather than a modification, so it was not selected."
+    },
+    {
+      "lead": "XXE in attacker-supplied SOAP/WSDD XML",
+      "reason": "Mitigated in this snapshot: XMLUtils sets DefaultEntityResolver (returns an empty InputSource) on SAX/DOM parsers (XMLUtils 276-280, 360), and DeserializationContext.startDTD throws for DOCTYPE declarations (lines 1160-1182)."
+    },
+    {
+      "lead": "Reflected/unescaped XML construction in QSMethodHandler (lines 66-117)",
+      "reason": "Method name and query parameters are concatenated into a SOAP envelope without escaping, but the same content can be supplied through a normal SOAP POST, so no clear security boundary or privilege is crossed; no concrete impact could be established from source alone."
+    },
+    {
+      "lead": "SunFakeTrustSocketFactory accepts any server certificate",
+      "reason": "It is an explicitly configured opt-in client socket factory (documented as a hook for unsigned certificates), not the default trust path, so it is not a vulnerability by itself."
+    },
+    {
+      "lead": "SimpleAxisWorker Set-Cookie2 header uses the cookie instead of cookie2 buffer (line 662)",
+      "reason": "Appears to be a functional bug in the optional stand-alone/compat HTTP server, with no demonstrated security impact; likely upstream behavior."
+    }
+  ],
+  "summary": "Apache Axis 1.4.1-SNAPSHOT (modularized axis-axis1-java master) source review. After tracing externally reachable sinks and trust boundaries of the axis web application, the strongest source-evidenced candidate is the SOAP Monitor listener: SOAPMonitorService opens a TCP server socket (default 5001, all interfaces) at webapp startup, accepts unauthenticated clients, and loops on ObjectInputStream.readObject() with no authentication, allowlist, or type filtering. The standard axis war enables this servlet with load-on-startup 100 and a /SOAPMonitor mapping, while the repository's own install doc and i18n resource state the SOAP Monitor is \"not enabled\"/\"disabled by default for security reasons\" and must be uncommented in web.xml - i.e., the shipped configuration exposes a listener the project documents as intentionally disabled. Other leads were examined and rejected as weaker or mitigated (AdminService remote deployment is guarded by a localhost/enableRemoteAdmin check; XXE is mitigated; SSL hostname verification is present)."
+}

@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated client that can reach the Jenkins HTTP port fully controls the /cli POST body and headers (Session UUID, Side=download/upload). Those streams carry the remoting protocol; the client chooses which Java objects/classes are written into the channel during the handshake and command invocation. Jenkins' own client (cli/src/main/java/hudson/cli/CLI.java connectViaHttp) shows the wire format, but a custom client can send arbitrary serialized objects instead of legitimate Callables/commands.",
+      "confidence": "medium",
+      "counterevidence_checked": "The actual deserialization/filtering code lives in the external remoting library (pom.xml pins remoting 2.60.1), not in this snapshot, so exploitability is inferred rather than demonstrated here. The CLI only grants Jenkins.READ by default and each command performs its own check after authentication; the channel is created with restricted=true for non-admins (blocks remote class loading); cmdline clients cannot pick the classloader; admins can disable the CLI with -Djenkins.CLI.disabled=true; and the code comment documents the deferred-authentication design as intentional. I found no test or runtime evidence of a working gadget chain. The finding is therefore a lead, not a confirmed exploit.",
+      "id": "case-004-1",
+      "impact": "Potential pre-authentication remote code execution / full compromise of the Jenkins master (or at minimum unauthenticated object instantiation and denial of service). This crosses the network trust boundary into the master JVM, which also holds credentials, plugin code, and agent channels.",
+      "locations": [
+        {
+          "end_line": 135,
+          "path": "core/src/main/java/hudson/cli/CLIAction.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 101,
+          "path": "core/src/main/java/hudson/cli/CliManagerImpl.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 96,
+          "path": "core/src/main/java/hudson/model/FullDuplexHttpChannel.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 100,
+          "path": "core/src/main/java/hudson/cli/GroovyCommand.java",
+          "start_line": 93
+        },
+        {
+          "end_line": 257,
+          "path": "core/src/main/java/hudson/cli/CLICommand.java",
+          "start_line": 231
+        },
+        {
+          "end_line": 183,
+          "path": "pom.xml",
+          "start_line": 179
+        }
+      ],
+      "prerequisites": "HTTP access to /cli; CLI not disabled (jenkins.CLI.DISABLED defaults to false – core/src/main/java/jenkins/CLI.java line 16); a usable deserialization gadget available on the master's uber classloader (Jenkins ships many libraries and loads plugins into the same JVM). No Jenkins account is required to create the channel because CLIAction explicitly performs no permission check for channel establishment.",
+      "root_cause": "The /cli HTTP endpoint intentionally establishes a remoting Channel without requiring any permission ('do not require any permission to establish a CLI connection' – CLIAction.java), and the CLI protocol uses Java object serialization to ship commands/Callables from the client to the master (e.g. GroovyCommand.loadScript does checkChannel().call(new ScriptLoader(script))). Authentication/permission enforcement happens only later, inside CLICommand.main (Jenkins.READ) and inside each command, i.e. after the channel has already deserialized attacker-supplied objects. The FullDuplexHttpChannel 'restricted' flag only disables remote class loading; it does not restrict deserialization. The class filter available from the pinned remoting 2.60.1 (pom.xml) is the legacy denylist, not the later comprehensive blacklist.",
+      "title": "Unauthenticated Jenkins CLI/remoting channel deserializes client-supplied Java objects (pre-auth RCE surface)",
+      "trace": "1) Attacker POSTs to /cli with headers Session=<uuid>, Side=download; CLIAction.getTarget() throws CliEndpointResponse for any POST and generateResponse() registers a FullDuplexHttpChannel with no authentication/permission check (CLIAction.java lines 89-127; the comment itself states no permission is required). 2) Attacker POSTs Side=upload for the same UUID; upload side is wired to the download side. 3) FullDuplexHttpChannel.download() builds a remoting Channel over the attacker-controlled streams (FullDuplexHttpChannel.java lines 95-96) with restricted=!ADMINISTER (only blocks remote classloading). 4) The channel deserializes client-supplied Java objects; legitimate CLI usage already demonstrates server-side execution of client-provided serialized Callables (GroovyCommand.loadScript -> checkChannel().call(new ScriptLoader(script)), GroovyCommand.java lines 93-100). 5) CLI-level authorization occurs only afterwards: CLICommand.main sets transport authentication and calls Jenkins.checkPermission(Jenkins.READ) (CLICommand.java lines 246-257), and CliManagerImpl.main looks up the command and reads transport auth from the channel property (CliManagerImpl.java lines 75-95). Deserialization therefore precedes authorization. 6) With a suitable gadget chain, this yields code execution in the Jenkins master JVM (history: CVE-2016-9299, later CVE-2017-1000353); absent a gadget it still allows unauthenticated object injection/DoS.",
+      "unverified": "No runtime execution was performed; the presence of a working deserialization gadget on the classpath is unverified, and the exact remoting 2.60.1 class filtering behavior could not be inspected because the remoting artifact is not part of the snapshot.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (with CWE-306 Missing Authentication for Critical Function)"
+    }
+  ],
+  "coverage_summary": "Scope filters reported by get_source_scope: 8,875 visible files, 0 excluded by size/symlink/sensitive-name, binary files skipped; the snapshot contains main sources only (979 Java files, 6,907 properties, 92 JS, 15 XML; no tests and no Jelly templates). I inspected the core authentication/authorization stack (HudsonFilter, BasicAuthenticationFilter, BasicHeaderProcessor/api-token auth, SecurityRealm/AuthenticationProcessingFilter2, remember-me, CSRF crumb issuer/filter), ACL/SidACL/SparseACL/Permission logic, Secret and confidential-key crypto, the Jenkins CLI stack (CLIAction, CliManagerImpl, CLICommand, CliProtocol/2, client CLI, Groovy/ScriptLoader), model permission checks (AbstractItem/Job/Run/View/User/Computer/Queue/UpdateCenter/PluginManager), file-serving and path handling (DirectoryBrowserSupport, AssetManager, Slave.JnlpJar, FilePath), XStream/XXE hardening, and the JS resources for client-side injection sinks.",
+  "limitations": [
+    "No runtime, test, or exploit execution was performed; all conclusions are static source review.",
+    "The exact upstream commit/branch is unclear (poms say 2.7.5-SNAPSHOT and changelog stops at 2.6, while a few files carry later-version annotations such as '@since 2.9, 2.7.1' and JENKINS-37332/36593 references), so I could not diff this tree against the corresponding upstream commit to detect a subtly modified line.",
+    "The remoting, Stapler, Spring/Acegi, and other bundled dependencies are external artifacts; their class-filter/deserialization behavior could not be read and is the key unverified element of the submitted candidate.",
+    "Jelly/HTML view templates are absent from the snapshot, so server-side rendering/XSS sinks in views could not be reviewed.",
+    "No precomputed source-relation index was available (B0 condition); coverage is bounded by text search and bounded file reads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "hudson/console/ConsoleNote.readFrom (core/src/main/java/hudson/console/ConsoleNote.java lines 209-238) deserializes bytes parsed out of build console output, and ExpandableDetailsNote/HyperlinkNote render raw HTML/URLs from such notes (ExpandableDetailsNote.java lines 51-56; HyperlinkNote.java lines 56-71), suggesting a forged-console-note stored XSS/deserialization path for users with build permission.",
+      "reason": "Same code shape is long-standing upstream behavior for console annotations, no missing validation vs. surrounding code was identified, and impact requires build/agent output control; could not establish that this snapshot lacks a specific later fix, so left unconfirmed rather than submitted."
+    },
+    {
+      "lead": "hudson/FilePath.java unzip()/readFromTar() extract entries with 'new File(dir, entryName)' and no '..' validation (FilePath.java lines 586-600 and 2300-2320), a potential Zip Slip / path traversal write.",
+      "reason": "Exploitation requires a caller to extract an attacker-supplied archive; core callers are admin-configured tool installers, and no clear untrusted-archive sink was traced from a low-privilege remote request."
+    },
+    {
+      "lead": "jenkins/model/Jenkins.doIconSize redirects to the unvalidated Referer header (Jenkins.java lines 4084-4093).",
+      "reason": "Open-redirect only, low security impact, and appears to be intended legacy behavior; not the strongest issue."
+    },
+    {
+      "lead": "Various endpoints re-checked for authorization gaps (PluginManager.doInstallNecessaryPlugins, UpdateCenter.doCancelRestart, Queue.clear, Computer.doDoDelete, CLI commands).",
+      "reason": "Checks are enforced in delegated methods (prevalidateConfig checks ADMINISTER, Queue.clear checks ADMINISTER, Computer.doDoDelete checks DELETE, most CLI commands check item/permission); no missing authorization of comparable impact was confirmed."
+    }
+  ],
+  "summary": "Snapshot is Jenkins core at a 2.7.x-era tree (root poms 2.7.5-SNAPSHOT, changelog through 2.6, remoting 2.60.1; test/Jelly files are not present). I reviewed the authentication/authorization stack (HudsonFilter, BasicAuthenticationFilter, BasicHeaderProcessor, SecurityRealm/AuthenticationProcessingFilter2, CSRF), ACL/SidACL/SparseACL, Secret/crypto/confidential key handling, item/queue/run/view permission checks, DirectoryBrowserSupport and JnlpJar path handling, PluginManager/UpdateCenter admin checks, XStream/XXE hardening, and the Jenkins CLI stack. Most historically known Jenkins protections are present (SECURITY-170 parameter filtering, SECURITY-144/247/105 XStream/remoting defenses, EXTENDED_READ secret masking, open-redirect guards, ADMINISTER checks on update center/plugin endpoints). The strongest surviving issue is the unauthenticated Java-serialization surface of the Jenkins CLI/remoting channel: POSTs to /cli create a full-duplex remoting Channel for anonymous clients, and CLI commands are transported/executed as Java-serialized objects (e.g. Callable objects sent by the client) before any CLI-level permission check, which is the classic Jenkins core deserialization RCE class (CVE-2016-9299 / CVE-2017-1000353 era)."
+}

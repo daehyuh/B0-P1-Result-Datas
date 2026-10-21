@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker supplies the ZIP archive (e.g. an uploaded/downloaded file) and therefore fully controls every ZipEntry name and its content bytes. The application only chooses the destination directory, which the attacker-controlled entry names can escape.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked all write paths in ZipUtil: unzip() is the only extraction sink and contains no normalization/containment check; validateFiles() (lines 763-782) only prevents the output ZIP from being placed inside the source directory when zipping, and does not protect unzip; unzipFileBytes() only reads into memory and never writes paths. FileUtil.touch/mkParentDirs/getOutputStream add no traversal guard. No in-repository caller sanitizes entry names. I also checked that the multipart-upload UploadFileHeader strips the directory portion of the client filename, so it is less exposed, and that XmlUtil.disableXXE does protect XML parsing, which is why those were rejected as the primary finding.",
+      "id": "zip-slip-ziputil-unzip",
+      "impact": "Arbitrary file write/overwrite with attacker-controlled content (and attacker-created directories) outside the intended extraction directory. Depending on deployment this can overwrite configuration files, JSP/scripts or authorized_keys-style material, corrupt or plant files for later execution, and can lead to code execution or denial of service. At minimum it is a directory-traversal integrity/confidentiality boundary violation.",
+      "locations": [
+        {
+          "end_line": 403,
+          "path": "hutool-core/src/main/java/cn/hutool/core/util/ZipUtil.java",
+          "start_line": 377
+        },
+        {
+          "end_line": 816,
+          "path": "hutool-core/src/main/java/cn/hutool/core/util/ZipUtil.java",
+          "start_line": 805
+        },
+        {
+          "end_line": 617,
+          "path": "hutool-core/src/main/java/cn/hutool/core/io/FileUtil.java",
+          "start_line": 604
+        },
+        {
+          "end_line": 2395,
+          "path": "hutool-core/src/main/java/cn/hutool/core/io/FileUtil.java",
+          "start_line": 2390
+        }
+      ],
+      "prerequisites": "The application calls one of ZipUtil.unzip(String/File) or unzip(String, String outDir)/unzip(File, File outDir) on an archive that is not fully trusted, and the JVM process has filesystem write permission on the resolved target path. Escaping the directory is easiest with `../` segments; an application that extracts into a web root, config directory or user home directory increases impact.",
+      "root_cause": "ZipUtil.unzip(File, File, Charset) takes each archive entry name verbatim and builds the output path with `outItemFile = new File(outFile, zipEntry.getName())` (line 389) without verifying that the resolved/canonical path stays inside outFile. Any entry such as `../../<path>` escapes the target directory; `FileUtil.touch(outItemFile)` creates the parent directories and `copy(...)` opens a FileOutputStream and writes the entry's bytes to that location. No `..` filtering, canonical-path check, or entry-name validation exists anywhere in the class.",
+      "title": "Zip Slip: path traversal in ZipUtil.unzip allows arbitrary file write outside the extraction directory",
+      "trace": "unzip(String, String outDir[, Charset]) -> unzip(File zipFile, File outFile, Charset) [ZipUtil.java:351-352, 338-339, 377] -> enumerate ZipFile entries [ZipUtil.java:384-388] -> `new File(outFile, zipEntry.getName())` [ZipUtil.java:389] -> directory entries call `outItemFile.mkdirs()`, file entries call `FileUtil.touch(outItemFile)` [ZipUtil.java:390-394] -> FileUtil.touch -> mkParentDirs -> createNewFile [FileUtil.java:604-617, 651-656] -> ZipUtil.copy -> FileUtil.getOutputStream(outItemFile) -> new FileOutputStream(...) and entry bytes copied [ZipUtil.java:805-816; FileUtil.java:2390-2395]. A malicious name like `../../../../tmp/pwned` therefore resolves outside outFile and is created and written.",
+      "unverified": "No code was executed and no archive was extracted, so this is a source-level lead, not a runtime-confirmed vulnerability. Exploitability depends on the calling application using ZipUtil.unzip on untrusted archives and on OS path/permission conditions. Whether and in which release upstream Hutool later added a canonical-path guard could not be verified offline (no history, network, or patches were available).",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / Zip Slip"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 790-file snapshot of Hutool 4.1.11, including the P1 relation index scope (779 files indexed, 11 omitted, syntax-level only, no data/control-flow, 9256 unresolved calls, no SAST findings loaded). I inspected and verified source in: hutool-core (ZipUtil, FileUtil, IoUtil, ObjectUtil, XmlUtil, URLUtil, RandomUtil, RuntimeUtil, ClassScanner/ClassLoaderUtil, resource handling), hutool-http (HttpConnection, HttpRequest/HttpUtil, HttpResponse, SoapRequest, SSL factories, HTMLFilter), hutool-extra (servlet multipart, template engines, SSH/Jsch, QR, mail, FTP), hutool-db (SQL building/execution, data sources, JNDI), hutool-crypto (SSL/crypto helpers, algorithms), hutool-json (parser/XML bridge), hutool-setting, hutool-captcha, hutool-aop, hutool-poi, hutool-cron, hutool-log and the module POMs. The strongest verified flow is the Zip Slip candidate above. Coverage is not exhaustive: not every one of the 727 Java files was read line-by-line, no tests are present in the snapshot, no build/tests/scanners were run, and docs/binary assets were not security reviewed.",
+  "limitations": [
+    "Static source review only: no code, tests, scanners or exploit payloads were executed, so nothing is runtime-confirmed.",
+    "No repository history, upstream diffs, patches, CVE/advisory data or internet access were available; mapping to a specific upstream fix could not be verified.",
+    "The P1 index is partial and syntax-only (11 source files missing from the index; no control-flow/data-flow or semantic resolution), so index edges were used only for navigation and every cited edge was re-checked in source.",
+    "Large portions of the library were sampled rather than exhaustively read; additional issues could exist in unread files/methods.",
+    "The snapshot contains no test sources and the docs/ directory contains website assets that were not reviewed.",
+    "Exploitability of the selected candidate depends on how downstream applications invoke ZipUtil.unzip and on filesystem permissions, which are outside this repository."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "hutool-http disables HTTPS verification by default: HttpConnection.openHttp sets TrustAnyHostnameVerifier and SSLSocketFactoryBuilder.create().build(), whose default TrustManager (DefaultTrustManager) accepts all certificates (HttpConnection.java:574-588; SSLSocketFactoryBuilder.java:38-41; DefaultTrustManager.java:20-26)",
+      "reason": "Real CWE-295 weakness with MITM impact, but it is an intentional, documented convenience default ('默认SSLSocketFactory') reachable only when callers neither pass a HostnameVerifier nor a custom SSLSocketFactory; not a distinct validation bypass introduced in this snapshot, so it was not selected as the strongest candidate. Kept as an unconfirmed lead."
+    },
+    {
+      "lead": "Path traversal via Content-Disposition filename in HttpResponse.writeBody(File): when the destination is a directory, the raw `filename=\"...\"` value is passed to FileUtil.file(destFile, fileName), so a malicious server can make the client write outside the directory (HttpResponse.java:242-255, 419-428)",
+      "reason": "Verified in source and genuinely dangerous, but it is a separate root cause, requires the caller to download from an attacker-controlled server into a directory, and has lower certainty of being the intended finding than the archive-extraction case. Kept as an unconfirmed lead."
+    },
+    {
+      "lead": "JschUtil.openSession sets StrictHostKeyChecking to 'no' (JschUtil.java:88), enabling MITM on SSH/SFTP sessions",
+      "reason": "Intentional default configuration for convenience, requires network attacker position; not selected."
+    },
+    {
+      "lead": "Insecure deserialization helpers IoUtil.readObj (IoUtil.java:550-558) and ObjectUtil.unserialize (ObjectUtil.java:322-331)",
+      "reason": "Generic readObject wrappers with no untrusted input source inside the library; the finding would depend entirely on an application feeding attacker bytes to these helpers."
+    },
+    {
+      "lead": "RuntimeUtil.exec / ProcessBuilder-based command execution (RuntimeUtil.java:66-140)",
+      "reason": "Command execution is the documented purpose of the API; no internal caller feeds it attacker input, so no library-level injection flow was demonstrated."
+    },
+    {
+      "lead": "Hutool captcha codes generated with RandomUtil (ThreadLocalRandom) rather than a CSPRNG (RandomGenerator.java:40-42; RandomUtil.java:45-47)",
+      "reason": "Predictable-RNG weakness is plausible but low impact compared with the selected candidate and depends on deployment usage; not selected."
+    },
+    {
+      "lead": "Multipart upload filename traversal via UploadFile.write(File) (UploadFile.java:86-101)",
+      "reason": "Investigated and substantially discounted: UploadFileHeader strips everything up to the last path separator from the client filename (UploadFileHeader.java:171-178), so directory traversal through `../` is not directly reachable here."
+    },
+    {
+      "lead": "XXE in XmlUtil/XML helpers",
+      "reason": "XmlUtil.createDocumentBuilder explicitly disables DTD/external entities (XmlUtil.java:362-372, 791-819), and hutool-json's XML class uses a hand-written tokenizer; no XXE flow found."
+    }
+  ],
+  "summary": "Snapshot is the Hutool 4.1.11 Java utility library (790 visible files, 727 Java files; no test sources). I reviewed the P1 syntax index (779 files indexed, 11 omitted, no data/control-flow, 9256 unresolved calls) and then verified candidate sinks directly in source, concentrating on hutool-core, hutool-http, hutool-extra, hutool-db, hutool-crypto, hutool-json, hutool-setting and hutool-captcha. One candidate meets the evidence bar: a classic Zip Slip in ZipUtil.unzip, where attacker-controlled ZIP entry names are turned into output files with no canonical-path containment check, enabling writes outside the chosen extraction directory. Other security-relevant observations (default trust-all TLS in hutool-http, Content-Disposition filename traversal in HttpResponse, StrictHostKeyChecking=no in JschUtil, deserialization helpers, RuntimeUtil.exec, captcha PRNG) were examined but not selected, mainly because they are dual-use/by-design, require unusual caller behavior, or have a distinct root cause."
+}

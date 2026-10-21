@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker fully controls the Thrift request sent to the DataNode RPC port (default 6667): `TPipeTransferReq.version` (=2), `type` (=0, COMBINE) and the serialized body, in which the state class name (read at CombineRequest line 111) and the byte stream passed to `deserialize` (line 113) are arbitrary. No `openSession`/credentials are required because `pipeTransfer` performs no login check. For the same root cause, a `TPipeSubscribeReq` handshake needs only a consumer-id/group-id (no username/password is read or validated anywhere in the subscription receiver), after which topic data can be subscribed to and polled.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) The version-1 pipe path is NOT unauthenticated: `IoTDBFileReceiver.handleTransferHandshakeV1` calls `tryLogin()` (lines 255-268) before any file transfer, and file pieces need the receiver dir created by that handshake. The version-2 COMBINE receiver has no HANDSHAKE case and its sender never logs in, so no equivalent gate exists. (2) `Class.forName(...).newInstance()` is not equivalent to unrestricted RCE: it requires a public no-arg constructor, the `(State)` cast is only needed for the subsequent `deserialize` call, and I could not verify at source level that a classpath gadget permitting code execution is present. (3) Other methods in `ClientRPCServiceImpl` consistently call `SESSION_MANAGER.checkLogin`, so the omission is not a repository-wide pattern; however legacy sync methods (handshake/sendPipeData/sendFile) also lack it, which suggests some of the omission may be intentional legacy design rather than an injected defect. (4) Subscription code contains no credential check at all, but the Java client library does open a login session on the same connection, so the server-side omission is easy to overlook in normal use. (5) No code was executed and no runtime confirmation was performed.",
+      "id": "iotdb-unauth-pipeTransfer-combine-class-instantiation",
+      "impact": "Pre-authentication, remote attacker can force the DataNode to load and instantiate arbitrary classes present on the classpath (executing static initializers and no-arg constructors) and to invoke `State.deserialize` on any class implementing that interface with attacker-controlled bytes. This is at minimum a denial-of-service/side-effect primitive, and becomes arbitrary code execution if a suitable class (gadget or state implementation) is on the classpath. Because authentication is missing at the entry point, the intended trust boundary (an authenticated internal peer driving the two-stage exchange) is not enforced, and the same omission lets an unauthenticated client handshake with the subscription receiver and poll subscribed topic data (information disclosure).",
+      "locations": [
+        {
+          "end_line": 2702,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/protocol/thrift/impl/ClientRPCServiceImpl.java",
+          "start_line": 2694
+        },
+        {
+          "end_line": 119,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/pipe/processor/twostage/exchange/payload/CombineRequest.java",
+          "start_line": 104
+        },
+        {
+          "end_line": 66,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/pipe/processor/twostage/exchange/receiver/TwoStageAggregateReceiver.java",
+          "start_line": 45
+        },
+        {
+          "end_line": 64,
+          "path": "iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/pipe/receiver/IoTDBReceiverAgent.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 234,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/subscription/receiver/SubscriptionReceiverV1.java",
+          "start_line": 187
+        }
+      ],
+      "prerequisites": "Network reachability to the DataNode client RPC port (pipeTransfer/pipeSubscribe expose no authorization). For code instantiation, the chosen class must exist on the server classpath with a public no-argument constructor; the following `deserialize` call additionally requires the class to implement org.apache.iotdb.db.pipe.processor.twostage.state.State. For the subscription data-access consequence, at least one existing topic is required. No special privilege is needed.",
+      "root_cause": "Unlike every other method in the same class, `ClientRPCServiceImpl.pipeTransfer` and `pipeSubscribe` do not invoke `SESSION_MANAGER.checkLogin(...)`, so the pipe-transfer and subscription receivers are reachable by any network client without a session. For version-2 pipe requests, `IoTDBReceiverAgent.receive` routes directly to `TwoStageAggregateReceiver` (which has no handshake case and requires no credentials - the internal `TwoStageAggregateSender` also never logs in). Parsing `CombineRequest` then reads a fully attacker-controlled class name from the wire body and performs `state = (State) Class.forName(stateClassName).newInstance(); state.deserialize(transferReq.body);` with no allow-list or type whitelist.",
+      "title": "Pre-authentication pipeTransfer (V2 COMBINE) instantiates attacker-chosen classes and deserializes attacker bytes; pipeSubscribe likewise unauthenticated",
+      "trace": "`ClientRPCServiceImpl.pipeTransfer(...)` (lines 2694-2697, no `SESSION_MANAGER.checkLogin`) -> `PipeDataNodeAgent.receiver().thrift().receive(req)` -> `IoTDBReceiverAgent.receive(...)` selects the receiver by `req.version`; version 2 maps to `TwoStageAggregateReceiver` (IoTDBDataNodeReceiverAgent lines 31-37) -> `TwoStageAggregateReceiver.receive` (case COMBINE, lines 50-53) -> `CombineRequest.fromTPipeTransferReq` -> `translateFromTPipeTransferReq` reads `stateClassName = ReadWriteIOUtils.readString(transferReq.body)` (line 111) -> `Class.forName(stateClassName).newInstance()` (line 112, static initializers and public no-arg constructor execute) -> `state.deserialize(transferReq.body)` (line 113) with attacker bytes. The instance is created before the combine-handler lookup, so no pipe needs to exist for the loading/instantiation to occur. In parallel, `ClientRPCServiceImpl.pipeSubscribe` (lines 2699-2702) -> `SubscriptionAgent.receiver().handle(req)` -> `SubscriptionReceiverV1.handle` -> handshake/subscribe/poll with no credential validation.",
+      "unverified": "Runtime exploitability is not confirmed. I could not verify which classpath classes are useful instantiation/deserialization gadgets, whether `ReadWriteIOUtils.readObject`-style Java deserialization is involved anywhere reachable, or whether the upstream fix (unknown in this offline run) is an authentication check, a state-class whitelist, or added subscription credentials. Test sources and the ANTLR grammar are absent from the snapshot, and external dependencies (tsfile, thrift) are not inspectable.",
+      "weakness_type": "CWE-306 Missing Authentication for Critical Function (primary), enabling CWE-502 Deserialization of Untrusted Data / CWE-470 Use of Externally-Controlled Input to Select Classes or Code"
+    }
+  ],
+  "coverage_summary": "Coverage: repository-relative inspection of the 4,194 model-visible files (test sources absent). Areas reviewed in depth: DataNode/ConfigNode RPC handlers (ClientRPCServiceImpl, DataNodeInternalRPCServiceImpl, processor/server-context handlers), pipe receiver stack (IoTDBFileReceiver, IoTDBDataNodeReceiver, IoTDBReceiverAgent, air-gap receiver, two-stage exchange payloads/receiver/handler, pipe consensus receiver), subscription stack (agent + SubscriptionReceiverV1), auth stack (AuthorityChecker, ClusterAuthorityFetcher, BasicAuthorizer, user/role managers, OpenID authorizer), REST v1/v2 (filters, request validation, Grafana/execute handlers), UDF/trigger/pipe-plugin installation and class loaders, load-tsfile paths, and config/file handling. Pattern sweeps: ObjectInputStream/readObject, Runtime.exec/ProcessBuilder, XML parsers, URL/SSRF sinks, ZipInputStream, `..`/path normalization, `Paths.get`/`new File` with user data, `Class.forName`, and per-statement permission checks. Not exhaustive: no full call-graph or data-flow analysis, and external dependency source (tsfile, thrift runtime) is not in the snapshot.",
+  "limitations": [
+    "No code was executed; all findings are source-evidence only and no candidate is runtime-confirmed.",
+    "Test sources are excluded from the snapshot (no `src/test` files), so there is no test-based oracle for intended validation behavior or the fix.",
+    "The ANTLR grammar and generated parser are absent, preventing confirmation of which tokens (e.g., backquoted plugin names) are accepted.",
+    "External dependencies (Apache TsFile, Thrift runtime, Caffeine, etc.) are not part of the source tree, so sinks such as ReadWriteIOUtils.readObject/readObjectSet could not be inspected.",
+    "Large repository: review was targeted/sampling-based rather than exhaustive; additional issues may exist in unexamined modules (consensus, metrics, CLI tools, schema engine internals).",
+    "No offline access to upstream history, patches, CVE metadata, or advisories, so the candidate was selected on source evidence and exploitability reasoning rather than matching a known fix."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Pipe receiver arbitrary file write via unsanitized network-supplied `fileName` (IoTDBFileReceiver.updateWritingFileIfNeeded line 398 / handleTransferFileSealV2 lines 562-565; PipeConsensusReceiver lines 499-502, 902) - the name is read from the wire and joined to the receiver directory with no `..`/separator check.",
+      "reason": "Concrete and high impact (arbitrary file write with attacker-controlled content), but the version-1 path first requires a successful handshake with valid IoTDB credentials (`tryLogin` with default root/root), so it is not pre-authentication, and it was rejected in favor of the pre-authentication class-instantiation path."
+    },
+    {
+      "lead": "Pipe plugin path traversal: a backquoted plugin name flows through CreatePipePluginStatement/ASTVisitor.parseIdentifier into PipePluginInfo.createPipePlugin -> PipePluginExecutableManager.getPluginInstallPathV2 (pluginName.toUpperCase() concatenated into a path), enabling arbitrary file write/delete on ConfigNode and DataNodes.",
+      "reason": "Depends on the ANTLR grammar accepting backquoted identifiers for `pluginName` (the .g4 grammar is absent from the snapshot, so this could not be confirmed), and requires the USE_PIPE privilege plus a trusted URI whose content passes the `Class.forName`/PipePlugin check; unconfirmed."
+    },
+    {
+      "lead": "OpenIdAuthorizer issues (JWT expiration effectively ignored via `setAllowedClockSkewSeconds(Long.MAX_VALUE/1000)`, loggedClaims map, `isOpenIdUser` short-circuits granting all path privileges on the DataNode).",
+      "reason": "Only active when the optional OIDC provider is configured; the JWT signature is still verified with the provider key and the user still needs a provider-issued token, so this is configuration-dependent and not the strongest source-evidenced issue."
+    },
+    {
+      "lead": "Grafana REST `expression` endpoint builds SQL by string concatenation from expression/condition/control request fields.",
+      "reason": "The resulting statement is parsed and authorization is checked against that statement before execution, so no privilege bypass was demonstrated; the behavior appears intentional for the Grafana data source."
+    },
+    {
+      "lead": "BasicSecurityContext.isUserInRole always returns true; LoadTsFileStatement.checkPermissionBeforeProcess returns SUCCESS unconditionally.",
+      "reason": "No role-based decisions were found that rely on `isUserInRole`, and LOAD's authorization is deferred to the analyze/execution phase (per-file checks) - neither could be tied to a concrete privilege bypass from source alone."
+    },
+    {
+      "lead": "Unsafe `Class.forName` in confignode Procedure.getProcedureClass and ConsensusFactory, and `SerializeUtils.deserializeObject`/`ReadWriteObject` helpers.",
+      "reason": "The procedure class name comes from persisted procedure state rather than a directly network-controlled request, and the SerializeUtils helpers have no callers in this snapshot; both are much weaker than the CombineRequest path."
+    }
+  ],
+  "summary": "Reviewed the Apache IoTDB source snapshot (repo reports version 1.3.4-SNAPSHOT, tsfile 1.1.0-241216-SNAPSHOT; 4,194 model-visible files, test sources and the ANTLR grammar are not present). After tracing user-controlled input across the DataNode/ConfigNode RPC surface, pipe receiver, subscription receiver, plugin/UDF/trigger installation, REST API, and auth code, I am submitting one candidate: the client-RPC entry points `pipeTransfer`/`pipeSubscribe` skip the login check that every other RPC method enforces, which makes the version-2 two-stage \"COMBINE\" handler reachable pre-authentication; that handler instantiates a class named in the request body (`Class.forName(...).newInstance()`) and calls `deserialize` on it with attacker-supplied bytes. The same missing-authentication pattern also exposes the subscription receiver (handshake/subscribe/poll without credentials). Other plausible but weaker/less verifiable leads are listed as rejected."
+}

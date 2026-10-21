@@ -1,0 +1,95 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls (or can influence) the HTTP response of a host the application contacts with the WebClient: a 3xx status plus an attacker-chosen `Location` (compromised/malicious upstream endpoint, an open redirect on the contacted site, a hostile API the app calls, or an on-path attacker on a plain-HTTP hop). The payload (the victim host's cookie header / token) is then delivered to the attacker's host by the library itself.",
+      "confidence": "medium",
+      "counterevidence_checked": "Considered that copying user-set headers on redirect may be intentional: but the copy also includes the `cookie` entries that the library itself injected for the previous host, which the same class scopes by domain on the CookieStore path and documents as domain/path-scoped. Checked `CookieStoreImpl.get` (reversed-domain matching, path/secure checks) — it would NOT return host A's cookies for host B, so the leak is caused only by the header copy plus the missing reset in `prepareRedirectRequest`. Checked that `prepareRequest` is not re-invoked for redirects (FOLLOW_REDIRECT only runs `processRedirectCookies`), so the stale cookies are not cleaned. Checked `HttpRequestImpl.headers()` returns the internal map (line 192-196) and that `HttpContext` keeps the same `request` object across phases, so the copy really transports those entries. Also verified the redirect phase is reachable by default (DEFAULT_FOLLOW_REDIRECTS = true; maxRedirects default) and that `session.addHeader` credentials are placed in that same map (WebClientSessionAware.java:36-46).",
+      "id": "case-027-c1",
+      "impact": "Disclosure of an authenticated session cookie and/or bearer token for the original origin to an arbitrary third-party origin chosen by the redirect. The receiving party can replay the cookie/token against the original site (session hijacking, account/API takeover), and additionally learns the token value in cleartext. This contradicts the documented contract that `WebClientSession` \"honors the cookies attributes: domain, path, secure, max-age and expires\" (WebClientSession.java:27-33) and the intent expressed in `processRedirectResponse`'s comment (\"we need to send cookies only to the domains we received them from\", SessionAwareInterceptor.java:91-95).",
+      "locations": [
+        {
+          "end_line": 226,
+          "path": "vertx-web-client/src/main/java/io/vertx/ext/web/client/impl/HttpContext.java",
+          "start_line": 205
+        },
+        {
+          "end_line": 66,
+          "path": "vertx-web-client/src/main/java/io/vertx/ext/web/client/impl/SessionAwareInterceptor.java",
+          "start_line": 42
+        },
+        {
+          "end_line": 125,
+          "path": "vertx-web-client/src/main/java/io/vertx/ext/web/client/impl/SessionAwareInterceptor.java",
+          "start_line": 101
+        },
+        {
+          "end_line": 357,
+          "path": "vertx-web-client/src/main/java/io/vertx/ext/web/client/impl/HttpContext.java",
+          "start_line": 355
+        },
+        {
+          "end_line": 30,
+          "path": "vertx-web-client/src/main/java/io/vertx/ext/web/client/impl/WebClientSessionAware.java",
+          "start_line": 24
+        },
+        {
+          "end_line": 55,
+          "path": "vertx-web-client/src/main/java/io/vertx/ext/web/client/WebClientOptions.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 33,
+          "path": "vertx-web-client/src/main/java/io/vertx/ext/web/client/WebClientSession.java",
+          "start_line": 27
+        }
+      ],
+      "prerequisites": "Application uses `WebClientSession.create(...)` (or otherwise sets Cookie/Authorization headers on the request) and leaves redirect following enabled — `WebClientOptions.DEFAULT_FOLLOW_REDIRECTS = true` (WebClientOptions.java:51) is propagated to each request in `HttpRequestImpl` (followRedirects = options.isFollowRedirects()). The contacted origin must return a 3xx whose `Location` is a different host; the cookie store must hold a cookie for the first host (any session-authenticated call) or the app must have set a credential header via `WebClientSession.addHeader` (the module's own example does exactly this: `session.addHeader(\"my-jwt-token\", jwtToken)` in WebClientSessionExamples.java:14-17).",
+      "root_cause": "`HttpContext.receiveResponse` copies the entire mutable request header map onto the redirect request (`nextRequest.headers().addAll(request.headers)`, HttpContext.java:215-218). That same map is mutated by `SessionAwareInterceptor.prepareRequest`, which clears it, re-adds the client headers and then appends the cookies retrieved for the *original* host from the cookie store (`request.headers().add(\"cookie\", ...)`, SessionAwareInterceptor.java:53-65). On the redirect phase (`processRedirectCookies` -> `prepareRedirectRequest`) the interceptor only adds the cookies for the *new* host (SessionAwareInterceptor.java:113-124); it never removes/resets the inherited headers, even though it retrieves the stored original-header snapshot at lines 107-111 and never uses it, and even though `prepareRequest`'s own comment states headers \"must be reset at every send because cookies can be changed\" (lines 53-54). Result: host A's Cookie header (and any `WebClientSession.addHeader` value such as an Authorization/JWT header) is transmitted to host B whenever host A answers with a 3xx pointing at host B.",
+      "title": "WebClientSession forwards the original origin's cookies (and addHeader credentials) to a different host when following a redirect",
+      "trace": "1) `WebClientSession.create(webClient)` -> `WebClientSessionAware` registers `SessionAwareInterceptor` on the interceptor chain (WebClientSessionAware.java:26-30); the chain is handed to every `HttpContext` (WebClientBase.java:286-289). 2) PREPARE_REQUEST: `SessionAwareInterceptor.prepareRequest` stores a snapshot of the current request headers under key `_originalHeaders`, clears `request.headers()`, re-adds the snapshot plus `webclient.headers()`, then appends the cookies matching the target host and path (`cookieStore().get(request.ssl, domain, request.uri)`) to that same map (SessionAwareInterceptor.java:47-65). 3) SEND_REQUEST: `HttpContext.handlePrepareRequest` builds the real `HttpClientRequest` and copies `request.headers` into it (HttpContext.java:355-357) — cookies/token go to host A, as intended. 4) Host A replies 302/303 with a `Location` for host B; `HttpContext.receiveResponse` (followRedirects default true, maxRedirects default) asks `client.redirectHandler()` for the next request and then executes `nextRequest.headers().addAll(request.headers)` (HttpContext.java:207-218), copying host A's `cookie` header (and any credential header added via `addHeader`) into the request that will be sent to host B. 5) FOLLOW_REDIRECT: `prepareRedirectRequest` computes the new domain and only *adds* the store cookies valid for host B (SessionAwareInterceptor.java:113-124); nothing removes the leaked host-A cookies, and the snapshot fetched at lines 107-111 is unused. 6) The leaked cookies/credentials therefore appear on the wire to host B.",
+      "unverified": "Not runtime-verified (no code executed; finding is source-level). vertx-core is not part of the snapshot, so I could not inspect `HttpClient.redirectHandler()`/`HttpClientRequestImpl` to confirm that the default handler follows absolute cross-host `Location` values and to confirm it does not itself strip Cookie/Authorization headers before `HttpContext.receiveResponse` runs; if the core handler refused cross-host redirects or stripped credentials, the leak would be limited to same-host redirects (where the duplicated cookie is harmless). I also could not diff against the upstream 3.9.x/4.x sources in this run, so I cannot exclude that this behaviour is inherited upstream rather than specific to this snapshot; the unused `_originalHeaders` lookup in `prepareRedirectRequest` (lines 107-111) is consistent with a missing reset step but is not proof.",
+      "weakness_type": "CWE-598/CWE-522 — disclosure of session cookie/credentials to an unintended party via cross-origin redirect"
+    }
+  ],
+  "coverage_summary": "Files: 338 source-root files (294 Java; also JS/HTML/XML/pom resources), all enumerated; the assigned scope excludes binaries and symlinks (0 excluded) and applies the same filters as B0. The P1 index covers 335/338 files (232 parsed, 3 missing), syntax-only, with no data-flow, control-flow, semantic resolution or reachability — it was used only for navigation and its labels were verified against source. I read in depth: vertx-web routing/dispatch (RouterImpl, RouterState, RouteImpl/RouteState matching, RoutingContextImpl/Wrapper/Base, HttpServerRequestWrapper), handlers (Session, CSRF, Cors, FormLogin/Redirect/OAuth2/JWT auth, Body, Static, Template, Error, Favicon, MultiTenant, Logger), SockJS/EventBusBridge transports, session stores (Local/Clustered/AbstractSession), vertx-web-client (HttpContext, SessionAwareInterceptor, CookieStoreImpl, WebClientOptions/Session, request/predicate/multipart internals), web-api-contract validation (BaseValidationHandler, type validators, XMLTypeValidator, OpenAPI3 path resolver/router factory, SecurityHandlersStore), graphql handlers, and the template engines. Not read in depth: large bundled web assets (vertx-web-graphql GraphiQL static JS ~840 KB, vertx-web/src/client/*.js), example/DTO/interface files, and build scripts beyond a scan. No code, tests, scanners or daemons were executed; no runtime confirmation exists for any statement.",
+  "limitations": [
+    "No execution: findings are source-level only; the candidate's wire behaviour (does the redirect request really carry the copied Cookie header to another host) was not confirmed at runtime.",
+    "vertx-core (HttpUtils.normalizePath/removeDots, URIDecoder, HttpClient redirectHandler/HttpClientRequestImpl, HttpClientResponse) is not part of the snapshot, so several path/redirect questions could not be closed; StaticHandler path-traversal analysis and the exact redirect-following semantics depend on that code.",
+    "No upstream comparison was possible in this run, so I cannot distinguish an inherited upstream weakness from a snapshot-specific regression, nor confirm whether the redirect header reset existed in an earlier revision.",
+    "No test sources, fixtures or CI logs are present in the snapshot, so intended behaviour could only be inferred from comments/javadoc.",
+    "The P1 index is syntactic only (no data-flow/reachability/DI semantics); it cannot establish exploitability, and 3 source files are absent from it.",
+    "Bundled generated web assets (GraphiQL static JS, client-side vertxbus.js) were not audited line by line; they could hide additional client-side issues.",
+    "Some handler/DTO files (e.g. handler interfaces, WebExamples) were skimmed rather than fully read, so a low-signal issue in those areas cannot be excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "StaticHandlerImpl path handling (decode + removeDots + Utils.pathOffset) possibly allowing traversal outside the webroot (StaticHandlerImpl.java:131, 610-614).",
+      "reason": "The handler decodes first and then applies `HttpUtils.removeDots(...)` (vertx-core), and the served path is webRoot + pathOffset(...); no in-snapshot defect (missing check, wrong order, wrong variable) is visible, and the decisive normalisation logic lives in vertx-core, which is not part of the snapshot. Note that decode-then-removeDots is the defensive order, so I could not substantiate a traversal."
+    },
+    {
+      "lead": "ErrorHandlerImpl writes `errorMessage`/stack trace into the HTML template without escaping (ErrorHandlerImpl.java:120-133, resources/META-INF/vertx/web/vertx-web-error.html:3), i.e. potential reflected XSS.",
+      "reason": "Exploitation requires an application-provided failure message that embeds attacker input (e.g. ValidationException messages that include the offending value, ValidationException.java:200-203 / EnumTypeValidator.java:31-32); the default path only uses the standard HTTP status message and the default 400/500 handlers are not mounted unless the app asks for them. App-dependent and matches upstream design."
+    },
+    {
+      "lead": "Path parameters can be shadowed by query parameters because `RouteState.addPathParam` only adds a route param when the name is not already in `request.params()` (RouteState.java:1016-1023).",
+      "reason": "Real parameter-pollution footgun, but it appears intentional (pathParams() is kept separately and is authoritative for validation), the impact is entirely application-dependent (only apps reading `request().params()`/`getParam()` for path data are affected), and no in-snapshot contradiction with documented behaviour could be established."
+    },
+    {
+      "lead": "CSRFHandlerImpl issues a stateless double-submit token not bound to the session and compares the HMAC with `String.equals` (CSRFHandlerImpl.java:99-133).",
+      "reason": "Matches the documented design (CSRFHandler javadoc, timeout default) and the stateless behaviour is standard double-submit; the non-constant-time comparison is theoretical (remote timing against a 256-bit HMAC) and not demonstrable from source alone."
+    },
+    {
+      "lead": "SockJS BaseTransport echoes the client-controlled JSESSIONID cookie segment into a `Set-Cookie` response header (BaseTransport.java:132-155).",
+      "reason": "Only affects the requesting client's own cookie jar and mirrors the upstream sockjs-node behaviour; no cross-user impact and no CRLF injection (header value comes from the parsed Cookie header)."
+    },
+    {
+      "lead": "WebEnvironment uses constants `vertxweb.environment`/`VERTXWEB_ENVIRONMENT` while its javadoc names `vertx.mode`/`VERTX_MODE` (WebEnvironment.java:23-38), affecting dev-mode features (ErrorHandler stack traces, GraphiQL default enablement, cache disabling).",
+      "reason": "Looks like documentation drift rather than a defect; clients cannot set server system properties/environment variables, so no attacker-controlled path or security impact in either direction could be shown."
+    },
+    {
+      "lead": "Template-engine loaders read arbitrary filesystem paths (PebbleVertxLoader.java:43-52, MVELTemplateEngineImpl.java:76-80, FreeMarkerTemplateLoader.java:38-53), and MVEL templates are executable code.",
+      "reason": "The template name is supplied by the application (TemplateHandlerImpl derives it from the normalised request path plus a configured directory), so this is a documented untrusted-template hazard rather than a demonstrable flaw in the snapshot; no missing sanitisation step was found inside these classes."
+    }
+  ],
+  "summary": "Snapshot is Eclipse Vert.x Web 3.9.3 (parent pom `vertx-web-parent` 3.9.3; modules vertx-web, vertx-web-common, vertx-web-client, template engines, api-contract, api-service, graphql). I reviewed the Java sources broadly (routing/dispatch, handlers, sessions/cookies/CSRF, SockJS bridge, static/template serving, api-contract validation + OpenAPI router, GraphQL handlers, WebClient internals) plus the P1 syntactic index scope. The single strongest evidence-backed candidate is in vertx-web-client: when a redirect is followed, the whole mutable request header map (which `SessionAwareInterceptor.prepareRequest` has just populated with the cookies of the original host, and which also carries any `WebClientSession.addHeader` values such as bearer tokens/JWTs) is copied onto the redirect request, and the redirect-phase interceptor only *adds* the new host's cookies without ever resetting the inherited ones — so a cross-origin `Location` causes the previous origin's session cookies/credentials to be sent to another host. All other suspicions I examined were either app-dependent, dependent on code outside the snapshot (vertx-core), or consistent with documented/intended behaviour; they are listed as rejected leads."
+}

@@ -1,0 +1,107 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unprivileged remote sender who can publish a message to a queue/topic the application consumes (JMS/ActiveMQ/Artemis, Kafka, Azure Service Bus). Message property/record-header names are attacker-chosen, so the attacker can attach a property such as `CAMELExecCommandExecutable`, `CAMELExecCommandArgs`, `CAMELSqlQuery`, `CAMELFileName` or `CAMELHttpUri` alongside the message.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) The repo already contains the earlier 'camel' (lowercase) prefix addition at lines 55 and 378 of `DefaultHeaderFilterStrategy`, so the trivial lowercase bypass is closed; the remaining gap is general case variation (`CAMEL`, `cAmel`, etc.). (2) Transports that set `lowerCase(true)` (HttpHeaderFilterStrategy, NettyHttp, Vertx, SpringRabbitMQ) lower-case the name before matching and therefore do catch arbitrary casings; the gap applies to filters with `lowerCase=false` (JMS, Kafka, ServiceBus) and to pattern-based strategies that are case-sensitive. (3) The bypass only works while the default case-insensitive header map is used; `camel.main.caseInsensitiveHeaders=false` or `HashMapHeadersMapFactory` defeats it. (4) Broker-side constraints on property/header names are not verified in this run. (5) Impact requires a route that forwards the message to a header-honoring producer; the injection itself is unconditional but no route is created by the framework. (6) Many other transports (mail, undertow, cxf, SQS/SNS) configure no inbound filter at all - a related but distinct weakness, listed as a rejected lead.",
+      "id": "camel-header-filter-case-sensitivity-bypass",
+      "impact": "Camel-internal header injection from a remote, low-privileged message publisher. Concrete impact is route-dependent but includes: OS command execution where a route forwards to `exec:` (attacker overrides executable/args/working dir), arbitrary SQL where a route forwards to `sql:` (`CamelSqlQuery` takes precedence over the endpoint query), attacker-controlled output file names where a route forwards to `file:` (`CamelFileName`/overrule), and request-target/destination override where a route forwards to `http:`/JMS (SSRF or C2-style redirection). Impact can escalate from data tampering to full host compromise in common EIP pipelines.",
+      "locations": [
+        {
+          "end_line": 406,
+          "path": "core/camel-support/src/main/java/org/apache/camel/support/DefaultHeaderFilterStrategy.java",
+          "start_line": 323
+        },
+        {
+          "end_line": 55,
+          "path": "core/camel-support/src/main/java/org/apache/camel/support/DefaultHeaderFilterStrategy.java",
+          "start_line": 52
+        },
+        {
+          "end_line": 33,
+          "path": "components/camel-jms/src/main/java/org/apache/camel/component/jms/JmsHeaderFilterStrategy.java",
+          "start_line": 27
+        },
+        {
+          "end_line": 224,
+          "path": "components/camel-jms/src/main/java/org/apache/camel/component/jms/JmsBinding.java",
+          "start_line": 202
+        },
+        {
+          "end_line": 34,
+          "path": "components/camel-kafka/src/main/java/org/apache/camel/component/kafka/KafkaHeaderFilterStrategy.java",
+          "start_line": 30
+        },
+        {
+          "end_line": 35,
+          "path": "core/camel-base-engine/src/main/java/org/apache/camel/impl/engine/DefaultHeadersMapFactory.java",
+          "start_line": 30
+        },
+        {
+          "end_line": 276,
+          "path": "core/camel-base-engine/src/main/java/org/apache/camel/impl/engine/AbstractCamelContext.java",
+          "start_line": 271
+        },
+        {
+          "end_line": 66,
+          "path": "components/camel-exec/src/main/java/org/apache/camel/component/exec/impl/DefaultExecBinding.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 146,
+          "path": "components/camel-exec/src/main/java/org/apache/camel/component/exec/impl/DefaultExecCommandExecutor.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 30,
+          "path": "components/camel-sql/src/main/java/org/apache/camel/component/sql/SqlConstants.java",
+          "start_line": 26
+        },
+        {
+          "end_line": 390,
+          "path": "components/camel-file/src/main/java/org/apache/camel/component/file/GenericFileProducer.java",
+          "start_line": 363
+        }
+      ],
+      "prerequisites": "1) Application runs Camel with default `caseInsensitiveHeaders=true` (default) and default JMS/Kafka/ServiceBus header filters (they use `CAMEL_FILTER_STARTS_WITH` with `lowerCase=false`). 2) A route consumes from that transport and forwards to a producer that reads Camel headers as configuration (e.g. `to(\"exec:...\")`, `to(\"sql:...\")`, `to(\"file:...\")`, `to(\"http:...\")`). 3) The attacker can publish to the consumed queue/topic (e.g. cross-account policy, leaked producer credentials, shared broker). No other privileges are needed.",
+      "root_cause": "`DefaultHeaderFilterStrategy.doFiltering` delegates prefix checks to `tryHeaderMatch`, which uses case-sensitive `String.startsWith` over `CAMEL_FILTER_STARTS_WITH = {\"Camel\",\"camel\",\"org.apache.camel.\"}` and only tests a lowercased copy when `lowerCase=true`. `JmsHeaderFilterStrategy`, `KafkaHeaderFilterStrategy` and `ServiceBusHeaderFilterStrategy` register this array as their inbound filter but leave `lowerCase=false`, so header names such as `CAMELSqlQuery` or `cAmelExecCommandExecutable` do not match the filter and are copied into the Camel message. Camel's default header map is `CaseInsensitiveMap` (`DefaultHeadersMapFactory`, `camel.main.caseInsensitiveHeaders` defaults to true), so those stored names are resolved by the exact-case `Camel*` lookups used by producers such as exec/sql/file/http. The filter therefore does not implement case-insensitive denial of Camel-internal headers even though the header store (and the deprecated case-insensitive filter regex) are case-insensitive.",
+      "title": "Camel internal header injection: case-sensitive Camel-header filter bypassed via case-insensitive header lookup (mixed-case Camel* headers)",
+      "trace": "1. Attacker publishes a JMS message with property `CAMELExecCommandExecutable=/bin/sh` (or `CAMELSqlQuery=...`, `CAMELFileName=...`).\n2. Inbound copy: `JmsBinding.extractHeadersFromJms` (lines 202-224) iterates the JMS property names and calls `headerFilterStrategy.applyFilterToExternalHeaders(name, value, exchange)`; `JmsHeaderFilterStrategy` configured only `setOutFilterStartsWith`/`setInFilterStartsWith(CAMEL_FILTER_STARTS_WITH)` with `lowerCase` defaulting to false.\n3. `DefaultHeaderFilterStrategy.doFiltering` (lines 336-372) -> `tryHeaderMatch` (lines 398-406): `\"CAMELExecCommandExecutable\".startsWith(\"Camel\")`/`\"camel\"`/`\"org.apache.camel.\"` are all false, the `lowerCase` retry is skipped, so `filterOnMatch` is not returned and the header is kept (`extendedFilter` returns false).\n4. `map.put(\"CAMELExecCommandExecutable\", value)` (line 220) stores it in the Camel message. Camel's default map is `CaseInsensitiveMap` (`DefaultHeadersMapFactory` lines 30-35; `caseInsensitiveHeaders` default true at `AbstractCamelContext` line 275), so exact-case lookups still find it.\n5. Downstream sink: `DefaultExecBinding.readInput` (lines 55-56) calls `getAndRemoveHeader(in, \"CamelExecCommandExecutable\", endpoint.getExecutable(), ...)` -> returns the attacker value -> `ExecProducer.process` -> `DefaultExecCommandExecutor.toCommandLine` (lines 137-146) builds the `CommandLine` from the attacker executable/args and executes it. Analogous header-driven behavior exists for `CamelSqlQuery` (SqlConstants line 30) and `CamelFileName` (GenericFileProducer lines 363-390).",
+      "unverified": "Not runtime-confirmed: no code was executed and no broker was contacted. I did not verify that every broker accepts the chosen property/header names, nor that the specific target application's routes forward to a header-honoring producer. Whether upstream classified/fixed this exact residual case is unknown from the snapshot alone; the finding is presented as a source-evidenced lead.",
+      "weakness_type": "CWE-178 (improper handling of case sensitivity) leading to header injection (CWE-74) and, via header-driven producers, command injection (CWE-78) / SQL injection (CWE-89) / file-path control (CWE-22)"
+    }
+  ],
+  "coverage_summary": "Scope: full Apache Camel 4.11.0-SNAPSHOT monorepo as exposed to this run - 14,422 model-visible files (14,442 at source root; 20 sensitive-name/path files excluded; tests are absent from the snapshot). P1 relation index: 14,340 files indexed, 46 omitted, 23 parse errors, 102 source files missing from the index; index provides syntax containment plus name/type/arity-based call and inheritance candidates only - no control flow, data flow, semantic resolution, Spring profile or runtime verification. I reviewed the security-relevant core (header filter strategies, message/binding classes, header map factory, bean/exec/sql/file/http producers, path/SSL/deserialization/expression-language sinks) and compared filter configurations across transports; generated catalog JSON was only sampled. I did not exhaustively review all ~1,000 components, and no build, test, or exploit was executed.",
+  "limitations": [
+    "No code execution, tests, scanners, or network activity: all conclusions are static and none of the traces is runtime-confirmed.",
+    "No git history or diff is available in the snapshot, so I could not confirm which security fix the snapshot precedes or that the candidate matches a specific upstream fix/CVE.",
+    "The relation index is syntactic only (no data flow/reachability); edges were used purely for navigation and every cited edge was verified in source text.",
+    "The exploitability of the candidate depends on application configuration (default case-insensitive headers, default JMS/Kafka filter, and a route that forwards to a header-honoring producer), which cannot be confirmed from the library source alone.",
+    "Broker-side restrictions on property/record-header names and possible additional per-component mitigations were not verified.",
+    "102 source files are missing from the index and 23 files had parse errors; those areas were not covered through index navigation.",
+    "Tests are not present in the snapshot, so I could not use test expectations as evidence."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "camel-undertow inbound header filtering missing: `UndertowHeaderFilterStrategy` (lines 28-36) sets only `setOutFilterStartsWith`, while `DefaultUndertowHttpBinding.populateCamelHeaders` (lines 209-250) applies it to inbound request headers/query parameters via `applyFilterToExternalHeaders`, and `UndertowEndpoint` (line 87) makes it the default. Sibling HTTP stacks (http-common, netty-http, vertx-http) set both in and out filters.",
+      "reason": "Real asymmetry and a plausible header-injection path, but several other components (mail, cxf, platform-http's deprecated strategy) show the same out-only pattern, so it may be longstanding design rather than the intended target of a fix; kept as a secondary lead behind the core filter bypass."
+    },
+    {
+      "lead": "Mail, SQS/SNS and CXF consumers copy Camel-prefixed external headers/attributes into Camel messages with no inbound filter configured (`MailHeaderFilterStrategy` out-only; `Sqs2HeaderFilterStrategy`/`Sns2HeaderFilterStrategy` out-only; `CxfHeaderFilterStrategy` out-only while `MailBinding`/`Sqs2Consumer` call `applyFilterToExternalHeaders`).",
+      "reason": "Same trust-boundary class and potentially high impact (e.g. email sender or SQS publisher injecting `CamelExecCommandExecutable`), but no in-filter is configured at all in several components, which suggests intentional/legacy behavior; not enough evidence to prefer it over the case-sensitive matching defect in the shared filter."
+    },
+    {
+      "lead": "`NettyHttpHelper.deserializeJavaObjectFromStream` (lines 125-139) uses a plain `ObjectInputStream` with no class filter, unlike `HttpHelper` which uses `CamelObjectInputStream` (which also applies no allow-list).",
+      "reason": "The Java-object path is used for `application/x-java-serialized-object` responses/transferException handling, i.e. not clearly attacker-controlled from the server side; exploitability unverified, so rejected."
+    },
+    {
+      "lead": "`JsonbDataFormat` (line 196) resolves a class from the `CamelJsonbUnmarshallType` header at unmarshal time, letting a message header select the target type.",
+      "reason": "Class resolution from an attacker-influenced header is a hardening concern, but it needs an application that unmarshals JSON-B and the resolved class must be a usable gadget; it is downstream of the same header-injection problem and was not traced to a concrete exploit, so rejected."
+    },
+    {
+      "lead": "`DefaultHeaderFilterStrategy` mixed-case check in the deprecated `CAMEL_FILTER_PATTERN` fast path (lines 375-396) also misses all-caps variants of `org.apache.camel.`-style names.",
+      "reason": "Part of the same root cause as the submitted candidate; not split into a separate candidate."
+    }
+  ],
+  "summary": "## What I reviewed\n\nApache Camel 4.11.0-SNAPSHOT (full monorepo, ~14,422 model-visible source files; tests are not present in the snapshot). I traced Camel's message-header trust boundary end to end: transport bindings that copy external headers/properties into Camel messages (JMS, Kafka, HTTP/netty/vertx/undertow/mail/AWS), the `HeaderFilterStrategy` implementations and the core `DefaultHeaderFilterStrategy`, Camel's default header store, and producers that consume Camel headers as per-message configuration (exec, sql, file, http). I also sampled path handling, SSL/JSSE, deserialization, expression-language and XML/XXE sinks. The one candidate with a complete source-evidenced trace is below; the lower-confidence alternatives are listed as rejected leads rather than additional candidates.\n\n## Candidate (single strongest lead)\n\n**Case-sensitive prefix filtering of Camel headers is defeated by Camel's case-insensitive header store.** The inbound (\"external -> Camel\") filter matches `Camel*` headers with case-sensitive `startsWith` against `{\"Camel\",\"camel\",\"org.apache.camel.\"}` and only retries with a lowercased name when `lowerCase=true` (default false; JMS/Kafka/ServiceBus filters don't set it). Since Camel's default header map is `CaseInsensitiveMap` (`caseInsensitiveHeaders=true` by default), a header stored as `CAMELSqlQuery` / `cAmelExecCommandExecutable` is returned by `getHeader(\"CamelSqlQuery\")` / `removeHeader(\"CamelExecCommandExecutable\")`. A remote JMS/Kafka/ServiceBus publisher can therefore inject Camel-internal headers that downstream producers treat as trusted configuration, and if the route forwards to `exec:`, `sql:`, `file:` or `http:` this becomes RCE / SQL injection / file write / SSRF depending on the route. The lowercase \"camel\" addition that closed the earlier trivial bypass is present in the snapshot, but filtering is still not case-insensitive, so the control does not cover all casings it claims to (\"filter headers begin with Camel\").\n\n## Evidence quality and uncertainty\n\nThe bypass is source-verified (filter logic, inbound bindings, header store, sinks). It is a lead, not a confirmed exploit: I did not execute anything, reachability depends on the application's routes and on the default `caseInsensitiveHeaders=true`, and broker property-name constraints are not verified. Transports that set `lowerCase(true)` (http/netty/vertx/rabbitmq) are not exploitable this way; the gap is mainly the `lowerCase=false` filters (JMS/Kafka/ServiceBus)."
+}

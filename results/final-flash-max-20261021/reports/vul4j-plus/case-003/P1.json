@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated HTTP client controls the request body and the Content-Type header of any request routed to a Camel HTTP consumer endpoint (e.g. `jetty:http://0.0.0.0:8080/...`, `servlet:...`, or a REST-DSL route using the same jetty/servlet bindings). Setting Content-Type to application/x-java-serialized-object and putting a serialized object (gadget chain) in the body is sufficient for the body to be deserialized.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the sink is not opt-in: the request-side branch has no configuration flag, and the only condition is the Content-Type equality check. Verified default binding resolution: camel-http HttpEndpoint.getBinding() creates DefaultHttpBinding lazily; JettyHttpComponent/ServletComponent only call setBinding when a custom binding is explicitly configured; JettyRestHttpBinding and ServletRestHttpBinding extend DefaultHttpBinding; camel-jetty's CamelContinuationServlet and camel-servlet's CamelHttpTransportServlet extend camel-http CamelServlet, which constructs HttpMessage for every request. Checked that the sibling response-side branches (camel-http/camel-http4 HttpProducer.extractResponseBody, camel-jetty-common DefaultJettyHttpBinding.extractResponseBody, camel-netty-http/NettyHttpHelper, camel-ahc DefaultAhcBinding) are a related but differently-gated instance (transferException/malicious server) and are not part of this submitted root cause. Verified no allow-list/filter is applied to the ObjectInputStream in either HttpHelper copy. Unable to run the code, so gadget-based RCE was not verified at runtime.",
+      "id": "camel-http-request-deserialization",
+      "impact": "Deserialization of attacker-supplied bytes in the server process: remote code execution in the Camel/JVM process under the application's privileges when a gadget chain is present on the classpath (a common situation in Java application servers), plus denial of service and object-injection side effects. This is a network-reachable trust-boundary violation in a core HTTP component used by the most common Camel HTTP server endpoints.",
+      "locations": [
+        {
+          "end_line": 145,
+          "path": "components/camel-http/src/main/java/org/apache/camel/component/http/DefaultHttpBinding.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 136,
+          "path": "components/camel-http/src/main/java/org/apache/camel/component/http/helper/HttpHelper.java",
+          "start_line": 122
+        },
+        {
+          "end_line": 135,
+          "path": "components/camel-http4/src/main/java/org/apache/camel/component/http4/DefaultHttpBinding.java",
+          "start_line": 124
+        },
+        {
+          "end_line": 120,
+          "path": "components/camel-http4/src/main/java/org/apache/camel/component/http4/helper/HttpHelper.java",
+          "start_line": 106
+        },
+        {
+          "end_line": 53,
+          "path": "components/camel-http/src/main/java/org/apache/camel/component/http/HttpMessage.java",
+          "start_line": 36
+        },
+        {
+          "end_line": 121,
+          "path": "components/camel-http/src/main/java/org/apache/camel/component/http/CamelServlet.java",
+          "start_line": 114
+        }
+      ],
+      "prerequisites": "1) The application exposes a Camel consumer endpoint whose binding is camel-http/camel-http4 DefaultHttpBinding, or a subclass (JettyRestHttpBinding / ServletRestHttpBinding / AttachmentHttpBinding), which is the default when no `httpBindingRef` is configured (HttpEndpoint.getBinding(), camel-http HttpEndpoint lines 228-232). 2) The request reaches that consumer with a body and `Content-Type: application/x-java-serialized-object`. 3) A usable deserialization gadget exists on the application classpath for code execution (without one, attacker-triggered deserialization errors/DoS/object confusion still occur). No authentication or special option is required for the request-side path (unlike the response-side path, which is gated by transferException).",
+      "root_cause": "DefaultHttpBinding.readRequest() inspects only the client-supplied Content-Type header and, when it equals `application/x-java-serialized-object`, converts the raw request body to an InputStream and calls HttpHelper.deserializeJavaObjectFromStream(), which does `new ObjectInputStream(is).readObject()` with no class allow-list, no type filter, no size limit, and no configuration switch to disable it. The same code is duplicated in camel-http4. Because HttpEndpoint.getBinding() lazily returns `new DefaultHttpBinding(this)` when no binding is configured, this is the default behavior of the camel-http/camel-http4 HttpMessage-based consumers (camel-jetty's CamelContinuationServlet and camel-servlet's CamelHttpTransportServlet extend camel-http's CamelServlet, which constructs an HttpMessage per request; JettyRestHttpBinding and ServletRestHttpBinding used by the REST DSL also extend DefaultHttpBinding). The attacker therefore controls the bytes that are deserialized while the trusted application supplies the vulnerable reader.",
+      "title": "Unauthenticated Java deserialization of HTTP request bodies in the default Camel HTTP bindings (camel-http / camel-http4 / camel-jetty / camel-servlet)",
+      "trace": "CamelServlet.service() (components/camel-http/.../CamelServlet.java:114-118; also camel-jetty-common CamelContinuationServlet.service():126) -> exchange.setIn(new HttpMessage(exchange, request, response)) -> HttpMessage constructor (HttpMessage.java:52) calls getEndpoint().getBinding().readRequest(request, this) -> DefaultHttpBinding.readRequest() reads the servlet body, sees Content-Type application/x-java-serialized-object (DefaultHttpBinding.java:137-141 in camel-http / 124-128 in camel-http4) and calls HttpHelper.deserializeJavaObjectFromStream(is) -> HttpHelper.java:128-130 (camel-http) / :112-114 (camel-http4) performs `new ObjectInputStream(is)` and unrestricted `readObject()`. The P1 relation index independently shows the syntactic CALLS edges readRequest -> deserializeJavaObjectFromStream for both camel-http and camel-http4, corroborating the call chain (index edges are navigation candidates only, verified here against source text).",
+      "unverified": "No runtime confirmation: exploitability of RCE depends on a gadget chain being present on the target classpath; Java serialization errors are always reachable but object-execution impact was not executed. It is also unverified whether this specific site is the case's intended ground-truth location versus other plausible leads listed below; camel-http4's request-side binding requires a camel-http4 HttpMessage-using consumer (the camel-http path is the one exercised by camel-jetty/camel-servlet).",
+      "weakness_type": "Deserialization of Untrusted Data (CWE-502), remote code execution class"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 6614 model-visible source files with no path/symlink exclusions and a binary-file filter (NUL in first 8 KiB); get_relation_scope reports a complete index of the same 6614 files (0 missing, 0 hash mismatches; 55,888 symbols / 104,247 edges) but explicitly syntactic-only, with no control/data-flow, reachability, or exploitability proof, and no SAST findings loaded. I searched and read across camel-core (HTTP/file/SQL/aggregation/XML conversion and XPath/XSLT, DefaultExchange/HttpMessage, serialization data format, CachedOutputStream, FileUtil), components/camel-http, camel-http4, camel-ahc, camel-jetty-common, camel-jetty9, camel-servlet, camel-netty-http, camel-netty4-http, camel-spark-rest, camel-jackson, camel-xstream, camel-jaxb, camel-xmljson, camel-xmlsecurity, camel-exec, camel-sql, camel-jdbc, camel-pgevent, camel-jms, camel-sjms, camel-shiro, camel-spring-security, camel-shiro, camel-ftp/file, camel-stream, plus selected tests/build metadata and parent/pom.xml. I did not exhaustively read all 6614 files or all ~200 component modules; large areas (camel-web JS/vendor code, examples, tooling, most cloud/API components) were not deeply reviewed, and the P1 index was used only for navigation then verified against source.",
+  "limitations": [
+    "Static source review only; no build, test, scanner, or exploit execution was performed, so no finding is runtime-confirmed.",
+    "The HTTP request-deserialization weakness is verified at source level; RCE impact additionally depends on a gadget chain on the target classpath, which cannot be verified from this snapshot.",
+    "The snapshot is a development version (Apache Camel 2.15-SNAPSHOT); the exact upstream commit and the intended benchmark ground-truth location cannot be confirmed from the source alone, so other plausible weaknesses are documented as rejected leads instead of additional candidates.",
+    "The P1 relation index is syntactic/navigation-only: its CALLS/CONTAINS edges were used as leads and re-verified in source text; it does not prove runtime reachability or data flow.",
+    "Coverage is broad but not exhaustive: most of the 6614 files (including most of the ~200 component modules, examples, tooling, and web assets) were not individually audited.",
+    "No authentication/authorization or deployment configuration files (e.g., servlet/web.xml, OSGi blueprints) were exhaustively reviewed, so the default-binding assumption for a specific deployment should be confirmed by the maintainers."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "camel-xstream data format unmarshals XML into arbitrary Java types (AbstractXStreamWrapper.createXStream builds `new XStream()` with no type/allow-list; XStream 1.4.7 dependency), a deserialization-RCE pattern for untrusted XML.",
+      "reason": "Real weakness, but the data format exists precisely to convert XML to objects, the effective type restriction is supplied by user configuration (aliases/converters/mode), and there is no in-source control that was omitted; evidence of an unconditional attacker-to-sink path is weaker than the HTTP binding case. Left as unconfirmed lead."
+    },
+    {
+      "lead": "camel-core DOM parsing (XmlConverter.createDocumentBuilderFactory) disables external-general-entities and sets a Xerces SecurityManager but does not disable external-parameter-entities or DOCTYPE, leaving a parameter-entity XXE path for routes that parse untrusted XML through the DOM converter (e.g. xpath on a String body).",
+      "reason": "Plausible CWE-611 gap with genuine impact (file read/SSRF), but it requires a route that maps untrusted XML through the DOM conversion path and is partially mitigated (general entities disabled, entity-expansion limits); the StAX path in the same class is fully hardened, and I could not establish attacker-to-sink reachability as directly as for the HTTP deserialization. Left as unconfirmed lead."
+    },
+    {
+      "lead": "camel-pgevent PgEventProducer builds `NOTIFY <channel>, '<body>'` by string concatenation (PgEventProducer.java:56), allowing quote-breakout SQL injection.",
+      "reason": "String concatenation into SQL is present, but the interpolated value comes from exchange.getOut().getBody(String.class), and DefaultExchange.getOut() (DefaultExchange.java:257-265) lazily creates a new empty OUT message when none exists, so the attacker-controlled IN body is not necessarily used; exploitability depends on application routes that populate an OUT body. Lower confidence and impact than the submitted candidate."
+    },
+    {
+      "lead": "camel-jms JmsBinding.extractBodyFromJms deserializes JMS ObjectMessage payloads on the consumer side.",
+      "reason": "Inherent to JMS provider semantics and controlled by the broker/JMS client rather than by a Camel-side missing check; not submitted."
+    },
+    {
+      "lead": "camel-shiro ShiroSecurityPolicy has a hardcoded default 128-bit passphrase (`bits128`) and ShiroSecurityProcessor deserializes the decrypted token (ShiroSecurityProcessor.java:119-126).",
+      "reason": "Configuration/default-key weakness plus deserialization of data that first has to pass AES decryption with the policy key; weaker attacker path and impact than the submitted candidate."
+    },
+    {
+      "lead": "Response-side Java deserialization in producer paths (camel-http/camel-http4 HttpProducer.extractResponseBody, camel-jetty-common DefaultJettyHttpBinding.extractResponseBody, camel-netty-http/NettyHttpHelper.populateNettyHttpOperationFailedException, camel-ahc DefaultAhcBinding.onComplete).",
+      "reason": "Same weakness class but gated by `transferException`/malicious-server conditions; treated as a related instance of the submitted root cause rather than a separate candidate."
+    }
+  ],
+  "summary": "Reviewed the Apache Camel 2.15-SNAPSHOT snapshot (pre-2.15.0 tree; dependency versions such as CXF 3.0.4/Spring 4.1.5 place it around late Feb–Mar 2015). I traced the HTTP consumer binding paths, the XML conversion/parsing stack, the file/exec/sql/JMS/security components, and the deserialization helper sites. The single strongest source-evidenced candidate is an unauthenticated Java-deserialization sink in the default HTTP bindings of camel-http/camel-http4: any remote client that can reach a Camel HTTP consumer (camel-jetty, camel-servlet, REST-DSL bindings that extend DefaultHttpBinding) can set Content-Type: application/x-java-serialized-object and have the raw request body passed to an unrestricted ObjectInputStream.readObject(), i.e. remote code execution in the Camel JVM if a gadget is on the classpath. Other plausible-but-weaker leads (XStream data format, DOM-parser XXE, pgevent SQL concatenation, JMS ObjectMessage, Shiro defaults) are listed as rejected/unconfirmed leads rather than additional candidates. No code was executed; nothing is runtime-confirmed."
+}

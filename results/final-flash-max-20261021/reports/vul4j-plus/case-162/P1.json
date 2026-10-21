@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The remote TLS peer controls the X.509 certificate it presents (client certificate on the server side, or server certificate on the client side). The peer's issuer DN is attacker-influenced at the level of choosing/obtaining a certificate from a CA and can be fully attacker-chosen with a private/leaf CA accepted by the trust manager; the subject DN is the field applications normally expect.",
+      "confidence": "low",
+      "counterevidence_checked": "Verified the helper is the only use of getIssuerX500Principal in the tree; getSubjectX500Principal is used elsewhere for trust-store keys (OpenSslClientContext/SslContext). Verified JdkSslSession delegates to the JDK SSLSession (subject semantics), so the OpenSSL path is inconsistent. Checked that no constructor/test path overrides these methods. Checked for a possible certificate-verification bypass in OpenSslContext.AbstractCertificateVerifier (verification failures set engine.handshakeException and return false, which is consumed by checkPendingHandshakeException) and found no missing verification there. No source evidence that the issuer value is ever normalized to the subject elsewhere.",
+      "id": "cand-1-openssl-principal",
+      "impact": "Authentication/authorization decisions and audit identity based on SSLSession.getPeerPrincipal() under the OpenSSL provider use the issuer DN instead of the peer's subject DN. Depending on how the application consumes the principal, this can misidentify all peers sharing a CA (loss of per-identity granularity), deny legitimate peers, or grant access where the application's allow-list accidentally matches the issuer rather than the subject (authorization bypass class). It is a correctness/trust-boundary defect in a security API rather than a memory-safety issue.",
+      "locations": [
+        {
+          "end_line": 1410,
+          "path": "handler/src/main/java/io/netty/handler/ssl/OpenSslEngine.java",
+          "start_line": 1390
+        },
+        {
+          "end_line": 1280,
+          "path": "handler/src/main/java/io/netty/handler/ssl/OpenSslEngine.java",
+          "start_line": 1273
+        },
+        {
+          "end_line": 133,
+          "path": "handler/src/main/java/io/netty/handler/ssl/JdkSslSession.java",
+          "start_line": 120
+        }
+      ],
+      "prerequisites": "Application uses Netty's OpenSSL provider (SslProvider.OPENSSL / OpenSslEngine, e.g. via SslContextBuilder / OpenSslServerContext) and makes an identity or authorization decision based on SSLSession.getPeerPrincipal() (or getLocalPrincipal()). The handshake must complete so getPeerCertificates() yields data; mutual-TLS/server-side or client-side certificate validation must be in use.",
+      "root_cause": "In the OpenSslSession implementation, the helper `principal(Certificate[] certs)` calls `((java.security.cert.X509Certificate) certs[0]).getIssuerX500Principal()`; it should return the certificate subject (`getSubjectX500Principal()`). `getPeerPrincipal()` and `getLocalPrincipal()` therefore expose the certificate's issuer DN as the session principal. The JDK-provider path (`JdkSslSession`) delegates to the JDK `SSLSession`, which returns the subject principal, so the two SSL providers disagree on the same handshake.",
+      "title": "OpenSslEngine SSLSession returns certificate issuer instead of subject as peer/local principal",
+      "trace": "Remote cert -> OpenSslSession.getPeerCertificates() -> initPeerCertChain() (line 1471) builds Certificate[] -> getPeerPrincipal() (line 1391) -> principal(peer) -> certs[0].getIssuerX500Principal() (line 1409). getLocalPrincipal() (line 1400) follows the same helper for the local certificate chain. Result: for a typical PKI, every certificate issued by the same CA yields the same 'peer principal' (the CA DN) regardless of the actual subject, and client identity checks/logging that rely on getPeerPrincipal() are computed from the wrong field. The JDK path (JdkSslSession.getPeerPrincipal(), delegated) returns the subject, confirming the intended semantics.",
+      "unverified": "Cannot confirm from source alone that this defect is the dataset case's ground truth (it matches the 4.1.0.Beta5-SNAPSHOT security-release window, but no CVE labels or fix patches were consulted). No runtime check: the exact application-side impact depends on how getPeerPrincipal() is used, and OpenSSL provider tests (handler/src/test not present in this snapshot) were not available. Additionally, the helper being called for getLocalPrincipal() means local-identity reporting is also affected, an aspect not further traced into user code.",
+      "weakness_type": "Improper Authentication / Incorrect principal identity (CWE-287/CWE-345 class)"
+    }
+  ],
+  "coverage_summary": "Source scope: 1,398 files at the assigned root; relation index reports complete coverage (same 1,398 files indexed, no mismatches), but it is syntactic navigation only (calls/edges/facts) and was used just to locate symbols, never as a verdict. Files actually read include handler/ssl (SslHandler, OpenSslEngine, OpenSslContext, OpenSslClientContext, OpenSslServerContext, JdkSslContext, JdkSslClientContext, JdkSslSession, SniHandler, FingerprintTrustManagerFactory, OpenSslX509Certificate), codec-http (HttpObjectDecoder, HttpHeaderUtil, HttpObjectAggregator, cookie decoders), codec/MessageAggregator, ByteToMessageDecoder, codec-haproxy, parts of codec-http2 (frame reader, headers codec, DefaultHttp2Connection family overview) and codec-mqtt. Broader modules (buffer, common, transport-*, resolver*, codec-dns/stomp/memcache/socks/xml, most of codec-http2 flow control) were only sampled or not read in depth; no tests are present in the snapshot and no build, test, scanner, or exploit execution was performed.",
+  "limitations": [
+    "No test files exist under */src/test in the snapshot, so the fix/reproducer surface could not be inspected (and was intentionally not sought outside the assigned source).",
+    "The P1 index is syntactic/navigational (no data flow, reachability, or exploitability proof); index facts such as 'security_call' are name-based hints only and were not treated as findings.",
+    "No CVE/CWE labels, patches, or sibling case artifacts were consulted, so the candidate's correspondence to a specific CVE (the snapshot era is consistent with the 4.1.0.Beta5 security-release window) is unverified.",
+    "Runtime behavior was not observed: no build, tests, or payloads. All impact statements are source-level reasoning.",
+    "Many modules and files were not read line-by-line (noted in the coverage summary), so an equally strong or stronger vulnerability in unread areas cannot be excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HTTP request smuggling logic in HttpObjectDecoder (Transfer-Encoding: chunked wins over Content-Length at lines 561-570; getContentLength() returns only the first of multiple Content-Length values; splitHeader() accepts whitespace before ':') maps to known Netty CVEs (CVE-2019-16869/20444/20445).",
+      "reason": "Real smuggling class, but those fixes landed in 2019 (4.1.42/4.1.44) while this snapshot is 4.1.0.Beta5-SNAPSHOT (~Nov 2015), so it is inconsistent with the likely fix era; the TE-precedence and lenient header parsing are also arguably RFC-compliant behaviors whose exploitability requires a disagreeing front-end proxy (not shown from source). Kept as unconfirmed lead only."
+    },
+    {
+      "lead": "HAProxyMessageDecoder over-limit/discarding state could loop or mishandle oversized v1/v2 headers.",
+      "reason": "failOverLimit() -> fail() unconditionally throws and ctx.close() is called, so the 'discarding' branches are effectively unreachable and the decoder terminates the connection; no infinite loop or memory issue found in source."
+    },
+    {
+      "lead": "SniHandler client-hello parsing reads offsets without bounding them to the record and can return a null context/wrong SNI.",
+      "reason": "All out-of-bounds reads raise IndexOutOfBoundsException, which the catch(Throwable) converts into handshaken=true with the default context; the SNI value is client-chosen by design, so no trust-boundary bypass was demonstrated."
+    },
+    {
+      "lead": "OpenSslClientContext loads the trust chain file with SSLContext.setCertificateChainFile(ctx, trustCertChainFile, true) (skipFirst=true), which looks like a copy/paste error from server mode.",
+      "reason": "Certificate verification on the OpenSSL path is delegated to the Java trust manager via setCertVerifyCallback, and the same trust file is separately loaded into a KeyStore (initTrustManagerFactory) with all certificates, so no verification bypass could be shown; impact appears limited to the presented client chain."
+    },
+    {
+      "lead": "Zlib/SPDY header decompression paths could allow unbounded allocation (zip-bomb DoS, later CVE-2020-11612).",
+      "reason": "The inspected SPDY header decoders enforce maxHeaderSize and stream output; the relevant modern hardening/fix is from a much later era than this snapshot, and no concrete unbounded-allocation path was traced within the time available."
+    },
+    {
+      "lead": "SslHandler handshake/failure handling (setHandshakeFailure/notifyHandshakeFailure) as a possible DoS.",
+      "reason": "Inspected decode/unwrap/wrap loops (consumed==0 && produced==0 break present), handshake timeout cancelation, and failure paths; no spin or missing-close condition could be established from source."
+    }
+  ],
+  "summary": "Netty 4.1.0.Beta5-SNAPSHOT (Oct/Nov 2015 era) source review focused on remotely reachable decoders/handlers (codec-http, codec-http2, codec-haproxy, codec, handler/ssl) with navigation help from the P1 index (syntactic only). Strongest source-supported lead: `OpenSslEngine`'s session implementation returns the X.509 **issuer** principal instead of the **subject** principal for `SSLSession.getPeerPrincipal()`/`getLocalPrincipal()`, contradicting the SSLSession contract and the JDK-engine path, which is a plausible authentication/identification flaw for applications on `SslProvider.OPENSSL`. Other suspected areas (HTTP request smuggling in `HttpObjectDecoder`, HAProxy over-limit handling, SNI parsing, trust-chain loading in `OpenSslClientContext`) were examined and either fixed in a much later era than this snapshot or not shown to be exploitable from source."
+}

@@ -1,0 +1,86 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote unauthenticated TLS peer controls the first bytes of the connection, including the content-type byte, SSLv2 length/version bytes, and TLS record-length field. It can send a 5-byte SSLv2-shaped prefix (for example 00 00 00 00 02) or a complete TLS record with a length field up to 0xFFFF.",
+      "confidence": "medium",
+      "counterevidence_checked": "SslHandler's JDK-compatible path explicitly handles NOT_ENOUGH_DATA before calling the engine (SslHandler 1363-1365), and SslClientHelloHandler does the same (94-97); the asymmetry is in ReferenceCountedOpenSslEngine. The engine does check len < 5, NOT_ENCRYPTED, and MAX_RECORD_SIZE, but none covers the -1 sentinel, and the MAX_RECORD_SIZE check is conditional on insufficient destination capacity. SslHandler-sized destinations make capacity >= packetLengthDataOnly, so oversized records bypass the guard. The negative native call only occurs for direct input buffers; heap buffers take the directBuffer(-1) Java-exception path. The tcnative native implementation (SSL.bioSetByteBuffer, readPlaintextData) is an external dependency and was not inspectable.",
+      "id": "netty-openssl-record-length-validation",
+      "impact": "Remote denial of service against Netty TLS endpoints using the native OpenSSL engine. A negative or over-maximum record length can reach native OpenSSL BIO/record handling; depending on tcnative/OpenSSL behavior this can cause an out-of-bounds native read or invalid-length crash of the JVM. At minimum it produces an unhandled runtime exception that aborts the connection. No authentication or completed handshake is required for the 5-byte negative-length path.",
+      "locations": [
+        {
+          "end_line": 1234,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 1196
+        },
+        {
+          "end_line": 1269,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 1264
+        },
+        {
+          "end_line": 644,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 629
+        },
+        {
+          "end_line": 681,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 656
+        },
+        {
+          "end_line": 487,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslUtils.java",
+          "start_line": 472
+        },
+        {
+          "end_line": 1393,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslHandler.java",
+          "start_line": 1387
+        },
+        {
+          "end_line": 2419,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslHandler.java",
+          "start_line": 2414
+        },
+        {
+          "end_line": 517,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslContext.java",
+          "start_line": 497
+        }
+      ],
+      "prerequisites": "The application uses SslHandler with Netty's native OpenSSL engine (netty-tcnative available and OpenSsl provider selected). ReferenceCountedOpenSslContext.newHandler creates the engine with jdkCompatibilityMode=false, so SslHandler.decodeNonJdkCompatible forwards bytes directly to the engine and the handshake-not-finished branch parses the length. The negative-length path requires a direct input ByteBuffer (default for NIO/epoll reads); heap input instead throws a Java exception. The oversized-record path requires the whole oversized record in one engine unwrap buffer (reliable in jdkCompatibilityMode=true, possible in one read in non-JDK mode).",
+      "root_cause": "ReferenceCountedOpenSslEngine.unwrap() trusts SslUtils.getEncryptedPacketLength() as a native buffer length. It handles NOT_ENCRYPTED but not NOT_ENOUGH_DATA (-1), so a crafted SSLv2-shaped 5-byte prefix yields packetLength == -1, survives the capacity and 'len < packetLength' checks, and becomes pendingEncryptedBytes == -1 passed to writeEncryptedData()/SSL.bioSetByteBuffer(). Separately, the only MAX_RECORD_SIZE upper-bound check is inside 'if (packetLengthDataOnly > capacity)'; SslHandler allocates its decode buffer with the attacker-declared record length, so capacity is large enough and the guard is never evaluated before oversized data is handed to native OpenSSL.",
+      "title": "Peer-controlled TLS/SSLv2 record length reaches native OpenSSL BIO without full validation",
+      "trace": "1) ReferenceCountedOpenSslContext.newHandler creates the engine with jdkCompatibilityMode=false (lines 497-517); SslHandler routes inbound data through decodeNonJdkCompatible (SslHandler 1421-1430), which calls unwrap(ctx, in, in.readableBytes()) without checking the record header (SslHandler 1387-1393). 2) During the initial handshake, oldHandshakeState != FINISHED, so ReferenceCountedOpenSslEngine.unwrap parses the packet length via SslUtils.getEncryptedPacketLength(srcs, srcsOffset) (engine 1191-1200). 3) For prefix 00 00 00 00 02, the ByteBuffer parser takes the SSLv2 branch, computes packetLength = 3, sees packetLength <= headerLength (3), and returns NOT_ENOUGH_DATA (-1) (SslUtils 472-487). 4) The engine checks only NOT_ENCRYPTED (1201-1203), computes packetLengthDataOnly = -6 (1205); '-6 > capacity' is false, and 'len (5) < packetLength (-1)' is also false (1223), so no BUFFER_UNDERFLOW is returned. 5) The loop sets pendingEncryptedBytes = min(-1, 5) = -1 (1267) and calls writeEncryptedData(src, -1) (1269). For a direct input buffer this executes SSL.bioSetByteBuffer(networkBIO, address, -1, false) (629-632), passing a negative length into native OpenSSL/tcnative; for a heap buffer, alloc.directBuffer(-1) throws. 6) Upper-bound variant: a TLS header with length 0xFFFF yields packetLength 65540; SslHandler allocates decodeOut with that declared capacity (SslHandler 2414-2419), so engine capacity is at least packetLengthDataOnly and the MAX_RECORD_SIZE check at 1209-1216 is skipped; the oversized record is written to the BIO (1267-1269) and passed to SSL.readFromSSL (656-681).",
+      "unverified": "Exact native behavior of SSL.bioSetByteBuffer with a negative length is not verifiable from this snapshot; if tcnative safely rejects negative lengths, the 5-byte path degrades to a Java exception and the oversized-record path remains the primary native risk. No build, tests, or runtime execution were performed. The exact upstream fix mapping is not asserted. Oversized-record reachability depends on the complete record being presented in one engine buffer, which is reliable in jdkCompatibilityMode=true and possible but less deterministic in the default non-JDK handler mode.",
+      "weakness_type": "Improper input validation (CWE-20) of a peer-controlled length before native use, with native out-of-bounds/denial-of-service risk"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 2231 model-visible files with a 5 MiB per-file cap, text-only reads, binary skipping, and no test or symlink entries exposed. Reviewed main sources across buffer, common (platform/native loading/NetUtil), codec (ByteToMessageDecoder, length-field framing, compression, serialization), codec-http (decoder, aggregator, multipart, HttpUtil), codec-http2 framing, codec-dns, codec-haproxy, handler-ssl (SslHandler, SslUtils, ReferenceCountedOpenSslEngine/Context, SslClientHelloHandler), resolver-dns, and transport native/Java address handling. The final candidate is based on the handler-ssl path; no exhaustive line-by-line audit of all 2231 files was performed.",
+  "limitations": [
+    "Only main sources are visible; no test sources, build execution, or runtime validation was available.",
+    "The netty-tcnative native implementation (SSL.bioSetByteBuffer, SSL.readFromSSL) is an external dependency and was not in the source snapshot, so exact native crash/out-of-bounds behavior is unverified.",
+    "The negative-length path requires a direct input ByteBuffer for the native call; heap-buffer configurations instead raise a Java IllegalArgumentException.",
+    "The oversized-record path depends on the complete oversized record being available in a single engine unwrap buffer, which is configuration- and transport-dependent.",
+    "Only one candidate was submitted per the review cap; other malformed-input and resource-exhaustion concerns were noted as unconfirmed leads rather than additional candidates."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Bzip2 malformed Huffman code-length handling",
+      "reason": "Bzip2HuffmanStageDecoder.createHuffmanDecodingTables indexes tableBases[codeLengths[i] + 1] without validating delta-decoded code lengths in Bzip2Decoder.RECEIVE_HUFFMAN_LENGTH, so a crafted stream can throw an ArrayIndexOutOfBoundsException. This is a malformed-input exception rather than memory corruption, and the snapshot already contains block-size and BWT start-pointer bounds checks; not selected as the strongest candidate."
+    },
+    {
+      "lead": "CompactObjectInputStream / ObjectDecoder deserialization",
+      "reason": "The class-resolver-based ObjectInputStream can deserialize attacker-supplied classes, but this is an explicitly documented opt-in API with a security warning; no new root cause beyond the documented serialization liability was identified."
+    },
+    {
+      "lead": "SslClientHelloHandler ClientHello accumulation",
+      "reason": "The handler bounds ClientHello accumulation via maxClientHelloLength (default 16MB, configurable) and validates record and handshake lengths; no stronger bypass was found than the candidate above."
+    },
+    {
+      "lead": "NativeLibraryLoader resource/file handling",
+      "reason": "The reviewed code performs duplicate-resource digest checks and loads bundled native resources; exploiting it requires local classpath/resource control, not a remote attacker, so it was not selected."
+    }
+  ],
+  "summary": "Reviewed Netty 4.1.118.Final-SNAPSHOT main sources (2231 model-visible text files) with focus on the TLS/native-SSL path, HTTP/1+2, compression, serialization, DNS, and native loading. Strongest candidate: peer-controlled TLS/SSLv2 record lengths parsed by SslUtils are not fully validated in ReferenceCountedOpenSslEngine.unwrap before being used as native OpenSSL buffer lengths. The NOT_ENOUGH_DATA sentinel (-1) is not handled, and the only MAX_RECORD_SIZE upper-bound guard is nested under a capacity condition that SslHandler's length-sized destination defeats. On the default OpenSSL newHandler path (jdkCompatibilityMode=false), a 5-byte SSLv2-shaped prefix can drive packetLength=-1 into min()/writeEncryptedData and ultimately SSL.bioSetByteBuffer(..., -1, ...); an oversized record similarly bypasses the max-record guard. This is a remote, potentially pre-handshake DoS/native-crash candidate, but it is not runtime-confirmed and tcnative native code is outside this snapshot."
+}

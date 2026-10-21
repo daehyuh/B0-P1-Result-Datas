@@ -1,3 +1,5 @@
+> Historical snapshot. Current CodeQL/B0/P1 statistics are in [the current summary](../summary.md).
+
 # Vul4J CodeQL 79사례 지정 취약점 대조
 
 현재 연구 집계에서는 완료된 실행에서 지정 취약점 적중 근거가 확인되지 않으면 미적중으로 산정한다. `VUL4J-1`의 CVE 정답을 재확인한 후 이 사례와 기존에 판단을 유보했던 `VUL4J-29`를 미적중에 포함했다. `VUL4J-1`의 재판정 근거는 `VUL4J-1-CodeQL-CVE-재판정-20261008.md`에 기록했다.

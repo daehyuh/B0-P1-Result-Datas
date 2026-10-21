@@ -1,0 +1,93 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any unauthenticated client (default mapfish-spring-security.xml maps /** to permitAll) that can POST a print request as JSON/form to /print/{app}/report.{format} or /print/buildreport.{format}. The template must declare a 'table' attribute (TableAttribute) and a !prepareTable processor with dynamic: true (a documented, commonly used feature). The attacker fully controls attributes.table.columns[] strings (and the matching data rows). Example payload element: \"columns\":[\"c\\\" + (new java.lang.ProcessBuilder(\\\"id\\\")).start() + \\\"\"] with a data row so the column enters the columns map.",
+      "confidence": "medium",
+      "counterevidence_checked": "Confirmed the injection sink is real and unescaped (no java-identifier/quote validation in TableProcessor, TableAttribute, MapfishParser, or Configuration validation). Verified the injection is only reached when the config enables dynamic tables (this.jasperTemplate/defaultTemplate and this.dynamic paths; non-dynamic tables pass column names only as data, see lines 296-302). Verified JasperReports expressions are full Java expressions (the code itself uses method calls such as $F{x}.getClass().equals(...) in generated expressions), so arbitrary method invocation is in scope. Could not verify from this snapshot whether JasperReports 6.9.0 sanitizes non-identifier field names when generating variable names for $F{...} references: if it does not, the malicious name would also be used inside $F{...} in the same generated report and the whole sub-report could fail to compile, preventing the injected header expression from being evaluated. The jasperreports jar is not part of the snapshot (no libraries/tests available offline), so this library-internal behaviour remains unconfirmed. Also noted that the same code can be triggered only by requests that reach a template with a table attribute.",
+      "id": "mapfish-dynamic-table-column-expression-injection",
+      "impact": "Injection of arbitrary Java/Jasper expressions into a server-generated sub-report leads to arbitrary code execution in the print server JVM (as the servlet user), i.e. full compromise of the print service host, plus arbitrary data accessible to that process. Weaker variants (failed compilation) are a denial of service for the affected print job.",
+      "locations": [
+        {
+          "end_line": 411,
+          "path": "core/src/main/java/org/mapfish/print/processor/jasper/TableProcessor.java",
+          "start_line": 380
+        },
+        {
+          "end_line": 446,
+          "path": "core/src/main/java/org/mapfish/print/processor/jasper/TableProcessor.java",
+          "start_line": 426
+        },
+        {
+          "end_line": 488,
+          "path": "core/src/main/java/org/mapfish/print/processor/jasper/TableProcessor.java",
+          "start_line": 468
+        },
+        {
+          "end_line": 300,
+          "path": "core/src/main/java/org/mapfish/print/processor/jasper/TableProcessor.java",
+          "start_line": 256
+        },
+        {
+          "end_line": 43,
+          "path": "core/src/main/java/org/mapfish/print/attribute/TableAttribute.java",
+          "start_line": 33
+        },
+        {
+          "end_line": 302,
+          "path": "core/src/main/java/org/mapfish/print/parser/MapfishParser.java",
+          "start_line": 281
+        },
+        {
+          "end_line": 113,
+          "path": "core/src/main/java/org/mapfish/print/processor/jasper/JasperReportBuilder.java",
+          "start_line": 75
+        }
+      ],
+      "prerequisites": "Config uses a !table attribute plus a !prepareTable processor with dynamic: true (or a dynamic table nested in a !datasource); at least one data row containing a value at the malicious column index; the print request passes the referer/access checks in effect (by default the app is public).",
+      "root_cause": "TableAttribute.TableAttributeValue.columns is a String[] taken verbatim from the untrusted print request (MapfishParser.parseValue -> PArray.getString, no validation). TableProcessor.execute copies each column name into the generated table layout, and TableProcessor.generateSubReport builds JasperReports expressions by string concatenation with that name: the header expression is '\"' + columnName + '\"' (line 409), and detail/image/printWhen expressions are \"$F{\" + columnName + \"}\" (lines 472, 485, 431-433, 443-445). The design is serialized with JRXmlWriter and then compiled by JasperCompileManager.compileReportToFile (JasperReportBuilder.compileJasperReport) and evaluated at fill time, so attacker-controlled text becomes Java/Jasper expression source. There is no escaping or identifier validation anywhere (TableAttribute.validate is a no-op, TableProcessor has no column-name checks).",
+      "title": "Untrusted table column names are concatenated into JasperReports expressions (dynamic table), enabling report-expression code injection / RCE",
+      "trace": "(1) Request JSON 'attributes.table' -> Values.populateFromAttributes -> TableAttribute.getValue -> MapfishParser.parseValue/parseArrayValue populates TableAttributeValue.columns (String[]) and data (PArray[]) with raw strings. (2) TableProcessor.execute iterates data rows and puts columnNames[j] into the LinkedHashMap columns (lines 268-288). (3) When dynamic == true, generateSubReport(input, columns) is called (line 298). (4) generateSubReport creates JRDesignField with the raw name and JRDesignExpression.setText('\"' + columnName + '\"') for the header cell, and '\"$F{\" + columnName + \"}\"' for detail/printWhen, then JRXmlWriter.writeReport + JasperReportBuilder.compileJasperReport(jasperFile) -> JasperCompileManager.compileReportToFile (JasperReportBuilder lines 93-94). (5) The compiled report expressions are evaluated while the print job is filled, so the injected Java is executed on the print server and the job result/status returns to the client. Errors are also returned to the client via PrintJobStatus.getError in MapPrinterServlet.getStatus.",
+      "unverified": "Runtime confirmation is impossible here (no execution allowed and no dependencies/test sources in the snapshot). The precise payload form and whether the generated JRXML compiles end-to-end depends on JasperReports 6.9.0's handling of non-identifier field names (field variable naming for $F{...}), which I could not inspect. It is also unverified whether any particular deployment's config uses dynamic: true; if none does, the sink is unreachable in that deployment.",
+      "weakness_type": "Code injection via template expression construction (CWE-94/CWE-917)"
+    }
+  ],
+  "coverage_summary": "Source scope: 442 visible files (432 indexed; 10 source files absent from the relation index; no binaries/jars, no tests, no config.yaml/app examples, no jrxml resources in the snapshot). I reviewed the HTTP entry points (MapPrinterServlet, filters, Spring security/context XML, ServletMapPrinterFactory, file loaders), the request parsing/attribute layer (Values, MapfishParser, ReflectiveAttribute, wrappers, JsonDatasource/Table/DataSource/Map attributes), processors (Table, DataSource, MergeDataSource, Legend, PdfConfiguration, map/scalebar/northarrow, HTTP matchers/processors), the HTTP stack (ConfigFileResolvingHttpRequestFactory, MfClientHttpRequestFactoryImpl, HttpRequestFetcher, proxies/credentials/SSL, URIUtils, FileUtils), job/queue/accounting/storage code, and the JasperReports output path. The P1 index was used only for navigation (no control/data flow, no semantic resolution, no Spring runtime verification); all cited code was re-read in source text.",
+  "limitations": [
+    "No test sources or dependency jars are present, so behaviour of third-party libraries (notably JasperReports 6.9.0 expression compilation/field-name handling, SnakeYAML, GeoTools parsers) could not be verified; conclusions about sinks that depend on library internals are inferential.",
+    "The P1 relation index has no control-flow or data-flow analysis and omits 10 files; call/reachability edges are syntactic candidates only.",
+    "No code was executed, no scanners or exploits were run, and no runtime/deployment configuration (mapfish-spring.properties overrides, config.yaml files, deployed Tomcat settings) is available, so template-level prerequisites (e.g. dynamic: true, table attributes, allowedReferers use) are deployment-dependent.",
+    "Gradle-built scope excludes other modules/services; only the assigned snapshot was reviewed.",
+    "Coverage of some large classes (e.g. ThreadPoolJobManager, CreateMapProcessor, CreateOverviewMapProcessor, Hibernate job queue, scalebar/grid rendering) was skim-level rather than line-by-line."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal in AbstractFileConfigFileLoader.resolveFileAssumingPathIsFile (first branch returns an existing file relative to the config dir without FileUtils.assertIsSubDirectory, unlike the second branch and the resolveChildFile branches).",
+      "reason": "The missing containment check is clearly visible (lines 183-198) and reachable from request-controlled strings that reach Configuration.loadFile (e.g. a feature-layer 'style' string or a GeoJSON crs 'link' href that is a relative path), but in the paths I could verify the loaded bytes are consumed internally (parsed as SLD/JSON style or WKT, or rendered as an image) rather than returned to the client, so the concrete disclosure impact is weaker/largely blind than the selected candidate. Worth a separate follow-up."
+    },
+    {
+      "lead": "MapPrinterServlet.createAndSubmitPrintJob calls checkReferer(httpServletRequest, mapPrinter) but ignores the boolean result (line 1007), while getCapabilities (line 713) and getExampleRequest (line 806) enforce it with a 403.",
+      "reason": "Real asymmetry and a missing enforcement of the configured allowedReferers control on job creation, but impact is config-dependent (only deployments that set allowedReferers rely on it) and lower severity than the selected candidate."
+    },
+    {
+      "lead": "JSONP callback reflected verbatim into responses (appendJsonpCallback, appendJsonpCallbackEnd, pretty path via getOutputStream().print) for status/capabilities/apps/exampleRequest.",
+      "reason": "No validation of the callback, but responses are served as application/javascript, so modern-browser script execution as HTML is not established from source alone; classic reflected-XSS-style impact is uncertain."
+    },
+    {
+      "lead": "RequestSizeFilter only compares getContentLength() > max, so chunked requests (Content-Length == -1) bypass the size limit.",
+      "reason": "Plausible DoS hardening gap, but no concrete unbounded processing path was traced to the point where a single request causes severe resource exhaustion beyond the documented job limits (maxNumberOfWaitingJobs etc.)."
+    },
+    {
+      "lead": "XXE: SLDParserPlugin.tryLoadSLD parses request-supplied style XML with a DocumentBuilderFactory that has no disallow-doctype-decl / external-entity restrictions (lines 95-99); AbstractJasperReportOutputFormat.parseXML is similar but reportTemplate is config-defined.",
+      "reason": "The parsed document is discarded and failures are swallowed, so only a blind/out-of-band effect is plausible; no client-visible data return was established."
+    },
+    {
+      "lead": "ServletMapPrinterFactory.checkForAddedApp builds a URI from the URL-path app id ('..' plus ':' -> '/') and can point outside appsRootDirectory when the location is a file:/servlet: URI.",
+      "reason": "Traversal is limited (max 3 levels, requires an existing config.yaml at the target and servlet/file-loader behaviour), and the loaded config is validated; not selected."
+    },
+    {
+      "lead": "GmlLayer includes the full fetched document in an exception message ('unable to parse gml: ' + gmlData) and CachingUrihandler reads local file: XSDs without containment checks.",
+      "reason": "The GML URL path is guarded by FileUtils.testForLegalFileUrl for file: URLs, and I could not construct a request URL (known protocol, authority/relative forms) that both passes that check and reaches the file-loader traversal; the content-disclosure chain is therefore unproven."
+    }
+  ],
+  "summary": "Reviewed the MapFish Print 3.22.0 snapshot (442 visible files; 354 Java files indexed; no test sources, no dependency jars in scope). I traced request-data flow from the servlet/attribute layer into processors, file loaders, HTTP request factory, and report generation. The strongest source-evidenced issue is in the JasperReports-backed table processor: request-supplied table column names are interpolated without escaping or validation into JasperReports expression text that is written to a JRXML and compiled/executed during printing, giving a code-injection/RCE primitive in templates that use the documented dynamic table feature. Other suspicious areas (file-loader containment gap, referer check not enforced on job creation, JSONP reflection, XXE in the SLD validator, chunked-request size-filter bypass) are listed as rejected/alternative leads and were not selected."
+}

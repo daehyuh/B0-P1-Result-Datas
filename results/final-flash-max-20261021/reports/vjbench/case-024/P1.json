@@ -1,0 +1,93 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A network client POSTs to /emissary/WorkSpaceClientEnqueue.action with Content-Type application/x-www-form-urlencoded (ISO-8859-1, exactly as the peer transport emits via UrlEncodedFormEntity(..., Charset.forName(\"8859_1\"))) and fully controls the `pickUpClientName` and `tpObj` values. `tpObj` is percent-encoded attacker-chosen bytes that become the ObjectInputStream byte source; `pickUpClientName` only needs to identify an IPickUpSpace bound in the namespace (e.g. the FilePickUpClient service location, enumerable through /api/places after authentication).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the endpoint is not anonymous: EmissaryServer installs a ConstraintSecurityHandler with DigestAuthenticator and a '/*' authenticated constraint, with only /api/health no-auth (EmissaryServer lines 470-493); therefore the finding depends on credentials, mitigated only by the fact that the repo ships and publicly documents a default password. Checked that the deserialization is really on the request-handling path and not a client-side helper: ObjectOutputStream/ObjectInputStream pairs at WorkSpaceAdapter 100-114 and 302-310 show the designed round trip, and WorkSpaceClientEnqueueAction is an annotated JAX-RS resource (annotations confirmed via the relation index and source). Checked the second sink in MoveToAdapter: MoveToAction.java has no @Path/@POST annotations (lines 1-44) so /MoveTo.action is not registered by Jersey package scanning, which makes that particular deserialization likely unreachable - this reduces, but does not remove, the issue because the WorkSpaceClientEnqueue action is annotated. Searched for ObjectInputFilter/serialization filters or class allow-lists in the snapshot: none found.",
+      "id": "EMISSARY-DESER-001",
+      "impact": "Remote code execution in the Emissary server JVM under the service account (gadget-chain dependent), or at minimum deserialization-driven denial of service. For a data-processing node this yields full control of the host/process handling sensitive ingested data, not merely a routing/integrity error.",
+      "locations": [
+        {
+          "end_line": 54,
+          "path": "src/main/java/emissary/server/mvc/internal/WorkSpaceClientEnqueueAction.java",
+          "start_line": 35
+        },
+        {
+          "end_line": 310,
+          "path": "src/main/java/emissary/server/mvc/adapters/WorkSpaceAdapter.java",
+          "start_line": 302
+        },
+        {
+          "end_line": 119,
+          "path": "src/main/java/emissary/server/mvc/adapters/WorkSpaceAdapter.java",
+          "start_line": 91
+        },
+        {
+          "end_line": 177,
+          "path": "src/main/java/emissary/util/PayloadUtil.java",
+          "start_line": 160
+        },
+        {
+          "end_line": 219,
+          "path": "src/main/java/emissary/server/mvc/adapters/MoveToAdapter.java",
+          "start_line": 194
+        },
+        {
+          "end_line": 570,
+          "path": "src/main/java/emissary/server/EmissaryServer.java",
+          "start_line": 553
+        }
+      ],
+      "prerequisites": "(1) Network reachability to the Emissary HTTP port (bind host is localhost by default but non-loopback in cluster use, cf. contrib/docker/docker-compose.yml with network_mode host). (2) Digest authentication; the server requires auth for '/*' except /api/health (EmissaryServer.buildSecurityHandler), but the snapshot ships src/main/config/jetty-users.properties with the default emissary/emissary123 credential and README.md lines 722-724 document it, so an unchanged default deployment is effectively pre-authenticated to anyone who reads the public docs. (3) An IPickUpSpace (FilePickUpClient) bound in the Namespace, i.e. cluster mode; in standalone mode the lookup fails before the sink. (4) A usable deserialization gadget on the classpath (commons-collections4 4.4 per pom.xml is a plausible candidate) - not verified in this review.",
+      "root_cause": "The servlet/JAX-RS layer accepts a serialized Java object from an HTTP form parameter and deserializes it with a bare ObjectInputStream before any type check. `WorkSpaceClientEnqueueAction.workspaceClientEnqueue` (@POST @Path(\"/WorkSpaceClientEnqueue.action\")) does `new ObjectInputStream(new ByteArrayInputStream(workBundleString.getBytes(\"8859_1\"))).readObject()` and only then casts to WorkBundle, so gadget side effects execute during readObject(). Identical unsanitized sinks exist in `WorkSpaceAdapter.EnqueRequestBean.setPaths` (used by the inbound legacy enque path) and in `PayloadUtil.deserialize` (used by `MoveToAdapter.MoveToRequestBean.setPayload`). There is no ObjectInputFilter, serialization allow-list, or restricted class loader anywhere in the snapshot, and the transport deliberately round-trips raw 8859-1 serialized bytes over HTTP, so the bytes can be reproduced by an external client.",
+      "title": "Untrusted Java deserialization on HTTP action /emissary/WorkSpaceClientEnqueue.action (tpObj) permits remote code execution",
+      "trace": "HTTP POST /emissary/WorkSpaceClientEnqueue.action (context /emissary, mvc ResourceConfig registered in EmissaryServer.buildMVCHandler, lines 553-570) -> Jersey dispatches to WorkSpaceClientEnqueueAction.workspaceClientEnqueue (line 39) -> Namespace.lookup(KeyManipulator.getServiceLocation(clientName)) (lines 46-50) -> new ObjectInputStream(new ByteArrayInputStream(workBundleString.getBytes(\"8859_1\"))) (line 52) -> ois.readObject() (line 53) on attacker-controlled bytes -> arbitrary Serializable graph is constructed/invoked by the JVM before the (WorkBundle) cast completes. Sibling paths: WorkSpaceAdapter.setPaths lines 304-305; PayloadUtil.deserialize line 163-164 invoked from MoveToAdapter.setPayload line 218.",
+      "unverified": "No runtime execution, no gadget-chain proof, and no verification that a specific class on the declared dependency set yields a working chain; the exact deployment state (whether default credentials were changed, whether the node runs in cluster mode with an IPickUpSpace bound, and whether the HTTP port is non-loopback) was not observable from source. Line-level reachability of Jersey form-param decoding for arbitrary 8859-1 bytes assumes no JVM-level serialization filter is configured at launch (launcher scripts are not part of the snapshot).",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (secondary: CWE-20 improper input validation, CWE-94)"
+    }
+  ],
+  "coverage_summary": "Review covered the 349 model-visible files (314 Java sources plus pom.xml, config and resources) using read-only search and the P1 relation index (index status: partial; 314 files parsed, 1 parse error, 9,367 unresolved calls, no control-flow or data-flow analysis, syntactic call/containment edges only). I inspected the HTTP server wiring (EmissaryServer contexts, ConstraintSecurityHandler, digest realm and credential source), all emissary.server.api and emissary.server.mvc resource classes, the internal peer-to-peer actions, the client/adapters (EmissaryClient, WorkSpaceAdapter, MoveToAdapter, DirectoryAdapter, PlaceStarterAdapter), PayloadUtil/WorkBundle serialization and XML paths, JDOMUtil, pickup/WorkSpace and FilePickUpClient path handling, output/DropOff and journal/coalescer file handling, Executrix command construction (config-driven, temp names generated from SecureRandom), JNI/JniRepositoryPlace library lookup, JSAcceptFacet Rhino loading, and the core data-object/metadata classes. Files not read line-by-line include large classes such as DirectoryPlace, WorkSpace, BaseDataObject, MobileAgent, PickUpPlace and most sample places; findings there are limited to the specific constructs that were read. The relation index did not report Spring components or any data-flow/security analysis, so no reachability claim relies on index labels alone.",
+  "limitations": [
+    "Static review only: no code execution, tests, scanners, or exploit payloads were used, so no finding is runtime-confirmed.",
+    "The deserialization candidate depends on a usable gadget chain that was not verified; commons-collections4 4.4 is present in pom.xml, but the actual runtime classpath and JVM-level serialization filters (possibly set in launcher scripts not present in the snapshot) are unknown.",
+    "Reachability of /emissary/WorkSpaceClientEnqueue.action requires an IPickUpSpace (cluster mode) and credentials; the snapshot does not include the deployment config files (node.cfg, peer.cfg, MasterClassNames.cfg, filter configs) that would confirm default deployment shapes.",
+    "Source filters exclude binary-like files and files over 5 MiB, and the source tree contains only src/main (no tests/JSP templates), so template-level XSS and test-based hints could not be evaluated.",
+    "The P1 index provides syntactic navigation candidates only; it has no control-flow, data-flow, or semantic resolution, and it reported one unparsed file, so absence of an index edge is not evidence of absence of a flow.",
+    "Several large core classes (DirectoryPlace, WorkSpace, MobileAgent, BaseDataObject, PickUpPlace) were only partially read; an issue confined to their unread regions would not appear in this report."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Potential XXE via partially hardened JDOM parsing helper: JDOMUtil.createSAXBuilder(validate=false) (src/main/java/emissary/util/xml/JDOMUtil.java lines 32-43) disables validation and external DTD loading but never disables external general entities/DOCTYPE; pom.xml line 49 pins jdom 2.0.2, and JDOMUtil.createDocument is used on peer/WorkSpace XML responses (DirectoryXmlContainer line 141, WorkBundle line 502)",
+      "reason": "Verified the hardening that is present and both parse sites; however the XML comes from a remote actor the node contacts (peer directory / WorkSpace response), so exploitation requires controlling or MITMing that peer, which is materially weaker than the deserialization lead. Whether JDOM 2.0.2 resolves external general entities with these three features disabled, and whether a practical exfiltration path exists for parsed values, could not be verified from source - kept as an unconfirmed rejected lead."
+    },
+    {
+      "lead": "Default credentials shipped in src/main/config/jetty-users.properties (emissary/emissary123) and documented in README.md:722-724",
+      "reason": "This is a shipped default configuration value, not a source-code validation flaw by itself, and operators are expected to replace it. It is treated as an enabling prerequisite for the deserialization candidate rather than a separate finding."
+    },
+    {
+      "lead": "CreatePlaceAction lets an authenticated caller pass arbitrary sppClassName/sppLocation/sppDirectory to PlaceStarter.createPlace -> Factory.create -> ClassLookupCache/ConstructorLookupCache reflection instantiation",
+      "reason": "Real arbitrary-instantiation primitive, but it only succeeds for classes with a matching public (String,String,String) constructor and an existing config name; no in-repo class/method was found that turns this into code execution, so impact is speculative."
+    },
+    {
+      "lead": "JSAcceptFacet loads and evaluates Rhino JavaScript (ctx.evaluateString) via addRoutingFunction/debug resource loading",
+      "reason": "No remote caller exists in the snapshot: addRoutingFunction has no callers and resource names are derived from directory-entry keys, not HTTP input; execution also requires config-directory write access. Not attacker-reachable from the reviewed surface."
+    },
+    {
+      "lead": "FilePickUpClient.processBundle consumes file paths from WorkBundle values received over HTTP and can read/rename arbitrary local files",
+      "reason": "Requires the attacker to control the WorkSpace server or the response to a take (peer-auth position) and is part of the intended distributed-work design; the impact is local file read/move rather than direct code execution, so it ranks below the deserialization candidate."
+    },
+    {
+      "lead": "DirectoryAdapter.configure() defines DISABLE_ADD_PLACES/FILTER_DIRECTORY_ENTRY_MAP config reads but is never invoked (no static block), so config file values are ignored",
+      "reason": "Looks like dead/latent code, but the hard-coded defaults are the safe ones (true/true), so the omission does not weaken security in this snapshot."
+    },
+    {
+      "lead": "JournaledCoalescer/JournalReader parse .bgjournal files from the output directory and use the contained key value in Path.resolve(...) for the final output path and in Files.deleteIfExists for part files; JournalReader.readString/JournalEntry.deserialize also allocate arrays from file-declared lengths",
+      "reason": "A crafted journal could allow path traversal on write/delete and length-driven allocation, but no source path was found that lets a remote user place attacker-controlled bytes into the output directory under a .bgjournal name; exploitation needs a separate file-write primitive."
+    },
+    {
+      "lead": "Audience-scoped Digest credentials via AuthScope.ANY_HOST (EmissaryClient lines 125-132) combined with peer-controlled URLs (api/cluster/agents|places, DirectoryAdapter zone transfer)",
+      "reason": "Requires an attacker to control a registered peer URL, which already implies an authenticated position needed for stronger primitives; the leaked material is a Digest challenge response, not a cleartext password, so this was judged not the strongest finding."
+    }
+  ],
+  "summary": "Emissary (6.6.0-SNAPSHOT) is a Java data-processing/workflow engine whose embedded Jetty server (Digest-authenticated via a realm file shipped with publicly documented default credentials) exposes JAX-RS \"mvc\" and \"api\" applications plus internal peer-to-peer actions. Reviewing HTTP entry points against dangerous sinks, the strongest source-evidenced issue is untrusted Java deserialization: the live JAX-RS action /emissary/WorkSpaceClientEnqueue.action passes the attacker-supplied form field `tpObj` straight into ObjectInputStream.readObject() with no allow-listing, class filtering, or JEP-290 serialization filter, and only casts the result to WorkBundle afterwards. The same anti-pattern exists in WorkSpaceAdapter.EnqueRequestBean and PayloadUtil.deserialize (used by the MoveTo path, which is likely unreachable because MoveToAction lacks JAX-RS annotations). With a gadget chain on the classpath (commons-collections4 4.4 is a declared dependency) and the documented default credential unchanged, this is an authenticated remote-code-execution primitive on a cluster node. All other candidate leads (XXE via the partially hardened JDOM helper, arbitrary-class instantiation in CreatePlaceAction, Rhino script loading, journal/coalescer parsing, default credentials as such) were examined and recorded as rejected or unconfirmed leads below. No runtime testing or exploit construction was performed; the finding is a source-evidence lead, not a confirmed exploit."
+}

@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Anyone able to open a TCP connection to the provider port (Dubbo protocol, default hessian2, no token configured by default) controls the whole request: method name $invoke, the String[] parameter types, the Object[] arguments (maps with \"class\" keys, JavaBeanDescriptor objects, or byte[] JDK-serialized payloads) and the attachments map including the `generic` value (generic/nativejava/bean). DecodeableRpcInvocation.decode reads these directly from the wire (lines 100-131); no authentication or service-level generic opt-in is required.",
+      "confidence": "medium",
+      "counterevidence_checked": "A mitigation exists but is ineffective by default: SerialDetector is wired into the nativejava/JDK paths only, its dubbo.security.serialization.check defaults to false (reporting/log-only) and the blacklist is empty unless dubbo.security.serialization.blacklist or dubbo.registry.serialization.blacklist.file is explicitly configured (SerialDetector.java:100-113); it does not cover the PojoUtils/JavaBeanSerializeUtil paths at all. CodecSupport only restricts JDK serialization ids 3/4/7 to the locally configured serialization (CodecSupport.java:69-78), so a default hessian2 provider still accepts the hessian2 envelope carrying these arguments; the generic filter requires an existing method signature (findMethodByMethodSignature) and, for bean/nativejava, a compatible method parameter, which limits but does not eliminate the attack surface. The http module's CVE-2019-17564 wrapper (HttpInvokerServiceExporter/CodebaseAwareObjectInputStream) is a separate mitigation and not present on this path. No runtime validation was performed.",
+      "id": "dubbo-provider-generic-invocation-rce",
+      "impact": "Remote code execution in the provider JVM under the provider's privileges: arbitrary class instantiation plus attacker-chosen public setter/field writes (JNDI injection via com.sun.rowset.JdbcRowSetImpl.setDataSourceName/setAutoCommit and similar bean gadgets, or a JDK-deserialization gadget chain through the nativejava path). Even without a full gadget chain this is an arbitrary-object-construction primitive that can trigger class initialization, JNDI/LDAP/RMI lookups, file/URL side effects and information disclosure; it can also be used to invoke unintended service methods (the converted RpcInvocation at GenericFilter.java:112 is dispatched as a normal call).",
+      "locations": [
+        {
+          "end_line": 112,
+          "path": "dubbo-rpc/dubbo-rpc-api/src/main/java/com/alibaba/dubbo/rpc/filter/GenericFilter.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 458,
+          "path": "dubbo-common/src/main/java/com/alibaba/dubbo/common/utils/PojoUtils.java",
+          "start_line": 371
+        },
+        {
+          "end_line": 413,
+          "path": "dubbo-common/src/main/java/com/alibaba/dubbo/common/beanutil/JavaBeanSerializeUtil.java",
+          "start_line": 192
+        },
+        {
+          "end_line": 71,
+          "path": "dubbo-serialization/dubbo-serialization-jdk/src/main/java/com/alibaba/dubbo/common/serialize/nativejava/NativeJavaObjectInput.java",
+          "start_line": 29
+        },
+        {
+          "end_line": 113,
+          "path": "dubbo-common/src/main/java/com/alibaba/dubbo/common/utils/SerialDetector.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 131,
+          "path": "dubbo-rpc/dubbo-rpc-dubbo/src/main/java/com/alibaba/dubbo/rpc/protocol/dubbo/DecodeableRpcInvocation.java",
+          "start_line": 89
+        }
+      ],
+      "prerequisites": "Provider exports a service with the default dubbo protocol (Filter chain includes GenericFilter) and no token/auth; the attacker must name a method signature that exists on the service (used by findMethodByMethodSignature). For the default path only a Map argument with a \"class\" key is needed; for bean/nativejava a method able to carry a JavaBeanDescriptor/byte[] argument (e.g. an Object/byte[] parameter) or a generic reference is helpful. RCE depends on a gadget class/gadget server reachable from the provider classpath (e.g. JdbcRowSetImpl + JNDI, or a JDK-serialization gadget chain).",
+      "root_cause": "GenericFilter is activated for every provider-side service and intercepts any $invoke call on a non-GenericService (GenericFilter.java:54-57). It trusts the consumer-supplied `generic` attachment (lines 67-71) and the argument objects without requiring the service to be exported as generic and without any class allow-list: (a) default/empty generic routes to PojoUtils.realize (line 75), where PojoUtils.realize0 takes the attacker map key \"class\", replaces the declared parameter type with that arbitrary class (PojoUtils.java:371-379), then instantiates it and invokes attacker-selected setters via reflection (PojoUtils.java:437-458); (b) generic=bean routes to JavaBeanSerializeUtil.deserialize (GenericFilter.java:97-111), which names any class from JavaBeanDescriptor.className, instantiates it (JavaBeanSerializeUtil.java:369-413, 315-345) and calls setters (253-290); (c) generic=nativejava routes to NativeJavaObjectInput/SerialDetector, i.e. a JDK ObjectInputStream.readObject on attacker bytes (GenericFilter.java:76-96, NativeJavaObjectInput.java:29-35/64-71), while SerialDetector defaults to reporting-only with an empty blacklist (SerialDetector.java:100-113), so no gadget class is actually blocked unless the operator sets both dubbo.security.serialization.check=true and a blacklist file/property.",
+      "title": "Provider-side generic invocation deserializes/instantiates consumer-controlled classes (RCE)",
+      "trace": "network bytes -> DubboCodec.decodeBody (dubbo-rpc-dubbo/.../DubboCodec.java:108-144) -> DecodeableRpcInvocation.decode reads path/version/method/desc/args/attachments from the wire (DecodeableRpcInvocation.java:89-131) -> provider filter chain -> GenericFilter.invoke sees methodName \"$invoke\", 3 args, interface != GenericService (GenericFilter.java:54-57) -> reads generic attachment (67-71) -> default: PojoUtils.realize -> realize0 class override (PojoUtils.java:371-379) -> newInstance(type) + setter calls (437-458); bean: JavaBeanSerializeUtil.deserialize -> instantiateForDeserialize/instantiate + setter calls (JavaBeanSerializeUtil.java:192-207, 369-413, 253-290); nativejava: NativeJavaSerialization.deserialize(...).readObject() (GenericFilter.java:76-96) -> NativeJavaObjectInput with SerialDetector (NativeJavaObjectInput.java:29-35, 64-71), whose blacklist is empty and check=false by default (SerialDetector.java:100-113).",
+      "unverified": "Not runtime-confirmed and not mapped to a specific CVE (the generic-invocation deserialization issues in Dubbo are publicly known as CVE-2021-30179/30180/30181 family, but the snapshot's exact commit/fix state is unknown). Exploitability of the nativejava branch depends on classpath gadgets; the java.rmi/ldap gadget availability (JDK version) was not verified. The provider Filter SPI activation descriptors (META-INF/dubbo) are absent from the snapshot, so GenericFilter activation is inferred from @Activate(group=PROVIDER, order=-20000) and upstream behaviour. hessian-lite 3.2.5 is an external dependency whose internal class filtering could not be inspected.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (compounded by CWE-470 unsafe reflection / CWE-863 missing authorization)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 876 model-visible files (no tests present; non-source/filtered resources such as META-INF/dubbo SPI descriptors absent) using file listing plus targeted search/reads across all modules. Deep inspection: dubbo-rpc-api filters (GenericFilter, ProtocolUtils, MockInvoker), dubbo-rpc-dubbo codec/decode path, dubbo-rpc-http (HttpInvokerServiceExporter/CodebaseAwareObjectInputStream/HttpProtocol), dubbo-rpc-rmi, dubbo-rpc-hessian, dubbo-serialization (jdk/nativejava/hessian2/fastjson/kryo/fst), dubbo-common (SerialDetector, serial-blacklist.properties, PojoUtils, JavaBeanSerializeUtil, ReflectUtils, URL/UrlUtils, compiler/bytecode), dubbo-cluster routers (ScriptRouter, ConditionRouter, TagRouter, MockInvokersSelector), dubbo-registry-api integration (RegistryDirectory), dubbo-registry-zookeeper, dubbo-remoting-api/http (CodecSupport, DispatcherServlet) and dubbo-plugin/dubbo-qos. Searched for command execution, JNDI, openConnection, ScriptEngine, ObjectInputStream/readObject, Class.forName/newInstance, XMLDecoder and JSON auto-type sinks; no other comparable source-evidenced issue was found.",
+  "limitations": [
+    "Static, read-only review: no execution, build, tests or exploit validation, so the finding is a lead, not a runtime-confirmed vulnerability.",
+    "Third-party libraries are not in the snapshot (hessian-lite 3.2.5, Spring 4.3.16, fastjson 1.2.60, Caucho Hessian 4.0.38, JSR-223 engines), so their internal filtering/hardening could not be inspected and may affect exploitability.",
+    "Test sources and META-INF/dubbo SPI descriptor files are absent from the snapshot, so activation of GenericFilter and of the provider filter chain is inferred from @Activate and upstream knowledge rather than verified from package resources.",
+    "The snapshot is version 2.6.8 with com.alibaba packages; the exact upstream commit and therefore which later security fixes are already backported (e.g. the precise patch state for the known Dubbo generic-invocation/deserialization CVEs) could not be established.",
+    "No dynamic confirmation that a concrete gadget chain is present on a typical provider classpath; the impact statement assumes common gadget libraries or JNDI-reachable gadget servers."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "dubbo-rpc-http HttpInvokerServiceExporter / CodebaseAwareObjectInputStream Java deserialization (CVE-2019-17564 pattern)",
+      "reason": "The module already contains the mitigation wrapper (HttpInvokerServiceExporter.java:26-32, CodebaseAwareObjectInputStream.java:35-48) that resolves classes through SerialDetector.isClassInBlacklist before delegating; it is only weak because the blacklist/check is off by default, and the http protocol is non-default, so it is a less direct finding than the generic-invocation path."
+    },
+    {
+      "lead": "Dubbo protocol hessian2 deserialization of attacker-chosen classes (DecodeableRpcInvocation with serialization id 2, the CVE-2020-1948 surface)",
+      "reason": "The code accepts hessian2 (id 2) regardless of local configuration, but the class filtering lives inside the external com.alibaba:hessian-lite 3.2.5 artifact, which is not part of the snapshot, so no source evidence can establish whether the class check is absent or bypassable; CodecSupport does restrict ids 3/4/7."
+    },
+    {
+      "lead": "dubbo-cluster ScriptRouter JSR-223 evaluation of route rules",
+      "reason": "ScriptRouter(URL) compiles and evals the `rule` parameter with a ScriptEngine (ScriptRouter.java:56-90), a real code-execution primitive, but router URLs in this snapshot come from the registry/routers notification (RegistryDirectory.notify/toRouters, lines 196-225, 318-342); no path from an unauthenticated network peer to a script rule was established, so the attacker precondition (registry/console control) is stronger than for the generic-invocation path."
+    },
+    {
+      "lead": "ReflectUtils.desc2classArray/desc2class attacker-controlled Class.forName(desc, true, cl)",
+      "reason": "Reachable from the Dubbo request header (desc), but it only loads/initializes classes; no in-repo gadget or subsequent dangerous use was demonstrated, so impact is unproven."
+    },
+    {
+      "lead": "RMI protocol Spring RmiServiceExporter / Hessian web protocol (Caucho HessianSkeleton) deserialization",
+      "reason": "Both are opt-in protocols; the snapshot contains no missing check that could be tied to attacker-controlled input beyond the underlying libraries, and the generic-invocation path is exposed by default."
+    },
+    {
+      "lead": "Qos telnet/http command RCE (telnet invoke style CVE)",
+      "reason": "The bundled dubbo-qos module only implements help/ls/offline/online commands (no invoke), and LocalHostPermitHandler restricts remote access, so no relevant sink exists in this snapshot."
+    }
+  ],
+  "summary": "Dubbo 2.6.8 snapshot (com.alibaba packages). After accounting for the source filters (876 model-visible files; test sources and non-source files such as META-INF/dubbo SPI descriptors are not present), I reviewed the provider-side request path, serialization modules, cluster routers, registries and the HTTP/RMI/Hessian protocol modules. The strongest source-supported issue is the provider-side generic invocation handling: GenericFilter (active for every exported non-GenericService) converts consumer-controlled data from the default Dubbo protocol into live objects with no class/allow-list enforcement, and its existing SerialDetector guard is disabled and empty by default. This yields a remote code-execution primitive on providers (PojoUtils \"class\" override / JavaBeanDescriptor instantiation / nativejava JDK readObject)."
+}

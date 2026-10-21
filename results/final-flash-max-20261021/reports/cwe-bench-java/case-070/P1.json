@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The cron expression string. CronParser.parse(String) is the library's documented entry point and is fed with untrusted strings in the common deployment (e.g. a scheduling-expression form field validated with @Cron / CronValidator, a task definition, a header/JSON value, or the cron-utils CLI). Fields are split on whitespace and then on '|', so every token of the input is attacker-chosen; only whitespace normalisation (replaceAll(\"\\\\s+\", \" \")), an emptiness check and a trailing-comma check precede the composite branch.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the library bounds the input elsewhere: CronParser only trims whitespace, rejects an empty expression and rejects fields ending with a comma (CronParser.java:86-116); there is no maximum length or alternative count, and no surrounding try/catch for RuntimeException in either CronParser or CronValidator. Checked whether the composite path is dead code: it is reachable from the public parse() and documented in README.md:110 (\"Squash multiple cron expressions into a single one! ... wrap it into 0 0|0|30|0 9|10|11|12 * * ? *\"), and CompositeCron/CompositeExecutionTime are wired into ExecutionTime.forCron (ExecutionTime.java:76-78). Checked whether validation of the generated sub-crons makes the blow-up harmless: validation happens per generated sub-cron (CronParser.java:129, SingleCron.validate), i.e. after the whole expansion has already been built, so it does not bound the work done. Checked regex-based ReDoS as an alternative root cause: all Pattern instances in the snapshot are constant or built from constant string-mapping names (StringValidations.java:29-83, FieldParser.java:48-49), with no nested quantifiers, so I do not claim catastrophic backtracking. Verified that the failing index expression is reached before any per-field parsing (the sub-crons are built as strings first), i.e. the AIOOBE is not masked by a per-field IllegalArgumentException for the crafted mixed-count case.",
+      "id": "cron-utils-composite-parse-dos",
+      "impact": "Denial of service against any component that parses cron strings supplied by an untrusted party: (a) unchecked ArrayIndexOutOfBoundsException (and the analogous failure in CompositeCron.asString) turns a crafted input into an unexpected runtime failure instead of the documented IllegalArgumentException - a validation-bypass/robustness failure that can abort request handling or crash a batch job; (b) with a moderately long expression (tens to hundreds of KB of '|'-separated alternatives) the k*L sub-expression materialisation and repeated split/parse can exhaust heap/CPU for the duration of the request (in the worst case OutOfMemoryError or a multi-second/minutes stall). No confidential-data or code-execution impact is claimed.",
+      "locations": [
+        {
+          "end_line": 109,
+          "path": "src/main/java/com/cronutils/parser/CronParser.java",
+          "start_line": 95
+        },
+        {
+          "end_line": 94,
+          "path": "src/main/java/com/cronutils/parser/CronParser.java",
+          "start_line": 91
+        },
+        {
+          "end_line": 35,
+          "path": "src/main/java/com/cronutils/validation/CronValidator.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 54,
+          "path": "src/main/java/com/cronutils/model/CompositeCron.java",
+          "start_line": 45
+        }
+      ],
+      "prerequisites": "1) The application parses an attacker-supplied cron string with any cron definition and the expression contains '|' or '||' (the README explicitly advertises this syntax, e.g. 0 0|0|30|0 9|10|11|12 * * ? *). 2) For the array-index variant, at least two '|'-bearing fields with different numbers of alternatives (e.g. 5 alternatives in one field, 2 in another) - the smaller field is indexed out of range. 3) For the resource-exhaustion variant, a long expression whose alternative count k and length L are both large; no application-side length cap is imposed by the library. 4) The caller does not pre-validate the expression length/structure itself.",
+      "root_cause": "CronParser.parse's composite-cron branch derives the number of sub-expressions from the maximum per-field alternative count (cronscount) and then, for every j in [0, cronscount), indexes every '|'-bearing field with s.split(\"\\\\|\")[j] without checking that this field actually has at least j+1 alternatives (CronParser.java:95-109). In addition, the whole field string is re-split inside the j loop and each generated sub-expression is stored and re-parsed, so work and retained memory grow with (alternatives x expression length) for input supplied by the caller. There is no length/alternative-count limit anywhere in this path and no guard comparable to SingleExecutionTime.MAX_ITERATIONS used elsewhere in the snapshot.",
+      "title": "Unbounded expansion of \"|\" alternatives in CronParser.parse (unchecked ArrayIndexOutOfBoundsException and super-linear resource consumption from an attacker-supplied cron expression)",
+      "trace": "CronParser.parse (CronParser.java:84) -> whitespace normalisation/emptiness check (86-89) -> expression.contains(\"||\") branch splitting and re-parsing each part (91-93) or expression.contains(\"|\") branch (95): cronscount = max over fields of s.split(\"\\\\|\").length (97) -> for j in [0, cronscount) (98) -> for each whitespace token, if it contains '|' append s.split(\"\\\\|\")[j] (100-102) -> ArrayIndexOutOfBoundsException when a field has fewer than j+1 alternatives (no try/catch anywhere in parse; CronParser.java:122-132 catches only IllegalArgumentException for the non-composite path) -> for large inputs, cronscount sub-expressions, each ~L characters, are materialised in the crons list (107-108) and re-parsed recursively via map(this::parse) (109), giving O(k*L) time and memory (k*L entries of length ~L). Downstream, CompositeCron.asString() also indexes pattern.split(\" \")[j] against the first pattern's field count (CompositeCron.java:45-49), so composites whose parts have different field counts (possible because Quartz/Spring year is optional) throw ArrayIndexOutOfBoundsException as well. If the string reaches the library through bean validation, CronValidator.isValid (CronValidator.java:28-35) catches only IllegalArgumentException, so the unchecked exception propagates out of validation and the resource blow-up happens on the request thread.",
+      "unverified": "Not executed or runtime-confirmed; all conclusions are from source reading. The exact input sizes needed for the resource-exhaustion variant were not measured (no benchmark/size test was run), and the array-index variant's precise field/value combinations were reasoned from Java String.split semantics rather than observed. I also could not confirm whether this specific composite path was later changed upstream (no repository history, no external data available in this run). Whether a consuming application exposes parse() to untrusted input is deployment-dependent; CronValidator/`@Cron` and the README's advertised syntax are the plausible vectors. The neighbouring observation that composite crons also break CronMapper/CronDescriptor (UnsupportedOperationException from retrieve()/retrieveFieldsAsMap() in CompositeCron.java:31-39) is a robustness issue, not claimed here.",
+      "weakness_type": "CWE-400/CWE-770 Uncontrolled resource consumption / CWE-20 improper input validation (missing bounds check on alternative counts); unhandled ArrayIndexOutOfBoundsException"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 109-file snapshot (src/main only: 84 Java files plus resources, pom.xml, README, CI workflows, checkstyle). The P1 index reports 108 indexed / 109 source files (1 file omitted from the index), 840 symbols, 1952 syntactic edges and no semantic resolution, data flow, control flow or runtime reachability; index labels were used only for navigation and every conclusion was re-checked against source text. All parser/validation classes (CronParser, CronParserField, FieldParser, StringValidations, Preconditions, CronValidator, ValidationFieldExpressionVisitor, CompositeCron), model/definition/constraint classes, all time generators, ExecutionTime/SingleExecutionTime/TimeNode/NearestValue, mapper, descriptor, converter and DateUtils/WeekendPolicy/StringUtils were read. Not inspected: resource-bundle contents of each locale (translation text only), the checkstyle rule list beyond the first 100 lines, and pom.xml beyond line 200; no test sources exist in the snapshot, and no code, tests or scanners were executed.",
+  "limitations": [
+    "No runtime verification: nothing was compiled, executed, fuzzed or measured; impact sizes (how long/how much memory a crafted expression needs) are reasoned from source, not measured.",
+    "The composite-cron feature is not the only parser path: the array-index failure depends on Java String.split semantics and on crafting fields with differing alternative counts, which I reasoned about rather than observed.",
+    "The relation index provides no data-flow, control-flow or reachability facts (explicitly 'not implemented'), and one source file is missing from the index, so cross-file taint claims (e.g. CronValidator -> provider EL interpolation) could not be confirmed and are reported only as leads.",
+    "Deployment context is unknown: whether a given application exposes cron parsing to untrusted users (web form, API, stored schedule, CLI) determines real exploitability; the library itself ships a bean-validation constraint (@Cron/CronValidator) and README-documented composite syntax, which is the assumed attack surface.",
+    "No repository history, tests, patches, CVE/GHSA data or sibling-run information were available (and none were consulted), so I cannot state whether this code path was later changed upstream.",
+    "The submitted candidate is a lead, not a confirmed vulnerability; the candidate count is intentionally one and is not a claim that this is the only issue in the repository."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Expression-Language / message-template injection in CronValidator.isValid: the raw, user-controlled exception message (CronParser.java:131 includes the expression, FieldParser.java:233/263 include field text) is passed to ConstraintValidatorContext.buildConstraintViolationWithTemplate (CronValidator.java:31-34), and cron-utils itself declares an EL implementation as a compile-scope dependency (pom.xml:139-149, org.glassfish:javax.el 3.0.0), so a Bean Validation provider that interpolates ${...} would evaluate attacker text.",
+      "reason": "Potentially the highest-impact lead, but the decisive behaviour (EL evaluation of custom violation templates) happens in Hibernate Validator / Apache BVal outside this snapshot and could not be verified with the available read-only tools; it is provider-, version- and configuration-dependent, so the source evidence inside the repository is insufficient for a confirmed candidate. Reported here as an unconfirmed lead only."
+    },
+    {
+      "lead": "FieldParser.parseOnWithHash indexes array[1] after exp.split(\"#\") with only a length==0 check (FieldParser.java:175-179), so a field such as \"5#\" throws ArrayIndexOutOfBoundsException instead of IllegalArgumentException; similarly \"?/2\" reaches Integer.parseInt(\"?\") (FieldParser.java:120-123).",
+      "reason": "Real unchecked-exception robustness bugs on malformed input, but each is a single-token input, lower impact than the composite expansion, and the same missing-check style is visible throughout the parser; not enough to outweigh the selected candidate."
+    },
+    {
+      "lead": "EveryDayOfWeekValueGenerator.getValidDays builds validDays with a for-loop that does not handle the day-of-week rollover (from > to, e.g. quartz FRI-WED/2) and then calls EnumSet.copyOf(validDays), which throws IllegalArgumentException(\"Collection is empty\") (EveryDayOfWeekValueGenerator.java:56-64), even though the parser accepts such expressions and the neighbouring BetweenDayOfWeekValueGenerator explicitly handles the same rollover for issue #340.",
+      "reason": "Credible unhandled-exception bug, but the impact is limited to one expression shape and generation-time failure; kept as a secondary lead rather than the single reported candidate."
+    },
+    {
+      "lead": "Dead-code infinite recursion in SecondsDescriptor.describe(FieldExpression, boolean): Always/Between instances call describe(fieldExpression, and) again instead of the (Always)/(Between) overloads (SecondsDescriptor.java:44-62).",
+      "reason": "Unreachable from the public API: no other class references SecondsDescriptor (grep found only its own declaration), so it cannot be triggered by untrusted input in this snapshot."
+    },
+    {
+      "lead": "DateUtils.findIdx binary search uses pivot=(endidx-startidx)/2 and recurses as findIdx(startidx,pivot,...), which can revisit the same range forever (DateUtils.java:50-64), potentially StackOverflowError.",
+      "reason": "Reached through DateUtils.workdaysCount/WeekendPolicy, whose holiday list and dates are supplied by the integrating application rather than by the cron-string attack surface; a bug, but not attacker-controlled in the parses-untrusted-cron threat model."
+    },
+    {
+      "lead": "SingleExecutionTime loops (nextClosestMatch/previousClosestMatch) and getNext/PreviousPotentialValue could be used to burn CPU with crafted schedules such as never-matching Feb 30-style expressions.",
+      "reason": "The snapshot already contains hardening for this class: MAX_ITERATIONS=100_000 plus a >100-year guard (SingleExecutionTime.java:56, 128-141, 286-294) and bounded 2*range scans (259-269, 434-447), so no unbounded loop is evidenced here."
+    },
+    {
+      "lead": "Workflow/config concerns: maven-publish.yml publishes on release with the built-in GITHUB_TOKEN, and .travis.yml embeds an encrypted SonarCloud token.",
+      "reason": "The publish workflow runs on release/workflow_dispatch (not on untrusted pull-request code) and uses the read-scoped default github.token; the Travis value is an upstream encrypted secret. Neither is a source-evidenced vulnerability of the library."
+    },
+    {
+      "lead": "Regex-based ReDoS in the parsing/validation path (StringValidations, FieldParser L/W patterns, whitespace normalisation).",
+      "reason": "All patterns in the snapshot are constant built-ins or alternations of constant literal names with no nested quantifiers, and they are applied to linear scans; no catastrophic-backtracking regex fed by user input was found, so I did not claim a ReDoS."
+    }
+  ],
+  "summary": "Scope reviewed: the whole 109-file snapshot of com.cronutils:cron-utils (pom version 9.1.5, README documents the newer \"squash multiple crons with |\" feature). I read all parser, validation, model, generator, mapper, descriptor, converter and util classes that handle cron strings, plus pom.xml, CI workflow files and checkstyle config. The only externally attacker-controlled input in this library is the cron-expression string (via CronParser/CronParserField/FieldParser, CronValidator, and the time-computation API), so I concentrated there.\n\nStrongest evidence-supported issue: the composite (\"|\" / \"||\") expansion in CronParser.parse. It is the least-hardened code path in the snapshot (neighbouring code has bounds such as SingleExecutionTime.MAX_ITERATIONS and Preconditions checks, but the composite path has none), it is reached directly from the untrusted expression, and it can both throw an unhandled ArrayIndexOutOfBoundsException and allocate/iterate super-linearly in the attacker-supplied input length (unbounded CPU/heap consumption, i.e. DoS). CronValidator.isValid, the library's own entry point for untrusted strings, only catches IllegalArgumentException, so these unchecked failures escape bean validation. One candidate is submitted; other plausible-but-weaker leads are listed as rejected."
+}

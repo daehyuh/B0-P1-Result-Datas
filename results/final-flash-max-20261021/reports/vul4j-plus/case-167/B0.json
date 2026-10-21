@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The template text and the resource URI are read from ordinary Exchange message headers. Camel consumers map inbound protocol metadata to Exchange headers (e.g. HTTP, JMS, AMQP, file, mail, SJMS), so a party that can send a message to a route that later invokes one of these producer endpoints can set e.g. 'CamelVelocityTemplate'/'CamelVelocityResourceUri', 'CamelFreemarkerTemplate'/'CamelFreemarkerResourceUri', 'CamelMvelTemplate'/'CamelMvelResourceUri' or 'MustacheTemplate'/'MustacheResourceUri'.",
+      "confidence": "medium",
+      "counterevidence_checked": "These header features are documented behavior for the components, so exploitation depends on a route that lets untrusted headers reach the producer (a real but common integration pattern). Sibling implementations differ in strength: Mustache is logic-less and cannot execute Java by itself (method/getter access only), so its impact is lower; XSLT/XPath do NOT take templates from headers in this snapshot. FreeMarker's ?new default depends on the bundled FreeMarker version (2.3.29 here) and should be treated as likely, not certain. Velocity 2.1's default uberspector may restrict some reflective access, but method invocation on context objects and #include/#parse with the configured file+class resource loaders still make the header path dangerous. Counter-hypothesis that this snapshot is already hardened was rejected: a full-tree search for 'allowTemplateFromHeader' (the option later releases use to gate exactly these headers) returns no results, and no null/whitelist checks guard these header reads. No CVE/patch/ground-truth data was consulted.",
+      "id": "camel-template-from-header-ssti",
+      "impact": "Remote code execution in the Camel JVM (template injection) with the privileges of the application, plus arbitrary resource/file disclosure and request forgery via the attacker-selected template resource URI. If only a subset of engine features is reachable, the minimum impact is unauthorized template execution and sensitive data exposure (Exchange body/headers, files).",
+      "locations": [
+        {
+          "end_line": 213,
+          "path": "components/camel-velocity/src/main/java/org/apache/camel/component/velocity/VelocityEndpoint.java",
+          "start_line": 167
+        },
+        {
+          "end_line": 152,
+          "path": "components/camel-freemarker/src/main/java/org/apache/camel/component/freemarker/FreemarkerEndpoint.java",
+          "start_line": 115
+        },
+        {
+          "end_line": 117,
+          "path": "components/camel-mvel/src/main/java/org/apache/camel/component/mvel/MvelEndpoint.java",
+          "start_line": 78
+        },
+        {
+          "end_line": 97,
+          "path": "components/camel-mustache/src/main/java/org/apache/camel/component/mustache/MustacheEndpoint.java",
+          "start_line": 82
+        }
+      ],
+      "prerequisites": "A Camel route in which untrusted header values can reach a velocity/freemarker/mvel/mustache producer endpoint (for example an HTTP/JMS/AMQP consumer that forwards the same Exchange, or a bridge between two external systems), and the deployed component version is this pre-hardening snapshot (option to disable is absent). No special configuration is required; the header paths are enabled by default.",
+      "root_cause": "The templating producer endpoints treat message headers as trusted configuration instead of untrusted input. In onExchange they read the script/template text and the template resource URI from headers (VelocityConstants.VELOCITY_TEMPLATE / VELOCITY_RESOURCE_URI, FreemarkerConstants.FREEMARKER_TEMPLATE / FREEMARKER_RESOURCE_URI, MvelConstants.MVEL_TEMPLATE / MVEL_RESOURCE_URI, MustacheConstants.MUSTACHE_TEMPLATE / MUSTACHE_RESOURCE_URI), compile/load them, and evaluate them with a data model built from the Exchange. There is no validation, whitelist, or opt-in flag: a grep of the whole tree shows no 'allowTemplateFromHeader' (or equivalent) option, i.e. this is the pre-hardening behavior that later Camel releases changed to default-deny. A resource-URI header is even used to create a new endpoint via CamelContext.getEndpoint() and re-enter onExchange, so the template source (including file:/classpath: resources) is attacker-chosen as well.",
+      "title": "Message headers supply the template and template resource URI in Velocity/FreeMarker/MVEL/Mustache producers (SSTI → RCE)",
+      "trace": "Inbound message header → exchange.getIn().getHeader(<*_TEMPLATE / *_RESOURCE_URI>) → (a) resource-URI branch: findOrCreateEndpoint()/getCamelContext().getEndpoint(uri) builds a new endpoint from the attacker string and recursively runs onExchange, or (b) content branch: new StringReader(content) → template compile → template engine execute/evaluate with a data model containing the exchange/message/body/headers (VelocityEndpoint.java:210-213 engine.evaluate; FreemarkerEndpoint.java:138-152 new Template(..., new Configuration()) + template.process; MvelEndpoint.java:100/117 TemplateCompiler.compileTemplate + TemplateRuntime.execute; MustacheEndpoint.java:90/97 createMustache + execute). The engine evaluates attacker-supplied code/expressions server-side. In Velocity and MVEL the context exposes Java objects and the engines' default introspection permits method invocation, so a crafted template can reach java.lang.Runtime or equivalent and execute commands; FreeMarker's freshly constructed default Configuration has historically left the ?new built-in usable, making ${...?new()(...)} style payloads executable; at minimum, the resource-URI branch permits arbitrary resource loading (file:/classpath:/URL) and template-driven data access.",
+      "unverified": "No runtime exploitation or build/test execution was performed; the exact engine-level payload capability (Velocity uberspector behavior, FreeMarker ?new resolver default) was not executed. It is not verified how many of the four endpoints a single upstream fix addressed, nor whether the benchmark's target is velocity, freemarker or a sibling component; the same root-cause pattern is present in each. Same-pattern sites not included as locations: camel-chunk (ChunkTemplate/ChunkResourceUri), camel-jolt (CamelJoltResourceUri), camel-jslt (CamelJsltString/CamelJsltResourceUri).",
+      "weakness_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine (Server-Side Template Injection), leading to CWE-94 code execution"
+    }
+  ],
+  "coverage_summary": "Tools used: get_source_scope (8,588 source-root files, 8,585 model-visible; binaries/NUL-containing files and 3 sensitive-name paths excluded), list_files, search_code (literal, repo-wide) and read_file on selected files. Broad sweeps covered: Runtime.exec/ProcessBuilder usage; ObjectInputStream/readObject call sites and their gating (ahc, http/jetty/servlet, rabbitmq, jms, hbase, consul, cassandraql, shiro, mina, netty, sql); ScriptEngine/GroovyShell; XStream and SnakeYAML configuration; Jackson/JacksonXML/JAXB/CBOR/Johnzon unmarshal-type-from-header flags; XML parser hardening (DocumentBuilderFactory/SAXParserFactory/TransformerFactory); template-from-header reads across templating components; and the velocity/freemarker/mvel/mustache/chunk/xslt/jolt/jslt producers. Coverage is targeted, not exhaustive: I did not read all 8,585 files, did not audit every component (e.g. AWS/Azure/cloud connectors, smooks, bindy, cxf, as2, salesforce), and test sources/docs appear stripped from the snapshot, so detection based on tests was not possible.",
+  "limitations": [
+    "No build, tests, scanners or exploit payloads were run; all conclusions are static source evidence.",
+    "The snapshot omits VCS history and appears to exclude test sources, so the exact upstream fix commit/CVE pairing for these endpoints could not be confirmed from the tree.",
+    "Whether the benchmark's ground-truth vulnerability is velocity, freemarker, mvel or another sibling with the same header-driven template pattern is unknown; the candidate lists the four strongest same-root-cause sites, led by Velocity/FreeMarker.",
+    "Engine-level exploitability (Velocity uberspector defaults, FreeMarker ?new resolver default in 2.3.29) is argued from library behavior, not executed.",
+    "RabbitMQ 'CamelSerialize' and JMS ObjectMessage deserialization are real-looking sinks but were not confirmed as the repository's target and are reported only as rejected leads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "camel-rabbitmq: an incoming AMQP message carrying the header 'CamelSerialize=true' causes RabbitMQMessageConverter.deserializeBody to run new ObjectInputStream(...).readObject() on the attacker-supplied body (components/camel-rabbitmq/src/main/java/org/apache/camel/component/rabbitmq/RabbitMQMessageConverter.java:287-311 after populateMessageBody is called by the consumer).",
+      "reason": "Genuinely dangerous-looking unrestricted Java deserialization triggerable by a message header, but I could not confirm that upstream treats it as a vulnerability/fixed it (no opt-in option present or added in the code I can see), so I kept it as an unconfirmed lead instead of the primary candidate."
+    },
+    {
+      "lead": "camel-jms: JmsBinding.getBody() calls ObjectMessage.getObject() unconditionally (components/camel-jms/src/main/java/org/apache/camel/component/jms/JmsBinding.java:142-155), deserializing attacker-controlled JMS ObjectMessage payloads by default.",
+      "reason": "This is intrinsic JMS ObjectMessage semantics on the broker/consumer boundary; no evidence in the snapshot of a missing per-message guard that upstream later added, so weaker as a distinct code-level finding."
+    },
+    {
+      "lead": "camel-sql: the producer lets a message header override the configured query by default (components/camel-sql/src/main/java/org/apache/camel/component/sql/SqlProducer.java:82-87, CamelSqlQuery header), enabling arbitrary SQL when headers are untrusted.",
+      "reason": "Appears to be an intentional, documented dynamic-query feature (parameters still bound via PreparedStatement); no counterevidence of a later guard, so not submitted."
+    },
+    {
+      "lead": "XML parsing / XStream / SnakeYAML: possible XXE or unsafe deserialization in core converters and data formats.",
+      "reason": "Inspected core XML entry points: DocumentBuilderFactory/SAXParserFactory set FEATURE_SECURE_PROCESSING and disable external-general-entities; camel-xstream calls XStream.setupDefaultSecurity plus configurable permissions; camel-snakeyaml defaults to SafeConstructor or a TypeFilter-guarded Constructor (allowAnyType=false). No exploitable default found."
+    },
+    {
+      "lead": "camel-shiro token deserialization and camel-hbase/camel-consul/cassandraql ObjectInputStream use sites.",
+      "reason": "Shiro tokens are AES-encrypted with a route-configured passphrase (attacker cannot forge them without the key); HBase/Consul/Cassandra paths deserialize data the application itself stored, requiring write access to the backing store — plausible but weaker/again feature-driven, left unconfirmed."
+    }
+  ],
+  "summary": "Reviewed the Apache Camel 3.1.0-SNAPSHOT tree (~8,585 visible files: core, components, catalog, tooling, examples). Tracing attacker-reachable dataflow into dangerous sinks, the strongest source-evidenced issue is that several templating producer endpoints take template content AND the template resource URI directly from message headers and evaluate the attacker-supplied template with the Exchange as the data model, with no opt-in guard anywhere in the tree (no 'allowTemplateFromHeader' or equivalent exists). Because Camel maps inbound protocol headers into Exchange headers, a remote sender (HTTP/JMS/AMQP/file etc.) can control these headers when a route invokes one of these endpoints, yielding server-side template injection with likely remote code execution (Velocity method invocation / MVEL Java execution / FreeMarker ?new with a default Configuration) plus arbitrary resource loading (local file read / internal resource access via the resource-URI header). I did not find a clearly injected/mutated flaw; other deserialization paths (RabbitMQ 'CamelSerialize', JMS ObjectMessage, HBase/Consul/cassandra aggregation repositories) were reviewed and are listed as rejected/uncertain leads. No runtime confirmation; this is a source-evidence lead only."
+}

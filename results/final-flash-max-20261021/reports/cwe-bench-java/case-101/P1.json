@@ -1,0 +1,117 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `bucketName` argument of S3 operations (and of TransferManager/pre-signed helpers) when an application accepts it from untrusted input (multi-tenant/BYO-bucket style usage). The attacker supplies a string recognized as an access-point ARN, e.g. `arn:aws:s3:<region>:123456789012:accesspoint/ap`, and controls the `region` field (the ARN parser only splits on the first colons, so the region may contain `/`, `#`, `?` and other non-hostname characters). The parsed region then flows unmodified into the hostname template `%s://%s-%s.s3-accesspoint%s.%s%s.%s` (and the outpost/object-lambda equivalents).",
+      "confidence": "low",
+      "counterevidence_checked": "Checked that default configuration blocks this: validateS3ResourceArn compares removeFipsIfNeeded(clientRegion) with the ARN region unless useArnRegion()/forceGlobalBucketAccess is set, so the default path rejects an injected region with IllegalArgumentEdexception. Checked that sibling components are validated (validateHostnameCompliant at S3AccessPointBuilder 144-145, S3OutpostAccessPointBuilder 84-86, S3ObjectLambdaEndpointBuilder 84-85) - region is the only host component left unvalidated. Checked that resource paths are URL-encoded and bucket names are not placed in hosts on the non-ARN path (S3RequestEndpointResolver.shouldUseVirtualAddressing uses BucketNameUtils.isDNSBucketName), so this gap is specific to the ARN path. Checked the signer lookup at AmazonS3Client 4172-4178: it re-uses the ARN region and RegionUtils/PartitionMetadataProvider will synthesize a Region for arbitrary names rather than failing outright, but the URI built there might itself be rejected if the crafted region survives URL-encoding into an unparseable host (AmazonWebServiceClient.computeSignerByURI throws when uri.getHost() is null) - this is the main unverified step. Checked that HostnameValidator exists and is used elsewhere for exactly this purpose, and that Arn.java and S3ObjectLambdasResource/ S3OutpostResource only assert non-empty region.",
+      "id": "case-101-1",
+      "impact": "Server-side request forgery / request redirection: an application that passes an attacker-influenced bucket ARN to the SDK can cause the SDK to connect (TLS server-auth against the attacker's own validly-certified domain) and send a request signed with the application's AWS credentials, exposing the SigV4 Authorization material (access key ID, signature, signed headers), the temporary session token header when applicable, the object key/path and any caller data, and letting the attacker return attacker-controlled responses to the SDK. A malformed non-resolvable region instead yields an unhandled exception/invalid-endpoint failure (availability/robustness side effect).",
+      "locations": [
+        {
+          "end_line": 153,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/internal/S3AccessPointBuilder.java",
+          "start_line": 143
+        },
+        {
+          "end_line": 91,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/internal/S3OutpostAccessPointBuilder.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 101,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/internal/S3ObjectLambdaEndpointBuilder.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 4973,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/AmazonS3Client.java",
+          "start_line": 4951
+        },
+        {
+          "end_line": 5084,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/AmazonS3Client.java",
+          "start_line": 5062
+        },
+        {
+          "end_line": 5163,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/AmazonS3Client.java",
+          "start_line": 5135
+        },
+        {
+          "end_line": 4178,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/AmazonS3Client.java",
+          "start_line": 4172
+        },
+        {
+          "end_line": 152,
+          "path": "aws-java-sdk-core/src/main/java/com/amazonaws/arn/Arn.java",
+          "start_line": 142
+        },
+        {
+          "end_line": 115,
+          "path": "aws-java-sdk-core/src/main/java/com/amazonaws/partitions/PartitionMetadataProvider.java",
+          "start_line": 102
+        },
+        {
+          "end_line": 55,
+          "path": "aws-java-sdk-core/src/main/java/com/amazonaws/util/HostnameValidator.java",
+          "start_line": 36
+        }
+      ],
+      "prerequisites": "(1) Application passes an untrusted value as the S3 bucket/ARN parameter (or the attacker otherwise controls that string). (2) The ARN-region trust path is taken so validateS3ResourceArn skips the region-equality check: S3ClientOptions.setUseArnRegion(true), the AWS_S3_USE_ARN_REGION environment/system property, or forceGlobalBucketAccess enabled. (3) Client is not in path-style or accelerate mode (required for ARN buckets anyway). Under default configuration (useArnRegion=false, forceGlobalBucketAccess=false) the ARN region is compared against the client region and a crafted region is rejected, so the flaw is configuration/trust-model dependent.",
+      "root_cause": "S3 ARN support parses `region` from the caller-supplied bucket ARN without any hostname/format validation and later interpolates it directly into the request hostname, while all sibling hostname components (accountId, accessPointName, outpostId) are validated with HostnameValidator.validateHostnameCompliant. In AmazonS3Client.validateS3ResourceArn the equality check between the ARN region and the client region is skipped when useArnRegion() is true or forceGlobalBucketAccess is enabled, so an attacker-shaped ARN region reaches the endpoint builders.",
+      "title": "Unvalidated ARN `region` interpolated into S3 access-point endpoint host allows request redirection (SSRF/host injection)",
+      "trace": "S3 operation with `bucketName` = crafted ARN -> AmazonS3Client.createRequest (line ~4953) -> isAccessPointArn -> Arn.fromString parses `region` with no charset validation (Arn.java 142-152) -> validateS3ResourceArn skips the region equality check when useArnRegion()/forceGlobalBucketAccess is set (AmazonS3Client 5156-5163) -> getEndpointForAccessPoint -> S3AccessPointBuilder.withRegion(arnRegion) (or S3OutpostAccessPointBuilder / S3ObjectLambdaEndpointBuilder for those ARN forms) -> toURI() validates accountId/accessPointName/outpostId but interpolates the raw region into the URI host template (S3AccessPointBuilder 144-153) -> URI.create -> IdentityEndpointBuilder returns it unchanged -> S3RequestEndpointResolver.resolveRequestEndpoint sets request.setEndpoint to the attacker-influenced host and url-encodes only the resource path -> the request (SigV4-signed with the client's credentials, plus X-Amz-Security-Token for temporary credentials) is executed against that host. The signing region is likewise taken from the ARN region (handler context SIGNING_REGION, line 4965/5014; signer selection at 4172-4178), and PartitionMetadataProvider synthesizes a Region object for arbitrary region names (lines 102-115), so a non-existent region does not necessarily stop the flow.",
+      "unverified": "No code was executed and no runtime reproduction was performed. Whether the crafted host actually reaches the wire depends on Java URI parsing/encoding behavior for the injected region (URL-encoding happens for the signer-region lookup but not for the endpoint template) and on whether the signer lookup in AmazonWebServiceClient.computeSignerByURI accepts the resulting URI; if it does not, only an unhandled exception/DoS results. I also could not confirm from the snapshot alone that this specific gap corresponds to any real advisory/fix, and the exploitability depends on the application using an opt-in ARN-region/trust configuration and accepting untrusted bucket ARNs.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery (host injection via unvalidated ARN region); secondary CWE-20"
+    }
+  ],
+  "coverage_summary": "Source scope: 111,341 files, 110,080 Java files (the P1 relation index parsed 110,080 with 0 parse errors and 1 file missing from the index; the same source filters apply to B0/P1). Coverage was targeted, not exhaustive: I inspected hand-written modules (aws-java-sdk-core auth/http/internal/regions/partitions/util/arn, aws-java-sdk-s3 client/internal/transfer/crypto/eventstreaming/AccessPoint ARN handling, aws-java-sdk-sns message verification, aws-java-sdk-sqs checksum handler, aws-java-sdk-workdocs ContentManager, samples) and used text search plus the relation-index facts to sample the rest. Generated service clients/model classes and the bulk of the ~320 service modules were only sampled via the index and search, not line-by-line reviewed. I did not access tests (the snapshot contains src/main sources only), did not build or run any code, and did not consult any external/ground-truth data.",
+  "limitations": [
+    "No execution, build, or runtime verification was performed; all conclusions are static source reasoning.",
+    "The P1 index provides syntactic name/arity-based call and containment candidates only (no data flow, control flow, semantic resolution, or reachability), and 1 of 111,341 files is absent from the index; index absence was never treated as evidence about a file.",
+    "Roughly 320 generated service modules (including hand-written service-specific helper code I did not open, e.g. DynamoDB datamodeling, Cognito credential providers, EC2 utilities) were not reviewed line-by-line; a vulnerability in those areas would not have been found.",
+    "The selected lead depends on opt-in configuration (useArnRegion / AWS_S3_USE_ARN_REGION / forceGlobalBucketAccess) and on Java URI parsing behavior for the injected region; the precise sink behavior (request actually sent to the crafted host vs. exception) was not verified.",
+    "I could not confirm whether any specific real-world advisory/CVE corresponds to the snapshot or to the selected lead; the finding is a source-evidence lead only.",
+    "No test sources are present in the snapshot, so no regression-test or intent evidence could be used to corroborate the finding."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE in XML parsers (XpathUtils, XmlUtils, S3 XmlResponsesSaxParser)",
+      "reason": "Protections are present and active: DocumentBuilderFactory feature/XInclude hardening in XpathUtils and RegionMetadataParser, XMLInputFactory SUPPORT_DTD=false and IS_SUPPORTING_EXTERNAL_ENTITIES=false in XmlUtils, and disableExternalResourceFetching (disallow-doctype-decl, external-general/parameter-entities, load-external-dtd) in the S3 SAX parser."
+    },
+    {
+      "lead": "Path traversal in TransferManager.downloadDirectory",
+      "reason": "The 2017 hardening is present (leavesRoot canonical-path check at TransferManager.java 1420-1423 / 1513-1517). The check uses startsWith without a separator boundary, so a destination whose canonical path is a string prefix of a sibling path can be bypassed, but that weakness is present in upstream and I could not tie it to a fix in this snapshot; rejected as weaker than the selected lead."
+    },
+    {
+      "lead": "SNS message signature verification bypass / SSRF via SigningCertURL",
+      "reason": "The hardened implementation is present: SignatureVerifier only downloads over HTTPS and SigningCertUrlVerifier asserts the exact expected SNS endpoint host plus certificate common-name/validity checks."
+    },
+    {
+      "lead": "ECS container credentials SSRF via AWS_CONTAINER_CREDENTIALS_FULL_URI",
+      "reason": "FullUriCredentialsEndpointProvider restricts hosts to 127.0.0.1/localhost and supports the authorization-token header (ContainerCredentialsProvider.java 107-141)."
+    },
+    {
+      "lead": "Credential/code execution via ProcessCredentialsProvider (sh -c) or EC2 metadata endpoint system-property override",
+      "reason": "These are documented configuration inputs (profile credential_process / com.amazonaws.sdk.ec2MetadataServiceEndpointOverride) controlled by the local operator, not by a remote attacker; no missing validation relative to the documented feature."
+    },
+    {
+      "lead": "Client-side encryption CBC padding oracle / key-wrap issues (CVE-2020-8911/8912 class)",
+      "reason": "The v2 crypto path and keywrap validation (InternalKeyWrapAlgorithm isV1Algorithm/isAsymmetric/isKms, validateKeyWrapAlgorithmForDecrypt/ForEncrypt, StrictAuthenticatedEncryption mode) are present in the snapshot; legacy v1 code is marked for decryption compatibility only."
+    },
+    {
+      "lead": "SSRF via WorkDocs ContentManager (new URL(downloadUrl)/openConnection)",
+      "reason": "The URL is returned by the WorkDocs service response rather than by a remote attacker in the SDK's trust model, and no credentials are attached to that fetch; rejected as weaker evidence than the ARN-region lead."
+    },
+    {
+      "lead": "TLS/trust hardening gaps (SdkTLSSocketFactory, TrustingX509TrustManager, disableCertChecking)",
+      "reason": "Certificate checking can only be disabled by explicit SDKGlobalConfiguration property; hostname verification uses Apache STRICT/BROWSER_COMPATIBLE verifiers and TLS protocol preference lists TLSv1.2 first; no defect identified in the reviewed paths."
+    },
+    {
+      "lead": "Deserialization / command injection / SQL sinks",
+      "reason": "No ObjectInputStream.readObject, Runtime.exec, SQL, ScriptEngine or LDAP usage exists in the reviewed main-source code; ProcessBuilder occurrences are the documented credential_process build tool/feature."
+    }
+  ],
+  "summary": "Reviewed the assigned snapshot (AWS SDK for Java v1, version 1.12.260, 111,341 files, ~110k Java files; hand-written core/S3/SNS/SQS/WorkDocs code inspected in depth, generated service modules sampled only). The known historical hardenings in this codebase are present (XXE protections in XpathUtils/XmlUtils/S3 SAX parser, TransferManager.downloadDirectory traversal guard, SNS SigningCertUrlVerifier, ECS container-credential host allowlist, IMDSv2 token use, no Java-deserialization sinks). The strongest remaining source-evidenced issue I found is a missing hostname validation of the `region` component of S3 access-point/outpost/Object-Lambda ARNs before that value is interpolated into the request hostname, which can redirect a signed SDK request to an attacker-chosen host (SSRF/host injection) when the ARN-region trust path (`useArnRegion` / `AWS_S3_USE_ARN_REGION` / `forceGlobalBucketAccess`) is enabled and the application lets untrusted input reach the `bucketName` parameter. I am submitting this as a single lead, not a confirmed vulnerability; several required runtime/URI-parsing steps could not be executed or verified, and I could not confirm that this corresponds to any specific fixed advisory."
+}

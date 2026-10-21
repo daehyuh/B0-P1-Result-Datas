@@ -1,0 +1,51 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The filePath argument is fully caller/user supplied and may contain '.' and '..' segments; canonicalization is applied before the comparison but does not prevent the prefix collision. Example: with baseDirPath '/srv/app/uploads' (which the attacker can typically guess/infer), an attacker-supplied filePath such as '/srv/app/uploads/../uploads_backup/secret' canonicalizes to '/srv/app/uploads_backup/secret', which startsWith('/srv/app/uploads') is true, so isFileOutsideDir returns false even though the file is outside the base directory. Directly supplying '/srv/app/uploads_backup/secret' works the same way.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the code is fully canonicalized, so the naive '/base/../../etc/passwd' and symlink-escape cases are correctly detected as outside (fail-safe in those directions). Verified the flaw is purely the missing separator boundary and that the method's own Javadoc/'FileSecurityUtils' naming establishes the intended guarantee. Confirmed there are no in-repo callers/tests that constrain the argument sources; the fix pattern is to compare against baseDir canonical + File.separator (or use java.nio.file.Path.startsWith) so both the base dir itself and separator-bounded descendants are accepted. No runtime execution was performed.",
+      "id": "curekit-path-containment-prefix-bypass",
+      "impact": "Bypass of a path-traversal defense offered by a security-remediation library: files in prefix-named sibling locations can be read, overwritten or deleted as if they were inside the intended base directory (integrity/confidentiality impact on data outside the confined directory). The scope is narrower than full arbitrary path traversal because the canonical target must literally start with the base canonical string.",
+      "locations": [
+        {
+          "end_line": 26,
+          "path": "src/main/java/io/whitesource/cure/FileSecurityUtils.java",
+          "start_line": 21
+        }
+      ],
+      "prerequisites": "1) A caller relies on the boolean as the guard that confines file access (read/write/delete) to baseDirPath - the method's documented contract. 2) The attacker can influence the path handed to the method (typical for upload/filename/download paths). 3) The desired target canonicalizes to a location whose path string begins with the base directory's canonical string, e.g. a sibling directory named with the base directory's name plus a suffix (uploads/uploads_backup, public/public_html, www/www2). The attacker does not need arbitrary-target access: paths that do not share the prefix (e.g. '/etc/passwd') are still correctly rejected.",
+      "root_cause": "FileSecurityUtils.isFileOutsideDir implements the containment decision as `!file.getCanonicalPath().startsWith(baseDir.getCanonicalPath())` (line 25). String.startsWith performs a raw character-prefix comparison with no boundary (no trailing File.separator, no Path.startsWith on normalized Path objects). Canonical paths that begin with the base directory's canonical string but lie outside it (e.g., a sibling directory whose name extends the base name) are therefore classified as inside the base directory, and the method returns false.",
+      "title": "isFileOutsideDir path-containment check can be bypassed with a sibling path sharing the base directory name prefix",
+      "trace": "Caller passes filePath/baseDirPath -> `new File(filePath)` and `new File(baseDirPath)` -> both getCanonicalPath() resolve symlinks and collapse '..' lexically -> raw `startsWith` on the two canonical strings with no separator check -> boolean result is inverted-free but wrong for prefix-sharing siblings -> caller treats an out-of-base path as in-base and proceeds with the file operation.",
+      "unverified": "Exploitability depends on the (unseen) calling application's use of the boolean as an access-control gate and on the presence of a target file whose canonical path shares the base directory's string prefix; the exact canonicalization behavior for non-existent components under the deployed JDK was reasoned from the JDK contract, not executed. Line 25 is the sole defect site; no in-repo tests or callers were available to confirm the guard's usage.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-41 Improper Path Equivalence (containment check missing separator boundary)"
+    }
+  ],
+  "coverage_summary": "Scope reported by get_source_scope: 7 model-visible files, no sensitive-name, size or symlink exclusions, binaries skipped by policy. I read in full: Encoder.java (409 lines), FileSecurityUtils.java (40 lines), SecureObjectInputStream.java (69 lines), WssAllowListForLog.json (36 lines), pom.xml (211 lines), README.md (42 lines). .gitignore was not read (build/ignore metadata only). P1 relation scope: 7 files indexed, 3 Java files parsed, 41 symbols / 94 call sites / 70 edges, syntax-only; control flow, data flow and semantic resolution are 'not_implemented', one file omitted from the index, and the index contains no finding/fact records (search_relation_facts returned empty). The relations confirmed the library classes have no in-repo callers (all sinks are unresolved external calls), so the security impact of each guard is realized in consuming applications, not inside this snapshot. No code was built, executed or scanned, and no tests exist in the snapshot.",
+  "limitations": [
+    "Only 7 files were available; there are no tests, no call sites inside the repo, and no downstream consumer code, so reachability and the actual authorization semantics of isFileOutsideDir could not be confirmed.",
+    "Runtime behavior of File.getCanonicalPath on non-existent path components and of caller-side file operations was reasoned about, not executed (no code execution permitted).",
+    "P1 index is syntax/navigation only (no data flow, control flow or semantic resolution); several call sites were 'unresolved', so candidate relations were verified manually against source text.",
+    "The exact escaping of WssAllowListForLog.json entries was inferred from the rendered file content; this does not affect the submitted candidate.",
+    "No external advisories, patches, CVE/CWE mappings or sibling conditions were consulted, so the submission is based solely on this snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SecureObjectInputStream.isSubpackage uses packageName.startsWith(pack) (line 63) with no package-name boundary and derives the package via FilenameUtils.removeExtension (line 61), so a class in a package that merely shares a name prefix with a whitelisted package (e.g. whitelist 'com.app.safe' matching 'com.app.safeLegacy.Gadget') passes the deserialization allow-list.",
+      "reason": "Real logic defect defeating a security control (attacker controls the class name read from the serialized stream), but exploitation for RCE additionally requires a usable gadget class on the classpath inside a prefix-matching sibling package, which cannot be established from this snapshot; treated as unconfirmed rather than the single strongest finding."
+    },
+    {
+      "lead": "Encoder.escapeForbiddenCharacters builds a regex character class from allow-list entries without escaping and passes safeCharReplacement through Matcher.replaceAll as a replacement template; the bundled WssAllowListForLog.json also permits CR/LF.",
+      "reason": "The default bundled configuration is well-formed (entries are character ranges/Unicode escapes and replacement is '_'), and any regex/replacement injection requires the caller to supply an attacker-influenced properties file - a configuration trust decision, not source-evidenced exploitability."
+    },
+    {
+      "lead": "Encoder.forOsCommand escapes non-alphanumerics by prefixing '^' (Windows) or '\\' (Unix); the encoding is context dependent (e.g. inside single quotes on POSIX, or with cmd.exe variable expansion) and charsToIgnore can preserve dangerous characters.",
+      "reason": "Contract-context issue in a generic helper rather than a demonstrable injection path in this snapshot; no caller or sink is present to establish a concrete exploit."
+    },
+    {
+      "lead": "SecureObjectInputStream does not override resolveProxyClass, so dynamic proxy classes are resolved by the JDK default path rather than the class whitelist.",
+      "reason": "Gating of the invocation handler still occurs through resolveClass, and no gadget chain is demonstrated from source; hardening observation only."
+    }
+  ],
+  "summary": "Review of the 7-file curekit snapshot (3 Java library classes, bundled allow-list JSON, pom.xml, README). The code is a set of security-control wrappers (path confinement, deserialization allow-listing, encoders). The strongest source-evidenced issue is the path-containment guard in FileSecurityUtils.isFileOutsideDir, which compares canonical paths with a bare String.startsWith and no directory-separator boundary, so paths that merely share the base directory's name prefix are reported as \"inside\" the base directory. The SecureObjectInputStream package allow-list uses a similarly boundary-less prefix check; it was treated as a second, unconfirmed lead because exploitation needs a gadget class in a prefix-matching package on the classpath."
+}

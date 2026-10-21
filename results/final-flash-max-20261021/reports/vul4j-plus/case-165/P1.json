@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `href` attribute of an `xop:Include` element in the SOAP/XML request body (namespace http://www.w3.org/2004/08/xop/include), e.g. href=\"http://169.254.169.254/...\", \"file:///etc/passwd\", or \"http://slow-host/\". Fully attacker-controlled XML content; no framework-level authentication is performed before the databinding runs.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that local-only resolution is the intended behavior elsewhere: LazyDataSource (core/.../attachment/LazyDataSource.java) throws when no local attachment matches; the JS client explicitly refuses non-cid hrefs (rt/javascript/javascript-runtime cxf-utils.js: \"we only support cid:, not URLs\"); STSStaxTokenValidator (rt/ws/security) checks href.startsWith(\"cid:\") before use. The URL branch in core AttachmentUtil is therefore an anomaly, not a guarded alternative path. Verified that AttachmentInInterceptor leaves attachments null for non-multipart requests (so an attacker must include at least one MIME part), and that no scheme/host allow-list or local-only check exists in either AttachmentUtil. GetAttachmentDataSource ignores the `atts` collection entirely in the URL branch.",
+      "id": "cxf-xop-href-ssrf",
+      "impact": "Remote attacker can make the CXF server issue outbound requests to arbitrary URLs (internal network/port scanning, access to internal services or cloud metadata endpoints), read local files accessible to the JVM via file:/jar: URLs when the resulting bytes are exposed to the service/response, and cause resource exhaustion (e.g. href=file:///dev/zero read into a ByteArrayOutputStream, or slow-responding URLs holding request threads).",
+      "locations": [
+        {
+          "end_line": 544,
+          "path": "core/src/main/java/org/apache/cxf/attachment/AttachmentUtil.java",
+          "start_line": 525
+        },
+        {
+          "end_line": 65,
+          "path": "rt/databinding/jaxb/src/main/java/org/apache/cxf/jaxb/attachment/JAXBAttachmentUnmarshaller.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 65,
+          "path": "rt/frontend/jaxrs/src/main/java/org/apache/cxf/jaxrs/provider/JAXBAttachmentUnmarshaller.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 78,
+          "path": "rt/databinding/aegis/src/main/java/org/apache/cxf/aegis/type/mtom/AttachmentUtil.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 140,
+          "path": "rt/databinding/aegis/src/main/java/org/apache/cxf/aegis/type/mtom/AbstractXOPType.java",
+          "start_line": 125
+        }
+      ],
+      "prerequisites": "Endpoint uses the JAXB databinding (CXF default for JAX-WS; also JAX-RS JAXBElementProvider) or the Aegis databinding, and has an operation part mapped to xsd:base64Binary / byte[] / DataHandler with XOP/MTOM. The request must be multipart/related (or otherwise have a non-null message attachment collection) so that JAXB's AttachmentUnmarshaller.isXOPPackage() is true / Aegis Context.getAttachments() is non-null; including one dummy MIME part is sufficient. Server needs outbound connectivity (or readable local files) for impact.",
+      "root_cause": "Incoming XOP/MTOM attachment references are not restricted to content-ids of parts actually present in the message. When the href/contentId does not match a local attachment (or contains \"://\"), AttachmentUtil creates a javax.activation.URLDataSource from the attacker-supplied string, which opens a URL connection when read.",
+      "title": "Attacker-controlled xop:Include href is fetched as a URL (SSRF / local file read) in attachment resolution",
+      "trace": "1) AttachmentInInterceptor (core) creates a LazyAttachmentCollection for a multipart/related request, so message.getAttachments() is non-null. 2) AbstractInDatabindingInterceptor (core, line 87) passes message.getAttachments() to the DataReader; JAXBDataBase.getAttachmentUnmarshaller() builds a JAXBAttachmentUnmarshaller. 3) When JAXB RI meets <xop:Include href=\"...\"> it calls getAttachmentAsByteArray/DataHandler with the href; both delegate to AttachmentUtil.getAttachmentDataSource(contentId, atts) (jaxb lines 49/56). 4) Since the href contains \"://\", the else branch at core AttachmentUtil lines 536-541 returns new URLDataSource(new URL(contentId)) without checking atts. 5) getAttachmentAsByteArray immediately does IOUtils.copy(datasource.getInputStream(), ...) → URLConnection request (SSRF/file read); with DataHandlerType/DataHandler the fetch happens when the handler data is used. 6) Aegis: AbstractXOPType.readMtoM → readInclude (lines 125-140) → aegis AttachmentUtil.getAttachment falls back to new URLDataSource(new URL(id)) (lines 71-77) → ByteArrayType.readAttachment reads it (lines 43-50).",
+      "unverified": "JAXB RI (external Maven dependency, not in snapshot) is assumed to pass the raw href attribute value to AttachmentUnmarshaller methods as CXF's own \"://\" branch and the JS client comment imply; I could not execute code to confirm request-time behavior. No runtime exploit was attempted. I did not determine which upstream fix commit (if any) corresponds to this code, and no CVE identifier is claimed.",
+      "weakness_type": "Server-Side Request Forgery (CWE-918) with local file access (CWE-73) and DoS potential"
+    }
+  ],
+  "coverage_summary": "Source scope: 4,959 model-visible files (0 excluded by sensitive-name/symlink/size filters; binary-like files skipped by the reader). P1 relation index reports complete coverage of the same 4,959 files (52,929 symbols, 156,782 calls, 119,533 edges, 1,400 facts) with no missing files or hash mismatches; index data was used only for navigation and every cited edge was re-verified in source text. I inspected the core/attachment package, both JAXB attachment unmarshallers, the Aegis MTOM attachment code, the WSDL query handling in rt/frontend/simple, the STS client trust code, StaxUtils/DOMUtils XML hardening, and transport header/attachment plumbing. I did not review every module (e.g. most of rt/rs/security OAuth2/JOSE, JMS/netty/undertow transports, tools, services/wsn, integration and systests) file by file.",
+  "limitations": [
+    "Static review only: no code was executed, no dependencies (notably the JAXB RI jar, javax.activation) were available for inspection, and no runtime confirmation of the SSRF/file-read path was performed.",
+    "The candidate relies on the JAXB RI forwarding URL-valued xop:Include hrefs to AttachmentUnmarshaller; this is strongly implied by CXF's own \"://\" branch and the JavaScript client comment but was not verified against the RI source in this snapshot.",
+    "Exact upstream fix commit/CVE mapping was not available offline, so I cannot assert this is the specific ground-truth issue; it is submitted as the strongest evidence-backed candidate.",
+    "P1 index facts (security_call hints) are name-based and were not treated as findings; large areas of the repository remain uninspected at line level."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Attachment-size denial of service (attachment-max-size enforcement / CVE-2019-12406-shaped issue)",
+      "reason": "Expected hardening already exists: AttachmentDeserializer.ATTACHMENT_MAX_SIZE is plumbed through AttachmentUtil.setStreamedAttachmentProperties to CachedOutputStream/CachedWriter, header size is limited (HeaderSizeExceededException), and JAX-RS maps CacheSizeExceededException to HTTP 413. No default cap is a hardening gap, but I found no source-verifiable missing check tied to the snapshot's fix window, so it is weaker than the URL-dereference issue."
+    },
+    {
+      "lead": "SSRF via ?wsdl=/?xsd= query parameters in WSDLGetUtils",
+      "reason": "WSDLGetUtils.getDocument/writeWSDLDocument only looks up definitions already known to the endpoint (lookupDefinition throws WSDL_NOT_FOUND; mapUri restricts to known SchemaReferences), so no remote fetch from the query parameter was found in this snapshot."
+    },
+    {
+      "lead": "Weak java.util.Random MIME boundaries in AttachmentUtil (BOUND_RANDOM)",
+      "reason": "The comment shows this is an intentional performance trade-off inherited from upstream; exploitation (boundary prediction/injection) requires a specific multi-tenant scenario and was not demonstrated from source."
+    },
+    {
+      "lead": "SSRF via AbstractSTSClient MEX/schema download (configureViaEPR/downloadSchema)",
+      "reason": "The EPR/MEX location is normally derived from server-side STS configuration, not from an unauthenticated remote request in this snapshot; XML parsing there also sets disallow-doctype-decl. Not enough source evidence of attacker control."
+    },
+    {
+      "lead": "XXE in XML parsing paths",
+      "reason": "StaxUtils, DOMUtils, ExtendedDocumentBuilder and AbstractSTSClient.downloadSchema all enable secure-processing / disallow-doctype-decl; no missing entity restriction found in the main parsing utilities."
+    }
+  ],
+  "summary": "Review of the Apache CXF 3.4.0-SNAPSHOT tree (4,959 files; snapshot contains 3.3.3 release notes and Aug/Sep-2019 dependency levels). I traced the incoming-message attachment path (AttachmentInInterceptor → AbstractInDatabindingInterceptor → JAXBAttachmentUnmarshaller / Aegis AbstractXOPType) and found one strongest, source-verified candidate: an attacker-controlled `xop:Include@href` value is dereferenced as a URL instead of being resolved only against the message's MIME attachments. In `core/.../attachment/AttachmentUtil.getAttachmentDataSource` the `else` branch (href contains \"://\") returns `new URLDataSource(new URL(contentId))` with no validation that the id matches a local attachment; the JAXB attachment unmarshallers (default JAX-WS databinding and JAX-RS JAXB provider) call this with the raw href and immediately read the stream in `getAttachmentAsByteArray`. The Aegis MTOM helper has the same \"Try loading the URL remotely\" fallback. This yields SSRF, `file:`/`jar:` local-file reads, and unbounded-read DoS. Other leads (attachment-size DoS, ?wsdl SSRF, weak MIME-boundary Random, STS MEX fetch) were rejected or left unconfirmed as noted."
+}

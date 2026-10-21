@@ -1,0 +1,77 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated HTTP/2 peer fully controls the inbound frame stream: it can complete the HTTP/2 connection preface, open a stream, and send an arbitrary number of DATA frames whose payload length is zero and whose END_STREAM flag is unset (9 bytes per frame, no flow-control window consumption).",
+      "confidence": "medium",
+      "counterevidence_checked": "1) Searched case-insensitively for `emptydataframe` across all readable files: only the two class files themselves, no callers. 2) Searched for `decoderEnforce` and `DEFAULT_MAX_CONSECUTIVE`: zero matches, so no setter or default constant exists. 3) Relation index confirms `Http2EmptyDataFrameConnectionDecoder` has only internal edges (constructor/override/containment) and no incoming construction calls, whereas `buildFromConnection` does call `Http2ControlFrameLimitEncoder` (line 499) and `StreamBufferingEncoder` (line 509). 4) Examined `DefaultHttp2ConnectionDecoder.onDataRead` for any alternative empty-frame accounting: none; empty frames reach the application listener. 5) Compared with other wired defenses (`Http2SettingsReceivedConsumer` used by `DefaultHttp2ConnectionDecoder` lines 118-126; `Utf8FrameValidator` added by both WebSocket client/server handlers), confirming the orphaned state is specific rather than a general pattern. 6) `Http2EmptyDataFrameConnectionDecoder`/`Listener` are package-private with no public exposure, so an application cannot enable the protection itself through a builder API.",
+      "id": "netty-http2-empty-data-frame-flood-protection-unwired",
+      "impact": "Remote denial of service: an attacker can force unbounded per-frame parsing, flow-control bookkeeping, and application-listener callbacks for arbitrarily many 9-byte empty DATA frames on a single connection, without ever consuming the flow-control window that would otherwise throttle data. Netty's own class Javadoc states these classes exist to enforce a limit and tear the connection down; with the wiring absent, that protection never activates for any HTTP/2 endpoint built via the shipped builders (the flood-protection threshold is not even configurable). The defect corresponds to the unprotected state for the HTTP/2 empty-DATA-frame flood vector.",
+      "locations": [
+        {
+          "end_line": 110,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/AbstractHttp2ConnectionHandlerBuilder.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 515,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/AbstractHttp2ConnectionHandlerBuilder.java",
+          "start_line": 481
+        },
+        {
+          "end_line": 136,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2CodecUtil.java",
+          "start_line": 133
+        },
+        {
+          "end_line": 41,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2EmptyDataFrameConnectionDecoder.java",
+          "start_line": 23
+        },
+        {
+          "end_line": 64,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2EmptyDataFrameListener.java",
+          "start_line": 25
+        },
+        {
+          "end_line": 293,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2ConnectionDecoder.java",
+          "start_line": 229
+        },
+        {
+          "end_line": 199,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2FrameCodecBuilder.java",
+          "start_line": 173
+        }
+      ],
+      "prerequisites": "The application uses Netty's HTTP/2 handlers built through the standard builders (`Http2FrameCodecBuilder`, `Http2ConnectionHandlerBuilder`, `Http2MultiplexCodecBuilder`, or subclasses), which all lead to `AbstractHttp2ConnectionHandlerBuilder.buildFromConnection`; the attacker can reach the HTTP/2 endpoint and keep one connection open.",
+      "root_cause": "The repository contains the mitigation pair `Http2EmptyDataFrameConnectionDecoder` + `Http2EmptyDataFrameListener` (which closes the connection with ENHANCE_YOUR_CALM after a bounded number of consecutive empty DATA frames), but the decoder is never instantiated. `AbstractHttp2ConnectionHandlerBuilder.buildFromConnection` (lines 481-515) builds `DefaultHttp2ConnectionDecoder` and passes it directly to `buildFromCodec`; there is no `maxConsecutiveEmptyFrames` field/setter and no `DEFAULT_MAX_CONSECUTIVE_EMPTY_FRAMES` constant in `Http2CodecUtil` (only `DEFAULT_MAX_QUEUED_CONTROL_FRAMES` at line 135), so neither the default path nor any configuration path can enable the limit. The analogous encoder-side flood control (`Http2ControlFrameLimitEncoder`) *is* wired at lines 498-500, showing the omission is specific to the empty-DATA-frame defense.",
+      "title": "HTTP/2 empty-DATA-frame flood protection class is never wired into decoder construction",
+      "trace": "Inbound bytes -> `DefaultHttp2FrameReader.readDataFrame` computes `dataLength = lengthWithoutTrailingPadding(payloadEndIndex - payload.readerIndex(), padding)` = 0 for an empty frame -> `DefaultHttp2ConnectionDecoder.FrameReadListener.onDataRead` (line 231) -> `bytesToReturn = data.readableBytes() + padding` = 0 and flow-control bookkeeping consumes nothing (lines 235, 281-283) -> application `listener.onDataRead(ctx, streamId, data, padding, endOfStream)` is invoked once per frame (line 292). Nothing in this path counts consecutive empty frames. The only counter implementation is `Http2EmptyDataFrameListener.onDataRead` (lines 38-50, `emptyDataFrames++ == maxConsecutiveEmptyFrames` -> connection error ENHANCE_YOUR_CALM), and `Http2EmptyDataFrameConnectionDecoder.frameListener` (lines 33-40) is the only way to install it; neither class is referenced from any builder or handler (`buildFromConnection` lines 512-514 construct `DefaultHttp2ConnectionDecoder` and never wrap it, and `Http2FrameCodecBuilder.build()` lines 193-196 do the same on its test-only frameWriter path).",
+      "unverified": "No upstream diff was available in this run, so I could not prove the wiring was intentionally removed versus an incomplete upstream intermediate commit; the exact intended default threshold (upstream-style value unverified) and the exact builder setter name are unknown. No code was executed, so the DoS is not runtime-confirmed. It is possible an application that supplies its own decoder via `codec(...)` and manually wraps it could re-add the protection, but no such helper or documentation exists here. Whether this rather than the HTTP/1.1 smuggling lead is the dataset's target cannot be established from source alone.",
+      "weakness_type": "Missing/disabled security control leading to uncontrolled resource consumption (CWE-693 / CWE-400)"
+    }
+  ],
+  "coverage_summary": "Scope: 1990 readable files under the assigned source root; binary-like files are refused/skipped, no src/test sources exist in the snapshot (only main sources plus testsuite/src/main and poms), and no file was excluded by size (0 excluded over 5 MiB) or by sensitive-name filters. The P1 relation index reports complete coverage of the same 1990 files (0 missing, 0 hash mismatches) but is navigational only. Review concentrated on network-facing parsing/trust boundaries: buffer/common index checks, codec HTTP/1.1 decoder and multipart decoders, codec-http2 frame reader/decoder/encoder/builders, compression decoders, handler SSL and ipfilter, websocket frame decoding, and the API builders' wiring; the relation index was used to confirm that `Http2EmptyDataFrameConnectionDecoder` has no incoming construction edge. Modules such as resolver-dns, codec-redis/memcache/mqtt/stomp/smtp/socks/dns, transport-native-* C code, and the example/microbench/testsuite trees were only sampled, not exhaustively reviewed; no build or runtime checks were performed.",
+  "limitations": [
+    "No upstream source or patch data was available in this run, so the candidate rests on internal-consistency evidence (unused security classes, missing wiring/config) rather than a verified regression diff.",
+    "No code was built, executed, or fuzzed; the DoS impact is argued from source flow, not runtime-confirmed.",
+    "Test sources are absent from the snapshot, so test expectations could not be used to confirm the intended default behavior or to discover the target defect.",
+    "Only one candidate may be submitted; the HTTP/1.1 request-smuggling leniency, the zlib unbounded-decompression path, and multipart parsing growth remain unselected and were not fully traced.",
+    "Large portions of the repository (native C transports, DNS resolver, non-HTTP codecs, example/microbench code) were not exhaustively reviewed, so a stronger defect there cannot be excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HTTP/1.1 request smuggling via lenient header/framing parsing in codec-http: `HttpObjectDecoder.splitHeader` (lines 720-751) accepts whitespace before the colon and trims trailing whitespace from header values, `HttpUtil.getContentLength` (lines 145-197) parses only the first Content-Length value without rejecting duplicates/conflicts, and `readHeaders` (lines 568-620) lets `Transfer-Encoding: chunked` override a present Content-Length without rejecting the ambiguity.",
+      "reason": "This is a genuine parser-differential risk present in this version (it matches the class of later Netty request-smuggling fixes and is not disproved), but exploitation requires a front-end intermediary whose framing interpretation differs from Netty's, and I could not tie it to a snapshot-specific deviation as cleanly as the orphaned HTTP/2 mitigation. Kept as an unconfirmed secondary lead; not submitted due to the one-candidate cap."
+    },
+    {
+      "lead": "Unbounded decompression in `codec/src/main/java/io/netty/handler/codec/compression/JdkZlibDecoder.java` (`decode`, lines 131-238): the inflated `decompressed` buffer is grown with `ensureWritable(inflater.getRemaining() << 1)` and emitted without any maximum-output limit, allowing a small compressed payload to expand until allocation fails.",
+      "reason": "Reachable only when a Zlib/Gzip decoder is explicitly added to a pipeline and impact is availability-only DoS; the missing cap is arguably by design in this version and I could not establish that it is the snapshot-specific defect. DoS-only and weaker evidence than the candidate above."
+    },
+    {
+      "lead": "Memory-growth/DoS paths in `HttpPostMultipartRequestDecoder` (undecodedChunk handling and delimiter scanning) and other lenient multipart parsing.",
+      "reason": "Not traced to a concrete attacker-controlled unbounded allocation within the review budget; no source-level proof of an exploitable limit circumvention was established. Rejected as unverified."
+    }
+  ],
+  "summary": "Reviewed the Netty 4.1.39.Final-SNAPSHOT source tree (1990 readable files, main sources only; no src/test present; binary files skipped). Strongest candidate: the HTTP/2 empty-DATA-frame flood protection is present as dead code. `Http2EmptyDataFrameConnectionDecoder`/`Http2EmptyDataFrameListener` exist (added for the empty DATA frame flood class of DoS), but no code path ever constructs them: `AbstractHttp2ConnectionHandlerBuilder.buildFromConnection` (lines 481-515) returns a plain `DefaultHttp2ConnectionDecoder` without wrapping, `Http2CodecUtil` has only `DEFAULT_MAX_QUEUED_CONTROL_FRAMES` (no consecutive-empty-frame default), and there is no `maxConsecutiveEmptyFrames` field, setter, or builder API anywhere (zero matches for `decoderEnforce`, `DEFAULT_MAX_CONSECUTIVE`, `EmptyDataFrame` uses). Because empty DATA frames consume no flow-control window and are forwarded to the application listener (`DefaultHttp2ConnectionDecoder` lines 290-293), a remote unauthenticated HTTP/2 peer can drive per-frame processing indefinitely, which is exactly the vector the orphaned classes were written to stop. I selected this over the also-present HTTP/1.1 request-smuggling leniency (HttpObjectDecoder/HttpUtil), which depends on a non-conforming intermediary, and over the zlib-bomb lead."
+}

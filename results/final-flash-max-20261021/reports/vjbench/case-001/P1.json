@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated remote client fully controls the raw HTTP/1.x bytes, including the `Transfer-Encoding` header value/list and the `Content-Length` header, sent to any server built on Netty's `HttpRequestDecoder`/`HttpServerCodec` (optionally `HttpObjectAggregator`). No pre-existing trust or credentials are needed to reach the decoder; the attacker only needs a reachable listener.",
+      "confidence": "medium",
+      "counterevidence_checked": "Confirmed by reading source that: (a) `HttpHeaders.contains(name, value, ignoreCase)` is an exact whole-value comparison, not a token/substring search (HttpHeaders.java:1570-1586; DefaultHeaders.java:254-267); (b) `HttpHeaders.containsValue` is the comma-aware primitive (HttpHeaders.java:1588-1606) and is used for `Connection`/`Upgrade` in `HttpUtil.isKeepAlive` and websocket handshakes, showing the intended API exists in this snapshot; (c) the correct behavior applies when the value is exactly `chunked`, or when multiple separate single-token `Transfer-Encoding` headers are used, so the issue is specifically the multi-token/combined value case; (d) no later check in `readHeaders()` or validation in `DefaultHttpHeaders` rejects a `Transfer-Encoding` list, and `HttpUtil.getContentLength` simply takes the first `Content-Length` value. Counter-arguments that reduce impact: if the front-end rewrites/re-encodes chunked bodies or strips the header, no differential exists; a deployment with no intermediary does not exhibit cross-hop smuggling.",
+      "id": "netty-te-token-list-smuggling",
+      "impact": "Message-boundary desynchronization on a shared keep-alive connection: requests can be smuggled past front-end authorization/routing/WAF controls, request queues and caches can be poisoned, and a smuggled request can be attributed to a victim's connection/session context. In the `Content-Length` variant, the attacker can make Netty consume a different number of body bytes than an RFC-compliant proxy, leaving attacker-chosen bytes interpreted as a new request. Impact is high where a Netty-based origin sits behind a compliant proxy; it is mitigated if every hop normalizes `Transfer-Encoding`/re-encodes bodies or if only exact `chunked` values reach Netty.",
+      "locations": [
+        {
+          "end_line": 303,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 295
+        },
+        {
+          "end_line": 620,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 607
+        },
+        {
+          "end_line": 265,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 238
+        },
+        {
+          "end_line": 1606,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpHeaders.java",
+          "start_line": 1570
+        },
+        {
+          "end_line": 333,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/DefaultHttpHeaders.java",
+          "start_line": 325
+        },
+        {
+          "end_line": 267,
+          "path": "codec/src/main/java/io/netty/handler/codec/DefaultHeaders.java",
+          "start_line": 254
+        }
+      ],
+      "prerequisites": "1) The Netty endpoint is reachable through an intermediary (reverse proxy, load balancer, CDN, WAF, service mesh) that parses `Transfer-Encoding` as an RFC 7230 comma-separated transfer-coding list (sees `chunked`) and forwards the message without normalizing/sanitizing the header or re-encoding the body. 2) The attacker sends a message whose `Transfer-Encoding` value contains the `chunked` token but is not exactly the string `chunked` (e.g. `identity, chunked`, `chunked, identity`, or a combined value), optionally with a `Content-Length`. 3) The connection is kept alive long enough for the following bytes to be parsed as a second message. Multiple separate `Transfer-Encoding: chunked` header lines each containing one token do not trigger the mis-detection.",
+      "root_cause": "`HttpUtil.isTransferEncodingChunked()` (codec-http .../HttpUtil.java:301-303) calls `message.headers().contains(TRANSFER_ENCODING, CHUNKED, true)`. `HttpHeaders.contains(name, value, ignoreCase)` compares the value against the ENTIRE stored header value (codec-http .../HttpHeaders.java:1570-1586; DefaultHttpHeaders delegates at .../DefaultHttpHeaders.java:331-333; codec `DefaultHeaders.contains(K,V,HashingStrategy)` compares `valueHashingStrategy.equals(value, e.value)` at codec/.../DefaultHeaders.java:254-267). It therefore does not recognize RFC 7230 §3.3.1 transfer-coding lists such as `Transfer-Encoding: identity, chunked` or `chunked, identity` (also any single combined/multi-value header produced by intermediaries), because the whole value is not exactly `chunked`. The comma-aware helper `HttpHeaders.containsValue` (HttpHeaders.java:1588-1606, which splits on commas and trims OWS) exists in this snapshot and is already used for `Connection`/`Upgrade` (`HttpUtil.isKeepAlive`, websocket handshakes), but is not used for `Transfer-Encoding`. As a result, `HttpObjectDecoder.readHeaders()` (HttpObjectDecoder.java:607-620) never selects `READ_CHUNK_SIZE` for such messages: with `Content-Length` present it selects `READ_FIXED_LENGTH_CONTENT` (line 614-615) using the attacker-controlled length; with no `Content-Length` it selects `READ_VARIABLE_LENGTH_CONTENT` (line 617), and for requests `decode()` (lines 245-251) emits the message as having an empty body and immediately starts parsing the following bytes as the next request.",
+      "title": "HTTP request smuggling via exact-match Transfer-Encoding detection in HttpUtil/HttpObjectDecoder",
+      "trace": "1. Attacker sends `POST /x HTTP/1.1` with `Transfer-Encoding: identity, chunked` and `Content-Length: 0` (or no CL), followed by a second request. 2. `HttpObjectDecoder.readHeaders()` parses and stores the headers, then calls `HttpUtil.isTransferEncodingChunked(message)` at line 612. 3. `HttpUtil.isTransferEncodingChunked` (HttpUtil.java:302) calls `headers().contains(TRANSFER_ENCODING, CHUNKED, true)`; stored value is `identity, chunked`, which is compared for full equality against `chunked` (DefaultHttpHeaders.java:331-333 -> DefaultHeaders.java:261), so it returns false. 4. Branch selection falls to `contentLength() >= 0` (line 614) or `READ_VARIABLE_LENGTH_CONTENT` (line 617) instead of `READ_CHUNK_SIZE` (line 613). 5. With no CL, `decode()` lines 245-251 treats the request as having no body and calls `resetNow()`; the attacker-supplied remainder (which the proxy considers the chunked body of request 1) is parsed by Netty as request 2. The proxy and Netty now disagree on message boundaries, the defining condition for request smuggling.",
+      "unverified": "No code was executed and the snapshot contains no tests, so the smuggling behavior was not runtime-confirmed. The exact upstream/CVE attribution (e.g. which Netty security fix changed this call site to a token-aware check) could not be verified offline. I did not prove that the specific faulty branch is reachable through the exact proxy implementations an operator might deploy, nor did I enumerate all intermediaries' parsing rules. The encoder side (`HttpObjectEncoder`) was not exhaustively reviewed for a complementary framing issue, and native/JNI code and 2 index-omitted files were not inspected.",
+      "weakness_type": "CWE-444 Inconsistent Interpretation of HTTP Requests ('HTTP Request Smuggling')"
+    }
+  ],
+  "coverage_summary": "Source snapshot is Netty 4.1.42.Final-SNAPSHOT (~1,942 readable files; ~1,817 parsed Java files under src/main and module poms; no src/test sources present). I used the P1 index only for navigation (declarations/containment/calls are syntactic hints; no control-flow, data-flow, semantic resolution, or reachability is implemented) and verified every cited edge against source text. Broad review included codec-http request/response decoding, header storage/comparison, multipart/aggregation, websocket framing, spdy; codec-http2 framing/HPACK; codec compression (zlib/lz4/bzip2/snappy/fastlz); codec-haproxy, codec-redis, codec-mqtt, codec-xml; handler-proxy and SSL utility classes; resolver-dns entry points; common internal native-library loading and reflection; buffer/framing utilities. The strongest candidate was traced across HttpUtil, HttpObjectDecoder, HttpHeaders, DefaultHttpHeaders, and DefaultHeaders. Depth was prioritized on attacker-controlled parsing paths; several large subsystems received only targeted sampling (see limitations).",
+  "limitations": [
+    "No test sources exist in the snapshot, so intended behavior could not be corroborated by tests and no test-suite execution was possible.",
+    "No code was executed and no exploit payloads were constructed; the finding is based on source reading and is a lead, not a runtime-confirmed vulnerability.",
+    "No network access, so the upstream fixed version, the associated CVE/advisory, and historical context could not be consulted; the snapshot was dated only indirectly (version string 4.1.42.Final-SNAPSHOT, highest referenced GitHub issue #9500).",
+    "The P1 relation index is partial and syntactic: 2 files omitted from indexing, java_files 1,817, unresolved calls 28,069, and no control-flow/data-flow analysis; it was used only to navigate, and index labels/edges were not treated as vulnerability evidence.",
+    "Native/JNI code, build/plugin configuration, and non-Java resources were not security-reviewed; some large modules (SSL internals, DNS resolver internals, SPDY, SOCKS, STOMP, SMTP, native transports) were sampled rather than exhaustively reviewed.",
+    "Exact impact depends on the deployed proxy's Transfer-Encoding parsing/normalization behavior, which cannot be verified from this repository."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Duplicate / conflicting Content-Length handling: `HttpUtil.getContentLength` returns the first header value and no strict rejection exists in `HttpObjectDecoder`, a classic CL.CL smuggling differential.",
+      "reason": "Same class of framing-desync risk and real, but it is a separate root cause from the Transfer-Encoding mis-detection and has weaker source evidence in this snapshot (behavior depends on the exact intermediary's selection of first/last Content-Length). Kept out to avoid splitting one review into multiple candidates; the TE token-list issue is the more directly evidenced defect because the comma-aware API demonstrably exists but is unused at that call site."
+    },
+    {
+      "lead": "HAProxyMessageDecoder v1/v2 framing (LineHeaderExtractor/StructHeaderExtractor, length bounds).",
+      "reason": "Read the decoder and extractor logic; length caps (V1_MAX_LENGTH, v2MaxHeaderSize, failFast/discarding) and `getUnsignedShort` bounds are present and internally consistent. No concrete flaw found."
+    },
+    {
+      "lead": "HTTP/2 HPACK decoding (`decodeULE128`, Huffman literals, dynamic-table indexing).",
+      "reason": "`decodeULE128` contains explicit 32/64-bit overflow guards and index checks; literal length checks compare `readableBytes()` before allocation. No demonstrable flaw found in the reviewed paths."
+    },
+    {
+      "lead": "codec-redis / codec-mqtt length handling (integer overflow, unbounded allocation).",
+      "reason": "RedisDecoder enforces `REDIS_MESSAGE_MAX_LENGTH` and validates negative lengths; MqttDecoder enforces `maxBytesInMessage` and rejects non-zero remaining payload. No flaw established."
+    },
+    {
+      "lead": "codec-xml XmlDecoder external-entity (XXE) exposure via Aalto `InputFactoryImpl`.",
+      "reason": "Decoder passes bytes to Aalto with default factory settings; I did not establish that external entities/DTD resolution are enabled by default in the bundled Aalto version, and no explicit insecure configuration exists in the source. Left unconfirmed rather than asserted."
+    },
+    {
+      "lead": "InsecureTrustManagerFactory / InsecureTrustManager found in the tree.",
+      "reason": "Only used in `example/` modules where it is explicitly documented as insecure and test-only; not a library vulnerability."
+    },
+    {
+      "lead": "MessageAggregator/HttpObjectAggregator maxContentLength enforcement.",
+      "reason": "Oversize checks are performed both on the declared Content-Length and on cumulated chunk bytes before appending; arithmetic matched upstream expectations. No flaw found."
+    }
+  ],
+  "summary": "Reviewed the Netty 4.1.42.Final-SNAPSHOT source tree (1,942 readable files, ~1,817 Java files under src/main; no test sources are included in the snapshot; 2 files omitted from the P1 index and JNI C sources are out of scope for the Java parser). I inspected the highest-risk parsing/codec paths (codec-http request/response decoding, header storage, HTTP/2 HPACK, HAProxy, Redis, MQTT, XML, multipart, aggregation, length-field framing, SSL utilities, native-library loading) and traced header/body-length decisions end to end.\n\nThe single strongest source-evidenced candidate is an HTTP request-smuggling (CWE-444) flaw in codec-http: `HttpUtil.isTransferEncodingChunked()` tests `Transfer-Encoding` with the whole-value `HttpHeaders.contains(name, value, true)` primitive, not the comma-separated `HttpHeaders.containsValue(...)` primitive that exists in this snapshot and is used elsewhere (e.g. `Connection`/`Upgrade` checks). Because of this, a legal RFC 7230 token list such as `Transfer-Encoding: identity, chunked` is not recognized as chunked, and `HttpObjectDecoder.readHeaders()` falls back to `Content-Length` framing (or to bodyless-request handling when no Content-Length is present). An RFC-compliant intermediary that parses the token list as chunked then disagrees with Netty about message boundaries, allowing request smuggling / front-end control bypass on keep-alive connections. Verified in source that the comparison is exact per header value (DefaultHttpHeaders -> DefaultHeaders.contains(K,V,HashingStrategy) uses `valueHashingStrategy.equals(value, e.value)`), and that the comma-aware helper `HttpHeaders.containsValue` is present but unused at this call site.\n\nOther leads were examined and rejected or left unconfirmed (listed below). No runtime testing was performed and no upstream/CVE comparison was possible in this offline review, so the finding is a lead, not a confirmed exploit."
+}

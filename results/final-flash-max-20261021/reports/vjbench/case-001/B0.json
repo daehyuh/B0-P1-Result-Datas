@@ -1,0 +1,57 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated remote peer controls the raw HTTP/1.x byte stream decoded by HttpRequestDecoder/HttpServerCodec (and response stream for clients), including header-name padding before the colon, embedded control bytes in names, and inconsistent Transfer-Encoding/Content-Length framing.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the whitespace branch was already hardened: no RFC 7230 §3.2.4 rejection code or explanatory comment exists in this snapshot (searched '3.2.4' and 'No whitespace is allowed between the header field-name and colon' repository-wide - no matches), and splitHeader has no throw path for whitespace before ':' or for a missing colon. Checked that DefaultHttpHeaders validation does reject ' ', '\\t', CR/LF and ':' when validateHeaders=true, and that HttpObjectDecoder is typically constructed with validate=true, so the simplest space-in-name case is caught by validation while the whitespace-before-colon and unusual-control-char cases are not. Checked that the decoder ignores Content-Length when Transfer-Encoding: chunked is recognized (readHeaders, lines 609-618), which is standard but combines with the parsing leniency to make intermediary disagreement exploitable. No runtime test was run and no test sources are present in the snapshot to confirm behavior.",
+      "id": "netty-http-header-parsing-smuggling",
+      "impact": "HTTP request smuggling / message desynchronization: hidden requests behind an ACL-protected path, cache poisoning, security-control bypass, or cross-user response mix-up in proxy deployments. Header-name injection can also create ambiguity between Netty and intermediaries about which headers (e.g. Content-Length, Transfer-Encoding) apply.",
+      "locations": [
+        {
+          "end_line": 750,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 728
+        },
+        {
+          "end_line": 826,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 790
+        },
+        {
+          "end_line": 403,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/DefaultHttpHeaders.java",
+          "start_line": 356
+        }
+      ],
+      "prerequisites": "Netty's HTTP decoder is used as a front-end/reverse-proxy/server component in a chain where an upstream intermediary (proxy/CDN/WAF) parses or normalizes header whitespace/control characters differently (e.g., strips the whitespace and honors `Transfer-Encoding : chunked`, or rejects the message). For control-character names, the specific byte must be one allowed by DefaultHttpHeaders (0x01-0x08, 0x0e-0x1f, 0x7f) or header validation must be disabled.",
+      "root_cause": "HttpObjectDecoder.splitHeader() ends the field-name at the first ':' OR any whitespace character and then simply scans forward to the next ':' (lines 728-750), so RFC 7230 §3.2.4-invalid forms such as `Transfer-Encoding : chunked` or `Content-Length : 42` are accepted and interpreted as normal headers rather than rejected with a 400. In addition, HeaderParser.process() (lines 806-826) appends every byte except CR/LF to the header line without character validation, and DefaultHttpHeaders.validateHeaderNameElement() (lines 356-403) rejects only 0x00, TAB, LF, VT, FF, CR, space, ',', ':', ';', '=' while accepting control characters 0x01-0x08 and 0x0e-0x1f and DEL, so header names containing invalid/control bytes can pass Netty's own validation (and with validateHeaders=false are not checked at all).",
+      "title": "Lax HTTP/1.x header parsing/name validation allows request smuggling via parsing discrepancies",
+      "trace": "Socket bytes -> ByteToMessageDecoder -> HttpObjectDecoder.decode -> readHeaders -> headerParser.parse -> splitHeader. For `Transfer-Encoding : chunked`: the name loop breaks at the space (line 731), colonEnd loop finds ':' (lines 736-741), name='Transfer-Encoding', value='chunked', so readHeaders selects READ_CHUNK_SIZE while an intermediary that treats the line as invalid/unknown may use Content-Length -> desynchronized message boundaries. For a name like `Content-Length\\x01`: validation in DefaultHttpHeaders.add -> validateHeaderNameElement(0x01) falls through the switch to the default branch (line 396-401), is ASCII, and is accepted, so Netty stores a header that stricter parsers may normalize to Content-Length.",
+      "unverified": "Exact exploitability depends on the specific intermediary in front of or behind Netty and on whether validateHeaders is enabled; I could not verify framing outcomes at runtime. It also remains possible that the whitespace-tolerant branch is a deliberate partial mitigation applied in this revision for an earlier smuggling report, with the residual/related hardening landing only in later releases - the snapshot's pom version (4.1.42.Final-SNAPSHOT) is in the affected range for Netty's later HTTP-smuggling advisories (fixed in 4.1.44), but I did not inspect any patch or advisory metadata.",
+      "weakness_type": "CWE-444 HTTP Request Smuggling (improper input validation / inconsistent interpretation of HTTP headers)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 1,942-file snapshot (all source filters applied; binary-like files skipped). Focused on the HTTP/1.x codec and header classes: read all of HttpObjectDecoder.java (850 lines), DefaultHttpHeaders name/value validators, HttpUtil.getContentLength, and searched repository-wide for whitespace-before-colon handling, RFC 7230 §3.2.4 markers, 'smuggling' test names, and related validation helpers. Confirmed the project version from pom.xml. Remaining modules (HTTP/2, SSL handler, compression, DNS/MQTT/etc. codecs, transport-native) were only listed/searched superficially, not fully read. Test sources are not included in the snapshot, so behavioral expectations could not be cross-checked against unit tests.",
+  "limitations": [
+    "No runtime execution, fuzzing, or dynamic confirmation; all conclusions are from static reading only.",
+    "No access to repository history, patches, advisories, or test sources (no test directories in the snapshot), so I could not verify which changes land in which release or confirm the intended fix for this revision.",
+    "Only the HTTP/1.x decoder and header-validation path was deeply traced; HTTP/2, TLS/SslHandler, compression decoders, multipart parsing, and native transports were not exhaustively reviewed.",
+    "Exploitability of the header-parsing issue depends on an external intermediary with different parsing behavior; this deployment condition is stated but not verifiable from the source tree.",
+    "Multi-line/obs-fold handling (readHeaders lines 576-596, readTrailingHeaders lines 645-669) was read but not fully analyzed for all desync variants."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DefaultHttpHeaders.HeaderValueConverterAndValidator permits CR followed by LF followed by SP/HT inside header values (lines 450-496), which could enable response splitting/header injection if an application stores partially attacker-influenced values and the encoder emits them.",
+      "reason": "Unconfirmed: the folding pattern is deliberate legacy behavior for obs-fold/CRLF-continuation handling, and I found no decoder path that lets CR/LF from the wire reach a stored value (HeaderParser drops CR and terminates on LF), so I could not establish attacker-controlled input reaching this validator in a way that survives encoding."
+    },
+    {
+      "lead": "JsonObjectDecoder.skipSpaces-style loops call in.getByte(i) for i up to the buffer writer index without an explicit bounds check (codec/src/main/java/io/netty/handler/codec/json/JsonObjectDecoder.java lines 138-147).",
+      "reason": "Unconfirmed and likely not security-relevant: ByteBuf.getByte() itself performs index checks, and the worst case appears to be an exception or parsing of padding bytes, not memory disclosure or code execution; requires a crafted JSON stream but produces no clear security impact."
+    },
+    {
+      "lead": "HTTP/2 DoS mitigations (CVE-2019-9512..9518 class: ping flood, settings flood, header-list-size abuse) may or may not be fully present in this 4.1.42-SNAPSHOT codec-http2 module.",
+      "reason": "Not traced to a concrete missing check in this review; I did not read the HTTP/2 frame/decoder classes in depth, so this remains an uninspected area rather than a supported finding."
+    }
+  ],
+  "summary": "Snapshot is Netty 4.1.42.Final-SNAPSHOT (pom.xml line 29), i.e. a pre-4.1.44 revision. The strongest source-evidenced issue is in the HTTP/1.x request-line/header parsing path: HttpObjectDecoder accepts RFC 7230-illegal header syntax (whitespace between field-name and colon, and arbitrary control/‑invalid bytes inside header names) instead of rejecting it, and DefaultHttpHeaders' own name validator only blocks a small subset of control characters. Because intermediaries (reverse proxies, CDNs) commonly normalize or reject these forms differently, a raw HTTP request can be parsed inconsistently across hops, yielding HTTP request smuggling/desynchronization. I found no source-level rejection of whitespace-before-colon (the RFC 7230 §3.2.4 MUST-reject requirement) and no validation of control characters 0x01-0x08/0x0e-0x1f/0x7f in names, unlike later hardened revisions. I am submitting this as one candidate, not a confirmed exploit; the deployment requires an intermediary whose parsing differs, and runtime confirmation was neither performed nor possible here."
+}

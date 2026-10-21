@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The YAML document is fully attacker-controlled in the common integration patterns this library supports: manifests/config passed to `KubernetesClient.resource(...)`/`load(...)` (which route to `Serialization.unmarshal(InputStream[, TypeReference], parameters)`), `DefaultKubernetesClient.fromConfig(String/InputStream)` and `DefaultOpenShiftClient.fromConfig(...)`, `TemplateOperationsImpl.load`, and `KubernetesAttributesExtractor.toKubernetesResource`. Additionally, `OperationSupport.handleResponse` (lines 469-478) runs every API response body through `Serialization.unmarshal`; any body whose first non-whitespace byte is not `{` is parsed by `unmarshalYaml`, so a malicious/compromised API endpoint (or a transport attacker when hostname verification/CA trust is misconfigured) can reach the same sink. Watch-message parsing (`WatchHTTPManager.readWatchEvent`) is another remote-influenced path.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the YAML path is constrained elsewhere: `Serialization.unmarshal(InputStream,ObjectMapper,Map)` intentionally routes any non-'{' body to `unmarshalYaml`; no allow-list, tag stripping, or SafeConstructor usage exists in the whole snapshot; snakeyaml 1.26 (root pom.xml) is a version where `new Yaml()` permits arbitrary type instantiation. The fix for CVE-2021-20218 (tar Slip) is genuinely present in `PodOperationsImpl.copyDir` (FilenameUtils.normalize check at lines 564-567), so I did not list that as a live finding. Mitigations that would invalidate this candidate and were not observed: SafeConstructor/LoaderOptions, `Yaml` configured with `setTagInspector`, or Jackson `YAMLFactory` being used for parsing instead of SnakeYAML (it is only used for writing in `yamlMapper()`/`asYaml`).",
+      "id": "cand-1",
+      "impact": "Deserialization of untrusted data with attacker-chosen type instantiation; depending on classpath gadgets this can yield remote code execution in the client process (or at minimum severe DoS/class-loading side effects) whenever the application parses untrusted YAML or accepts a crafted non-JSON API response. Integrity, confidentiality and availability of the host running the client are at risk.",
+      "locations": [
+        {
+          "end_line": 303,
+          "path": "kubernetes-client/src/main/java/io/fabric8/kubernetes/client/utils/Serialization.java",
+          "start_line": 298
+        },
+        {
+          "end_line": 137,
+          "path": "kubernetes-client/src/main/java/io/fabric8/kubernetes/client/utils/Serialization.java",
+          "start_line": 135
+        },
+        {
+          "end_line": 478,
+          "path": "kubernetes-client/src/main/java/io/fabric8/kubernetes/client/dsl/base/OperationSupport.java",
+          "start_line": 469
+        },
+        {
+          "end_line": 116,
+          "path": "pom.xml",
+          "start_line": 116
+        }
+      ],
+      "prerequisites": "A YAML document reaching any `Serialization.unmarshal` overload (or a non-JSON response body from the API server), plus a usable class/gadget on the application classpath (SnakeYAML's default `Constructor` supports the classic `ScriptEngineManager`/`URLClassLoader`/JNDI-style payloads). No credentials or elevated network position are required beyond the ability to supply a resource document or to influence an HTTP response. Exploitability is not runtime-confirmed.",
+      "root_cause": "Serialization.unmarshalYaml constructs SnakeYAML with the default `new Yaml()` (no SafeConstructor / no allowed-type restriction) and feeds it the raw input stream (`yaml.load(is)`) before converting to JSON. With snakeyaml 1.26 (root pom.xml:116), the default constructor honors global YAML tags and can instantiate arbitrary classes found on the classpath. There is no validation, tag filtering, or safe-constructor configuration anywhere in the repository (a repo-wide search for `SafeConstructor` returns nothing).",
+      "title": "Unsafe SnakeYAML deserialization in Serialization.unmarshalYaml (default Constructor allows arbitrary type instantiation)",
+      "trace": "Attacker-supplied YAML → Serialization.unmarshal(...) → (first non-'{' char) → unmarshalYaml(is, type) → `new Yaml().load(is)` → SnakeYAML global tag resolution instantiates the attacker-named class before `JSON_MAPPER.writeValueAsString(obj)` is ever reached. For responses: HttpClientUtils-built client → OperationSupport.handleResponse → body.byteStream() → Serialization.unmarshal(bodyInputStream, type, parameters) → same sink. No sanitization exists between input and `Yaml.load`.",
+      "unverified": "Not runtime-confirmed: no exploit was executed and no build/tests were run. Reachability of a gadget class on a typical application classpath, and whether the project later fixed this by switching to SafeConstructor/upgrading SnakeYAML, could not be verified from the snapshot (no VCS metadata, no tests, and web sources are out of scope). The precise fix commit/version window is therefore uncertain.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (leading to arbitrary object instantiation / potential RCE)"
+    }
+  ],
+  "coverage_summary": "Scope came from get_source_scope (933 repository files, 727 Java; binaries skipped; tests absent from the snapshot) and get_relation_scope (index covers 930/933 files, 3 omitted, syntax-only: no control flow, data flow, or semantic resolution; 13,169 unresolved calls; annotation/Spring facts are name-based only). I inspected the security-relevant core: Config (credentials, kubeconfig, exec credential, proxy/no-proxy), HttpClientUtils/SSLUtils/CertUtils (TLS, trust managers, hostname verification, PEM parsing), Serialization and KubernetesDeserializer/KubernetesResourceUtil (all JSON/YAML entry points), OperationSupport/BaseOperation and BaseOperationRequestBuilder (URL/query construction, response handling), PodOperationsImpl (exec, copy/read/upload, tar extraction, command construction), PodUpload/PodUploadWebSocketListener, PortForwarderWebsocket, ExecWebSocketListener, watch managers, OpenIDConnectionUtils, KubeConfigUtils, OpenShiftOAuthInterceptor/OpenshiftAdapterSupport, RawCustomResourceOperationsImpl, and the extension/mock modules' client wiring. I also searched repo-wide for Runtime/ProcessBuilder, ObjectInputStream/readObject, XML parsers, TrustManager/HostnameVerifier, TempFile, archive extraction, Class.forName and path-building sinks. Not exhaustively line-by-line reviewed: the large generated model modules (POJOs/schemas), most example modules, docs/CHANGELOG content, and parts of the 22-40KB dsl internals (RawCustomResourceOperationsImpl, NamespaceVisit...ListImpl, rolling updaters) beyond targeted pattern searches.",
+  "limitations": [
+    "No build, tests, or scanners were run; findings are static leads, not confirmed vulnerabilities.",
+    "No runtime/exploit verification: the SnakeYAML gadget path (class availability, tag handling under the pinned 1.26 version) is not demonstrated.",
+    "No VCS metadata or upstream fix commits are available, so I could not confirm which later commit/release addresses this code; the localization is based on the snapshot text alone.",
+    "The P1 relation index is partial (3 source files unindexed) and provides no data/control-flow, reachability, or semantic-resolution guarantees; index hints were only used for navigation and were verified against source text where cited.",
+    "Tests were stripped from the snapshot, so regression tests that might reveal intended security behavior for the copy/upload paths could not be consulted.",
+    "Some generated model and example modules were only pattern-searched, not fully reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Tar extraction path traversal in PodOperationsImpl.copyDir (CVE-2021-20218, CWE-22)",
+      "reason": "The known mitigation is present in this snapshot: entry names go through io.fabric8.kubernetes.client.lib.FilenameUtils.normalize and null (invalid, e.g. leading '../', NUL) results throw before `new File(destination, normalizedEntryName)`. Residual gaps remain (absolute/drive-qualified/UNC entry names are not rejected and there is no canonical-containment check, which can escape the destination on Windows JVMs, and destination symlinks are not resolved), but on Unix the concatenation semantics of `File(File,String)` and the normalize rejection of unresolved '..' neutralize the classic escape, so this is at most an incomplete-hardening lead, not the primary candidate."
+    },
+    {
+      "lead": "Shell command injection in PodOperationsImpl.readFile/readTar (`cat \" + source`, `tar -cf - \" + source`) and PodUpload (`mkdir -p %s && base64 -d - > %s`, `base64 -d - | tar -C %1$s -xzf -`) with an unquoted path parameter",
+      "reason": "The path argument is supplied by the client API caller (`.file(...)`/`.dir(...)`) and the command executes inside the target pod, not on the client host. Impact is real for applications that let end users choose the remote path, but the library's own trust model treats that argument as trusted and no evidence of a project fix exists in the snapshot; kept as unconfirmed."
+    },
+    {
+      "lead": "OpenShiftOAuthInterceptor.authorize() sends HTTP Basic credentials to the `authorization_endpoint` taken from the server's `/.well-known/oauth-authorization-server` response",
+      "reason": "Requires a malicious/compromised API server or an active MITM against a client configured to authenticate that way; this is also how the OpenShift challenging-client flow is designed to work, and no source-level validation/fix evidence exists to call it a defect in this snapshot."
+    },
+    {
+      "lead": "TokenRefreshInterceptor/OpenIDConnectionUtils token persistence writes the access token into the refresh-token field and KubeConfigUtils persists files without restrictive permissions",
+      "reason": "Primarily correctness/robustness issues; no confidentiality boundary is clearly crossed without additional attacker capability, and no fix evidence is available in-snapshot."
+    },
+    {
+      "lead": "PortForwarderWebsocket.forward(url, port, localPort) binds the local listener to all interfaces when localHost is null (`new InetSocketAddress(localPort)`)",
+      "reason": "Real hardening concern (could expose the forwarded pod port to the network), but it is an intentional API default with no source-level evidence of a vulnerability fix, and the API exposes a localHost overload for explicit binding. Rejected as a lead."
+    }
+  ],
+  "summary": "Reviewed the fabric8 kubernetes-client 5.0.2 snapshot (933 files, 727 Java, main sources only; tests are absent). The strongest source-evidenced issue is unsafe YAML deserialization in the client's serialization helper: `Serialization.unmarshalYaml` uses SnakeYAML's default `new Yaml()` (snakeyaml 1.26 is pinned in the root pom), which does not restrict type instantiation, while the same class is the single YAML entry point for public API paths (`Serialization.unmarshal`, resource/config loading, watch messages) and for API-server response bodies that do not begin with `{`. Input of the form `!!javax.script.ScriptEngineManager [!!java.net.URLClassLoader [...]]` is instantiated by SnakeYAML before the result is converted to JSON, giving deserialization-of-untrusted-data → potential RCE when an application parses attacker-influenced YAML. I also verified that the known CVE-2021-20218 tar path-traversal fix is already present in `PodOperationsImpl.copyDir` (FilenameUtils.normalize check), so that root cause is not a live finding here; the remaining copy/upload shell-command construction and OAuth/port-forward concerns were rejected as unconfirmed or caller-controlled leads."
+}

@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "`pathInContext` is built from `req.getServletPath()` + `req.getPathInfo()` (line 193), i.e. from the attacker-supplied request URL. The attacker influences both the `execCmd` file chosen by the walk-back loop (lines 199-209) and whether the guard at line 211 trips (e.g. by dereferencing a symlink/alias under the CGI directory or a symlinked docroot, or by targeting an empty path / directory).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that exec() itself does not re-validate the command (it only builds env and calls Runtime.exec); checked Jetty canonicalizes the decoded request path in HttpChannel.startRequest (URIUtil.canonicalPath, 400 on failure), so a literal `..` usually cannot reach getPathInfo(), which significantly limits classic traversal abuse; checked the CGI servlet is not enabled by default and its docroot is fixed at init; verified all other `sendError` sites in the tree either return/setHandled or are safe (e.g. DefaultServlet 502-507 is an else-if chain, Invoker 238 is method end); confirmed the branch also does not set baseRequest handled. Because the snapshot has no history/upstream reference, I could not verify whether the missing `return` is the seeded defect or long-standing Jetty code — the flaw is real on its face either way.",
+      "id": "case-187-cand-1",
+      "impact": "Bypass of the intended CGI docroot/alias restriction: a program that Jetty decided not to run (because the resolved path is empty, a directory, or not lexically equal to its canonical form, i.e. reachable via aliases) is still spawned. In deployments where an attacker can influence aliases/symlinks (shared hosting, uploaded content, symlinked CGI docroot) this can mean execution of a program outside the configured CGI directory; more generally it is a security-control bypass with the response status (404) being unreliable. Not runtime-confirmed.",
+      "locations": [
+        {
+          "end_line": 218,
+          "path": "jetty-servlets/src/main/java/org/eclipse/jetty/servlets/CGI.java",
+          "start_line": 193
+        },
+        {
+          "end_line": 352,
+          "path": "jetty-servlets/src/main/java/org/eclipse/jetty/servlets/CGI.java",
+          "start_line": 339
+        }
+      ],
+      "prerequisites": "The CGI servlet must be deployed (it is a sample servlet, not enabled by default) with the default `useFullPath=false`, and the deployment must contain an executable reachable through the path that the guard rejects (typically a symlink/alias inside the CGI docroot, an aliased docroot, or a directory/empty path). The program must be executable by the server OS user.",
+      "root_cause": "In CGI.service(), when useFullPath is false, the requested path is resolved to a program under _docRoot and then validated with `if (path.length()==0 || !execCmd.exists() || execCmd.isDirectory() || !execCmd.getCanonicalPath().equals(execCmd.getAbsolutePath()))`. The failure branch only calls `res.sendError(404)` and falls through (no `return`), so `pathInfo = info` and `exec(execCmd, pathInfo, req, res)` execute unconditionally; exec() contains no re-validation and calls `Runtime.getRuntime().exec(execCmd, env.getEnvArray(), _docRoot)` (line 352). The denial decision is therefore ignored and a command that the check explicitly classified as invalid (empty path, directory, or non-canonical/aliased path) is executed anyway.",
+      "title": "CGI servlet runs the resolved program even after the docroot/canonical-path validation decides to reject it (missing return after 404)",
+      "trace": "HTTP request -> CGI.service(): pathInContext from servletPath+pathInfo (193) -> new File(_docRoot, pathInContext) (194) -> walk-back loop picks execCmd (199-209) -> guard classifies the command as invalid and calls res.sendError(404) (211-214, no return) -> pathInfo = info (216) -> exec(execCmd, pathInfo, req, res) (218) -> Runtime.getRuntime().exec(execCmd, env.getEnvArray(), _docRoot) (352).",
+      "unverified": "No execution/exploit attempts were made; exploitability depends on deployment (CGI enabled) and on the presence of a symlink/alias that trips the canonical-path check, which I could not demonstrate from source alone. I also could not diff against upstream Jetty to confirm whether the `return` was removed by the benchmark or was always absent.",
+      "weakness_type": "CWE-696 (Incorrect Behavior Order) / CWE-20 (Improper Input Validation) leading to execution of a program outside the intended CGI docroot (CWE-78-adjacent)"
+    }
+  ],
+  "coverage_summary": "Enumerated the whole assigned tree via get_source_scope (1,580 readable files, no symlinks, no >5MiB files, no sensitive-name exclusions; test sources are absent from the snapshot). Deep-read: jetty-servlets CGI/PutFilter/CrossOriginFilter/ConcatServlet/MultiPartFilter area, jetty-servlet DefaultServlet/ServletHandler mapping paths, jetty-security SecurityHandler/ConstraintSecurityHandler/Basic/Digest/Form authenticators, jetty-server HttpChannel/HttpConnection/HttpInput/Request/Response headers/redirect/error handling/ContextHandler protected-targets/ShutdownHandler/handlers, jetty-http HttpParser PathMap HttpURI, jetty-util Resource/URIUtil/StringUtil/MultiPartInputStreamParser, jetty-webapp WebInfConfiguration, jetty-xml XmlParser, examples. Not exhaustively read: large modules jetty-client, jetty-websocket, jetty-osgi, jetty-spdy, jetty-fcgi, jetty-rhttp, jetty-jaspi, jetty-annotations, jetty-maven-plugin, and the bulk of Request/ContextHandler/JDBC session code; those remain uninspected areas.",
+  "limitations": [
+    "No build, test, scanner, or exploit execution was performed; findings are source-level only and not runtime-confirmed.",
+    "The snapshot has no VCS history and tests were pruned, so I could not diff against the upstream 9.2.27/9.2.28 code to distinguish an injected defect from long-standing Jetty behavior.",
+    "All external CVE/version research was intentionally out of scope, so I could not map the snapshot to a specific advisory.",
+    "Coverage is broad but not exhaustive; several large modules and areas were only spot-checked (listed in coverage_summary)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DefaultServlet.doGet lines 502-507 sendError(404) without an explicit return",
+      "reason": "Not a flaw: the following branch is `else if`, so after sendError the method falls through to the finally block; no resource is served."
+    },
+    {
+      "lead": "Directory-listing XSS in Resource.getListHTML / DefaultServlet.sendDirectory / ResourceHandler.doDirectory",
+      "reason": "Listing text is escaped via StringUtil.sanitizeXmlString (deTag escapes &,<,>,',\") and hrefs via URIUtil.encodePath/hrefEncodeURI; the 9.2.27 refactor and its escaping are present. Sort parameters are not reflected into HTML."
+    },
+    {
+      "lead": "Resource.getListHTML line 531 `UrlEncoded.decodeUtf8To(rawQuery, 0, query.length(), params)` length mismatch",
+      "reason": "query.length() (chars) is <= rawQuery.length (UTF-8 bytes), so this truncates the byte array for multi-byte queries; it does not read out of bounds and has no clear security impact."
+    },
+    {
+      "lead": "ForwardedRequestCustomizer trusting X-Forwarded-* to set remote address/scheme",
+      "reason": "By design: the customizer is only installed when the deployment explicitly decides to trust a front-end proxy; no missing check in the code itself."
+    },
+    {
+      "lead": "Request smuggling via HttpParser Content-Length/Transfer-Encoding handling",
+      "reason": "Duplicate Content-Length is rejected (`_hasContentLength`), Content-Length+chunked is rejected, and non-final 'chunked' Transfer-Encoding values are rejected; the classic protections are present."
+    },
+    {
+      "lead": "Session ID generation weak randomness",
+      "reason": "AbstractSessionIdManager uses SecureRandom by default and only falls back to java.util.Random (`_weakRandom=true`) if SecureRandom construction fails; no seeded weakness found."
+    },
+    {
+      "lead": "Invoker.java line 238 sendError(404) without return",
+      "reason": "It is the last statement of the method; nothing executes after it."
+    },
+    {
+      "lead": "AllowSymLinkAliasChecker / ContextHandler.checkAlias symlink handling",
+      "reason": "Uses real-path/alias comparison consistent with upstream; no missing comparison found. Unconfirmed lead only."
+    }
+  ],
+  "summary": "Reviewed the Jetty 9.2.28-SNAPSHOT tree (1,580 files; tests pruned by the snapshot, no .git history). I focused on network-facing request handling (HttpParser/HttpConnection/HttpChannel/Request/Response), servlet routing and static resources (ServletHandler, ContextHandler, DefaultServlet, ResourceHandler, Resource/getListHTML), security machinery (SecurityHandler, ConstraintSecurityHandler, Basic/Digest/Form authenticators, session handling), and servlet utilities (CGI, PutFilter, CrossOriginFilter, ConcatServlet, MultiPartInputStreamParser, XmlParser). The single strongest source-evidenced candidate is in the CGI servlet: the fail-closed path validation is not fail-closed because the 404 branch lacks a return, so the resolved executable is still run. This is a lead, not a runtime-confirmed exploit; other suspicious spots were checked and rejected (listed below)."
+}

@@ -1,0 +1,92 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `keyword` request parameter of GET /sys/api/loadDictItemByKeyword (and GET /sys/dict/loadDict/{dictCode}) is fully attacker-controlled; `dictCode` is attacker-controlled up to a 3/4 comma-separated `table,text,code[,condition]` shape. Nothing in the `/sys/api/...` route sanitizes or signs these values. The injected SQL is executed against the primary datasource and its result set is returned to the caller as text/value pairs.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked for a request-wide sanitizer: no XSS/SQL servlet filter is registered for request parameters (only FileTypeFilter/StrAttackFilter for uploads). Checked ShiroConfig: /sys/api/** is not anon, so a token is required (post-auth, not unauthenticated). Checked application-dev/test/prod.yml: signUrls covers /sys/dict/loadDict/*, /sys/dict/loadDictOrderByValue/*, /sys/dict/getDictItems/* and five /sys/api/... endpoints, but not /sys/api/loadDictItemByKeyword. Checked DictQueryBlackListHandler: it is only invoked in SysDictController, not in the API/SysBaseApiImpl path. Checked SqlInjectionUtil.specialFilterContentForDictSql: it receives dictCode, not keyword. X-Sign on /sys/dict/loadDict/* uses jeecg.signatureSecret (default constant committed in application yml, changeable in production), which partially mitigates that alternative route but not the /sys/api route.",
+      "id": "case-121-01",
+      "impact": "Arbitrary SELECT injection in the application's database context: an authenticated user can break out of the LIKE/IN expression and, because the query result set is returned as JSON, extract arbitrary table contents (e.g., `sys_user.username,password,salt` for offline cracking or lateral account takeover), enumerate schemas, and inject ORDER BY expressions. Injection is SELECT-only in this statement, so stacked INSERT/UPDATE/DELETE and RCE are not claimed (MySQL multi-statements are off by default). The same unsanitized filterSql/orderby path is also reachable, behind the shared-secret X-Sign control, from `/sys/dict/loadDict/*` and `/sys/dict/loadDictOrderByValue/*`.",
+      "locations": [
+        {
+          "end_line": 355,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/service/impl/SysDictServiceImpl.java",
+          "start_line": 307
+        },
+        {
+          "end_line": 471,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/service/impl/SysDictServiceImpl.java",
+          "start_line": 435
+        },
+        {
+          "end_line": 202,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/mapper/xml/SysDictMapper.xml",
+          "start_line": 188
+        },
+        {
+          "end_line": 561,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/api/controller/SystemApiController.java",
+          "start_line": 558
+        },
+        {
+          "end_line": 1167,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/service/impl/SysBaseApiImpl.java",
+          "start_line": 1164
+        },
+        {
+          "end_line": 219,
+          "path": "jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysDictController.java",
+          "start_line": 192
+        }
+      ],
+      "prerequisites": "A valid JWT for any authenticated account (the route is behind the Shiro `jwt` filter but is not in the `anon` list). No X-Sign header is required for `/sys/api/loadDictItemByKeyword`: the configured `jeecg.signUrls` lists `/sys/dict/loadDict/*` etc. but not this API route, so the SignAuthInterceptor and the `dictQueryBlackListHandler` used by SysDictController.assistant are both bypassed. A `dictCode` such as `sys_user,realname,id` passes `specialFilterContentForDictSql`.",
+      "root_cause": "SysDictServiceImpl.getFilterSql() builds SQL text by string concatenation from the request parameter `keyword` (like '%<keyword>%' at line 336, IN list at lines 330-334, and ' order by ' + orderField + ' ' + orderType at lines 350-352, both orderField/orderType extracted from keyword at lines 317-327). The only check in this flow (SqlInjectionUtil.specialFilterContentForDictSql, line 437) is applied to `dictCode`, never to `keyword`/orderField/orderType/condition, and it is a keyword blacklist rather than escaping. The built `filterSql` is passed to MyBatis mappers `queryTableDictWithFilter` / `queryAllTableDictItems`, whose XML uses raw `${filterSql}` substitution (SysDictMapper.xml lines 189-193 and 197-201), so the concatenated input becomes executable SQL.",
+      "title": "SQL injection via `keyword` in table-dictionary query (`loadDict` -> `getFilterSql` -> MyBatis `${filterSql}`), reachable through unsigned `/sys/api/loadDictItemByKeyword`",
+      "trace": "1) Attacker (with token) calls GET /sys/api/loadDictItemByKeyword?dictCode=sys_user,realname,id&keyword=<payload>. 2) SystemApiController.loadDictItemByKeyword (lines 558-561) -> SysBaseApiImpl.loadDictItemByKeyword (1164-1167). 3) SysDictServiceImpl.loadDict (435-471) runs only specialFilterContentForDictSql(dictCode) and forwards the unchanged keyword to queryLittleTableDictItems (287-297, when pageSize is supplied) or queryAllTableDictItems (357-361, when pageSize is null). 4) getFilterSql (307-355) concatenates keyword into `keywordSql` and appends attacker-derived orderField/orderType/condition to `filterSql`. 5) baseMapper.queryTableDictWithFilter/queryAllTableDictItems executes the statement with `${filterSql}` (SysDictMapper.xml 192/200). 6) The UNION/boolean result rows are serialized back to the attacker.",
+      "unverified": "No build or runtime execution was performed; payload feasibility (e.g., exact UNION column shape and comment termination inside the generated WHERE clause) was reasoned from source only. Behavior depends on each deployment's signUrls/signatureSecret configuration; the sign-protected variant of the same defect was not verified end-to-end. Multi-statement/stacked-query write impact was not established.",
+      "weakness_type": "CWE-89 Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+    }
+  ],
+  "coverage_summary": "Scope was the assigned snapshot of 840 files (JeecgBoot 3.4.3-era: jeecg-boot-base-core, jeecg-module-system, jeecg-module-demo, jeecg-server-cloud, db/config files). I read the Shiro/JWT authentication stack (ShiroConfig, JwtFilter, ShiroRealm, TokenUtils/JwtUtil), the request-signature stack (SignAuthConfiguration, SignAuthInterceptor, SignUtil, HttpUtils) and the per-profile signUrls, the generic query builder and SQL guards (QueryGenerator, SqlInjectionUtil, AbstractQueryBlackListHandler, DictQueryBlackListHandler), the table-dictionary path end to end (SysDictController, SystemApiController, SysBaseApiImpl, SysDictServiceImpl, SysDictMapper.xml), plus SysUserController/ServiceImpl and its mapper, CommonController upload/download/transitRESTful, CommonUtils/MinioUtil/OssBootUtil upload helpers, SysCheckRule, quartz endpoints/service, third-party login, CAS, monitor/OSS/message controllers, and the cloud gateway filters/dynamic route loader. Automated searches covered command execution, ProcessBuilder, ObjectInputStream, deserialization/fastjson parse sites, getOriginalFilename, `${}` mapper interpolations, and signature/anon URL configuration.",
+  "limitations": [
+    "Static review only: no build, test, scanner, or payload execution was performed; exploitability details (exact UNION syntax, comment/newline handling in the generated SQL) are reasoned from source.",
+    "The snapshot is incomplete relative to a buildable tree (e.g., org.jeecg.common.util.PathMatcherUtil, imported by SignAuthConfiguration, is not present), so the fallback SIGN_URL_LIST used when jeecg.signUrls is unset could not be inspected.",
+    "Sign/SQL behavior depends on deployment configuration (jeecg.signatureSecret, signUrls, database engine, --allowMultiQueries); only dev/test/prod yml profiles and the dm8 profile in the snapshot were checked.",
+    "The 840 files were reviewed by targeted reading and pattern searches, not exhaustively line-by-line; the xxl-job admin code, sentinel dashboard, large SQL dumps, and bundled static JS were not deeply audited.",
+    "No runtime confirmation exists for any candidate; the submitted item is a source-evidence lead, not a confirmed vulnerability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SQL injection in /sys/user/deleteRecycleBin: userIds split on comma, each value joined into a quoted list and interpolated into `DELETE FROM sys_user WHERE del_flag = 1 AND id IN (${userIds})` (SysUserServiceImpl.removeLogicDeleted line 469, SysUserMapper.xml line 149).",
+      "reason": "Also a real-looking CWE-89 sink with no per-value validation, but it is blind/destructive (result rows are not returned) and was not selected as the single candidate; left as a secondary, unverified lead."
+    },
+    {
+      "lead": "SSRF in /sys/common/transitRESTful: attacker-supplied `url` is decoded and fetched via RestUtil.request with the caller's token attached, and the response body is returned (CommonController lines 353-394; RestUtil).",
+      "reason": "Reachable only with a valid JWT and it is an intentional cross-origin relay feature; no host allowlist, but no unauthenticated impact and less direct evidence of a defect than the SQL injection."
+    },
+    {
+      "lead": "Quartz scheduling: /sys/quartzJob/add|edit take an arbitrary jobClassName that is instantiated via Class.forName/JobBuilder.newJob (QuartzJobServiceImpl lines 138-160, 178-181); the @RequiresRoles(\"admin\") annotations are commented out.",
+      "reason": "Any authenticated user can schedule a job, but the cast to org.quartz.Job limits abuse and no reachable RCE gadget/Job implementation in the reviewed source was identified, so impact is not established."
+    },
+    {
+      "lead": "Upload filtering weakness: FileTypeFilter.fileTypeFilter uses `forbidType` {\"jsp\",\"php\"} with `type.contains(suffix)` and case-sensitive suffix comparison (FileTypeFilter lines 97-104), and CommonController.upload accepts a client-supplied `biz` path.",
+      "reason": "Default upload directory is outside the servlet webroot and files are streamed from /sys/common/static/** with Content-Disposition, so code execution was not demonstrated; treated as hardening weakness, not the selected finding."
+    },
+    {
+      "lead": "Path traversal in /sys/common/static/**: extractPathFromPattern result is concatenated to the upload path after a naive replace(\"..\",\"\").",
+      "reason": "The replace plus container path normalization (Tomcat rejects/normalizes encoded traversal and `..` segments) makes a working bypass unverified; not submitted."
+    },
+    {
+      "lead": "LoginController.checkCaptcha computes md5(captcha+checkKey) while /sys/randomImage and /sys/login store/verify md5(captcha+checkKey+signatureSecret) (LoginController lines 605-619 vs 91-96, 509-515).",
+      "reason": "Produces a functional mismatch that fails closed; no bypass of the captcha or of authentication was established."
+    },
+    {
+      "lead": "CORS configured with allowCredentials(true) and allowedOriginPattern(\"*\") (WebMvcConfiguration lines 80-94).",
+      "reason": "Known risky pattern, but authentication is JWT in a header rather than cookie-based, so credentialed cross-origin data theft was not demonstrated."
+    },
+    {
+      "lead": "CasServiceUtil disables TLS certificate validation (createHttpClientWithNoSsl) and concatenates the `service`/`ticket` parameters into the CAS validation URL.",
+      "reason": "CAS server URL is deployment configuration, not attacker-chosen host; impact limited to trust-all TLS and possible query-parameter injection, not selected."
+    }
+  ],
+  "summary": "JeecgBoot 3.4.3-era snapshot (pom 3.4.3, with late-2022 backports). Strongest source-evidenced issue: an authenticated SQL injection in the table-dictionary \"loadDict\" path. User-controlled `keyword` (and the `[orderby:...]` fragment parsed out of it, plus the 4th `dictCode` part `condition`) are concatenated into `filterSql`, which is then interpolated with MyBatis `${filterSql}`. The best route is `/sys/api/loadDictItemByKeyword`, which is not covered by the configured sign-intercepted URLs and does not run the dict black-list handler, so only a valid JWT (not the X-Sign header or the blacklist) is required. The response returns the query rows, giving a direct data-exfiltration channel (e.g., reading `sys_user` password/salt values). One candidate is submitted; other plausible leads are listed as unsubmitted."
+}

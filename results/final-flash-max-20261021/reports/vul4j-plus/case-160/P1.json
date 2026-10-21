@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remote, unauthenticated client controls the raw HTTP/1.x byte stream on a connection accepted by a Netty server (e.g. HttpServerCodec/HttpRequestDecoder pipeline). The attacker fully controls header names, whitespace around colons, header ordering, and the number/values of Content-Length and Transfer-Encoding headers.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the snapshot does not already contain a strict path: no HttpUtil.normalizeAndGetContentLength (search 'normalize' in codec-http returned no matches), no 'Multiple Content-Length' handling, and contentLength() still calls HttpUtil.getContentLength(message, -1L) (HttpObjectDecoder.java:618-623). Verified the parser's whitespace tolerance in source rather than inferring it: name scan breaks on Character.isWhitespace and the colon scan restarts from that position (716-737). Considered that Netty's HTTP/1 decoder is documented as non-strict and that exploitability requires a disagreeing intermediary; also considered that some deployments reject such requests in application code. Considered that headers are stored verbatim so no normalization masks the duplicates, and that the TE-vs-CL precedence is a deliberate RFC choice, but it is made without the mandatory ambiguity rejection. Did not run any code or tests, so no runtime confirmation.",
+      "id": "netty-http1-lenient-header-framing",
+      "impact": "HTTP request smuggling/desynchronization: a remote attacker can make a front-end and Netty back-end disagree on message boundaries, allowing requests to be smuggled past front-end access controls, to poison the connection so a subsequent legitimate user's request is processed with attacker-controlled prefix (request/response queue poisoning), to bypass authentication or rate limiting on the front-end, and to cause application-level DoS on affected connections. Severity depends on deployment topology, but the decoder-level defect is reachable by any remote client that can send an HTTP/1.x request.",
+      "locations": [
+        {
+          "end_line": 747,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 716
+        },
+        {
+          "end_line": 623,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 604
+        },
+        {
+          "end_line": 598,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 572
+        },
+        {
+          "end_line": 189,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 147
+        }
+      ],
+      "prerequisites": "Netty HTTP/1.x server (or client) whose traffic traverses another HTTP parser with different leniency (reverse proxy, load balancer, CDN, or another Netty hop). The application must not add its own duplicate-Content-Length/whitespace validation before routing on the decoded message.",
+      "root_cause": "HttpObjectDecoder parses HTTP/1 headers permissively and never normalizes/rejects ambiguous framing headers. splitHeader() stops the name at whitespace and then searches forward for a colon, so whitespace before the colon (or leading whitespace on the first header line) is silently accepted and the header is treated as valid (HttpObjectDecoder.java:716-747, plus the obs-fold branch at 572-586). readHeaders() chooses body framing without rejecting ambiguity: it stores every Content-Length/Transfer-Encoding header as-is (572-598) and prefers chunked TE over CL (604-615). contentLength() (618-623) delegates to HttpUtil.getContentLength(message, -1L), which returns only the first Content-Length value and does no duplicate/conflicting-value check (HttpUtil.java:147-189). The strict helpers that later Netty versions use here (e.g. HttpUtil.normalizeAndGetContentLength and duplicate/last-wins Content-Length rejection) do not exist in this snapshot (searches for 'normalize' in codec-http and 'Multiple Content-Length' return no matches), and no post-2019 security fixes are present in this file.",
+      "title": "HTTP/1.x request framing desync (request smuggling) from lenient Content-Length / Transfer-Encoding header parsing",
+      "trace": "Client bytes -> HttpObjectDecoder.decode() -> READ_HEADER -> readHeaders() (HttpObjectDecoder.java:564-616) accumulates each header line via splitHeader(); for 'Transfer-Encoding : chunked' splitHeader() breaks the name at the space (724-730) and then finds the colon after the whitespace (732-737), so the header is added as a normal chunked TE and readHeaders() selects State.READ_CHUNK_SIZE (608-609) even though RFC 7230 3.2.4 requires rejecting whitespace before the colon. For two different Content-Length headers, readHeaders() adds both unchanged (582-585); contentLength() -> HttpUtil.getContentLength() returns the first value only (HttpUtil.java:147-150, 174-189), so only that many body bytes are consumed as content (READ_FIXED_LENGTH_CONTENT, 275-302) and remaining attacker bytes are decoded as the next pipelined request. If both Content-Length and Transfer-Encoding: chunked are present, TE silently wins (604-615) without the RFC 7230 3.3.3 rejection. In each case Netty's framing can differ from an intermediary's, producing a desync on the shared connection.",
+      "unverified": "No runtime test was executed and no intermediary was deployed, so the desync is demonstrated at source level only; the exact CVE/fix-commit mapping is inferred from version markers (no 2020+ copyright headers, netty-build 25, tcnative 2.0.25.Final, absence of later APIs) rather than from history. Whether a specific deployment is exploitable depends on the front-end parser's behavior for whitespace-before-colon and duplicate Content-Length headers, and on whether the application validates framing before routing.",
+      "weakness_type": "CWE-444 Inconsistent Interpretation of HTTP Requests ('HTTP Request/Response Smuggling') / CWE-436 Interpretation Conflict"
+    }
+  ],
+  "coverage_summary": "Reviewed the full 1832-file main-source snapshot with emphasis on attacker-facing parsing code: HTTP/1.x codec (HttpObjectDecoder, HttpUtil, HttpRequestDecoder/ResponseDecoder, HttpObjectAggregator, multipart decoder), compression (ZlibDecoder/JdkZlibDecoder, Snappy, Bzip2, LZ4), and source-level version dating (all pom files, copyright headers, referenced GitHub issue numbers, native-image and GraalVM settings). The P1 relation index covered all 1832 files (0 missing) with 29114 symbols/62264 edges, but its edges are syntactic navigation candidates only, unsupported for data flow or reachability. HTTP/2 (HPACK/frame codec), DNS/resolver, SSL, SOCKS/HAProxy, and the native C transports were inspected selectively rather than line-by-line, so coverage there is partial. No tests or build artifacts exist in the snapshot, and no code was executed.",
+  "limitations": [
+    "No runtime, build, or fuzz execution; all conclusions are static source reading, so no candidate is runtime-confirmed.",
+    "Precise snapshot commit/branch date could not be obtained from history; dating rests on indirect markers (no 2020+ copyright headers, netty-build 25, tcnative 2.0.25.Final, absence of SameSite/HttpDecoderConfig/HttpHeaderValidationUtil/maxAllocation).",
+    "Exploitability is deployment-dependent: it requires an intermediary HTTP parser that disagrees with Netty's lenient parsing; a direct client-to-Netty deployment without a disagreeing proxy reduces the impact to malformed-request acceptance.",
+    "Large areas (HTTP/2 HPACK, DNS resolver, SSL handler, SOCKS/HAProxy, native C code, buffer/transport internals) were only sampled, so a different vulnerability there cannot be excluded.",
+    "P1 index relations are syntactic candidates only; no complete control/data-flow, semantic resolution, or exploitability proof exists for any edge used for navigation."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "JdkZlibDecoder unbounded decompression-buffer growth (pre-maxAllocation: heapBuffer(inflater.getRemaining() << 1) plus repeated ensureWritable at JdkZlibDecoder.java:180,211; ZlibDecoder has no maxAllocation field).",
+      "reason": "Plausible decompression-DoS lead, but the growth path is entangled with ByteBuf ensureWritable heuristics and needs a size/derivation argument that could not be fully verified statically; the HTTP framing desync has clearer attacker-control-to-impact evidence in the same snapshot."
+    },
+    {
+      "lead": "HAProxyMessageDecoder header-length/stack behavior in codec-haproxy.",
+      "reason": "The known stack-overflow class in this decoder postdates the snapshot's version markers and no concrete bad recursion/array path was verified in the sampled lines, so it was left unconfirmed rather than reported."
+    },
+    {
+      "lead": "HTTP/2 content-length/header validation issues in codec-http2.",
+      "reason": "Only sampled; the code predates the known HTTP/2 smuggling fixes, but no specific missing check was traced to attacker-controlled input within the review time, so it remains an unverified lead."
+    },
+    {
+      "lead": "SslHandler / SslContext hostname-verification behavior in handler/ssl.",
+      "reason": "Sampled only; several hostname-verification CVEs concern versions much later than this snapshot and no defect was confirmed in the inspected code."
+    },
+    {
+      "lead": "General HTTP/1 obs-fold (line folding) handling at HttpObjectDecoder.java:572-586.",
+      "reason": "Related parsing leniency that can also cause proxy disagreement, but it is part of the same root cause as the submitted candidate rather than a separate finding."
+    }
+  ],
+  "summary": "Snapshot is the Netty 5.0 tree (pom version 5.0.0.Final-SNAPSHOT) at ~late 2019 state: no file has a 2020/2021 copyright header, netty-build is 25 and tcnative 2.0.25.Final, and later APIs (HttpDecoderConfig, HttpHeaderValidationUtil, SameSite, ZlibDecoder.maxAllocation, HttpUtil.normalizeAndGetContentLength) are absent. In that state the HTTP/1.x head-of-line decoder performs lenient header parsing without the strict validation/rejection added by the 4.1.44 request-smuggling fixes: (1) splitHeader accepts whitespace before the colon (and leading whitespace on the first header line) so \"Transfer-Encoding : chunked\" / \" Transfer-Encoding: chunked\" is honored as chunked framing, (2) multiple or comma-ambiguous Content-Length headers are not rejected and the first value silently wins, and (3) Transfer-Encoding: chunked is preferred over Content-Length without rejecting the ambiguous combination required by RFC 7230 3.3.3. For a Netty server deployed behind any intermediary that parses these headers differently, a remote client can create a framing desync (HTTP request smuggling). This is submitted as one root cause: missing strict HTTP/1 header validation in the decoder path, not as separate findings. Other inspected areas (HTTP/2, DNS, SSL, native transports, compression) were only sampled and produced no verified candidate stronger than this one; the JdkZlibDecoder allocation growth (pre-maxAllocation state) was treated as a rejected lead because its attacker-controlled memory-growth chain is less directly evidenced than the framing desync."
+}

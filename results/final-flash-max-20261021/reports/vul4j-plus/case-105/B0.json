@@ -1,0 +1,78 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote WebSocket client controls the messages it sends to the Netflux endpoint (no authorization at this layer). JOIN with no key makes ChannelStore.create() return the freshly generated 48-hex key in JACK (NetfluxEndpoint lines 247-266), and IDENT discloses the generated user name (lines 92-98). This yields repeated samples of the same JVM-wide new Random() seeding sequence (seedUniquifier() ^ System.nanoTime(), deterministic uniquifier sequence), enabling seed recovery and prediction of keys/names generated for other sessions.",
+      "confidence": "medium",
+      "counterevidence_checked": "The channel key is a bearer capability (ChannelStore javadoc 'Access an existing channel by its key'; JOIN/relay logic uses only the key), so it is security-relevant. No in-repo comment justifies java.util.Random, and the crypto modules use SecureRandom, showing the project knows better. Server sets message `from` from its own User object, so user names are not trusted from clients. No authorization check for JOIN exists in this component; the platform layer (not in scope) may add or re-validate keys, which is a limitation. java.util.Random is not trivially invertible remotely, but new Random() seeds are nanoTime XOR a deterministic JVM-wide uniquifier and the attacker can sample outputs from the same sequence.",
+      "id": "netflux-weak-prng-session-keys",
+      "impact": "Unauthorized access to other users' realtime editing sessions: disclosure of in-progress content and injection/modification of relayed operations (integrity). The 16-hex history-keeper key has far lower entropy than the 48-char keys and can expose recorded histories. User-name prediction weakens protocol identity handling (server always sets `from`, so this is aggravating, not direct impersonation).",
+      "locations": [
+        {
+          "end_line": 48,
+          "path": "xwiki-commons-core/xwiki-commons-netflux/src/main/java/org/xwiki/netflux/internal/Utils.java",
+          "start_line": 36
+        },
+        {
+          "end_line": 36,
+          "path": "xwiki-commons-core/xwiki-commons-netflux/src/main/java/org/xwiki/netflux/internal/Channel.java",
+          "start_line": 36
+        },
+        {
+          "end_line": 36,
+          "path": "xwiki-commons-core/xwiki-commons-netflux/src/main/java/org/xwiki/netflux/internal/HistoryKeeper.java",
+          "start_line": 36
+        },
+        {
+          "end_line": 181,
+          "path": "xwiki-commons-core/xwiki-commons-netflux/src/main/java/org/xwiki/netflux/internal/NetfluxEndpoint.java",
+          "start_line": 169
+        },
+        {
+          "end_line": 268,
+          "path": "xwiki-commons-core/xwiki-commons-netflux/src/main/java/org/xwiki/netflux/internal/NetfluxEndpoint.java",
+          "start_line": 238
+        },
+        {
+          "end_line": 339,
+          "path": "xwiki-commons-core/xwiki-commons-netflux/src/main/java/org/xwiki/netflux/internal/NetfluxEndpoint.java",
+          "start_line": 301
+        }
+      ],
+      "prerequisites": "Network reachability to the Netflux WebSocket end-point; ability to create/join a channel to sample PRNG output; seed recovery/timing assumptions for remote prediction (easier for the 16-hex history-keeper key). Platform-side authorization of channel-key issuance is outside this snapshot.",
+      "root_cause": "Utils.getRandomHexString(int) creates a fresh java.util.Random (48-bit LCG, not a CSPRNG) per call and appends Integer.toHexString(random.nextInt()) until the requested length is reached (Utils.java lines 40-48). It mints security-relevant values: Channel.key = getRandomHexString(48) (Channel.java line 36), HistoryKeeper.key = getRandomHexString(16) (HistoryKeeper.java line 36), and each session's user name = getRandomHexString(32) (NetfluxEndpoint.java line 174). The endpoint treats the channel key as the sole bearer capability, unlike the crypto modules which consistently use SecureRandom.",
+      "title": "Netflux realtime channel keys and history-keeper/user identifiers generated with java.util.Random (predictable bearer tokens)",
+      "trace": "onOpen -> getOrRegisterUser -> Utils.getRandomHexString(32) (IDENT). JOIN '' -> ChannelStore.create -> new Channel -> Utils.getRandomHexString(48) (JACK oracle). Predicted key -> onCommandJoin (lines 247-266) grants membership based only on channels.get(channelKey) != null; membership then exposes relayed traffic and message injection (onCommandMessage lines 325-333), and a predicted history-keeper key reaches the GET_HISTORY branch (lines 305-324) to dump recorded channel history.",
+      "unverified": "No execution or runtime confirmation (out of scope). The end-to-end seed-prediction cost was not reconstructed, and the xwiki-platform realtime layer (not in this snapshot) may hand out/re-validate keys, which could change exploitability.",
+      "weakness_type": "CWE-338 Use of Cryptographically Weak PRNG / CWE-330"
+    }
+  ],
+  "coverage_summary": "Snapshot is XWiki Commons 14.10-SNAPSHOT: 1422 readable files, no binary/sensitive-path exclusions, and no src/test sources at all. I inspected the netflux/websocket modules, XML/HTML modules (XMLUtils, LocalEntityResolver, DefaultXMLReaderFactory, HTML cleaner/sanitizer), job store and XStream serialization, extension descriptor parsing/storage, filter XML/XStream parameters, crypto, classloader and configuration for weak validation, deserialization, XXE, path handling and PRNG misuse. Lower-risk modules were searched/sampled rather than fully line-by-line audited.",
+  "limitations": [
+    "No tests are present, so fix-adjacent behaviour cannot be validated against test expectations.",
+    "Decisive trust boundaries (which REST/UI flows pass attacker input into job ids, filter XML, extension descriptors or realtime channels) live in xwiki-platform, outside this snapshot.",
+    "No dynamic analysis/CVE lookup was allowed; the weak-PRNG impact is argued from source semantics only."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XMLUtils.parse sets disallow-doctype-decl to false under an 'Avoid XXE' comment (xwiki-commons-xml/.../XMLUtils.java lines 600-618), while the tool-xar XMLUtils uses true.",
+      "reason": "The same method disables load-external-dtd and external general/parameter entities, blocking external entity resolution; DOCTYPE must stay allowed because UnifiedHTMLDiffManager feeds XML with a <!DOCTYPE html> from HTMLUtils.toString. Residual risk is internal-entity expansion DoS, not confirmed XXE."
+    },
+    {
+      "lead": "DefaultExtensionSerializer parses descriptors with an unhardened DocumentBuilderFactory (lines 210, 284-301), an XXE sink.",
+      "reason": "Descriptor bytes come from classpath jars, the admin-controlled local repository, or configured extension repositories; no unprivileged in-repo attacker path."
+    },
+    {
+      "lead": "SafeXStream disables XStream's security framework and SafeTreeUnmarshaller swallows conversion errors (xwiki-commons-xstream).",
+      "reason": "Unsafe deserialization is intentional (documented TODO), and no attacker-controlled XStream XML source exists within this repository's trust boundary."
+    },
+    {
+      "lead": "DefaultJobStatusStore encodes id segments with URLEncoder only, so '..' is not escaped (lines 208-225, 341-352).",
+      "reason": "Attacker-controlled job ids are a platform concern not visible here; impact is limited to fixed file names (status.xml(.zip)/log*)."
+    },
+    {
+      "lead": "NetfluxEndpoint relays MSG without membership checks and NPEs on LEAVE with empty/unknown keys.",
+      "reason": "Secondary to key prediction: injection still requires a channel key, and the LEAVE NPE only terminates the sender's own session."
+    }
+  ],
+  "summary": "Reviewed XWiki Commons 14.10-SNAPSHOT (main sources only; no tests). The single strongest source-evidenced candidate is the use of java.util.Random to mint Netflux realtime channel keys, the history-keeper key and per-session user identifiers, where the channel key is the endpoint's only bearer capability. Other suspicious spots have material counterevidence and are listed as rejected leads. No code was executed and nothing was runtime-confirmed."
+}

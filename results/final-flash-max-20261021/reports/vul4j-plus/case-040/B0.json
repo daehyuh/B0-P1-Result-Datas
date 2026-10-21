@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any authenticated user with an OAuth2 access token for their own account controls: the target path segment (`/Users/{ownId}`), the `If-Match` header (`*` is accepted by `getVersion`), and the full JSON body, including `origin`, `externalId`, `verified`, `active`, `userName` and `email`. No privileged scope is required because the `@self.isUserSelf(request,1)` expression is an alternative to `scim.write`.",
+      "confidence": "medium",
+      "counterevidence_checked": "Considered that UAA intentionally permits self-service profile updates: the existing guard class shows which fields the codebase itself treats as non-self-modifiable (email, username, verified, active, origin), and the snapshot wires that guard nowhere (searched whole tree for 'ScimUserSelfUpdateAllowed' and 'selfUpdateAllowed': only the class file matches). Considered that deactivation might invalidate tokens: UaaTokenServices.loadAuthentication (lines 776-840) rebuilds the authentication from the token and user id with no active/verified/locked check, and no salt/token revocation is performed on deactivation in ScimUserEndpoints.deleteUser. Considered that `ScimUtils.validate` might constrain values: it only enforces a username pattern when origin is `uaa` and exactly one email - it does not prevent origin/active/verified changes. Considered server-side scoping: `IdentityZoneHolder` scopes the record to the current zone, but the attacker's own record is in that zone, so it does not mitigate.",
+      "id": "scim-self-update-sensitive-fields",
+      "impact": "Authorization-control bypass and account-integrity compromise: a user can undo administrative deactivation, self-verify an unverified account, and convert an externally managed (LDAP/SAML/OIDC) account into a locally managed `uaa`-origin account with a self-set password - bypassing SSO/IdP controls and preserving stale local group/scope memberships (LDAP group synchronization only happens on LDAP logins). Changing `userName`/`email` also enables identity/profile manipulation on the record.",
+      "locations": [
+        {
+          "end_line": 232,
+          "path": "uaa/src/main/webapp/WEB-INF/spring/scim-endpoints.xml",
+          "start_line": 229
+        },
+        {
+          "end_line": 311,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/scim/endpoints/ScimUserEndpoints.java",
+          "start_line": 263
+        },
+        {
+          "end_line": 276,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/scim/jdbc/JdbcScimUserProvisioning.java",
+          "start_line": 238
+        },
+        {
+          "end_line": 58,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/security/ScimUserSelfUpdateAllowed.java",
+          "start_line": 23
+        },
+        {
+          "end_line": 775,
+          "path": "model/src/main/java/org/cloudfoundry/identity/uaa/scim/ScimUser.java",
+          "start_line": 770
+        },
+        {
+          "end_line": 88,
+          "path": "model/src/main/java/org/cloudfoundry/identity/uaa/scim/impl/ScimUserJsonDeserializer.java",
+          "start_line": 83
+        }
+      ],
+      "prerequisites": "A valid bearer token for the user's own UAA record (ordinary user token). For self-reactivation: the account must have been deactivated by an administrator but the previously issued access token must still be within its validity window (UaaTokenServices.loadAuthentication does not check the user's active/verified/locked state). For the SSO-bypass variant: the attacker must control the email address stored on their external-IDP-provisioned record so the reset mail reaches them.",
+      "root_cause": "The `/Users/**` filter chain authorizes PUT/PATCH for the caller's own user with `@self.isUserSelf(request,1)` only; no field-level restriction is applied. `ScimUserEndpoints.updateUser`/`patchUser` pass the caller-supplied object to `JdbcScimUserProvisioning.update`, whose SQL writes `origin`, `verified`, `externalId`, `userName`, `email`, `active` (and salt). The codebase contains an unused guard, `ScimUserSelfUpdateAllowed.isAllowed(request)`, which compares the database record against the request body and returns false when email, username, verified, active or origin differ - exactly the missing check. Additionally `ScimUser.patch()` copies `active`/`verified` unconditionally from a patch object whose primitive defaults are both `true`, so even a PATCH body that omits those fields forces them to true. `ScimUserEndpoints.updateUser` also calls `checkIsEditAllowed(user.getOrigin(), request)` with the attacker-supplied body origin rather than the stored origin, so the disable-internal-user-management guard is evaluated against attacker-chosen data.",
+      "title": "Self-service SCIM update of a user's own record allows changing security-sensitive attributes (origin, active, verified, externalId, username, email)",
+      "trace": "1) User obtains a normal access token (e.g. via LDAP/SSO login or password grant). 2) `PUT /Users/{self}` with `If-Match: *` and a JSON body containing e.g. `\"origin\":\"uaa\"`, `\"active\":true`, `\"verified\":true` (or `PATCH` with any body, since `ScimUser.patch` sets active/verified from defaults). 3) scim-endpoints.xml line 231/232 allows the request because `@self.isUserSelf(request,1)` is true. 4) `ScimUserEndpoints.updateUser` (263-284) / `patchUser` (286-311) forwards the object without field filtering; only `ScimUserSelfUpdateAllowed` (unused) would have rejected the origin/active/verified change. 5) `JdbcScimUserProvisioning.update` (238-276) writes the attacker-chosen `origin`/`active`/`verified` values. 6) With `origin=uaa`, the public `/forgot_password` flow (`UaaResetPasswordService.forgotPassword`, line 153, queries `userName ... and origin eq \"uaa\"`) issues a reset code to the attacker-controlled email, letting the attacker set a local password and log in through the internal user store, bypassing the external IdP. In the reactivation case the account is active again despite administrative deactivation.",
+      "unverified": "No code execution or runtime verification was possible: the snapshot contains no tests, and the mail/reset chain (forgot-password -> emailed code -> local password) was traced by source reading only, not executed. Exact behavior of a deactivated account's previously issued token is inferred from the absence of an active-state check in UaaTokenServices.loadAuthentication, not observed at runtime. Whether upstream UAA considers some of these field changes (e.g. verified) acceptable for self-update is a design question the snapshot cannot fully settle; the unused guard class is the strongest signal that these fields were meant to be immutable for self-updates.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-284 Improper Access Control (missing field-level authorization on a self-service object update)"
+    }
+  ],
+  "coverage_summary": "Coverage is limited to the 1,186 text source files exposed by the snapshot filters (binary-like files skipped; no symlinks or sensitive-name exclusions reported by get_source_scope). Test sources are entirely absent (@@src/test@@ contains 0 files), so verification relied on production code, Spring XML security configuration, and Thymeleaf templates. I read the SCIM user/group endpoints and provisioning, client-admin and identity-zone endpoints, OAuth authorization/token/refresh/revocation classes, JWT signature/validation utilities, LDAP/Keystone/SAML/OIDC authentication managers and configuration classes, password-reset/change-email/invitation flows, the security filters (CORS, CSRF, session, zone-switching), redirect handlers, guard/utility classes, and the relevant Spring XML filter chains (scim-endpoints, oauth-endpoints, login-server-security, multitenant-endpoints, identity-zones, saml-providers). I did not read every one of the 1,186 files line-by-line; dependency-level CVEs (Spring Security OAuth 2.3.0, Spring 4.3.20, etc.) were out of scope because external lookups are not permitted.",
+  "limitations": [
+    "No runtime execution, test execution, or exploit payloads were used (per instructions); all conclusions are source-level and unconfirmed.",
+    "The repository snapshot omits all test sources, so the guard classes'/expected behaviors could not be cross-checked against tests that may exist upstream.",
+    "The snapshot exposes only the assigned tree; upstream history/fix commits and sibling versions were not available, so I could not diff against the fixed version to identify the exact intended patch.",
+    "Several findings require deployment assumptions (which identity providers are configured, whether logout whitelists are restrictive, whether the JDK/browser URL parser normalization applies) that cannot be validated inside this run.",
+    "SAML/OIDC signature-verification and LDAP-binding code was reviewed only at a high level; deeper cryptographic verification paths were not exhaustively audited."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Logout redirect control is inert: `Links.Logout.isDisableRedirectParameter()` returns a constant false and `setDisableRedirectParameter(boolean)` ignores its argument (model/src/main/java/org/cloudfoundry/identity/uaa/zone/Links.java lines 64-70), while `ZoneAwareWhitelistLogoutHandler` (lines 51-55) feeds this value into `setAlwaysUseDefaultTargetUrl`. `WhitelistLogoutHandler.isAlwaysUseDefaultTargetUrl()` (lines 33-36) also returns false, so the `logout.redirect.parameter.disable` option cannot take effect.",
+      "reason": "Blatant control defect, but I could not establish a concrete, unauthenticated open redirect from it: `WhitelistLogoutHandler.determineTargetUrl` still passes the target through `findMatchingRedirectUri(whitelist+clientURIs, target, defaultTargetUrl)` with the non-null default `/login`, so non-whitelisted external URLs fall back to /login. Classified as a security-control/hardening defect rather than the primary memory-corruption-free vulnerability; kept as a secondary lead because it is clearly defective code."
+    },
+    {
+      "lead": "Open-redirect/parser-differential in `UaaUrlUtils.uriHasMatchingHost` (server/src/main/java/org/cloudfoundry/identity/uaa/util/UaaUrlUtils.java lines 231-242) used by `UaaSavedRequestCache` (line 95) and `UaaSavedRequestAwareAuthenticationSuccessHandler` (line 42) for `form_redirect_uri`: `new URL(uri).getHost()` can differ from what the browser navigates to for authorities containing a backslash before '@' (e.g. `https://evil.com\\@uaa-host`).",
+      "reason": "Plausible but depends on JDK URL parsing versus browser WHATWG normalization, which cannot be verified with the read-only, no-execution tools available; impact is an open redirect of a post-login redirect parameter rather than token/credential compromise."
+    },
+    {
+      "lead": "`UaaUrlUtils.findMatchingRedirectUri` documents and implements an open redirect when the whitelist is empty and the fallback is null (lines 92-114), used by `EmailChangeEmailService.completeVerification` (line 127) where the client's `change_email_redirect_url` may be null, and by `SamlRedirectLogoutHandler`/`WhitelistLogoutHandler`.",
+      "reason": "Reaching the unfiltered redirect requires a valid emailed expiring code (sent to the new email address), so the redirect is attacker-influenced mainly for the attacker's own flow; the login-page path re-checks the host via `uriHasMatchingHost`. Impact too limited and conditions too strong to be the primary candidate."
+    },
+    {
+      "lead": "SCIM `patch()` overwrites `active`/`verified` with model defaults `true` unconditionally (model/src/main/java/org/cloudfoundry/identity/uaa/scim/ScimUser.java lines 327-329 and 770-775), enabling self-reactivation of a deactivated user via PATCH.",
+      "reason": "Kept as part of the main candidate's trace rather than a separate candidate because it is another manifestation of the same self-service update path; on its own it is one root-cause facet, not a distinct issue."
+    },
+    {
+      "lead": "`UaaRequestMatcher.matches` uses a prefix (`startsWith`) match on the request URI (server/src/main/java/org/cloudfoundry/identity/uaa/security/web/UaaRequestMatcher.java line 108), and `AccessController.getLocation`/`InvitationsController` build absolute URLs from the `Host` header (AccessController lines 285-287; InvitationsController lines 168-172).",
+      "reason": "Prefix matching is hardening-relevant only if a distinct controller is mapped under a path with the same prefix; Host-header injection requires the ability to make the victim's browser send a forged Host (proxy/misconfiguration), which is not demonstrated by source evidence alone."
+    }
+  ],
+  "summary": "Reviewed the UAA 4.28.0-SNAPSHOT source tree (1,186 model/server/module files; tests are absent from the snapshot). The strongest evidenced issue is in the SCIM user API: self-service updates (`PUT`/`PATCH /Users/{self}`) are authorized solely by `@self.isUserSelf(request,1)` in the security configuration, while neither the controller nor the JDBC provisioning layer restricts which fields may change. The record body (deserialized by `ScimUserJsonDeserializer`) can carry `origin`, `externalId`, `verified`, `active`, `userName` and `email`; `JdbcScimUserProvisioning.update` persists all of them. A purpose-built guard class (`ScimUserSelfUpdateAllowed`) that exists precisely to reject self-updates changing email, username, verified, active or origin is present but is not referenced by any configuration or production code, confirming both intent and the missing enforcement. Concrete impact: a deactivated or externally-managed (LDAP/SAML/OIDC) user holding a still-valid token can reactivate their own account, self-verify, or convert their record to `origin=uaa` and then obtain a local password through the self-service reset flow, bypassing the external identity provider/SSO controls. Several other leads (logout redirect flag, redirect-host checks) were examined and rejected as weaker/unconfirmed and are noted below."
+}

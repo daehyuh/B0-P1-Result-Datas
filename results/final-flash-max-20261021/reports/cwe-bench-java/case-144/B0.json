@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `source` (and `name`/`type`) values of attachment objects are deserialized from `*-result.json` files in the results directory (io.qameta.allure.model.Attachment, Allure2Plugin.java:266) or from Allure1 testsuite XML/JSON (Allure1Plugin.java:332). An attacker who can deliver or poison a results artifact - e.g. a CI artifact produced by an untrusted/fork PR, a shared results store, or an untrusted test environment - fully controls this string, including absolute paths such as `/etc/passwd` or traversal sequences such as `../../secret` (absolute paths override `source` entirely in `resolve`).",
+      "confidence": "medium",
+      "counterevidence_checked": "FileSystemReportStorage.checkPath does enforce normalization/absolute-path rejection, but it applies only to the output resource name, which is always the internally generated UID (`uid + extension`, DefaultResultsVisitor.java:74-80); the input file is never checked, so this guard does not mitigate the issue. Results directories are normally produced by the user's own test run, so exploitation requires results that are attacker-influenced (standard CI-artifact-from-untrusted-source scenario); this is a real prerequisite, not a fix. I found no `normalize`/`startsWith`/`toRealPath` containment check anywhere in the attachment read path, and the Allure1 and Allure2 readers as well as the xctest plist reader all use the same unchecked `resolve`. No code execution was performed; the finding is source-analysis only.",
+      "id": "allure2-attachment-source-arbitrary-file-read",
+      "impact": "Arbitrary file disclosure / information exfiltration: any file readable by the report-generation process (CI tokens, credentials, ~/.ssh, environment/config files, arbitrary sources) can be silently copied into the generated report, which is then typically uploaded as a build artifact or served, giving the party that supplied the malicious results read access to those files. Secondary effect: if the input path escapes to an unreadable/exotic target the generation fails with UncheckedIOException (availability).",
+      "locations": [
+        {
+          "end_line": 284,
+          "path": "allure-generator/src/main/java/io/qameta/allure/allure2/Allure2Plugin.java",
+          "start_line": 264
+        },
+        {
+          "end_line": 349,
+          "path": "allure-generator/src/main/java/io/qameta/allure/allure1/Allure1Plugin.java",
+          "start_line": 329
+        },
+        {
+          "end_line": 89,
+          "path": "allure-generator/src/main/java/io/qameta/allure/DefaultResultsVisitor.java",
+          "start_line": 70
+        },
+        {
+          "end_line": 41,
+          "path": "allure-generator/src/main/java/io/qameta/allure/core/AttachmentsPlugin.java",
+          "start_line": 32
+        }
+      ],
+      "prerequisites": "Victim runs `allure generate` / `allure serve` (or embeds ReportGenerator) on a results directory containing at least one attacker-controlled `*-result.json`/testsuite file. The targeted file must exist and be readable by the JVM running Allure and be a regular file (`Files.isRegularFile`, Allure2Plugin.java:268). To benefit, the resulting report must be accessible to the attacker (published CI artifact, report server) - the default CI behavior.",
+      "root_cause": "The result readers resolve the attacker-controlled `source` field of an attachment directly against the results directory without normalization or containment validation: Allure2Plugin.java:267 `final Path attachmentFile = source.resolve(attachment.getSource());` (identical pattern in Allure1Plugin.java:332 and, for plist data, XcTestPlugin.java:190-197). Because `Path.resolve` accepts absolute paths and `..` segments, the resolved path may point anywhere on the file system. No later stage re-validates the input path: DefaultResultsVisitor.visitAttachmentFile reads/probes that file and keeps it as the map key, and AttachmentsPlugin copies its bytes into the report under the internally generated UID name, so FileSystemReportStorage.checkPath (which only constrains output resource names, not input files) does not prevent the disclosure.",
+      "title": "Arbitrary file read via unvalidated attachment `source` path during Allure report generation",
+      "trace": "results dir -> Allure2Plugin.readResults (lines 129-135) -> convert(source, visitor, attachment) -> line 267 `source.resolve(attachment.getSource())` (no normalize/contains check) -> `Files.isRegularFile` -> ResultsVisitor.visitAttachmentFile -> DefaultResultsVisitor.visitAttachmentFile lines 71-88 (opens file for Tika probe, records size, stores it as the map key in `attachments`) -> DefaultLaunchResults.getAttachments -> AttachmentsPlugin.aggregate lines 35-40 (`addDataFile(Constants.dataPath(\"attachments\", entry.getValue().getSource()), entry.getKey())`) -> FileSystemReportStorage.addDataFile lines 66-74 (`Files.copy(file, target)`) writes the attacker-chosen file's content to `<report>/data/attachments/<uid>.<ext>`; in single-file mode InMemoryReportStorage base64-embeds the bytes into index.html. Allure1Plugin.convert is equivalent.",
+      "unverified": "No runtime PoV was executed. The external model classes (io.qameta.allure:allure-model / allure1-model jars) are not part of the snapshot, so exact JSON binding leniency for `source` was inferred from usage. Exfiltration depends on the generated report being published/accessible to the attacker; the path must resolve to a readable regular file. Whether this exact location is the case's intended ground truth is uncertain - see alternative leads below.",
+      "weakness_type": "Path traversal / external control of file path (CWE-22, CWE-73, CWE-200)"
+    }
+  ],
+  "coverage_summary": "All Java sources in allure-commandline (Commands, CommandLine, options, validators, ConfigLoader), allure-generator (Allure1/Allure2 readers, core storage/web generator, all bundled data plugins, plugin loader, GA/Jira-related code), allure-plugin-api (entity/model helpers, storage/metric/csv/tree utilities, contexts, XmlElement), allure-jira-commons, and all plugins/* Java sources were read or searched; the JavaScript front-end (app/router/data/attachment/behavior/tooltip/escape/linky helpers) was inspected for injection and escaping logic; build files, quality configs and .github workflows were reviewed for trust assumptions. Binary/excluded counts from get_source_scope: 0 over-size, 0 sensitive-name, 0 symlinks; parity note says B0/P1 share the same filters. Not exhaustively line-read: some entity/tree/csv/datetime utility classes and many translation/test-data JSON files (searched/spot-read only).",
+  "limitations": [
+    "No test sources are present in the snapshot, so intended behavior/regression coverage could not be compared against the code.",
+    "No .hbs/.ftl/.scss/resources are present, so server-side report templates and the FreeMarker index.html.ftl (relevant to report-side rendering/XSS) could not be inspected.",
+    "External dependencies (io.qameta.allure:allure-model/allure1-model, Tika, Jackson) are not in the snapshot; their validation behavior was inferred from usage.",
+    "No git history/blame is available, so I could not distinguish long-standing upstream code from a snapshot-specific change; the selected candidate is long-standing-looking code, so its status as the case's intended ground truth is uncertain.",
+    "No code was executed, built, or fuzzed; findings are source-evidence only, and no scanner output was used."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Un-normalized path traversal in the built-in static server used by `allure serve`/`allure open`: Commands.java:325-339 builds `reportDirectory.resolve(\".\" + exchange.getRequestURI().getPath())` with no normalization or containment check, so `..` (or percent-encoded variants when sent by a raw HTTP client) escapes the report directory and `serveFile` (lines 341-356) returns arbitrary local files. Real CWE-22 pattern, but not selected because it is a separate root cause, the server binds to localhost by default (remote reachability requires `--host`), and browser clients normalize dot segments.",
+      "reason": "Plausible but separate root cause; kept as an unselected lead rather than a second candidate to respect the one-candidate cap."
+    },
+    {
+      "lead": "Missing XXE hardening in DOM-based result readers: `DocumentBuilderFactory.newInstance()` is used without disabling DTDs/external entities in plugins/junit-xml-plugin (line 135), plugins/trx-plugin (line 108) and plugins/xunit-xml-plugin (line 96); attacker-controlled XML results could read local files (entity values flow into parsed test data that is written into the report) or trigger SSRF from the generator process.",
+      "reason": "Real CWE-611 lead, but it is a different weakness class/root cause and requires the XML-based plugins; the selected candidate has a more direct attacker-field-to-report-content trace."
+    },
+    {
+      "lead": "`linky.js` builds a Handlebars SafeString with raw interpolation (`<a href=\"${text}\"...>${text}</a>`) and only a `^\\w+://` prefix check, unlike the entity-encoding `text-with-links.js`; if it is applied to test-controlled text (status message/description), it would be a stored-XSS sink.",
+      "reason": "Unconfirmed: template (.hbs) files that would show the actual usage/data binding are not part of this snapshot, so reachability with attacker-controlled text could not be verified."
+    },
+    {
+      "lead": "Other unvalidated path constructions with attacker-influenced names: JunitXmlPlugin.getLogFile (className + \".txt\" resolved against the results dir, lines 222-231) and XcTestPlugin.addAttachments (plist `Filename` resolved under Attachments, lines 186-198).",
+      "reason": "Same underlying pattern as the selected candidate (unvalidated path resolution on result-derived data); not counted separately and weaker (extension/suffix constraints, plugin-specific formats)."
+    }
+  ],
+  "summary": "Reviewed the assigned allure2 snapshot (557 visible files; modules allure-commandline, allure-generator, allure-plugin-api, allure-jira-commons, plugins/*, JS front-end, build/CI files). The snapshot contains no test sources and no .hbs/.ftl/.scss resources, so server-side templating and UI-template sinks could not be verified; Java/JS sources were the focus. One candidate is submitted: unvalidated attachment `source` path resolution in the Allure result readers, which turns crafted result files into an arbitrary file read whose content is copied into the generated report. Two other plausible but separate root causes (static-server traversal in `allure serve`/`allure open`, and missing XXE hardening in XML result parsers) are recorded as unselected leads rather than additional candidates."
+}

@@ -1,0 +1,57 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the signature bytes passed to Signature.verify()/verifySignature(). They can supply an RSA value whose PKCS#1 v1.5 unpadding succeeds and whose recovered DigestInfo encoding omits the optional NULL parameter and differs in the final two digest bytes from the digest the verifier computed.",
+      "confidence": "medium",
+      "counterevidence_checked": "The normal (NULL-included) path does a full constant-time comparison and is correct; PKCS1Encoding.findStart/checkPkcs1Encoding enforce PKCS#1 v1.5 padding for type-1 blocks; the verifier still requires RSA-processBlock to yield a structurally valid block, so the attacker cannot simply present arbitrary plaintext; the same snippet exists in all three copies, so this may be a long-standing upstream weakness rather than a single-file mutation; no test suite is present in the snapshot to observe expected NULL-less behavior.",
+      "id": "rsa-null-less-digest-compare-off-by-two",
+      "impact": "Signature verification does not bind the entire message digest: a signature whose recovered DigestInfo matches everywhere except the last two digest bytes is still reported as valid. This weakens the integrity guarantee of RSA PKCS#1 v1.5 verification (for example by reducing the effective checked digest suffix) and may enable signature forgery or acceptance of modified signatures in deployments where the attacker can craft the recovered block (e.g. low-exponent RSA) - impact is bounded by those additional conditions.",
+      "locations": [
+        {
+          "end_line": 225,
+          "path": "core/src/main/java/org/bouncycastle/crypto/signers/RSADigestSigner.java",
+          "start_line": 200
+        },
+        {
+          "end_line": 200,
+          "path": "prov/src/main/java/org/bouncycastle/jcajce/provider/asymmetric/rsa/DigestSignatureSpi.java",
+          "start_line": 175
+        },
+        {
+          "end_line": 201,
+          "path": "prov/src/main/jdk1.1/org/bouncycastle/jcajce/provider/asymmetric/rsa/DigestSignatureSpi.java",
+          "start_line": 177
+        }
+      ],
+      "prerequisites": "A caller uses the lightweight RSADigestSigner or the BC JCE RSA DigestSignatureSpi verifier (e.g. SHA1withRSA/SHA256withRSA) with a public key; PKCS1Encoding unpadding must accept the recovered block (padding checks are present); the signature must be encoded without the NULL AlgorithmIdentifier parameter. A practical full forgery additionally depends on the RSA modulus/exponent (classically small e) and on how the verified result is consumed, so the two freed bytes do not by themselves guarantee a forgery in every deployment.",
+      "root_cause": "In the branch handling signatures whose recovered DigestInfo encoding omits the AlgorithmIdentifier NULL parameter (sig.length == expected.length - 2), the function computes sigOffset = sig.length - hash.length - 2 and expectedOffset = expected.length - hash.length - 2. Both offsets point two bytes before the OCTET STRING digest value (i.e. at the OCTET STRING tag), but the comparison loop runs only hash.length iterations, so it compares tag/length plus hash[0..hashLen-3]. The trailing two digest bytes (positions sig.length-2 and sig.length-1 in the recovered block) are never compared by either loop before 'return nonEqual == 0'. The correct comparison must cover hash.length + 2 bytes (or start at the digest value and compare hash.length bytes).",
+      "title": "RSA PKCS#1 v1.5 verification skips the last two digest bytes when the DigestInfo NULL parameter is omitted",
+      "trace": "engineVerify/verifySignature -> digest.doFinal(hash) -> rsaEngine.processBlock(signature) (PKCS1Encoding with FF-padding checks) -> derEncode(hash) -> length check -> NULL-less branch: sigOffset/expectedOffset computed, lengths adjusted by -2, loop i < hash.length compares from the OCTET STRING tag forward, second loop compares only bytes before sigOffset -> return nonEqual == 0, with sig[sig.length-2], sig[sig.length-1] (and the corresponding expected digest bytes) never examined.",
+      "unverified": "No runtime confirmation was possible (no tests executed, no builds). I did not prove a practical forgery using the two unchecked bytes for any specific key size/exponent, nor did I trace every caller that consumes the boolean verification result. I also cannot confirm whether this is the specific vulnerability the review case targets versus the separate DSA/ECDSA DER strictness gap.",
+      "weakness_type": "Improper verification of cryptographic signature / incomplete digest comparison (signature verification bypass class)"
+    }
+  ],
+  "coverage_summary": "Scope: 3,203 source files (core, prov, pkix, mail, pg, jce and variant trees). Reviewed: core crypto signers (DSA/ECDSA/RSA/PSS/X9.31), crypto encodings (PKCS1Encoding), crypto params (EC/DSA/DH/RSA/public-key validation), key generators, TLS RSA key exchange and RSA utils, provider RSA/DSA/EC signature and cipher paths, jdk1.1/jdk1.3/jdk1.4 variant copies of RSA/DSA code, ASN.1 sequence parsers, keystore PKCS12/BKS MAC checks, CMS SignerInformation digest/tag checks, and OpenBSDBCrypt. The one-candidate limit and review time prevented exhaustive review of pg, mail, pqc, jce compat classes and every provider algorithm.",
+  "limitations": [
+    "Source-only snapshot: no git history, patches, tests, or build outputs were available, so I could not distinguish an injected defect from a long-standing upstream weakness or confirm the intended review target.",
+    "No code was executed; the incomplete-comparison finding is based on static reading and index arithmetic, not a runtime demonstration.",
+    "I did not prove end-to-end exploitability (a concrete forgery requires additional RSA/protocol conditions and an attacker-controlled verification path).",
+    "Large parts of the repository (pg, mail, pqc, most ASN.1 and provider variant classes, and all j2me copies) were not exhaustively inspected; other vulnerabilities may exist there.",
+    "Variant trees (jdk1.1/jdk1.3/jdk1.4) are not always kept in sync with main, so differences between them were not treated as evidence of tampering."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DSA/ECDSA signature verification decoders accept DER SEQUENCEs with more than two INTEGERs (no size==2 check): prov DSA DSASigner.derDecode (lines 177-186), prov EC SignatureSpi.StdDSAEncoder.decode (lines 365-377), core DSADigestSigner.derDecode (lines 151-162).",
+      "reason": "Plausible signature-encoding malleability/'invisible data' weakness (extra sequence elements are ignored), but impact is lower than the incomplete digest comparison and exploitability is limited to encoding ambiguity; not selected because only one candidate may be submitted."
+    },
+    {
+      "lead": "DSA key-pair generation / parameter generation edge cases (DSAKeyPairGenerator, DSAParametersGenerator) reviewed for the known 'weak key with default parameters' class of issue.",
+      "reason": "Private-key generation uses BigIntegers.createRandomInRange with rejection sampling and NAF-weight filtering, and parameter generation follows FIPS 186-2/3; no concrete source-level defect found."
+    },
+    {
+      "lead": "DH/EC/DSA/RSA public-key validation and PKCS1Encoding constant-time decode.",
+      "reason": "The expected validation code is present (ECPublicKeyParameters.validate, DSAPublicKeyParameters.validate, DHPublicKeyParameters q-check, RSA modulus/exponent checks, PKCS1Encoding.checkPkcs1Encoding / decodeBlockOrRandom), so these were treated as already hardened."
+    }
+  ],
+  "summary": "Reviewed a source-only snapshot of bc-java (release notes place it in the 1.56 development window; 3,203 files, no tests/build execution). I traced RSA PKCS#1 v1.5 signature verification in the lightweight API and the JCE provider, plus related DSA/ECDSA DER decoders, TLS RSA key exchange, PKCS1Encoding padding checks and keystore/CMS MAC checks. The strongest source-level defect found is an incomplete digest comparison in the \"DigestInfo without NULL parameters\" verification path of RSADigestSigner / DigestSignatureSpi: the constant-time comparison loop starts two bytes before the digest in both arrays and runs only hash.length iterations, so the final two digest bytes are never compared. A secondary, lower-impact lead (DSA/ECDSA DER decoders accepting sequences with extra elements) is noted but not submitted."
+}

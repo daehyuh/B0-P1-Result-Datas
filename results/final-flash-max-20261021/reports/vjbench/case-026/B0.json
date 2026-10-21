@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The bytes handed to the parser are attacker-influenced extension-descriptor XML: (a) a descriptor served by an extension repository the instance uses (repository content is fetched over HTTP and parsed with this serializer), (b) `META-INF/extension.xed` inside an extension JAR that gets installed/found on the classpath (`DefaultCoreExtensionScanner.parseCoreExtension` -> `loadCoreExtensionDescriptor`), (c) a `.xed` file placed in the local extension repository/cache directory that is parsed at startup (`LocalExtensionStorage.loadDescriptor` -> `loadLocalExtensionDescriptor`, `CoreExtensionCache.getExtension`). A `<!DOCTYPE ... [ <!ENTITY xxe SYSTEM \"file:///...\"> ]>` payload plus `&xxe;` in a text element (e.g. name/description/license content) is fully under the attacker's control; the parsed value can surface in extension metadata and error paths, and external DTDs can be used for out-of-band exfiltration or SSRF.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the class contains no `setFeature`/`setEntityResolver`/`setExpandEntityReferences` calls and no injected EntityResolver (lines 207-301); checked that no project-wide XML hardening utility exists for DOM parsers (other DocumentBuilderFactory uses build documents only); checked that XMLUtils/Xerces and formatXMLContent do apply protections, so the project's intent exists; verified the callers so this is not dead code (startup/local-repository loading and core-extension scanning). Considered the counterargument that an actor installing a JAR extension can typically execute code anyway, and that descriptors from the official repository are semi-trusted - this reduces escalation value in the 'install' scenario but does not remove the repository/descriptor trust-boundary violation or the blind/OOB information-disclosure and SSRF impact; this is a code-level lead and was not validated at runtime.",
+      "id": "xxe-extension-descriptor",
+      "impact": "XML External Entity injection: disclosure of local files readable by the XWiki server process (configuration/secrets such as database or mail credentials), server-side request forgery to internal endpoints referenced by external DTDs/entities, and denial of service via recursive entity expansion. The parser runs with full application privileges and no output intended for untrusted handling is required for a blind/OOB exfiltration variant.",
+      "locations": [
+        {
+          "end_line": 210,
+          "path": "xwiki-commons-core/xwiki-commons-extension/xwiki-commons-extension-api/src/main/java/org/xwiki/extension/repository/internal/DefaultExtensionSerializer.java",
+          "start_line": 207
+        },
+        {
+          "end_line": 301,
+          "path": "xwiki-commons-core/xwiki-commons-extension/xwiki-commons-extension-api/src/main/java/org/xwiki/extension/repository/internal/DefaultExtensionSerializer.java",
+          "start_line": 284
+        },
+        {
+          "end_line": 192,
+          "path": "xwiki-commons-core/xwiki-commons-extension/xwiki-commons-extension-api/src/main/java/org/xwiki/extension/repository/internal/local/LocalExtensionStorage.java",
+          "start_line": 160
+        },
+        {
+          "end_line": 292,
+          "path": "xwiki-commons-core/xwiki-commons-extension/xwiki-commons-extension-api/src/main/java/org/xwiki/extension/repository/internal/core/DefaultCoreExtensionScanner.java",
+          "start_line": 275
+        }
+      ],
+      "prerequisites": "An attacker must be able to influence a descriptor that the server parses: get a crafted extension into a configured repository or an uploaded/installed extension artifact, or place a crafted `.xed` in the local extension storage/cache, or provide a JAR whose `META-INF/extension.xed` is scanned. The runtime must resolve external entities (Java 8 is the target at this version, and no JAXP hardening is present in this code; JVM-wide `javax.xml.accessExternalDTD` restrictions or newer JDKs could reduce or block file access). Impact is server-side (files readable by the XWiki process, outbound connections), not client-side.",
+      "root_cause": "DefaultExtensionSerializer creates its XML parser with `DocumentBuilderFactory.newInstance()` (line 210) and calls `documentBuilder.parse(descriptor)` (line 295) without disabling DTDs/external entities (no `disallow-doctype-decl`, no `external-general-entities`/`external-parameter-entities=false`, no `XMLConstants.ACCESS_EXTERNAL_DTD=\"\"`, no EntityResolver, `setExpandEntityReferences` left at the default true). Extension descriptors are not trusted application data: they are read from remote extension repositories, from locally installed/uploaded extension artifacts, from JARs found on the classpath (`/META-INF/extension.xed`) and from the on-disk descriptor cache. A crafted descriptor therefore reaches a default-configured DOM parser with external entity resolution enabled. Contrast: the project does apply targeted XXE mitigation elsewhere (org.xwiki.xml.XMLUtils.parse sets the Xerces `load-external-dtd` parameter to false and XMLUtils.formatXMLContent installs a no-op EntityResolver), which shows the missing control here is an oversight rather than an intentional trust decision.",
+      "title": "XXE in extension descriptor parsing (DefaultExtensionSerializer uses an unhardened DocumentBuilderFactory)",
+      "trace": "Remote/local repository/JAR `.xed` source (DefaultCoreExtensionScanner line 160-168 and 280-292; CoreExtensionCache line 120-130; LocalExtensionStorage line 160-192)\n  -> ExtensionSerializer.loadCoreExtensionDescriptor/loadLocalExtensionDescriptor (DefaultExtensionSerializer lines 254-282)\n  -> getExtensionElement (lines 284-301): DocumentBuilderFactory.newInstance() (line 210) -> documentBuilder.parse(descriptor) (line 295)\n  -> DOM tree with attacker DTD/entities expanded; getTextContent() values (e.g. lines 303-340, license content line 358) are then stored/logged as extension metadata, enabling exfiltration via error/log output and via attacker-controlled repository/extension endpoints.",
+      "unverified": "No runtime or parser-environment validation was performed (no builds, tests or payloads). Whether external entities are actually fetched depends on JDK/JAXP configuration and the deployment's JDK version; platform-side callers that fetch descriptors were inferred from commons code only, and the exact set of repositories/descriptor sources in a given instance was not inspected. Exfiltration paths depend on how metadata is surfaced/logged.",
+      "weakness_type": "XML External Entity (XXE) injection / CWE-611"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 1391 model-visible files under the assigned root with 0 exclusions for size/symlinks/sensitive paths; the snapshot contains main Java sources, resources and POMs (no test sources were visible). I enumerated the module layout and read/search across the security-relevant modules: xwiki-commons-xml (HTML cleaner, XMLUtils, StAX), filter + filter-xml (input/output streams, reference parsers, XML serializer/parser), extension (serializer, local/core repositories, caches, handlers, Maven/XWiki repository clients), job (status store, serializer, paths), logging (file tails, XStream), xstream (SafeXStream), velocity (engine config, sandbox introspectors, tools), crypto (filesystem stores, password/keys), classloader (extended jar URL handling), websocket, diff/displayer/text. Searches covered dangerous sinks (DOM/SAX/StAX parsing, XStream/fromXML, ObjectInputStream, file/URL/path construction and deletion, reflection, script engines, regexes, crypto constants) and the strongest trace with real attacker-controlled input was selected.",
+  "limitations": [
+    "Static review only: no build, test, scanner or payload execution, so no finding is runtime-confirmed.",
+    "Test sources are absent from the snapshot, so I could not use tests to learn intended security behaviour or which components are exercised.",
+    "Consumers of xwiki-commons (xwiki-platform/rendering) are out of scope, so some attacker paths (import/export, diff UI, REST endpoints) are inferred from commons callers rather than observed.",
+    "Dependency-level vulnerabilities and effective JAXP/JVM entity-resolution settings in a real deployment were not evaluated.",
+    "Coverage is best-effort reading of a 1391-file tree; files outside the security-relevant areas listed above were only searched, not exhaustively read."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "StAX/Woodstox XXE in the XML filter/parser path: XMLInputFilterStreamUtils (static XMLInputFactory.newInstance(), lines 43/55-95), StAXUtils (new WstxInputFactory(), line 53) and DefaultXMLParserFactory.parse parse caller-supplied XML without SUPPORT_DTD/IS_SUPPORTING_EXTERNAL_ENTITIES hardening.",
+      "reason": "Same XXE weakness class and plausible, but the default factory can be replaced by subclasses via the protected xmlFactory field, so reachability of the unhardened default from platform import flows could not be confirmed from this snapshot; kept out to avoid submitting two variants of one class of issue."
+    },
+    {
+      "lead": "HTML diff cleans its input without HTMLCleanerConfiguration.RESTRICTED (UnifiedHTMLDiffManager.cleanHTML, lines 104-119), so script/style can survive into diff output while the code comment acknowledges the input may come from the HTML macro with clean=false.",
+      "reason": "Could be an XSS/XEE-style issue, but exploitation depends on platform callers and on whether the diff input can contain script that a non-privileged author could store; no sender/sink for the produced HTML exists in this snapshot, so it is an unconfirmed lead."
+    },
+    {
+      "lead": "DefaultJobStatusStore.encode (lines 204-225) uses URLEncoder, which does not escape '.', so a job-id element equal to '..' could make getJobFolder/remove read or delete outside the job-status store.",
+      "reason": "Could not confirm any reachable job id element that is exactly '..': the only user-influenced ids in commons (FilterStreamConverterJobRequest via FilterStreamType.serialize) always contain a system-type prefix and encode '/' before path use; remaining job ids are built from fixed strings."
+    },
+    {
+      "lead": "SafeXStream (xwiki-commons-xstream) intentionally does not enable XStream's type whitelist, and JobStatusSerializer/XStreamFileLoggerTail deserialize files on disk with it.",
+      "reason": "Requires the attacker to write a crafted status/log file into the server permanent directory (no remote write path found in this snapshot); treated as a hardening gap rather than a demonstrable remote vulnerability."
+    },
+    {
+      "lead": "Dependency versions with known issues (XStream 1.4.17, SnakeYAML 1.29, Logback 1.2.5, log4j-api 2.14.1 in the POM).",
+      "reason": "Dependency/SCA findings rather than source-code logic flaws, and the runtime/fix state cannot be validated from the snapshot with read-only tools."
+    }
+  ],
+  "summary": "Static, source-only review of the assigned xwiki-commons snapshot (parent POM version 13.8-SNAPSHOT; 1391 model-visible files, main sources/resource/POMs only, test sources not present in the snapshot). I inspected the security-relevant areas first (xml/HTML cleaning, filter streams, extension manager and repositories, job status/logging, XStream, velocity sandbox, crypto, classloader, websocket, diff) and traced input-to-sink paths. The single strongest candidate is an XML External Entity (XXE) flaw in the extension-descriptor parser DefaultExtensionSerializer, whose DOM parser is created with JDK defaults and no entity hardening while parsing descriptors that originate from remote extension repositories and installed/scanned extension artifacts. Several other plausible leads (StAX/Woodstox XXE in the XML filter path, non-restricted HTML cleaning in the HTML diff, job-status path handling, XStream without type whitelist) are recorded as unconfirmed rejected leads. No code was executed and no runtime confirmation is claimed."
+}

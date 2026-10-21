@@ -1,0 +1,67 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `href` attribute of an `xop:Include` element in the request body of a MTOM/XOP-encoded SOAP or JAX-RS (multipart/related) request. In the Aegis path the value is read verbatim from the message XML in `AbstractXOPType.readMtoM`/`readInclude` (lines 92-95 and 127) and passed unchanged to `AttachmentUtil.getAttachment`. In the JAXB paths the `contentId` supplied by the JAXB runtime to `AttachmentUnmarshaller#getAttachmentAsDataHandler/getAttachmentAsByteArray` is passed unchanged to the core `AttachmentUtil.getAttachmentDataSource`. No request validation in those call chains restricts the value to `cid:` references.",
+      "confidence": "medium",
+      "counterevidence_checked": "Confirmed that only `cid:`-prefixed values are resolved directly against supplied attachments and that the URL branch is reached only for unmatched/absolute references (core lines 529-535; Aegis lines 55-69). Confirmed `StaxUtils.createXMLInputFactory` disables DTDs, entity replacement and external entities, so this is not generic XXE. Searched all `URLDataSource`/`getAttachmentDataSource` callers: only the two JAXBAttachmentUnmarshaller classes (jaxb and jaxrs) and the Aegis path reach these sinks. Checked `AbstractXOPType.readInclude`, `JAXBDataBase.getAttachmentUnmarshaller`, `JAXBElementProvider.addAttachmentUnmarshaller` and `AttachmentDeserializer` for scheme allow-listing or href filtering and found none. Confirmed `ATTACHMENT_MAX_SIZE`/`ATTACHMENT_MEMORY_THRESHOLD` are separate CachedOutputStream controls and do not constrain URL dereference.",
+      "id": "cxf-xop-href-url-dereference-ssrf",
+      "impact": "Server-side request forgery driven by the request content: the CXF server issues outbound connections to arbitrary hosts/ports selected by the requester, reaching internal-only HTTP/FTP services or cloud instance metadata endpoints, with the response bytes returned into the unmarshalled attachment value. Because `java.net.URL` also accepts `file:`/`jar:` (e.g., href=\"file:///etc/passwd\" contains \"://\"), the same code path can read server-local files into the application's byte[]/DataHandler parameter. This is blind-to-partial-data SSRF plus local file disclosure; no code execution is demonstrated.",
+      "locations": [
+        {
+          "end_line": 546,
+          "path": "core/src/main/java/org/apache/cxf/attachment/AttachmentUtil.java",
+          "start_line": 527
+        },
+        {
+          "end_line": 78,
+          "path": "rt/databinding/aegis/src/main/java/org/apache/cxf/aegis/type/mtom/AttachmentUtil.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 140,
+          "path": "rt/databinding/aegis/src/main/java/org/apache/cxf/aegis/type/mtom/AbstractXOPType.java",
+          "start_line": 88
+        },
+        {
+          "end_line": 65,
+          "path": "rt/databinding/jaxb/src/main/java/org/apache/cxf/jaxb/attachment/JAXBAttachmentUnmarshaller.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 65,
+          "path": "rt/frontend/jaxrs/src/main/java/org/apache/cxf/jaxrs/provider/JAXBAttachmentUnmarshaller.java",
+          "start_line": 47
+        }
+      ],
+      "prerequisites": "A deployed service that processes MTOM/XOP messages: (a) Aegis databinding with an XOP-mapped parameter (byte[], DataHandler, DataSource), or (b) JAXB databinding / the JAX-RS JAXB provider with MTOM enabled. The incoming request must carry a non-null attachment collection (e.g., a multipart/related body with at least one part) so that `Context.getAttachments()`/`isXOPPackage()` is satisfied, and the `href` must be an absolute URL (contains \"://\" for the core path; any parseable URL for the Aegis path) that does not match a supplied content-id. For byte[] targets the fetch happens during unmarshalling; for DataHandler/DataSource returns it happens when the application reads the handler.",
+      "root_cause": "CXF attachment resolution treats an XOP/MTOM reference that does not match a supplied attachment as a URL: core `AttachmentUtil.getAttachmentDataSource(String contentId, ...)` falls through to `new URLDataSource(new URL(contentId))` for any value containing \"://\" that does not start with \"cid:\", and the Aegis `AttachmentUtil.getAttachment(String id, ...)` falls back to `new URLDataSource(new URL(id))` whenever no attachment matches the href. Neither site restricts the scheme, host, or port, and neither requires the reference to be a local MIME content-id, so `http:`, `https:`, `ftp:`, `file:` and `jar:` URLs supplied in the message are fetched by the server when the attachment stream is read.",
+      "title": "Attacker-controlled xop:Include/@href is dereferenced as a URL during MTOM attachment resolution (SSRF / local file read)",
+      "trace": "multipart/related request -> envelope parsed -> databinding sees `<xop:Include href=\"http://169.254.169.254/latest/meta-data/\"/>`. Aegis: `Base64Type.readObject` (line 69) -> `AbstractXOPType.readMtoM` (92-95) -> `readInclude` reads href (127) -> `AttachmentUtil.getAttachment(href, attachments)` (129): no match in supplied attachments (64-69) -> `new URLDataSource(new URL(id))` (72-74) -> `ByteArrayType.readAttachment` calls `handler.getInputStream()` (45) which performs an outbound request. JAXB/JAX-RS: JAXB runtime calls `JAXBAttachmentUnmarshaller.getAttachmentAsByteArray(contentId)` (jaxb / jaxrs lines 53-57) -> core `AttachmentUtil.getAttachmentDataSource` (527): not `cid:`-prefixed but contains \"://\" -> `new URLDataSource(new URL(contentId))` (536-544) -> `getInputStream()` (line 56-57) copies the remote/local resource into the unmarshalled byte[] (or hands a URL-backed DataHandler to the application).",
+      "unverified": "Not executed or runtime-verified. The Aegis path is fully visible and self-contained (href read from message XML to URL fetch), but for the JAXB path I could not inspect the bundled JAXB RI (external dependency) to verify that it passes a non-`cid:` absolute href to AttachmentUnmarshaller without rejecting it; if a given RI rejects non-`cid:` values, only the Aegis path remains reachable. Whether a specific deployment uses Aegis or MTOM-enabled JAXB, and whether a SecurityManager blocks outbound/file access, is application-dependent. The response-content exposure depends on the service later reading/returning the unmarshalled value.",
+      "weakness_type": "Server-Side Request Forgery (CWE-918), unrestricted URL dereference of untrusted input"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 4,762 model-visible files with no excluded sensitive/symlink/oversize files; only NUL-byte binary-like files are skipped by the read/search tools, so coverage is over the full readable tree. I inspected the branch/version context (root/parent poms, 3.2.0-SNAPSHOT), the core attachment stack (AttachmentUtil, AttachmentDeserializer, LazyAttachmentCollection), JAXB and JAX-RS attachment unmarshallers, Aegis MTOM types, StaxUtils/XXE hardening, service-list servlet, CORS filter, JOSE/JWT verification, OIDC claims validation, OAuth2 redirect handling, XSLT/transformer sites, management-web storage, and command-exec/reflection/serialization sinks. I did not exhaustively read all 4,762 files; the review prioritized request-processing and attachment/transport/security code.",
+  "limitations": [
+    "Read-only static review; no code was built, executed, or runtime-tested, so all taint/exploitability statements are source-reasoned leads.",
+    "No repository history or upstream diff was available, so I could not confirm whether the code is pre- or post-fix for any specific advisory, and I did not use CVE/CWE labels or external services.",
+    "External dependencies that participate in the flow (JAXB RI/MOXy, Woodstox, WSS4J, servlet containers) are not part of the snapshot and were reasoned about from their Java API contracts only.",
+    "Large areas of the 4,762-file tree (samples, systests, tools, distribution, OSGi, CORBA, JCA, JMS, WS-* modules) were only sampled, not fully reviewed; a stronger or additional vulnerability could exist there.",
+    "The single submitted candidate is one distinct root cause with two related sink sites (core and Aegis); it remains a candidate, not a confirmed vulnerability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected XSS in the CXF service list page: FormattedServiceListWriter writes `styleSheetPath` (built from request contextPath/servletPath/pathInfo at ServiceListGeneratorServlet lines 102-126) unescaped into an HTML attribute (lines 68, 96, 162).",
+      "reason": "Plausible but unconfirmed: I could not verify from source that the target servlet container preserves a decoded double-quote in `getPathInfo()` for this servlet mapping, and impact is lower than the SSRF candidate. Left as an unconfirmed lead, not submitted."
+    },
+    {
+      "lead": "Various auth/session checks reviewed (OAuth2 redirect-URI exact matching in RedirectionBasedGrantService, OIDC claim/expiry validation, JWS verifier selection in JwsUtils, TLS hostname-verifier selection in transport/https/SSLUtils) appeared to implement validation rather than omit it.",
+      "reason": "No attacker-controlled bypass with concrete source evidence was established; the OAuth2 prefix check (RedirectionBasedGrantService line 467) is an additional opt-in restriction on top of an exact-match check, not a weakening."
+    },
+    {
+      "lead": "Other URL/file sinks spotted while sweeping (e.g., URIResolver/DynamicClientFactory open URL-based resources, management-web log file storage) are developer/administratively configured rather than request-controlled in the paths inspected.",
+      "reason": "No taint path from a remote request to the sink with the evidence required; omitted to keep a single, best-supported candidate."
+    }
+  ],
+  "summary": "Static review of the Apache CXF 3.2.0-SNAPSHOT tree (4,762 source files; no binary/sensitive/symlink exclusions besides NUL-byte files). I traced the highest-impact attacker-controlled flow I could substantiate in source: MTOM/XOP attachment resolution dereferences the untrusted `xop:Include/@href` value as a URL (`new URLDataSource(new URL(...))`) with no scheme/host allow-list or requirement that the value be a local `cid:` part. This is present both in the core JAXB path (`core/.../attachment/AttachmentUtil.getAttachmentDataSource`) and in the Aegis path (`rt/databinding/aegis/.../type/mtom/AttachmentUtil.getAttachment` fallback), giving server-side request forgery and, because `java.net.URL` also accepts `file:`/`jar:` schemes, potential local-file disclosure into the unmarshalled attachment data. No other inspected area produced a comparably strong candidate; other leads were rejected or left unconfirmed. The finding is a lead based on source evidence only — nothing was executed."
+}

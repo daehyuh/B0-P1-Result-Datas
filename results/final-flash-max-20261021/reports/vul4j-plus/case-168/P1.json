@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Raw network bytes on any channel carrying HttpRequestDecoder/HttpServerCodec (or HttpObjectDecoder subclasses such as RtspDecoder). Header names/values and body framing, including Transfer-Encoding and Content-Length values and duplicates, are entirely attacker-controlled and are not reshaped by transport/TLS.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the snapshot already rejects the inputs: HttpObjectDecoder.splitHeader plus DefaultHttpHeaders name validation (space and control characters prohibited in header names) rejects the whitespace-before-colon class for requests, so that vector was dropped. validateHeaders=true does not help against comma-separated Transfer-Encoding or duplicate/conflicting Content-Length because the values are syntactically valid and each value is stored as-is. Verified the asymmetric API usage is real: isKeepAlive uses containsValue (comma-aware) while isTransferEncodingChunked uses contains (whole-value). Also verified the chunked branch and the zero-length shortcut line numbers in source. Uncertainties: no runtime execution or scanner confirmation; whether a specific deployment's peer parser creates the differential is environment-dependent, and I could not attribute the issue to a specific upstream fix hunk from source alone.",
+      "id": "http1-framing-cl-te-smuggling",
+      "impact": "Request smuggling: bypass of front-end access-control/authentication or routing decisions, cache poisoning, request-queue desynchronization, and cross-user request capture; additionally potential denial of service via desynchronized connections. These are integrity/confidentiality impacts on applications built on the affected pipeline.",
+      "locations": [
+        {
+          "end_line": 305,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 303
+        },
+        {
+          "end_line": 615,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 603
+        },
+        {
+          "end_line": 247,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 241
+        },
+        {
+          "end_line": 189,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 174
+        },
+        {
+          "end_line": 1142,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpHeaders.java",
+          "start_line": 1106
+        }
+      ],
+      "prerequisites": "A deployment where another HTTP parser (front-end proxy/load balancer, or a downstream/origin server when Netty is used as a proxy) interprets the same bytes differently: e.g., it recognizes 'chunked' inside a comma-separated Transfer-Encoding list or uses a different duplicate Content-Length value. No non-default Netty option is required; validateHeaders=true (default) does not reject syntactically valid TE/CL values, and validateHeaders=false only widens the issue. Exploitability depends on the surrounding parser chain; a lone Netty endpoint with no framing-differential peer is not exploitable by itself.",
+      "root_cause": "Body-length framing for HTTP/1 messages is decided from raw header values without normalization or cross-header validation. (1) HttpUtil.isTransferEncodingChunked() uses HttpHeaders.contains(name, value, ignoreCase), which compares a whole header value and does not split on commas (HttpHeaders.contains(String,String,boolean), lines 1106-1122), unlike containsValue() which explicitly handles comma-separated lists (lines 1124-1142). Therefore 'Transfer-Encoding: gzip, chunked' (valid, chunked final) is not detected as chunked. (2) HttpObjectDecoder.readHeaders() then selects READ_FIXED_LENGTH_CONTENT/VARIABLE_LENGTH_CONTENT instead of READ_CHUNK_SIZE (lines 603-615). (3) For a request with no parseable Content-Length, contentLength() is -1 and decode() emits the message plus EMPTY_LAST_CONTENT and resets (lines 241-247), so subsequent bytes are parsed as the next request. (4) HttpUtil.getContentLength() reads only one of possibly multiple Content-Length values (lines 174-189) and keeps Content-Length when Transfer-Encoding: chunked applies, so conflicting duplicates are also accepted.",
+      "title": "HTTP/1 decoder does not reconcile Content-Length and Transfer-Encoding, enabling request smuggling",
+      "trace": "Attacker sends a request containing e.g. 'Transfer-Encoding: gzip, chunked' (commonly with a body encoded as chunked, optionally with a duplicated/absent Content-Length). HttpObjectDecoder.readHeaders() stores the exact value and calls HttpUtil.isTransferEncodingChunked() (HttpObjectDecoder:608); that call reaches HttpHeaders.contains(CharSequence,CharSequence,boolean) -> contains(String,String,boolean) (HttpHeaders:1106), which compares the whole 'gzip, chunked' string against 'chunked' and returns false. readHeaders() consequently selects the non-chunked branch (HttpObjectDecoder:610-613); with no usable Content-Length, contentLength() returns -1 and decode() treats the request as complete with an empty body and resets (HttpObjectDecoder:241-246). The bytes of the chunked body are then decoded as a fresh HTTP request. A peer that correctly parses the comma-separated Transfer-Encoding consumes those bytes as part of the first request, so the two parsers disagree on request boundaries. Duplicate Content-Length works the same way via HttpUtil.getContentLength (first/only value read, no conflicting-duplicate rejection).",
+      "unverified": "No runtime test, parser-differential proof, or scanner confirmation was possible (execution and external lookups prohibited). The exact upstream fix commit/CVE that this snapshot predates is not established from source; the finding is based on verified code semantics (contains vs containsValue, readHeaders branch selection, zero-length shortcut) and HTTP/1 framing requirements.",
+      "weakness_type": "HTTP Request Smuggling (CWE-444, inconsistent interpretation of HTTP requests)"
+    }
+  ],
+  "coverage_summary": "Scope: 1851 repository-relative source files (build files, Java main sources, native module sources); no src/test trees are present in the snapshot. P1 relation index reports complete coverage (1851/1851 indexed, 0 source-file hash mismatches, 0 files missing from index) but is syntactic/navigation-only (no dataflow, reachability, or exploitability proof), and it neither flags nor excludes any file as vulnerable. I read in depth the HTTP/1 framing path (HttpObjectDecoder, HttpUtil, HttpHeaders, DefaultHttpHeaders), sampled HTTP/2 (Hpack*, Http2HeadersValidator, frame codecs), codec compression (JdkZlibDecoder and related), buffer internals, SslHandler, HAProxy and WebSocket decoders, and example handlers; the majority of the 1851 files were only sampled or indexed, not line-by-line audited.",
+  "limitations": [
+    "No code execution, tests, scanners, or exploit payloads were run; all conclusions are static source analysis.",
+    "The P1 index provides syntactic navigation only; it cannot prove runtime reachability or data flow, and absence of an index record is not evidence about any code area.",
+    "Only a minority of the 1851 files was inspected in depth; modules such as transport-native-*, resolver-dns, codec-memcache/mqtt/redis/smtp/socks/stomp/xml and most of handler/codec-http2 were not exhaustively reviewed.",
+    "No patch, CVE, or ground-truth data was consulted (per instructions), so the candidate could not be matched against the historical fix; the parser-differential requirement means exploitability is deployment-dependent."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "codec/src/main/java/io/netty/handler/codec/compression/JdkZlibDecoder.java (with ZlibDecoder having no decompression-buffer cap) appears to allow large inflate output buffering, a memory-exhaustion DoS lead.",
+      "reason": "Plausible but unconfirmed as the case's intended issue; the code matches a pre-4.1.46 upstream state and the exploitability depends on input/output ratios and downstream buffer handling that I could not verify statically within this review. Kept as a lead only, not a second candidate."
+    },
+    {
+      "lead": "HttpObjectDecoder.splitHeader whitespace-before-colon handling (lines 716-766) looked like a possible request-smuggling vector.",
+      "reason": "For requests, the header name retains the whitespace and DefaultHttpHeaders.validateHeaderNameElement rejects ' ' and control characters, so the message is failed as an invalid message; no exploitable path found with default validation."
+    },
+    {
+      "lead": "HAProxyMessageDecoder / WebSocket08FrameDecoder parsing paths for length-handling bugs.",
+      "reason": "Header-length limits, minimal-length-encoding checks and maxFramePayloadLength checks appear present and consistent with the surrounding design; no concrete missing check identified."
+    },
+    {
+      "lead": "HpackHuffmanDecoder.java is unusually large (271 KB of tables) and allocates byte[length * 8 / 5].",
+      "reason": "length is bounded by header-list-size policy checks elsewhere in HPACK decoding; no attacker-controlled overflow/over-read path was demonstrated."
+    }
+  ],
+  "summary": "Netty 5.0.0.Final-SNAPSHOT (1851 main-source files, no src/test trees). Review focused on attacker-reachable protocol parsing, especially HTTP/1 framing. The strongest source-evidenced candidate is an HTTP request-smuggling root cause in the HTTP/1 body-length decision path: HttpObjectDecoder accepts attacker-supplied Content-Length / Transfer-Encoding values without normalizing or cross-validating them, and HttpUtil.isTransferEncodingChunked (used by readHeaders) only matches an exact, whole header value \"chunked\", so legal comma-separated transfer-coding lists such as \"gzip, chunked\" are not recognized as chunked. A request whose framing Netty does not recognize is emitted as a zero-length request, and the following chunked body bytes are re-parsed as a new HTTP request. Where any intermediary or peer parses those same headers as chunked, message boundaries disagree, producing classic request smuggling. Related manifestations of the same root cause are duplicate/conflicting Content-Length values (only one value is read, no normalization/rejection) and retention of Content-Length when chunked is used. No code was executed; this is a lead, not a runtime-confirmed vulnerability."
+}

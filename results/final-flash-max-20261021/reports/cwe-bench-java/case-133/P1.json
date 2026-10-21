@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Unauthenticated network attacker. Any client can issue GET /api/eperson/epersons/search/byEmail?email=<arbitrary address>; the 'email' query parameter is fully attacker-controlled and used for an exact lookup.",
+      "confidence": "medium",
+      "counterevidence_checked": "(a) Checked whether the endpoint is intentionally public: other public EPerson-related methods are explicitly annotated @PreAuthorize(\"permitAll()\") elsewhere, whereas this method has no annotation at all, and sibling lookups by metadata/membership are ADMIN/MANAGE_ACCESS_GROUP-restricted; the registration flow does not need this endpoint (RegistrationRestRepository performs its own lookup and returns a generic result). This is symmetry evidence, not proof of intent. (b) Verified the HTTP filter chain does not add authentication for this path (WebSecurityConfiguration permits all /api/** and relies on method security). (c) Verified the returned converter really includes email/netid/metadata. (d) The test suite is absent from the snapshot, so no regression test could confirm the intended authorization.",
+      "id": "case-133-c1",
+      "impact": "Unauthenticated disclosure of personal data of registered users (email confirmation for arbitrary addresses, netid, display name and other exposed metadata, last-active/canLogIn flags) and a reliable user-enumeration oracle. This aids targeted phishing, credential-stuffing, and privacy violation, and contradicts the deliberate privacy design used for the registration/forgot-password flow (RegistrationRestRepository avoids revealing whether an account exists).",
+      "locations": [
+        {
+          "end_line": 269,
+          "path": "dspace-server-webapp/src/main/java/org/dspace/app/rest/repository/EPersonRestRepository.java",
+          "start_line": 256
+        },
+        {
+          "end_line": 35,
+          "path": "dspace-server-webapp/src/main/java/org/dspace/app/rest/converter/EPersonConverter.java",
+          "start_line": 25
+        },
+        {
+          "end_line": 95,
+          "path": "dspace-server-webapp/src/main/java/org/dspace/app/rest/security/EPersonRestPermissionEvaluatorPlugin.java",
+          "start_line": 51
+        }
+      ],
+      "prerequisites": "None beyond a default deployment: the eperson repository is always registered, the endpoint is under /api/** which is permitAll at the filter-chain layer, and anonymous access gets the ANONYMOUS authority only (no method check is present to fail). No special configuration is required.",
+      "root_cause": "EPersonRestRepository.findByEmail is exposed as the REST search method \"byEmail\" (@SearchRestMethod) but carries no @PreAuthorize annotation, unlike every adjacent EPerson lookup (findOne requires hasPermission(#id,'EPERSON','READ'); byMetadata and isNotMemberOf require ADMIN or MANAGE_ACCESS_GROUP). The method returns the full EPersonRest produced by EPersonConverter, which sets email, netid, lastActive, canLogIn, selfRegistered and the visible metadata (name/etc.). No permission check exists anywhere in the invocation path: WebSecurityConfiguration permits all /api/** at the HTTP layer and relies solely on method annotations, and RestResourceController executes search methods through the Spring-proxied repository, so an unannotated method has no authorization at all.",
+      "title": "Missing authorization on EPerson search/byEmail allows anonymous user enumeration and PII disclosure",
+      "trace": "1) GET /api/eperson/epersons/search/byEmail?email=target@example.org reaches RestResourceController (search path), which resolves the SearchRestMethod named 'byEmail' and invokes it via RestRepositoryUtils.executeQueryMethod on the Spring-proxied repository. 2) Because EPersonRestRepository.findByEmail (lines 256-269) has no @PreAuthorize, DSpace's MethodSecurity interceptors perform no permission evaluation; the HTTP security chain only does anyRequest().permitAll() for /api/**. 3) The method calls es.findByEmail(context, email) (EPersonServiceImpl lowercases and performs an exact DB lookup, DAO uses a CriteriaBuilder parameter) and, when found, converter.toRest(eperson, projection). 4) EPersonConverter sets email/netid/lastActive/canLogIn/selfRegistered on EPersonRest and DSpaceObjectConverter adds permission-filtered metadata (name, etc.), so the anonymous caller receives the record; when the address is unknown a 204/empty result is returned, giving a reliable existence oracle. 5) The only permission logic in this area, EPersonRestPermissionEvaluatorPlugin, is never invoked because no hasPermission() expression guards this method.",
+      "unverified": "Not runtime-confirmed (no code execution or requests performed). Whether DSpace upstream intends this search to be publicly available for UI email-availability checks, or whether a later release added an ADMIN/EPERSON-READ annotation, could not be verified offline. The candidate is a lead based on static source evidence, not a confirmed vulnerability.",
+      "weakness_type": "Missing Authorization (CWE-862) / Information Exposure (CWE-200)"
+    }
+  ],
+  "coverage_summary": "Scope: 3,301 files (2,845 Java) across dspace-api, dspace-server-webapp, dspace-iiif, dspace-oai, dspace-sword(v2), dspace-services, configs, workflows and Docker files; main-source only (all src/test directories are absent from the snapshot). I prioritized REST controllers/repositories and their @PreAuthorize expressions, DSpacePermissionEvaluator plugins, the JWT/CSRF/login filters, AuthorizeServiceImpl/AuthorizeUtil, submission/workflow repositories and patch operations, signposting/IIIF, and LDN/COIN Notify. I did not exhaustively read every file; large areas (e.g., MetadataImport/ItemImportServiceImpl, METS/SWORD packagers, OAI XOAI internals, statistics/Solr code, full dspace-api DAO layer) were sampled rather than fully audited.",
+  "limitations": [
+    "P1 relation index is partial: 54 of 3,301 source files are missing from the index, and the index explicitly does not implement control-flow, data-flow or semantic resolution; index labels/edges were treated only as navigation hints.",
+    "No build, tests, scanners or runtime requests were executed; all conclusions are static and unverified at runtime.",
+    "Test sources (src/test) are not part of the snapshot, so expected-status/regression evidence for the endpoint could not be consulted.",
+    "The dspace-angular UI (which may or may not call search/byEmail) is not in this repository, so the intended visibility of the byEmail search could not be confirmed offline.",
+    "Dependency-level and configuration-level issues (outdated libraries, default credentials, deployment settings) were not systematically assessed.",
+    "Large files/modules were sampled; absence of a finding there is not evidence of absence."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "IdentifierRestRepository.createAndReturn(Context, List<String>) (POST /api/pid?type=doi) has no @PreAuthorize, so DOI mint/registration appears reachable by any caller.",
+      "reason": "Traced the full path: uriListHandlerService.handle() returns the item without an authorization check, but registerDOI() then calls itemService.updateLastModified(), whose ItemServiceImpl.update() enforces WRITE/EDIT rights and throws AuthorizeException; DSpaceRestRepository.createAndReturn(List) never commits on exception and DSpaceRequestContextFilter aborts the context, so the DOI row/status change is rolled back. No unauthorized persisted state change established."
+    },
+    {
+      "lead": "LinksetRestController.getDescribedBy is guarded only by hasPermission(#uuid,'ITEM','READ') although findObject() also accepts Bitstream UUIDs (and the evaluator returns true when no ITEM exists).",
+      "reason": "The configured 'DataCite' crosswalk is an XSLTDisseminationCrosswalk, whose disseminateElement() throws CrosswalkObjectNotSupported for any non Item/Collection/Community object (lines 207-213), so a bitstream UUID yields an error, not disclosed data. Rejected."
+    },
+    {
+      "lead": "AuthorizeServicePermissionEvaluatorPlugin returns true when the requested object cannot be found (lines 84-87), which weakens type-specific hasPermission checks.",
+      "reason": "Documented upstream behavior and used deliberately (see the ITEM && BITSTREAM conjunction comment in LinksetRestController). The one endpoint where the type mismatch could matter (getDescribedBy) does not leak data. No additional concretely exploitable endpoint found in this pass."
+    },
+    {
+      "lead": "LDN inbound processing (LDNInboxController/LDNMessageServiceImpl/LDNMetadataProcessor) performs state changes from unauthenticated POSTs; possible spoofed-origin message injection or SSRF via SendLDNMessageAction redirects.",
+      "reason": "Default configuration validates origin against registered NotifyService records and requires source-IP range validation (ldn.notify.inbox.block-untrusted / block-untrusted-ip default true); the action-config driven effects are mostly QAEvent/email creation. Configuration-dependent and not verified in source to a concrete bypass."
+    },
+    {
+      "lead": "Solr filter construction in SolrServiceImpl (range values inserted unescaped when they match \\[.*TO.*\\]) could allow Solr query manipulation.",
+      "reason": "Values are appended to separate Solr filter queries that are ANDed; the READ/authorization filters are separate fq clauses, and no concrete access-control bypass or data exposure was established from source inspection."
+    }
+  ],
+  "summary": "Reviewed the DSpace 8.2-SNAPSHOT source snapshot with emphasis on REST-layer authorization (dspace-server-webapp), the DSpace core authorization service, authentication/JWT/CSRF filters, submission/workflow repositories, signposting/IIIF, and the newer LDN/COIN features. The strongest source-supported lead is a missing method-security annotation on the EPerson \"search/byEmail\" lookup, which exposes registered users' data to anonymous callers. Several other suspected issues were traced and rejected because a downstream check mitigates them or the data-flow does not reach a sensitive sink. Only one candidate is submitted per the review rules; no runtime verification, build, or scanners were run, and test sources are absent from the snapshot."
+}

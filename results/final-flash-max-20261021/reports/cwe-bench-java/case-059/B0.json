@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The \"target.url\" value (plus optional attacker-chosen \"user\"/\"password\") inside a POSTed JSON request body, e.g. {\"type\":\"version\",\"target\":{\"url\":\"service:jmx:rmi:///jndi/rmi://<internal-host>:<port>/jmxrmi\"}}. The URL is taken directly from the JSON map with no length/charset/host restriction. Default deployments perform no authentication and the default CORS handling reflects any Origin with credentials, so the POST can also be issued from a victim's browser (a text/plain body is parsed as JSON regardless of Content-Type, avoiding preflight).",
+      "confidence": "medium",
+      "counterevidence_checked": "Proxy mode is a documented feature and routing information in the request is by design (src/site/xdoc/features/proxy.xml:46-80; src/docbkx/architecture.xml:113-127), so the finding is about the missing target restriction/target trust boundary plus default enablement rather than the existence of the feature. I looked for and found no target validation in ProxyTargetConfig, Jsr160RequestDispatcher, BackendManager, or any Restrictor/PolicyRestrictor/NetworkChecker path (NetworkChecker only filters the HTTP client address). The JVM agent does not enable the dispatcher by default (no jsr160 reference in agent/jvm and default-jolokia-agent.properties), so exploitability is conditional on the WAR default or explicit proxy configuration; the OSGi bundle embeds jsr160 but enabling it depends on runtime configuration. The comment/TODO in createConnector only concerns connection pooling, not authorization.",
+      "id": "jolokia-jsr160-proxy-ssrf",
+      "impact": "Server-side request forgery and network pivot: the agent opens arbitrary outbound TCP/JMX-RMI connections from its network position to internal hosts/ports (reachability and timing oracle, internal service probing) and, with the default allow-all policy, provides full read/write/exec JMX access to any reachable MBean server using attacker-supplied credentials. Because JMX/RMI endpoints are frequently unauthenticated inside trusted networks and the RMI client deserializes objects returned by the target, connection to an attacker-controlled endpoint may enable deserialization-based code execution in the agent JVM (uncertain; depends on classpath and JDK settings). Browser-driven exploitation is possible via the permissive default CORS handling.",
+      "locations": [
+        {
+          "end_line": 105,
+          "path": "agent/jsr160/src/main/java/org/jolokia/jsr160/Jsr160RequestDispatcher.java",
+          "start_line": 95
+        },
+        {
+          "end_line": 92,
+          "path": "agent/jsr160/src/main/java/org/jolokia/jsr160/Jsr160RequestDispatcher.java",
+          "start_line": 73
+        },
+        {
+          "end_line": 57,
+          "path": "agent/core/src/main/java/org/jolokia/request/ProxyTargetConfig.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 84,
+          "path": "agent/core/src/main/java/org/jolokia/request/JmxRequest.java",
+          "start_line": 74
+        },
+        {
+          "end_line": 34,
+          "path": "agent/war/src/main/webapp/WEB-INF/web.xml",
+          "start_line": 27
+        },
+        {
+          "end_line": 418,
+          "path": "agent/core/src/main/java/org/jolokia/backend/BackendManager.java",
+          "start_line": 406
+        }
+      ],
+      "prerequisites": "Agent reachable by the attacker and configured with the JSR-160 dispatcher: default in jolokia.war (web.xml dispatcherClasses), optional for JVM/OSGi/Mule agents. No jolokia-access.xml on the classpath (default AllowAllRestrictor) or any policy that does not forbid the request type. Note the outbound connect happens in Jsr160RequestDispatcher.dispatchRequest before the handler-level restrictor check, so even a policy that would deny the MBean operation still triggers the network connection.",
+      "root_cause": "A POSTed Jolokia request can carry an arbitrary \"target\" object; JmxRequest builds a ProxyTargetConfig from it (agent/core/.../request/JmxRequest.java:80-83), ProxyTargetConfig copies the attacker-supplied \"url\" verbatim with no validation (agent/core/.../request/ProxyTargetConfig.java:43-47), and Jsr160RequestDispatcher creates a JMXServiceURL from it and calls connect() (agent/jsr160/.../Jsr160RequestDispatcher.java:95-105 and 78-81) without any host/port allow-list, scheme allow-list, or restrictor check on the target. The dispatcher is enabled by default in the WAR distribution (agent/war/src/main/webapp/WEB-INF/web.xml:27-34), and the default restrictor is AllowAll when no policy file is found (RestrictorFactory.java:48-62). The Restrictor interface has no concept of proxy targets (Restrictor.java:42-97), so even a strict jolokia-access.xml cannot constrain where the agent connects.",
+      "title": "Unauthenticated SSRF: default-enabled JSR-160 proxy dispatcher connects to attacker-chosen JMX target URLs",
+      "trace": "HttpRequestHandler.handlePostRequest (HttpRequestHandler.java:115-141) -> JmxRequestFactory.createPostRequest (JmxRequestFactory.java:113-121) -> JmxRequest(Map,..) reads \"target\" (JmxRequest.java:80-83) -> ProxyTargetConfig stores attacker URL (ProxyTargetConfig.java:43-56) -> BackendManager.callRequestDispatcher picks the first dispatcher that canHandle (BackendManager.java:406-418; JSR-160 dispatcher is added before the local one, BackendManager.java:330-337) -> Jsr160RequestDispatcher.canHandle returns true when a target config exists (lines 139-141) -> dispatchRequest calls createConnector (line 95-105: new JMXServiceURL(attackerUrl); JMXConnectorFactory.newJMXConnector(url, env)) and connector.connect() (line 80), opening attacker-directed outbound JMX/RMI connections. Connection errors, authentication failures and JMX results are serialized back into the JSON response, giving the attacker a non-blind oracle.",
+      "unverified": "Static review only: no requests were sent and no build/tests were run. The claimed host/port reachability and any RMI-deserialization escalation were not reproduced. Real-world exposure depends on the deployment (WAR default vs agents where proxy mode is not configured). The presence/absence of a site security policy in real deployments is outside the snapshot.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery"
+    }
+  ],
+  "coverage_summary": "Read and traced: agent/core HTTP entry points (AgentServlet, HttpRequestHandler), request factory/parsers and processing parameters (JmxRequestFactory, JmxRequest subclasses, ConfigKey, Configuration/ProcessingParameters), backend dispatch and MBean servers (BackendManager, LocalRequestDispatcher, MBeanServerHandler, executors), all handlers (Read/Write/Exec/List/Search/Version, JsonRequestHandler, RequestHandlerManager), restrictor and policy parsing (RestrictorFactory, PolicyRestrictor, MBeanAccessChecker/MBeanPolicyConfig, NetworkChecker, CorsChecker, HttpMethodChecker, RequestTypeChecker), JSR-160 proxy module, JVM-agent HTTP handler/config/security (JolokiaHttpHandler, JolokiaServerConfig, ParsedUri, authenticators incl. Delegating/ClientCert/UserPassword), OSGi security (AuthorizationHeaderParser, BasicAuthenticator, BasicAuthenticationHttpContext), WAR web.xml, and the security/proxy architecture docs used to judge intended behavior. Skimmed: converters/JSON serialization, history/debug stores, discovery multicast, Mule/JMX/Spring modules, JavaScript clients and site assets, build/assembly files. No tests exist in the snapshot; binary files are skipped by the tooling.",
+  "limitations": [
+    "Static review only - no code execution, build, tests, or network requests were performed; all exploitability statements are unconfirmed leads.",
+    "No git history, patch, or CVE metadata is present in the snapshot, so the mapping of findings to specific CVE IDs (e.g. CVE-2018-1000130/CVE-2018-1000129) is inference from the 1.4.0 version and dates, not verified.",
+    "Third-party dependencies (json-simple, servlet container, JDK com.sun.net.httpserver) are not in the snapshot; their escaping/parsing behavior is assumed from standard behavior and affects the unselected XSS lead.",
+    "The proxy-mode SSRF is conditional on deployment: jolokia.war enables the JSR-160 dispatcher in web.xml, while the JVM agent does not include it by default; I could not verify which deployments are actually exposed in practice.",
+    "Some areas (JavaScript client libraries, Mule/JMX modules, site/tooling resources, large minified JS) were only skimmed and are not claimed as fully reviewed.",
+    "Line numbers refer to this snapshot only."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected XSS via unvalidated response MIME type and JSONP callback: the response Content-Type is taken from the request parameter mimeType with no whitelist (AgentServlet.getMimeType 384-389 used at 471-473; JolokiaHttpHandler.getMimeType 381-393), and attacker-controlled strings are echoed unescaped into the JSON body (error messages and the \"request\" echo in HttpRequestHandler.getErrorJSON 258-271, e.g. ExecHandler.java:147/175) or, for the callback parameter, concatenated raw into the response (AgentServlet.sendAllJSON 495-511; IoUtil.streamResponseAndClose 30-48; JolokiaHttpHandler 355-378). A crafted URL such as one setting mimeType=text/html plus an HTML payload in a reflected MBean/attribute/operation value can execute script in the agent origin (json-simple escapes quotes/backslashes but not HTML metacharacters).",
+      "reason": "Plausible and likely the project's other known 1.4.0 issue, but it requires victim interaction and its payload delivery depends on the third-party json-simple escaping behavior (library source is not present in this snapshot) and browser handling of text/javascript for the callback variant; the proxy SSRF is server-side, needs no victim and has higher direct impact, so the XSS was not selected as the single candidate."
+    },
+    {
+      "lead": "XXE in the policy parser: PolicyRestrictor builds a DocumentBuilderFactory without disabling DTDs/external entities (PolicyRestrictor.java:68-69).",
+      "reason": "The parsed document is the operator-supplied jolokia-access.xml (classpath/file URL from configuration), not attacker-controlled request data, so no remote attacker reaches this path in the reviewed configurations."
+    },
+    {
+      "lead": "Credential comparison weaknesses: UserPasswordAuthenticator.checkCredentials uses String.equals (timing side channel) and OSGi BasicAuthenticator trims provided user/password before comparing (BasicAuthenticator.java:23-35, AuthorizationHeaderParser.decode).",
+      "reason": "Low practical impact (single credentials pair, timing on a short secret, whitespace trimming only affects configured secrets with surrounding spaces) and not remotely triggerable to bypass auth in the reviewed flows; noted as hardening only."
+    },
+    {
+      "lead": "DelegatingAuthenticator treats any HTTP 200 from the delegate URL as successful authentication (DelegatingAuthenticator.java:49-63) and, when authIgnoreCerts is set, installs a global trust-all SSL socket factory/hostname verifier (lines 137-174).",
+      "reason": "Requires explicit non-default configuration (authUrl/authMode=delegate, authIgnoreCerts=true) and is a hardening/design concern rather than a request-controlled flaw."
+    },
+    {
+      "lead": "Default CORS posture: with no <cors> policy section (or AllowAllRestrictor), any Origin is reflected in Access-Control-Allow-Origin with Access-Control-Allow-Credentials: true (CorsChecker.check 82-98, AllowAllRestrictor, HttpRequestHandler.extractCorsOrigin 299-310).",
+      "reason": "Documented as intentional behavior in this version (src/docbkx/security.xml:206-214: \"By default Jolokia allows cross origin access from any host\"), so it was treated as a known design trade-off, although it amplifies the other findings (e.g. allows drive-by proxy requests and access to an unauthenticated local agent)."
+    },
+    {
+      "lead": "Information disclosure: /version returns all global configuration values including user/password when set (VersionHandler.java:91-104 via Configuration.get 90-96).",
+      "reason": "The credentials are only exposed to clients that can already reach/authenticate to the agent (single configured account), so impact is limited; not selected."
+    }
+  ],
+  "summary": "Snapshot identified: Jolokia 1.4.0 (JMX-over-HTTP/JSON agent; agent/core, agent/jsr160, JVM/OSGi/Mule/WAR agents, Java+JS clients, docs). I traced the request pipeline end-to-end: servlet/JVM-agent HTTP entry points -> JmxRequestFactory/JmxRequest -> BackendManager dispatcher selection -> handlers/restrictor -> JMX invocation and JSON output. The single strongest candidate is an unauthenticated SSRF through the JSR-160 proxy dispatcher, which is enabled by default in the jolokia.war deployment: an attacker-supplied POST body can cause the agent to open outbound JMX/RMI connections to any host/port, with no target allow-list anywhere in the code or policy model. A second plausible issue (reflected XSS via unvalidated mimeType/callback and unescaped reflection) is recorded as an unselected lead, along with several lower-severity hardening observations. No code was executed; all conclusions are static-reading based."
+}

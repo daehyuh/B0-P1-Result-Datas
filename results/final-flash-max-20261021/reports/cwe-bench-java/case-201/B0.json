@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any authenticated CQL user (e.g., a user with no SELECT/ALTER grants) can send ordinary statements (SELECT/INSERT/UPDATE/etc.) or prepared statements to the coordinator. Because the plugin's handler is installed process-wide, those requests are dispatched to the plugin's `process`/`processPrepared` rather than to stock `QueryProcessor.processStatement`.",
+      "confidence": "medium",
+      "counterevidence_checked": "The plugin's javadoc explicitly states it replaces the previous CQL query handler ('Sets this query handler as the Cassandra CQL query handler, replacing the previous one'), and it overrides process/processPrepared/processBatch, which only makes sense if it is the dispatch target; stock Cassandra places checkAccess/validate in the QueryProcessor statement-processing path that this class replaces. Checked for any in-repo compensating check (grep for checkAccess/authorize/Permission: none); `processBatch` delegates to stock QueryProcessor (checks preserved there), which does not cover normal/prepared statements. The snapshot contains no Cassandra server sources, so the exact dispatch contract of Cassandra 4.1.8's QueryHandler/QueryProcessor and whether any check happens outside the handler could not be verified from the assigned tree.",
+      "id": "case-201-cand-1",
+      "impact": "Permission enforcement for CQL statements is bypassed while the plugin is active: a low-privileged authenticated user could read or modify tables for which they have no grants (e.g., authentication/system or other tenants' tables), i.e., a confidentiality/integrity authorization bypass on the whole node/cluster. Statement validation is also skipped, weakening request validation.",
+      "locations": [
+        {
+          "end_line": 122,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/IndexQueryHandler.scala",
+          "start_line": 76
+        },
+        {
+          "end_line": 157,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/IndexQueryHandler.scala",
+          "start_line": 151
+        },
+        {
+          "end_line": 275,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/IndexQueryHandler.scala",
+          "start_line": 262
+        },
+        {
+          "end_line": 54,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/Index.scala",
+          "start_line": 53
+        }
+      ],
+      "prerequisites": "The Lucene plugin is installed and at least one Lucene index has been created anywhere in the cluster (index construction calls `IndexQueryHandler.activate()`, making the plugin's handler the global CQL handler). No special privilege is required of the attacker beyond being able to connect and issue CQL.",
+      "root_cause": "`IndexQueryHandler` implements the server-side `QueryHandler` interface and replaces the stock handler globally (`IndexQueryHandler.activate()` reflectively sets the static `ClientState.cqlQueryHandler`, called from `Index`'s constructor). Its own `processStatement` reimplements stock `QueryProcessor.processStatement` (bind-variable preparation, `regularStatementsExecuted` metric, `statement.execute(...)`) but omits `statement.checkAccess(clientState)` and `statement.validate(clientState)`. Both entry points `process(...)` and `processPrepared(...)` funnel directly into this method, and `execute(...)` calls `statement.execute(state, options, requestTime)` with no permission check anywhere in the plugin (a repo-wide search for `checkAccess`, `authorize`, `Permission` returns nothing).",
+      "title": "Lucene plugin's replacement CQL QueryHandler executes statements without permission checks (missing authorization)",
+      "trace": "Index constructor -> IndexQueryHandler.activate() (Index.scala:54) reflectively overwrites ClientState.cqlQueryHandler (IndexQueryHandler.scala:263-275) -> incoming CQL statement reaches plugin's `process`/`processPrepared` (lines 77-93) -> `processStatement` (lines 95-122) prepares bind variables, increments metrics, optionally intercepts Lucene expressions, then `execute(...)` (lines 151-157) calls `statement.execute(state, options, requestTime)` directly. Unlike stock QueryProcessor.processStatement, no `statement.checkAccess(state.getClientState)` and no `statement.validate(...)` are performed. Additionally, `executeSortedLuceneQuery` builds read commands using `ClientState.forInternalCalls()` (line 216), i.e., an internal client state, and only checks that a consistency level is present (lines 202-205).",
+      "unverified": "Not runtime-confirmed and not verified against Cassandra 4.1.8 server sources (absent from the snapshot). The finding assumes `IndexQueryHandler.process/processPrepared` are the server's statement-processing entry points when the handler is installed (as the plugin's own activate() comment and the pattern of replacing the previous handler indicate). If Cassandra's transport or parser performed authorization before invoking the handler, this would not be exploitable; that external precondition remains unverified.",
+      "weakness_type": "CWE-862 Missing Authorization / CWE-863 Incorrect Authorization"
+    }
+  ],
+  "coverage_summary": "All 219 exposed files were enumerated (builder, plugin, testsAT pom, CI config). I read the plugin's interception/query path (IndexQueryHandler, Index, Search, SearchBuilder(s), ExpressionMapper, IndexService, IndexPostProcessor, DocumentIterator), paging/serialization code (IndexPagingState, ByteBufferUtils), schema/analyzer configuration and validation (IndexOptions, SchemaBuilder, SchemaAnalyzer, ClasspathAnalyzerBuilder, StandardAnalyzers, Snowball*, SchemaValidator, Mapper/MapperBuilder), partitioners, mapping classes (ColumnsMapper, ClusteringMapper, KeyMapper, PartitionMapper, TokenMapper, Column(s)), FSIndex/PartitionedIndex/TaskQueue/util classes, the Cassandra-side bridge classes (LuceneStorageProxy, LuceneReplicaPlan*), and a sample of condition/mapper classes (Range, Regexp, Fuzzy, Bitemporal, Lucene, Inet, GeoPoint, Mapper, SingleColumnMapper). Not every Java condition/mapper/sort builder was read line-by-line; no Cassandra server sources are present, so cross-layer handler semantics could not be inspected.",
+  "limitations": [
+    "No tests, docs or git history in the snapshot; the fix commit/CVE metadata for this case is not available, so ground truth could not be consulted.",
+    "Cassandra 4.1.8 server sources (QueryProcessor/QueryHandler/transport dispatch) are not part of the assigned tree; the authorization-bypass preconditions therefore rest on the plugin's own replacement semantics and comments rather than on the called code.",
+    "Static review only: no code was executed, no Cassandra instance was run, and no runtime confirmation of the candidate was obtained.",
+    "Java condition/mapper/sort classes were only partially read; residual issues there cannot be fully excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Arbitrary class instantiation via 'classpath' analyzer / analyzer-name-as-class-name (ClasspathAnalyzerBuilder.analyzer, SchemaAnalyzer.getAnalyzer, SchemaBuilder.build default analyzer), reachable from attacker-supplied index schema JSON.",
+      "reason": "Reachable only by a user who can create/alter an index (ALTER on the table), and the reflective cast to org.apache.lucene.analysis.Analyzer constrains loaded classes to Analyzer subclasses with no-arg constructors already on the classpath, so no direct attacker-supplied code execution. It is also a documented intended feature."
+    },
+    {
+      "lead": "User-controlled 'directory_path' index option (IndexOptions.parsePath) combined with recursive deletion in FSIndex.delete()/PartitionedIndex.delete() via FileUtils.forceDelete(path).",
+      "reason": "Real taint path (CQL index option -> path -> recursive delete), but the option is a designed administrative configuration; exploitation requires index create/drop privileges (ALTER) and a writable target directory, and no in-repo evidence shows the path is meant to be sandboxed. Kept as unconfirmed secondary lead."
+    },
+    {
+      "lead": "IndexPagingState.fromByteBuffer parses client-supplied paging-state bytes with no validation (SearchBuilder paging field and PagingState.partitionKey), including attacker-chosen remaining count, partition keys and clusterings.",
+      "reason": "Leads at most to parser exceptions/error responses and odd paging seek positions; the Lucene query itself still constrains results, so no privilege or confidentiality impact was substantiated."
+    },
+    {
+      "lead": "ByteBufferUtils.byteBuffer(BytesRef) passes bytesRef.offset + bytesRef.length as the ByteBuffer.wrap length instead of bytesRef.length.",
+      "reason": "Latent bug; stored-field BytesRefs read back from Lucene documents use offset 0 in the inspected call sites (PartitionMapper.decoratedKey, ClusteringMapper.clustering, toHex), so no concrete attacker-controlled impact was established."
+    },
+    {
+      "lead": "Other hardening/DoS observations: BooleanQuery.setMaxClauseCount(Integer.MAX_VALUE) (FSIndex object initializer), LuceneCondition QueryParser with allowLeadingWildcard(true), unbounded WKT/JTS parsing and recursive GeoShape transformations.",
+      "reason": "Resource-exhaustion/robustness concerns intrinsic to search functionality; no authorization or input-trust boundary corruption demonstrated, so not submitted as the single candidate."
+    }
+  ],
+  "summary": "Reviewed the instaclustr/cassandra-lucene-index snapshot (219 files; only main sources are present, no tests/docs). The single strongest source-supported candidate is a missing-authorization lead in the plugin's CQL interception layer: `IndexQueryHandler` globally replaces Cassandra's CQL `QueryHandler` (reflection into `ClientState.cqlQueryHandler`) and its replacement statement-processing path executes parsed statements without the `checkAccess`/`validate` calls that stock `QueryProcessor.processStatement` performs. Secondary leads (arbitrary class loading for analyzers, user-controlled `directory_path` feeding `FileUtils.forceDelete`, unvalidated paging-state parsing) were treated as rejected/unconfirmed because they are designed features, require elevated schema privileges, or lack a strong security impact."
+}

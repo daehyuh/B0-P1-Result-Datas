@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated user who can create or update task definitions in a project (project function permission `project:task-definition:create`/`edit`) supplies the SWITCH task `taskParams` JSON, including `dependTaskList[].condition`. The same field can be supplied through workflow import (`ProcessDefinitionController` import) since imported task parameters are persisted unchanged. The condition string is attacker-controlled text and is not validated against a safe expression grammar.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that (a) the switch-expression feature is documented as JavaScript-based (docs/docs/en/contribute/backend/mechanism/task/switch.md), which is the main argument that this is 'by design'; however the documented use is boolean expressions, and there is no sandbox, allowlist, class filter, or SecurityManager anywhere, so the Java interop bridge is an unintended capability for the master JVM. (b) Checked for mitigations: no `nashorn` JVM flags, no `SecurityManager` usage in the repository; the only JSR-223 engine use is this class. (c) Checked that the engine is created from `ScriptEngineManager` (not a restricted binding). (d) Checked parameter substitution: a condition referencing a missing `${param}` becomes empty string, but a payload with no placeholders bypasses this. (e) Checked that task params are not schema-validated; `SwitchParameters.checkParameters()` always returns true. (f) Java 15+ removes Nashorn, which limits the issue to Java 8/11 deployments; the project targets Java 8 and the distributed images use JDK 8, so this is the normal deployment case.",
+      "id": "dolphinscheduler-switch-task-js-injection",
+      "impact": "Arbitrary code execution as the OS user running the master server, from a workflow-author-level account. The master JVM handles workflow scheduling and holds DB/registry credentials, so this enables full compromise of the scheduling cluster (credential theft, workflow/data tampering, lateral movement), bypassing the intended model where user task code executes on workers under a tenant identity.",
+      "locations": [
+        {
+          "end_line": 37,
+          "path": "dolphinscheduler-master/src/main/java/org/apache/dolphinscheduler/server/master/utils/SwitchTaskUtils.java",
+          "start_line": 24
+        },
+        {
+          "end_line": 113,
+          "path": "dolphinscheduler-master/src/main/java/org/apache/dolphinscheduler/server/master/runner/task/switchtask/SwitchLogicTask.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 165,
+          "path": "dolphinscheduler-master/src/main/java/org/apache/dolphinscheduler/server/master/runner/task/switchtask/SwitchLogicTask.java",
+          "start_line": 134
+        },
+        {
+          "end_line": 38,
+          "path": "dolphinscheduler-task-plugin/dolphinscheduler-task-api/src/main/java/org/apache/dolphinscheduler/plugin/task/api/parameters/SwitchParameters.java",
+          "start_line": 26
+        },
+        {
+          "end_line": 33,
+          "path": "dolphinscheduler-task-plugin/dolphinscheduler-task-api/src/main/java/org/apache/dolphinscheduler/plugin/task/api/model/SwitchResultVo.java",
+          "start_line": 30
+        }
+      ],
+      "prerequisites": "1) A valid account with task-definition create/edit permission on at least one project (and ability to run/trigger the workflow). 2) A master JVM that provides the JSR-223 \"js\" engine, i.e. Nashorn on Java 8 (the version the project compiles for and the official distribution/container images use). 3) The SWITCH task is reached during workflow execution. The quoting transformation (`'` -> `\"`) does not prevent payloads that use double quotes, and `setTaskParams` returns the original content when no `${...}` placeholder is present, so no parameter setup is required.",
+      "root_cause": "`SwitchTaskUtils` creates a generic JSR-223 engine via `new ScriptEngineManager().getEngineByName(\"js\")` and calls `engine.eval(expression)` (line 35) with no sandbox, class filter, or SecurityManager. The expression is the SWITCH task's `condition` string from the task definition: `SwitchLogicTask.calculateConditionResult()` evaluates each `SwitchResultVo.getCondition()` after replacing single quotes with double quotes and substituting `${param}` placeholders (`setTaskParams`). Nothing constrains the condition to an expression-only grammar: `SwitchParameters` is deserialized from the user-supplied `taskParams` JSON, `checkParameters()` unconditionally returns true, and `TaskDefinitionServiceImpl.checkTaskDefinitionValid()` only checks project ACLs, not task parameter content. On Java 8 (Nashorn) the evaluated script can access `Java.type(...)`, `Packages...`, etc., so the condition can construct and invoke arbitrary Java classes in the master process.",
+      "title": "SWITCH task condition is evaluated as unsandboxed JavaScript in the master JVM (code execution via Nashorn Java interop)",
+      "trace": "API: `TaskDefinitionController.createTaskDefinition`/`updateTaskDefinition` -> `TaskDefinitionServiceImpl` validates only project authorization (lines 153-160, 259), stores `taskParams` verbatim. Execution: workflow instance is dispatched by the master, `SwitchLogicTask.handle()` -> `calculateConditionResult()` (SwitchLogicTask.java lines 86-119) reads `taskParameters.getDependTaskList()` and computes `content = setTaskParams(info.getCondition().replaceAll(\"'\", \"\\\"\"), rgex)` (line 103), then calls `SwitchTaskUtils.evaluate(content)` (line 107) -> `engine.eval(expression)` (SwitchTaskUtils.java line 35). Nashorn evaluates the string with its global Java bridge available, so a condition such as Java interop code (`Java.type(...)`/`Packages...`) is executed during `eval` regardless of the boolean result returned to the switch logic.",
+      "unverified": "No code was executed and no runtime reproduction was performed. Exploitability depends on the deployment's Java version (Nashorn availability) and on the permission model granting task-edit rights to the attacker; the exact upstream fix/CVE association could not be confirmed from the snapshot alone (no git history, no CVE metadata in the tree).",
+      "weakness_type": "Code Injection (CWE-94/CWE-95); unsafe dynamic code evaluation"
+    }
+  ],
+  "coverage_summary": "Scope per get_source_scope: 3332 model-visible files, no files excluded by size/symlink/sensitive-name filters; binary-like files are skipped by the read/search tools. I focused on the request-processing and execution paths: dolphinscheduler-api (controllers, services, interceptors, security authenticators, permission checks), dolphinscheduler-master (logic tasks incl. switch/condition/dependent, dispatchers), dolphinscheduler-service, dolphinscheduler-dao (mapper XML parameterization), dolphinscheduler-task-plugin API (parameters, ParameterUtils), dolphinscheduler-common (FileUtils/LogUtils/EncryptionUtils), datasource plugins (JDBC URL construction), alert plugins, and storage plugins (HDFS/S3/ABS download paths). Broad pattern searches covered ProcessBuilder/Runtime exec, ScriptEngine/eval, ObjectInputStream/readObject, SpEL, Class.forName/newInstance, SQL statement construction, `${}` in mapper XML, path/traversal helpers, hardcoded credentials, and actuator/auth configuration. I did not exhaustively audit the Vue UI, all ~30 task plugins, the registry/remote modules, or every test/e2e file.",
+  "limitations": [
+    "No code execution, build, or runtime testing was performed; all conclusions are static source analysis.",
+    "No git history, CVE metadata, or patch data is available in the snapshot, so the mapping of this issue to a specific upstream security fix/CVE could not be confirmed.",
+    "Exploitability of the selected candidate depends on deployment Java version (Nashorn present on Java 8/11; removed in later JDKs) and on the RBAC grants the attacker holds (task-definition write + workflow run).",
+    "Deployment-specific conditions (storage backend type, whether registration is open, network exposure of the Python gateway port) affect the rejected leads and were not verifiable from source alone.",
+    "Large areas of the tree (UI, most task plugins, registry, remote RPC, alert plugins) were reviewed only by targeted searches, not line-by-line."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Missing authorization on environment detail API: `GET /environments/query-by-code` calls `EnvironmentServiceImpl.queryEnvironmentByCode(Long)` (EnvironmentServiceImpl.java lines 270-290) which takes no User and performs no permission check, returning the environment `config` (often containing exports/secrets) to any authenticated user; sibling `queryEnvironmentListPaging`/`queryAllEnvironmentList` do filter by `resourcePermissionCheckService.userOwnedResourceIdsAcquisition(ENVIRONMENT, ...)`.",
+      "reason": "Real broken-access-control candidate (CWE-200/IDOR) and matches 'sensitive information exposure', but impact is information disclosure rather than code execution, and the API may intentionally expose environment config to logged-in users. Not selected as the single strongest candidate."
+    },
+    {
+      "lead": "Resource-center download path handling: `ResourcesServiceImpl.downloadResource` (ResourcesServiceImpl.java lines 1370-1401) only rejects names ending in '/', then calls `storageOperate.download(tenantCode, fullName, localFileName, true)`; `HdfsStorageOperator.download`/`copyHdfsToLocal` (HdfsStorageOperator.java lines 296-299, 358-379) ignore tenantCode and use the supplied path directly. In LOCAL storage mode (the default) this can copy arbitrary readable local files; in HDFS/object-storage modes it can cross tenant boundaries.",
+      "reason": "Plausible arbitrary-file-read/IDOR (CWE-22/639), but exploitability depends on the configured storage backend and on how deployments constrain `fullName`; no in-snapshot proof that the API is reachable with a non-resource path in the relevant deployment, so impact is less certain than the script-eval candidate."
+    },
+    {
+      "lead": "Python gateway default token: `ApiConfig.PythonGatewayConfiguration.authToken` hardcodes `jwUDzpLsNKEFER4*a8gruBH_GsAurNxU7A@Xc` (ApiConfig.java line 87, also application.yaml lines 137/231) while `PythonGateway.start()` binds `0.0.0.0:25333` and only sets the token if non-empty; the port is published in the official docker-compose/standalone quick-start.",
+      "reason": "Hard-coded credential (CWE-798) with possible Py4J RCE if the gateway is exposed, but the value is a documented default with an explicit 'should be changed' comment and the Py4J sandbox behavior is not visible in this repository, so it is weaker and more configuration-dependent than the code-injection candidate."
+    },
+    {
+      "lead": "MySQL datasource `other` parameters: `MySQLDataSourceProcessor.transformOther` filters only keys (`checkKeyIsLegitimate`) while values are concatenated unencoded into the JDBC URL (lines 155-179), so a value containing `&autoDeserialize=true`-style text could inject driver parameters; the appended fixed `APPEND_PARAMS` forces several dangerous flags to false afterwards, so the actual bypass is uncertain.",
+      "reason": "Unconfirmed JDBC-URL parameter injection; no in-repo evidence that the trailing hard-coded parameters can be overridden by injected duplicates, and exploitation would require a malicious datasource endpoint. Mentioned only as an unverified lead."
+    }
+  ],
+  "summary": "Snapshot is Apache DolphinScheduler 3.2.0 (root pom version 3.2.0; 3332 source files in scope). I reviewed the API server (auth/interceptor, task-definition, resource center, environment, datasource, logger, access-token, k8s services), the master (logic tasks: switch/condition/dependent), the task-plugin API, the DAO MyBatis mappers, and the storage plugins. The strongest source-evidenced issue is an unsandboxed script evaluation in the SWITCH task: the condition text stored in a task definition is passed to a Nashorn JavaScript engine and evaluated in the master JVM. Because Nashorn (the default JSR-223 \"js\" engine on Java 8, which the project and its containers target) exposes full Java interop, a workflow author with task-definition write permission can execute arbitrary Java/OS commands inside the master process, escaping the worker/tenant execution boundary. Several other plausible but weaker leads (environment-config exposure, resource download path handling, hardcoded Python-gateway token, MySQL `other`-value filtering) are listed as rejected/unconfirmed."
+}

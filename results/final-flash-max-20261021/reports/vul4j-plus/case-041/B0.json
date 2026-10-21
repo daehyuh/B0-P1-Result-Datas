@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the extracted archive bytes: zip entry names, Unix external attributes (indicating a symlink) and the entry payload that commons-compress returns as the link target via ZipFile.getUnixSymlink(); or tar entry name, typeflag (symlink) and link name via TarArchiveEntry.getLinkName(). The link target can be absolute or contain '..' segments. Entry ordering (physical order for zip, sequential for tar) lets the attacker place the symlink before the entry that writes through it, and a same-name regular entry can directly overwrite the symlink's target.",
+      "confidence": "medium",
+      "counterevidence_checked": "Classic '../' entry-name traversal appears mitigated in this snapshot: both extraction paths funnel names through FileUtils.resolveFile (AbstractUnArchiver.java:309) and the pom pins plexus-utils 3.1.0 (pom.xml:60), so the submitted candidate deliberately targets link targets, which are never checked. extractFile only skips writing when overwrite is disabled and the destination exists and is newer (line 313); overwrite defaults to true (line 52), so a same-name file entry still overwrites the symlink target. No global 'allow symlinks' flag or default file selector blocks link entries (isSelected at lines 234-257 only applies user-supplied selectors). The candidate is not confirmed at runtime and depends on plexus-io's SymlinkUtils actually creating the link without validating the target (dependency source is not in the snapshot). On platforms where symlink creation fails, only an error occurs; on Unix-like systems the write-through is straightforward.",
+      "id": "CAND-1",
+      "impact": "Arbitrary creation/overwrite of files outside the intended extraction directory with the privileges of the extraction process. Practical consequences include overwriting build/CI configuration, scripts or shell initialization files, .ssh/authorized_keys, cron entries, or other files writable by that process, which commonly escalates to code execution in the extracting context; it can also corrupt existing files outside the destination. This is the same class of issue as the later symlink-based extraction advisory for plexus-archiver.",
+      "locations": [
+        {
+          "end_line": 361,
+          "path": "src/main/java/org/codehaus/plexus/archiver/AbstractUnArchiver.java",
+          "start_line": 303
+        },
+        {
+          "end_line": 114,
+          "path": "src/main/java/org/codehaus/plexus/archiver/tar/TarUnArchiver.java",
+          "start_line": 107
+        },
+        {
+          "end_line": 215,
+          "path": "src/main/java/org/codehaus/plexus/archiver/zip/AbstractZipUnArchiver.java",
+          "start_line": 176
+        },
+        {
+          "end_line": 95,
+          "path": "src/main/java/org/codehaus/plexus/archiver/dir/DirectoryArchiver.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 66,
+          "path": "pom.xml",
+          "start_line": 57
+        }
+      ],
+      "prerequisites": "A consumer uses plexus-archiver's UnArchiver (role hints zip/jar/war/ear/tar, components.xml:89-166) to extract an archive from an untrusted or untrusted-influenced source (e.g., Maven dependency/assembly unpacking of third-party artifacts, CI or server-side extraction). The platform must support symlink creation (Unix-like; on Windows this normally requires elevated privilege and usually fails). Impact is bounded only by the filesystem permissions of the process performing extraction. Note the dest directory is typically user-chosen, so the attacker does not choose the extraction root, but does not need to.",
+      "root_cause": "AbstractUnArchiver.extractFile() computes the output path with FileUtils.resolveFile(dir, entryName) (lexical normalization only) and then, whenever the archive entry supplies a symlink destination, calls SymlinkUtils.createSymbolicLink(f, new File(symlinkDestination)) with no check that the target is relative or stays inside the extraction root (lines 309, 325-327). The path used for symlink creation and for subsequent regular entries is never canonicalized/re-validated against the destination, so any later FileOutputStream(f) (lines 333-347) or chmod on that path (lines 352-355) traverses the previously created symlink. The same unchecked pattern exists in DirectoryArchiver (lines 90-95). Link targets are taken verbatim from archive metadata: zf.getUnixSymlink(ze) for ZIP (AbstractZipUnArchiver.java:204-215, called at 176-181) and TarArchiveEntry.getLinkName() for TAR (TarUnArchiver.java:107-114). No code in the snapshot validates symlink targets or verifies that resolved paths remain under the destination directory.",
+      "title": "Archive extraction creates symlinks with unvalidated targets, enabling file writes outside the destination directory",
+      "trace": "ZipUnArchiver/TarUnArchiver.extract() -> AbstractUnArchiver.extract() -> execute() -> AbstractZipUnArchiver.execute() (AbstractZipUnArchiver.java:168-185), which for each entry computes symlinkDestination = zf.getUnixSymlink(ze) and calls extractFile(...); or TarUnArchiver.execute() (TarUnArchiver.java:107-114), which passes te.getLinkName(). AbstractUnArchiver.extractFile() resolves f = FileUtils.resolveFile(dir, entryName), creates parent dirs with dirF.mkdirs(), and if symlinkDestination is non-empty calls SymlinkUtils.createSymbolicLink(f, new File(symlinkDestination)) (line 327) - no absolute-path or containment check. A later entry with entryName 'link/...' (or the same entryName as the symlink) resolves to a path under the symlink; FileOutputStream(f) (line 338) follows the link and writes the attacker-supplied content to the link target. chmod(f, mode) (line 354) may also act on the target through the link.",
+      "unverified": "plexus-io 3.0.1 (SymlinkUtils.createSymbolicLink) and plexus-utils 3.1.0 (FileUtils.resolveFile) sources are dependencies outside the assigned tree, so their exact behavior (whether createSymbolicLink rejects targets, whether resolveFile fully neutralizes '..') is assumed from their call sites, not read. No tests or execution were available to confirm the write-through end to end. Whether this snapshot's intended case is the classic zip-slip rather than the symlink variant could not be determined from source alone.",
+      "weakness_type": "CWE-59 Link Following / CWE-22 Path Traversal (arbitrary file write via crafted archive)"
+    }
+  ],
+  "coverage_summary": "Source scope reported 386 readable files (no binary or sensitive-path exclusions). Of these, 284 are jira/PLXCOMP-*.json issue-tracker exports, which were treated as untrusted context and only keyword-sampled (no security/traversal advisory matching the 2018 snapshot was found); the remaining files are the plexus-archiver Maven project. All Java sources under src/main/java were searched for file-write, symlink, path-resolution, process-execution and temp-file sinks; the extraction stack (AbstractUnArchiver, AbstractZipUnArchiver, ZipUnArchiver, TarUnArchiver, tar/zip resource classes, DirectoryArchiver), the archive-creation stack (AbstractArchiver, AbstractZipArchiver, JarArchiver, TarArchiver, ConcurrentJarCreator, OffloadingOutputStream), ArchiveEntry, ReleaseNotes.md, pom.xml and components.xml were read in depth. Tests are absent from the snapshot, so no test-based confirmation was possible. No code was executed and no dependency sources (plexus-utils, plexus-io, commons-compress) or external data were consulted.",
+  "limitations": [
+    "Dependency sources for plexus-utils 3.1.0, plexus-io 3.0.1 and commons-compress 1.16.1 are not present in the snapshot; behavior of FileUtils.resolveFile and SymlinkUtils.createSymbolicLink is inferred from call sites only.",
+    "The snapshot contains no src/test tree, so no test names or fixtures could corroborate the intended vulnerability.",
+    "No build, execution, scanner or exploit payload was used; all statements are source-level and the candidate is not runtime-confirmed.",
+    "The jira/ issue export ends in 2015 and does not describe the 2018-era changes, so it could not be used to disambiguate the intended case; its contents were treated as untrusted data.",
+    "Manifest.java, the full JarArchiver, TarArchiver and ByteArrayOutputStream were not read line-by-line end to end; they were searched for the relevant sink patterns and skimmed, so a lower-severity issue in those classes cannot be fully excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Plain '../' entry-name traversal (zip-slip) in AbstractUnArchiver.extractFile / TarUnArchiver / AbstractZipUnArchiver",
+      "reason": "Entry names are normalized through org.codehaus.plexus.util.FileUtils.resolveFile (AbstractUnArchiver.java:309), and pom.xml:60 pins plexus-utils 3.1.0, the generation that hardened resolveFile; the dependency source is not in the snapshot so a residual bypass cannot be claimed. Not selected because the symlink target path has no equivalent mitigation and is a distinct root cause."
+    },
+    {
+      "lead": "DirectoryArchiver builds output paths by string concatenation destDir + File.separator + entryName with no containment check (lines 86-88)",
+      "reason": "A resource name containing '..' could escape the destination, but names come from configured file sets / archived file sets (build configuration and artifact contents) rather than from a directly untrusted extraction API, and the primary UnArchiver path is protected by resolveFile, so attacker control is weaker. Mentioned as related, not submitted."
+    },
+    {
+      "lead": "JarToolModularJarArchiver writes module descriptor entries to tempDir.resolve(vPath) (line 121)",
+      "reason": "vPath reaches this branch only when isModuleDescriptor() matches: prefix is empty or matches META-INF/versions/\\d+/ (lines 181-197), so absolute or '..' segments cannot occur in the matched paths; resource names are also build-controlled. No traversal demonstrated."
+    },
+    {
+      "lead": "ArchiveEntryUtils.chmod / AttributeUtils.chmod being applied to freshly created symlink entries may change the permissions of the link target (AbstractUnArchiver.java:352-355)",
+      "reason": "This is a secondary effect of the same unchecked symlink handling and depends on plexus-io's chmod semantics (not present in the snapshot, and PLXCOMP-244-era fixes may already skip symlinks); it is not split into a separate candidate."
+    },
+    {
+      "lead": "Decompression-based denial of service via bzip2/xz/snappy/gzip streams (BZip2UnArchiver, XZUnArchiver, SnappyUnArchiver, GZipUnArchiver)",
+      "reason": "Only fixed, dependency-provided decompressors are used with no unbounded intermediate buffering visible in these classes; no concrete exploit path or resource-exhaustion evidence was established."
+    }
+  ],
+  "summary": "Snapshot is Plexus Archiver 3.6.0-SNAPSHOT (pom.xml:13), a Maven archive component exposing UnArchiver implementations for zip/jar/war/ear/tar (src/main/resources/META-INF/plexus/components.xml:89-166). After tracing the extraction call chain and all file-writing sinks, the strongest source-evidenced issue is that archive extraction creates symbolic links from archive-provided targets without any containment validation, and subsequent entries are written through paths that follow those links (FileOutputStream on a lexically-resolved path). A crafted zip/tar entry pair (symlink entry followed by a file entry whose path runs through it, or a same-name file entry) can therefore create/overwrite files outside the extraction directory with the extracting process's privileges. Classic \"../\" entry-name traversal is not the selected candidate because entry names are passed through org.codehaus.plexus.util.FileUtils.resolveFile (AbstractUnArchiver.java:309), while link targets are not. One candidate submitted; related weaker leads are listed as rejected. No runtime testing was performed."
+}

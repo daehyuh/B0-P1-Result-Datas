@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The untrusted Venice script fully controls the file argument of load-resource* / load-file* (and of the load-resource / load-file macros built on them). The string is passed through ModuleFunctions.loadResource()/ModuleLoader.loadExternalFile() as new File(file) with no normalization or '..' rejection; only a '.venice' suffix restriction applies to load-file*. The script therefore chooses the traversal path (e.g., a relative path containing '../' segments).",
+      "confidence": "medium",
+      "counterevidence_checked": "- SandboxInterceptor.validateFileRead()/validateFileWrite() would reject files that are not on the load path, but a full-repository search shows they are only declared/implemented and never invoked, so they do not interfere. - Under RejectAllInterceptor or rejectAllVeniceIoFunctions(), load-resource*/load-file* are in the blacklist, so this traversal is not reachable in the strictest configuration; it matters for customized sandboxes that permit these load functions while relying on load paths. - The absolute-path branch does call isFileWithinDirectory(), i.e. the author intended containment for file loads, which argues against the omission being deliberate. - The sandbox documentation notes Java-interop sandboxing is 'skin deep', but load paths are explicitly described as the security mechanism for load-file/load-resource (LoadPathsFactory javadoc, ChangeLog 1.9.1), so this is a boundary the product claims to provide. - Direct interpreter-level sandbox validation (VeniceInterpreter.validateVeniceFunction at call sites) does not help here because the functions are allowed and the check operates on function names, not file paths.",
+      "id": "case-013-cand-1",
+      "impact": "Confidentiality breach / sandbox escape: a script that the host confined to a load-path directory can read arbitrary files readable by the JVM process (configuration files, credentials, keys, source, etc.) and receive the contents as a String or ByteBuf inside the script. This defeats the documented 'files only from the specified load paths' guarantee for load-file/load-resource. It is a local, source-verified boundary violation; no remote code execution is claimed.",
+      "locations": [
+        {
+          "end_line": 229,
+          "path": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+          "start_line": 210
+        },
+        {
+          "end_line": 270,
+          "path": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+          "start_line": 253
+        },
+        {
+          "end_line": 227,
+          "path": "src/main/java/com/github/jlangch/venice/impl/functions/ModuleFunctions.java",
+          "start_line": 182
+        },
+        {
+          "end_line": 102,
+          "path": "src/main/java/com/github/jlangch/venice/impl/ModuleLoader.java",
+          "start_line": 80
+        },
+        {
+          "end_line": 89,
+          "path": "src/main/java/com/github/jlangch/venice/javainterop/LoadPathsFactory.java",
+          "start_line": 60
+        }
+      ],
+      "prerequisites": "(1) The host embeds Venice with a restricted load path and relies on it for confinement, e.g. new SandboxInterceptor(rules, LoadPathsFactory.of(dir)) or LoadPathsFactory.parseDelimitedLoadPath(path, false); (2) load-file*/load-resource* are callable in that sandbox. The default SandboxRules has an empty Venice-function blacklist, so they are callable by default; they are only blocked when the embedder calls rejectAllVeniceIoFunctions() or uses RejectAllInterceptor.",
+      "root_cause": "LoadPaths.loadFileFromDir() only applies a containment check (isFileWithinDirectory) to absolute file arguments. For relative arguments it builds new File(loadPath, file.getPath()), tests only isFile(), and reads the file, so any '../' sequence escapes the load path. The containment helper itself compares canonical paths with fl.getCanonicalPath().startsWith(dir_.getCanonicalPath()) without appending File.separator (LoadPaths.java:261), so sibling directories sharing the load path's name prefix would also pass. The API contract (LoadPathsFactory.of: 'allows loading files only from the specified load paths', lines 60-70) and ChangeLog 1.9.1 ('load paths (used with load-file and load-resource) to make load paths more secure') show containment was intended. In addition, SandboxInterceptor.validateFileRead()/validateFileWrite(), which perform the stricter isOnLoadPath() check, are never called by any production code (only declared/implemented), so nothing else blocks the traversal.",
+      "title": "Sandbox load-path escape: relative file arguments are not contained, allowing '../' traversal outside configured load paths",
+      "trace": "Script -> (load-resource* \"../<outside file>\" :binary false) -> ModuleFunctions.loadResource (lines 182-227) builds new File(file) and calls interceptor.getLoadPaths().loadTextResource(...) with no ThreadContext interceptor.validateFileRead() call (that hook has no callers anywhere in the snapshot) -> LoadPaths.load() (lines 144-160) -> loadFromLoadPath() -> loadFileFromDir(): file.isAbsolute() is false, so the code takes the else branch (lines 217-221), builds new File(loadPath, file.getPath()), checks only f.isFile(), and returns loadFile(f) via Files.readAllBytes. The '..' segments in file.getPath() are resolved by the OS, so the returned bytes come from outside loadPath. load-file* follows the same route through LoadPaths.loadVeniceFile() (ModuleLoader.loadExternalFile -> LoadPaths.java lines 76-91). Counter-check: the absolute branch (lines 212-215) does call isFileWithinDirectory(), confirming containment is the intended invariant, and that helper compares with a bare startsWith at line 261.",
+      "unverified": "No code was executed and no runtime confirmation was performed; exploitability is inferred from source. I could not confirm whether upstream Venice 1.10.16 differs here (no history available), nor the exact File(File,String) semantics used by the absolute branch (Java converts an absolute child into a relative path, which appears to make that branch ineffective and the prefix check at line 261 hard to reach). The core .venice library scripts and unit tests are absent from the snapshot, so macro-level wrappers (load-file/load-resource) could not be inspected directly.",
+      "weakness_type": "CWE-22 Path Traversal (sandbox/load-path confinement bypass)"
+    }
+  ],
+  "coverage_summary": "Scope: 604 repository-visible files (474 under src/main/java, plus docs, resources and jmh benchmarks); filters reported 0 exclusions. Inspected the sandbox stack (IInterceptor, Interceptor, ValueFilterInterceptor, SandboxInterceptor, RejectAllInterceptor, SandboxRules, CompiledSandboxRules, SandboxRuleCompiler, RestrictedBlacklistedFunctions, SandboxRecorder), load-path handling (LoadPaths, LoadPathsFactory, ModuleLoader, ModuleFunctions), I/O and zip functions (IOFunctions, ZipFunctions, Zipper, ZipFileSystemUtil, ClassPathResource, FileUtil, IOStreamUtil), Java interop/reflection (JavaInteropFunctions, JavaInteropUtil, ReflectionAccessor, ReflectionUtil, DynamicInvocationHandler, DynamicClassLoader, JavaImports), threading (ThreadContext, ThreadBridge), interpreter invocation/sandbox checks (VeniceInterpreter, VncFunction, SpecialFormsUtil), precompiled serialization (PreCompiled, Venice), and parsers/renderers (nanojson, VncJsonReader/Writer, XMLUtil, PdfRenderer/ClasspathUserAgent, CSV, markdown). Strongest traceable issue selected: the load-path traversal.",
+  "limitations": [
+    "No execution, tests, or scanners were run; all conclusions are static source evidence, and no finding is runtime-confirmed.",
+    "The snapshot excludes src/test and the core/extension .venice library scripts (print/println, load-file/load-resource macros, extension modules), so macro-level behavior and parts of the denylist surface could not be inspected.",
+    "The behavior of java.io.File(File,String) with an absolute child (which determines whether the absolute-path branch and the prefix check at LoadPaths.java:261 are reachable) was reasoned from documented Java semantics, not executed.",
+    "Third-party dependency versions in build.gradle (poi 4.1.2, openpdf 1.3.28, flying-saucer 9.1.22, docx4j, commons-io 2.6, etc.) were noted but not audited against their own CVEs; the compiled third-party code is not in the snapshot.",
+    "Whether the selected code path matches the repository's upstream state at a later fix commit could not be checked (no history, no web access).",
+    "Extension-module sources (crypt, shell, excel, geoip, maven, etc.) referenced by docs are not part of the visible snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Denylist gaps in RestrictedBlacklistedFunctions: the reject-all blacklist contains the non-existent name 'io/wait-for' while the real function is 'io/await-for' (IOFunctions.java:891), and 'io/watch-dir', 'io/close-watcher', 'io/zip-list-entry-names', 'io/file-can-read?/write?/execute?', 'io/file-hidden?', 'io/file-symbolic-link?', 'io/file-last-modified' are also not listed.",
+      "reason": "Real oversight with a crisp source signature (exact-match set) and reachable even under RejectAllInterceptor, but impact is limited to filesystem metadata/event disclosure (existence, names, timing) rather than content disclosure, so it is weaker than the load-path traversal. Kept as an unconfirmed secondary lead, not a second candidate."
+    },
+    {
+      "lead": "SandboxInterceptor.validateFileRead()/validateFileWrite() are dead code (no callers), so I/O functions whitelisted in a custom sandbox never enforce the load paths.",
+      "reason": "Could be an unfinished design rather than a regression, and it overlaps with the same root cause as the selected candidate (load-path confinement not enforced on file reads). The selected candidate is the concrete, script-reachable manifestation."
+    },
+    {
+      "lead": "FileUtil.copy(File,File,boolean) has its overwrite flag inverted (Files.copy without REPLACE_EXISTING when overwrite==true, WITH REPLACE_EXISTING when false; lines 80-103), contradicting its javadoc and the adjacent save() methods.",
+      "reason": "Clear logic bug, but the method has no callers anywhere in the snapshot (search for FileUtil.copy/FileUtil::/copydir callers came up empty), so no attacker-reachable security impact can be shown."
+    },
+    {
+      "lead": "Blacklisted functions/special forms that lack their own sandboxFunctionCallValidation(), e.g. callstack (SystemFunctions.java:651-688) and load-jar (SystemFunctions.java:1189-1232), plus the special form dorun (SpecialForms_OtherFunctions.java:741-832) which also invokes a symbol-bound function via fn.apply() directly.",
+      "reason": "These are bypassable only through indirect invocation (e.g. (apply ...)), they are widespread in the codebase (author relies mainly on the interpreter-level name check), and the reachable impact is low (callstack leaks file/line data; load-jar only works when a DynamicClassLoader2 is installed, i.e. the REPL). Not strong enough to be the single candidate."
+    },
+    {
+      "lead": "XML external entity exposure: XMLUtil.newParser uses SAXParserFactory defaults (lines 155-158) and PdfRenderer.parseXHTML uses DocumentBuilderFactory defaults (lines 114-120), both without disabling external entities/DOCTYPE, so parsing attacker-supplied XML can resolve file:// or network entities.",
+      "reason": "Likely real hardening gap, but in this repo the XML/PDF content is normally supplied by the same script/embedder, the resolved entity content is only surfaced indirectly, and the strongest direct trust boundary (untrusted script) is better covered by the selected load-path finding. Not selected."
+    }
+  ],
+  "summary": "Reviewed the Venice 1.10.16 snapshot (604 visible files, 474 Java sources; tests and the .venice core library files are not present). I focused on the sandbox/trust boundary: Interceptor/SandboxInterceptor/RejectAllInterceptor, CompiledSandboxRules and the blacklist, the load-path implementation, IO/Zip functions, Java interop/reflection, classloaders, threading, and parsers. The strongest source-evidenced issue is a path-traversal / sandbox load-path escape in com.github.jlangch.venice.impl.util.io.LoadPaths: containment is enforced only for absolute file arguments, while relative paths are joined to the load path and read with no '..' validation at all; the one containment helper also compares canonical paths with startsWith() without a separator. Because load-file*/load-resource* (and their macros) forward fully script-controlled strings into LoadPaths without invoking the (never-called) interceptor file-validation hooks, a script confined to a load path can read files outside it. I choose this as the single candidate; the denylist gaps, unused validateFileRead/validateFileWrite hooks, inverted FileUtil.copy overwrite flag, and XML external-entity exposure are recorded as rejected/unconfirmed leads."
+}

@@ -1,0 +1,86 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated caller controls the complete JSON body bound to `ManagedUser`: `username`, `password` (the stored password representation), `authorities`, `disabled`, `locked`, and related fields. No session, basic-auth credential, or internal caller identity is required by the endpoint.",
+      "confidence": "high",
+      "counterevidence_checked": "`LdapUserService.updateUser` rejects updates, so the LDAP profile is a mitigating condition. `NUserController.createUser` and the normal `PUT /api/user` path have `@PreAuthorize(ACCESS_HAS_ROLE_ADMIN)`, confirming normal user administration is intended to be protected. `KylinUserService.updateUser` has an explicit comment explaining that adding `@PreAuthorize` there created a circular dependency, which is consistent with the missing check rather than a hidden authorization mechanism. `ManagedUser` fields are explicitly annotated with `@JsonProperty` despite restrictive `@JsonAutoDetect`, so the sensitive fields are deserializable. The login provider and manager paths were checked to confirm the saved `ManagedUser` is reloaded for authentication.",
+      "id": "case-123-unauth-user-update",
+      "impact": "Unauthenticated creation or modification of a Kylin user with `ROLE_ADMIN` effective authority, leading to administrative control of the platform, including access to project metadata, data, queries, jobs, and system configuration. The same primitive can disable or overwrite other accounts. This is a high-integrity and high-confidentiality compromise, not merely account-profile tampering.",
+      "locations": [
+        {
+          "end_line": 85,
+          "path": "src/server/src/main/java/org/apache/kylin/rest/config/SecurityConfig.java",
+          "start_line": 74
+        },
+        {
+          "end_line": 272,
+          "path": "src/common-server/src/main/resources/kylinSecurity.xml",
+          "start_line": 259
+        },
+        {
+          "end_line": 519,
+          "path": "src/metadata-server/src/main/java/org/apache/kylin/rest/controller/NUserController.java",
+          "start_line": 513
+        },
+        {
+          "end_line": 92,
+          "path": "src/common-service/src/main/java/org/apache/kylin/rest/service/KylinUserService.java",
+          "start_line": 80
+        },
+        {
+          "end_line": 85,
+          "path": "src/core-metadata/src/main/java/org/apache/kylin/metadata/user/ManagedUser.java",
+          "start_line": 66
+        },
+        {
+          "end_line": 117,
+          "path": "src/core-metadata/src/main/java/org/apache/kylin/metadata/user/NKylinUserManager.java",
+          "start_line": 110
+        },
+        {
+          "end_line": 104,
+          "path": "src/common-service/src/main/java/org/apache/kylin/rest/security/LimitLoginAuthenticationProvider.java",
+          "start_line": 85
+        },
+        {
+          "end_line": 290,
+          "path": "src/server/src/main/resources/config/init.properties",
+          "start_line": 287
+        }
+      ],
+      "prerequisites": "Network access to the REST server and an active `testing` or compatible `custom` security profile. The shipped default is `kylin.security.profile=testing`, and the corresponding security profile permits `/api/user/update_user`. The `ldap` profile is mitigated because `LdapUserService.updateUser` throws `UnsupportedOperationException`, so this is not claimed for that profile. An existing target account is not necessarily required because the persistence path can save a new user resource; overwriting an existing account is the clearest case.",
+      "root_cause": "`/api/user/update_user` is included in the security permitAll allowlists and its controller method directly calls `userService.updateUser(user)` with an attacker-controlled `ManagedUser`. Neither the controller method nor `KylinUserService.updateUser` requires authentication or an admin role; the service checks only that the submitted authority list contains `ALL_USERS`, then persists the caller-supplied password hash, authorities, and account flags through `NKylinUserManager`.",
+      "title": "Unauthenticated user_update endpoint permits admin account takeover",
+      "trace": "1) A POST to `/kylin/api/user/update_user` matches the explicit permitAll entry in `SecurityConfig` and the XML allowlist, so Spring Security does not require authentication. 2) `NUserController.updateUserWithoutAuth` accepts a `ManagedUser` request body and immediately calls `userService.updateUser(user)` without `@PreAuthorize` or any caller check. 3) `KylinUserService.updateUser` only verifies that the submitted authorities contain `ALL_USERS`; it does not verify current identity, admin status, or that the edited username belongs to the caller. 4) `NKylinUserManager.update` serializes and saves the supplied object to the user resource path. 5) On subsequent login, `LimitLoginAuthenticationProvider` loads the saved object and `DaoAuthenticationProvider` compares the submitted password with the saved hash, so a caller-supplied password hash and `ROLE_ADMIN` authority become effective credentials. The `testing` profile's normal `createUser`/`PUT /api/user` operations are admin-protected, making this POST path the inconsistent unauthenticated operation.",
+      "unverified": "The review is source-only and does not confirm runtime behavior of the deployed security filter chain, Jackson deserialization, resource-store creation of a new account versus only updating an existing account, or whether a particular deployment uses `testing`/`custom` rather than `ldap`. The candidate remains a high-confidence source-level lead, not a runtime-confirmed exploit.",
+      "weakness_type": "Missing authorization / authentication bypass (CWE-862, CWE-306) with privilege escalation"
+    }
+  ],
+  "coverage_summary": "The assigned snapshot exposes 3,537 model-visible source files with no over-5-MiB, sensitive-name, or symlink exclusions; binary-like files are filtered on read/search. I reviewed the Spring Security configurations, user controller/service/model and login flow, then searched broadly across controllers, services, persistence, file/zip handling, command execution, deserialization, and public RPC endpoints. The report is based on static source inspection only.",
+  "limitations": [
+    "No code, tests, security scanners, or exploit payloads were executed, so the candidate is not runtime-confirmed.",
+    "The repository contains both XML and Java security configuration paths; their exact filter-chain precedence in a deployed server was not verified dynamically.",
+    "The impact is profile-dependent: the LDAP profile's `LdapUserService.updateUser` rejects this operation, while the default `testing` profile and compatible custom implementations may not.",
+    "The review was source-led rather than an exhaustive line-by-line audit of all 3,537 files; unrelated modules and binary-like resources may contain additional issues.",
+    "Jackson deserialization behavior and metadata-store creation semantics were inferred from annotations and source, not exercised at runtime."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unauthenticated local file read through `/api/system/metadata_backup_tmp_file`",
+      "reason": "The XML security allowlist includes the endpoint and `FileService` reads any existing local path after checking its length, but the Java `SecurityConfig` allowlist does not include it and the request needs an exact file size. Its exploitability therefore depends on the active filter-chain configuration and is less certain than the user-update path."
+    },
+    {
+      "lead": "Unauthenticated broadcast event handling through `/api/broadcast`",
+      "reason": "The endpoint is permitAll and `BroadcastEventReadyNotifier` uses `@JsonTypeInfo(Id.CLASS)`; however, practical impact depends on selecting a notifier subtype and supplying valid project/job identifiers, so this was treated as an unresolved lead rather than the strongest single candidate."
+    },
+    {
+      "lead": "Unauthenticated metadata cleanup endpoints `/api/metastore/cleanup` and `/api/metastore/cleanup_storage`",
+      "reason": "Both are permitAll in the security configuration, but the destructive scope and project-name validation of the cleanup implementations were not established strongly enough to displace the direct admin-takeover path."
+    },
+    {
+      "lead": "Custom jar upload/delete filename handling and zip extraction paths",
+      "reason": "Jar operations generally require project write permission or are constrained by extension checks, and the reviewed zip extraction helper normalizes and bounds target paths. No source-supported unauthenticated path traversal or stronger impact than the user-update issue was established."
+    }
+  ],
+  "summary": "The strongest source-supported candidate is the unauthenticated `/api/user/update_user` endpoint. It is explicitly allowed by the Spring Security permit-all lists, has no method-level authorization, and persists a caller-supplied `ManagedUser`, including a password hash and arbitrary authorities. Under the default `testing` security profile this permits creation or overwrite of an account with `ROLE_ADMIN`. Other public endpoints were reviewed; the arbitrary-file-read and broadcast-event leads are noted below but were not selected because their exploitability or applicability is less certain."
+}

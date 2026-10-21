@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any untrusted value that the application passes to a `@Path` parameter, e.g. a username, repository name, file/folder identifier or route component taken from an HTTP request, query string or database content. The `@Path` Javadoc and the module's own samples (`SimpleService.contributors(@Path(\"owner\") String owner, @Path(\"repo\") String repo)`, website example `@Path(\"user\")`) show this identifier-style parameter is the normal usage. No attacker control of the base URL or of the annotation template is needed; only the value is attacker-controlled. `encoded=false` (the default) is sufficient, and `encoded=true` is equally exposed to literal `.`/`..` (and possibly to `%2e`-style dot segments canonicalized by OkHttp).",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) `canonicalizeForPath` does encode `/` and `%` for `encoded=false`, which blocks injecting additional path segments or a new authority — impact is therefore limited to dot-segment traversal on the same origin; I still consider it a real flaw because it defeats the documented 'value is URL encoded' contract for the segment. (2) `RequestFactory.validatePathName` and the `PARAM_URL_REGEX` checks constrain only the annotation/placeholder name, and `Utils.hasUnresolvableType` only the type — no runtime value validation exists anywhere. (3) The `@Path` Javadoc only promises URL-encoding, and `.` is a legal path character, so the behavior could be argued as by-design; however the code's own mitigation (encoding `/` when not already encoded) shows the intent is to keep the value within one segment, and `.`/`..` are exactly the values that escape a segment via RFC 3986 resolution. (4) Retrofit's own Javadoc documents that endpoint values are resolved 'using HttpUrl#resolve(String)' with 'the behavior of an <a href=...> link on a website', i.e. the code path performing dot-segment removal is intentional and documented. (5) I found no validation elsewhere (interceptors are user-supplied and not part of this library) that would neutralize a traversal before the request is built.",
+      "id": "path-traversal-at-path-parameters",
+      "impact": "Path traversal / forced browsing within the configured origin: an attacker who controls a `@Path` value can make the application issue requests to paths the developer did not intend for that service method (e.g. stripping a resource segment or moving to a sibling path). Where routing, per-endpoint authorization, API version prefixes, or URL-based filtering is enforced by path, this can bypass those assumptions and disclose or mutate data reachable by the unintended endpoint while still carrying the application's credentials. Host, port and scheme are not attacker-controlled in the default (`encoded=false`) configuration, so this is not cross-origin SSRF.",
+      "locations": [
+        {
+          "end_line": 114,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 164,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 146
+        },
+        {
+          "end_line": 202,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 189
+        },
+        {
+          "end_line": 101,
+          "path": "retrofit/src/main/java/retrofit2/ParameterHandler.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 733,
+          "path": "retrofit/src/main/java/retrofit2/RequestFactory.java",
+          "start_line": 724
+        },
+        {
+          "end_line": 51,
+          "path": "retrofit/src/main/java/retrofit2/http/Path.java",
+          "start_line": 28
+        }
+      ],
+      "prerequisites": "The application must pass an external/untrusted value into a `@Path` parameter of a Retrofit service method (a very common pattern). The request stays on the configured base-URL host; the effect is path manipulation on that origin, not arbitrary-host SSRF, because `/` (segment separator) is not injectable when `encoded=false`. Exploitability is highest when the endpoint template contains segments after the placeholder (`users/{id}/profile`) or several path parameters, so that popping segments yields a different, existing endpoint.",
+      "root_cause": "`RequestBuilder.addPathParam` substitutes the converted `@Path` value into `relativeUrl` using `canonicalizeForPath`, which only percent-encodes control chars, `\"<>^`{}|\\?#`, and (when `encoded=false`) `/` and `%`. The `.` character is never encoded or rejected, so a value of `.` or `..` produces a literal relative-path dot segment. `RequestBuilder.get()` (and the query-parameter path in `addQueryParam`) then resolves that relative URL against the configured base URL through OkHttp's `HttpUrl.resolve`/`HttpUrl.newBuilder`, which applies RFC 3986 remove_dot_segments normalization; the dot segment is therefore consumed during resolution and the preceding path segment is popped instead of being sent literally. `RequestFactory.validatePathName` validates only the annotation placeholder name (`[a-zA-Z][a-zA-Z0-9_-]*` and presence in the template), never the runtime value. The mitigation intent (keep an untrusted value inside one path segment) is visible in the code (`/` and `%` are encoded), but the dot-segment normalization path is not covered.",
+      "title": "Path traversal in `@Path` parameter substitution (dot segments survive URL normalization)",
+      "trace": "1) `Retrofit.create()` parses `@Path` and builds `ParameterHandler.Path` (`RequestFactory.java:352-377`), validating only the placeholder name (`validatePathName`, `RequestFactory.java:724-733`). 2) At call time `ParameterHandler.Path.apply` (`ParameterHandler.java:94-100`) converts the value (default converter is `toString()`) and calls `RequestBuilder.addPathParam`. 3) `addPathParam` (`RequestBuilder.java:89-95`) replaces `{name}` with `canonicalizeForPath(value, encoded)`; `canonicalizeForPath` (`RequestBuilder.java:97-114`) never encodes `.`, so `\"..\"` is inserted verbatim. 4) `RequestBuilder.get()` (`RequestBuilder.java:189-202`) calls `baseUrl.resolve(relativeUrl)` (or, if query parameters were added, `addQueryParam` at lines 146-164 calls `baseUrl.newBuilder(relativeUrl)`), which performs RFC 3986 relative resolution and dot-segment removal. Result: with base `https://api.example.com/v1/` and template `users/{id}/profile`, a value of `..` produces relative URL `users/../profile`, which resolves to `/v1/profile` — a different sibling endpoint — instead of a literal `users/..` request. The request continues to use the application's configured client, headers and interceptors (including auth headers), so it is sent with the application's privileges to the unintended path.",
+      "unverified": "OkHttp's source is a Maven dependency and is not present in this snapshot, so the exact dot-segment normalization (`HttpUrl.resolve`/`HttpUrl.newBuilder`) could not be read here; it is inferred from Retrofit's own Javadoc describing href-style resolution plus RFC 3986 semantics, and from the explicit encoding of `/` and `%` in `canonicalizeForPath`. I could not execute code or inspect tests to confirm an end-to-end request. Whether `%2e`/`%2E` forms are also normalized in the `encoded=true` case is unverified. Exploitability in any concrete application depends on that application passing untrusted data into `@Path` parameters.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / CWE-20"
+    }
+  ],
+  "coverage_summary": "Scope reported by `get_source_scope`: 196 model-visible files, no sensitive-name, symlink or size exclusions; the same filters apply to all conditions. I read essentially all production sources in the `retrofit` core module (RequestFactory, RequestBuilder, ParameterHandler, OkHttpCall, Retrofit/Builder, Utils, Platform, ServiceMethod/HttpServiceMethod, adapters for Call/Executor/CompletableFuture/Optional, Call/CallAdapter/Converter/Callback/Response/HttpException/Invocation, KotlinExtensions.kt), all converter modules (gson, jackson, moshi, jaxb, simplexml, protobuf, wire, scalars, guava/java8 optional), all adapter modules (rxjava, rxjava2, guava, java8, scala), the retrofit-mock module, all samples, the Maven POMs, the build/CI scripts (`.travis.yml`, `.buildscript/*`, `deploy_website.sh`), and the website HTML/JS. I also ran targeted text searches for dangerous APIs (Runtime/ProcessBuilder, ObjectInputStream, URL/openConnection, MessageDigest/Cipher, XML factories, DocumentBuilder/XmlPullParser, TrustManager, system properties/env). The XML, crypto, exec and deserialization searches returned no hits outside the JAXB XXE hardening and the mock module's `Random`. Tests, OkHttp/Okio and other third-party library sources are not part of the snapshot.",
+  "limitations": [
+    "No execution, build, test run or scanner was performed (per instructions), so no finding is runtime-confirmed; all conclusions are from source reading.",
+    "The sandbox exposes only this repository's files: OkHttp (the component that performs dot-segment normalization) and the XML/JSON/third-party libraries are external dependencies, so their exact behavior/defaults could not be read here.",
+    "Test sources are not present in the snapshot, so I could not check whether a regression test or expected-behavior assertion exists for path traversal or for XML external entities.",
+    "The website `index.html` and minified JS were reviewed only at the level needed to judge whether they constitute a code-level vulnerability in this repository; minified third-party bundles were not fully audited.",
+    "Only the single strongest candidate is submitted per the one-candidate limit; the rejected leads above are unconfirmed and were not ranked as candidates."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE in `SimpleXmlConverterFactory`/`JaxbConverterFactory` XML parsing",
+      "reason": "`JaxbResponseConverter` explicitly disables DTDs and external entities (jaxb/src/main/java/retrofit2/converter/jaxb/JaxbResponseConverter.java:37-39), showing the project's XML handling is hardened; `SimpleXmlResponseBodyConverter` merely delegates to the third-party `org.simpleframework.xml.Serializer`, whose parser defaults are not in this snapshot. No in-repo source evidence establishes an insecure configuration that turns a response body into file/SSRF access."
+    },
+    {
+      "lead": "`retrofit-mock` `NetworkBehavior` uses `java.util.Random` (weak randomness)",
+      "reason": "The value randomizes simulated delay/failure/error in a test mock module (NetworkBehavior.java:50); there is no security decision, secret, token or credential derived from it, so there is no concrete security impact."
+    },
+    {
+      "lead": "Shell word-splitting/`rm -rf` in `deploy_website.sh` (`rm -rf $DIR`, `ls | grep -E -v ... | xargs rm -rf`)",
+      "reason": "Maintainer-run release script operating on the project's own cloned gh-pages tree; the file list is not attacker-controlled input from an untrusted boundary, and impact would be limited to the deployer's working copy. Raised as a hardening issue, not a reportable vulnerability."
+    },
+    {
+      "lead": "Stale third-party assets: `website/static/bootstrap.min.js` (Bootstrap 2.x), jQuery 1.9.1 loaded from googleapis in `website/index.html`, `jackson-databind 2.9.4` in `pom.xml`",
+      "reason": "Old versions with known advisories, but (a) the JS is static documentation-site code with no server-side trust boundary in this repository, and (b) `JacksonConverterFactory`/`JacksonResponseBodyConverter` do not enable polymorphic default typing, so the databind gadget CVEs are not reachable through the code as written. No source evidence of an exploitable path."
+    },
+    {
+      "lead": "`Platform.Java8.invokeDefaultMethod` uses `MethodHandles.Lookup` constructor with `setAccessible(true)`",
+      "reason": "The method/class come from the developer-declared service interface, not attacker input; this is a reflective default-method invocation detail, not an externally reachable vulnerability."
+    },
+    {
+      "lead": "`Calls.failure(Throwable)` 'sneaky throw' of arbitrary throwables",
+      "reason": "Documented behavior of a test/mock helper in `retrofit-mock` (Calls.java:51-96); no attacker-controlled boundary and no impact on production request handling."
+    }
+  ],
+  "summary": "Retrofit 2.4.1-SNAPSHOT (square/retrofit). I reviewed the 196 in-scope files: the whole `retrofit` core (RequestFactory, RequestBuilder, ParameterHandler, OkHttpCall, Retrofit, Utils, Platform, adapters), all converter modules, the mock module, samples, build scripts and website assets. One candidate stands out: `@Path` parameter values are substituted into the relative URL before it is resolved against the base URL, and the value canonicalization deliberately encodes `/` and `%` but lets `.`/`..` through unmodified. Because `RequestBuilder` then resolves the URL with OkHttp's RFC-3986-style `HttpUrl.resolve`/`newBuilder` (documented in-repo as behaving like an `<a href>` resolution), a `..` segment supplied by an untrusted caller is treated as a dot segment and removes the preceding path segment, letting the request be redirected to a sibling path on the same origin. This is the strongest source-evidenced issue; other things I looked at (SimpleXml/JAXB XML parsing, mock `Random`, deploy-script shell word splitting, stale JS/Jackson versions) did not meet the evidence bar and are listed as rejected leads."
+}

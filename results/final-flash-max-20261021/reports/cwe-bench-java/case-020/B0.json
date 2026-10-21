@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Every byte of ZipEntry.getName() is attacker-controlled when an untrusted archive is processed. A crafted entry name containing '../' (or mixed separators on Windows-style extraction) survives new File(newPath, currentEntry) and is used both to mkdirs() parent directories and as the FileOutputStream target, so the write destination is chosen by the archive author. Entry names also control which directory tree is created.",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched all Java sources for 'unzip'/'IOUtils.unzip': no in-repo call site (the only other 'unzip' matches are the Maven antrun <unzip> tasks in one-java-agent/pom.xml, a different mechanism). Searched for any validation of entry names / canonical path checks: none ('getCanonicalPath', 'normalize' absent in IOUtils). Confirmed Java semantics: new File(parent, child) does not resolve '../', and absolute children are prefixed by the parent on Unix, so the exploitable primitive is '../' rather than leading '/'. Checked that the method is public and in a library module (one-java-agent-plugin) intended for external reuse, which is the only way the sink is reached. Checked whether dataset-relevant other sinks (temp-file extraction in AgentImpl uses File.createTempFile, which is safe) exist; the only arbitrary-path write sink is this one.",
+      "id": "case-020-io-unzip-zipslip",
+      "impact": "Arbitrary file creation/overwrite with attacker-controlled bytes under the privileges of the JVM running the agent/plugin framework. Realistic consequences: clobbering application or agent configuration/plugin JARs and subsequently loaded classes, overwriting user-level trust files (e.g. ~/.ssh/authorized_keys), cron/autostart or startup files where writable, destroying data or planting persistence, i.e. integrity loss that commonly escalates to code execution. Denial of service via overwriting critical files is also possible.",
+      "locations": [
+        {
+          "end_line": 161,
+          "path": "one-java-agent-plugin/src/main/java/com/alibaba/oneagent/utils/IOUtils.java",
+          "start_line": 106
+        },
+        {
+          "end_line": 141,
+          "path": "one-java-agent-plugin/src/main/java/com/alibaba/oneagent/utils/IOUtils.java",
+          "start_line": 122
+        }
+      ],
+      "prerequisites": "Some caller invokes the public IOUtils.unzip(zipFile, extractFolder) with an archive whose entries can be influenced by the attacker, and the JVM/agent account has write permission to the target path; the extraction directory itself must be writable. No caller exists inside this snapshot, so this is a library-level sink that becomes exploitable through a consumer of the plugin framework module (or future in-repo use). Important nuance: on Unix, absolute entry names ('/etc/x') are neutralized because File(parent, child) prepends the parent, so escaping relies on '../' traversal; symlink handling is likewise not checked.",
+      "root_cause": "IOUtils.unzip(String zipFile, String extractFolder) builds the output path directly from the archive entry name: File destFile = new File(newPath, currentEntry) where currentEntry = entry.getName() (IOUtils.java:122-124), creates directories for destFile.getParentFile() (line 129) and writes entry bytes through new FileOutputStream(destFile) (line 141). Java's new File(parent, child) does not normalize '..', so entries such as '../../etc/...' escape the extraction folder. There is no getCanonicalPath() containment check, no entry-name validation, and the clearly containing alternative 'destFile = new File(newPath, destFile.getName())' is present only as a comment (line 125), showing the unsafe form was deliberately kept.",
+      "title": "Zip Slip in IOUtils.unzip: attacker-named zip entries are written outside the extraction directory",
+      "trace": "IOUtils.unzip -> new ZipFile(zipFile) (line 112) -> zip.entries() -> entry.getName() (line 122) -> new File(newPath, currentEntry) (line 124) -> destFile.getParentFile().mkdirs() (line 126-129) -> new FileOutputStream(destFile) + BufferedOutputStream write loop (lines 141-148). Attacker entry '../../<target>' yields a destination outside extractFolder that is created/overwritten with attacker-supplied content.",
+      "unverified": "Not runtime-confirmed; no in-repository data flow reaches unzip, so exploitability depends on an external/future caller passing an attacker-influenced archive. I could not inspect tests or consumers outside the snapshot, and I cannot rule out that the benchmark's intended ground-truth weakness is a different location (e.g. plugin/agent-JAR path handling).",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal' / Zip Slip)"
+    }
+  ],
+  "coverage_summary": "Inspected all 102 model-visible files reported by get_source_scope: every Java source under one-java-agent, one-java-agent-plugin, one-java-agent-spy, demo-* and dubbo-test-* (including the copied Spring env/conversion classes), all POMs, assembly descriptors, plugin/instrument property files, logback config, GitHub workflows, Maven wrapper files and README/.gitignore. Traced: agent argument parsing (FeatureCodec, URLDecoder), plugin discovery and classpath scanning, property resolution and system-property overrides, classloader/agent-spy hook, instrumentation transformers, and all file/archive I/O. The candidate is the only place in the snapshot where attacker-controlled names reach a file-write sink without validation; the strongest rejected alternatives are recorded above.",
+  "limitations": [
+    "No test sources are present in the snapshot, so intended callers of IOUtils.unzip and other utilities cannot be confirmed from tests.",
+    "No runtime/build execution was permitted, so reachability and exploitability are static-analysis conclusions only; the candidate is explicitly a lead, not a confirmed vulnerability.",
+    "Large copied utility files were only partly line-by-line reviewed (ObjectUtils.java read 1-760 and 760-946; StringUtils.java read via targeted searches and key ranges rather than every line), though they are Spring/Apache-derived and contained no sinks for untrusted data beyond what is reported.",
+    "Binary artifacts (jars, class files) are outside the readable scope, so behavior provided by bytekit/ASM instrumentation dependencies could not be inspected.",
+    "External consumers of the published one-java-agent-plugin library and any deployment scripts are outside the snapshot; the Zip-Slip sink's exploitability depends on such a caller.",
+    "I could not verify whether the benchmark's intended ground-truth flaw is the reported Zip Slip or a different weakness class (e.g. plugin/JAR path handling), so the single candidate is offered with medium confidence and the alternatives are documented rather than asserted."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "TraditionalPlugin.start()/PluginConfigImpl: agentJarPath, classpath and pluginActivator are read from plugin.properties and can be overridden via system properties (oneagent.plugin.<name>.*), then loaded with URLClassLoader/reflection with no containment or allow-list checks (TraditionalPlugin.java:80-109, OneAgentPlugin.java:96-104, OneAgentPlugin.java:201-238, PluginConfigImpl.java:61-89).",
+      "reason": "Configuration and plugin directories are trusted deployment inputs in this design: abusing it requires placing a JAR/directory on the host or setting JVM system properties, at which point the actor already controls the JVM (or can simply pass -javaagent). The framework's purpose is to load third-party code, so this is an inherent trust assumption rather than a distinct vulnerability."
+    },
+    {
+      "lead": "AgentSpyBridge.spy(AgentSpy) is a public, bootstrap-visible setter (AgentSpyBridge.java:17) and the instrumented ClassLoader.loadClass hook consults it first for every classload (ClassLoader_Instrument.java:15-22, ClassLoaderHandlerManagerImpl.java:75-90), letting any same-JVM code install a JVM-wide class-resolution hook.",
+      "reason": "Same-JVM code is already fully privileged in normal deployments (no SecurityManager), so no additional trust boundary is crossed; the setter is also an intended plugin extension point (the only hint is a 'TODO private ?' comment). Impact is speculative without a sandbox scenario, so it was not selected."
+    },
+    {
+      "lead": "ComponentManagerImpl.inject() applies Class.isAssignableFrom in reversed form (ComponentManagerImpl.java:86,92), which looks like a functional injection bug.",
+      "reason": "No security impact: it can mis-assign references to Object/super-typed fields but does not expose data or privilege; no sensitive fields exist in the in-repo components."
+    },
+    {
+      "lead": "PluginManagerImpl.parallelInitPlugins/parallelStartPlugins increment successCounter after latch.countDown (PluginManagerImpl.java:261-285, 327-355), a race that can raise a spurious PluginException.",
+      "reason": "Availability/robustness defect only; attackers cannot control the timing from outside and there is no security impact."
+    },
+    {
+      "lead": "logback-classic/logback-core pinned to 1.2.3 (pom.xml:96-105), a version range with known logback issues (e.g. CVE-2021-42550-class configuration attacks).",
+      "reason": "Dependency-version concern; exploitation needs control of the logback configuration file or serialized input outside this source snapshot, and the agent ships its own relocated configuration (oneagent-logback.xml), so no concrete source-level attacker-controlled flow was established."
+    },
+    {
+      "lead": ".mvn/wrapper/MavenWrapperDownloader.java downloads maven-wrapper.jar from a URL taken from maven-wrapper.properties without integrity verification (lines 48-115).",
+      "reason": "Generated Maven wrapper code with an in-repo pinned official URL; abusing it requires repository write access. Standard build-tooling behavior, not a repository-specific vulnerability."
+    },
+    {
+      "lead": "PropertiesInjectUtils performs reflective setter injection including File/InetAddress/Charset/Enum conversions from Property values (lines 51-164).",
+      "reason": "The class is unused anywhere in the snapshot, and the input Properties come from plugin/system configuration (trusted, admin-controlled); no attacker-controlled data flow was found."
+    }
+  ],
+  "summary": "The assigned snapshot is alibaba/one-java-agent (Java agent + plugin framework; 102 model-visible text files: 8 modules, ~60 Java sources plus POMs, CI workflows and wrapper files). I traced the external-input paths (agent args/FeatureCodec, system/global/plugin properties, plugin and agent JAR loading, class-loading hook, property resolution, and file/zip handling). The single strongest source-evidence candidate is a Zip-Slip path traversal in the public utility IOUtils.unzip: destination paths are derived verbatim from ZipEntry.getName() and written with FileOutputStream, with no canonical-containment check and no rejection of \"../\" entries (the containing alternative line is commented out). Other leads (plugin/agent-JAR class loading, global AgentSpy class-loading hook, unused reflection injector, counter race) are either by-design trust assumptions or have no concrete security impact and are listed as rejected. Reachability of unzip within this snapshot is the main weakness of the candidate: no in-tree caller exists, so exploitation depends on a consumer of this public library API passing an untrusted archive."
+}

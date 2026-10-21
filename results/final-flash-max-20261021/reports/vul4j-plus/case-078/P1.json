@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker supplies the XML/text stream that the application passes to XStream.fromXML/unmarshal. Element names and the `class` attribute select arbitrary Java types and, via the dynamic-proxy representation (DynamicProxyConverter reads <interface> and the handler's class attribute), an arbitrary InvocationHandler instance plus its fields. No special privileges are required; the payload is attacker-authored data fed to a normal deserialization API.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked whether another control blocks EventHandler despite the dead blacklist: whenever a caller actually initializes the framework via XStream.setupDefaultSecurity (XStream.java:713-798), NoTypePermission.NONE + explicit type/interface permissions do reject EventHandler at SecurityMapper.realClass, and users who register their own converter/deny rules are protected - so the defect is limited to instances in the documented default state that the internal blacklist was specifically meant to protect. Checked converter ordering: InternalBlackList (PRIORITY_LOW = -10, XStream.java:964, registered last among LOW converters so iterated first there) is consulted before SerializableConverter/ExternalizableConverter and before ReflectionConverter (PRIORITY_VERY_LOW = -20, XStream.java:958-959), so canConvert is the only gate; there is no second blacklist elsewhere in xstream/src/java for these names. Checked that DynamicProxyConverter resolves both interface and handler class through mapper.realClass, i.e. the same permission path. The 'Security framework of XStream not initialized' stderr warning is only a log message and does not stop deserialization. I did not run any code and did not consult external CVE data.",
+      "id": "cand-1",
+      "impact": "An instance in XStream's default (uninitialized security framework) configuration will deserialize attacker-chosen java.beans.EventHandler objects and build the well-known dynamic-proxy/EventHandler gadget, allowing arbitrary shell command execution on the application host (remote code execution) from crafted XML; the documented since-1.4.7/since-1.4.10 revocation of EventHandler, *$LazyIterator and javax.crypto.* types is not effective. Behavior is also asymmetric: before the first unmarshal the same checks block marshalling, after any unmarshal they are permanently off, confirming the flag-timing logic error.",
+      "locations": [
+        {
+          "end_line": 2546,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 2539
+        },
+        {
+          "end_line": 1487,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 1480
+        },
+        {
+          "end_line": 700,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 693
+        },
+        {
+          "end_line": 964,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 957
+        },
+        {
+          "end_line": 134,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/extended/DynamicProxyConverter.java",
+          "start_line": 100
+        },
+        {
+          "end_line": 76,
+          "path": "xstream-distribution/src/content/security.html",
+          "start_line": 72
+        }
+      ],
+      "prerequisites": "The application uses an XStream instance whose security framework was never initialized (plain `new XStream(...)` without XStream.setupDefaultSecurity/allowTypes/NoTypePermission.NONE), which is the library's default configuration, and unmarshals attacker-influenced data. The JDK classes used by the gadget (java.beans.EventHandler, java.lang.reflect.Proxy, java.lang.ProcessBuilder) are present in normal runtimes. Nothing needs to be enabled beyond default XStream behavior.",
+      "root_cause": "XStream.InternalBlackList.canConvert() only rejects java.beans.EventHandler, any class whose name ends with \"$LazyIterator\", and javax.crypto.* types when the private field `insecureWarning` is true (XStream.java:2539-2546). However, XStream.unmarshal(...) sets `insecureWarning = false` before delegating to the actual unmarshalling strategy (XStream.java:1482-1486), and the converter lookup (which calls canConvert) happens inside that strategy. Consequently the flag is always false when the blacklist is evaluated during any unmarshal, so only the unconditional `void`/`Void` check can ever fire; the security-relevant type checks are unreachable in the unmarshalling path. Because the internal blacklist is the compensating control for the default, uninitialized security framework (setupSecurity() grants AnyTypePermission.ANY and sets insecureWarning = true, XStream.java:693-700; blacklist registered at PRIORITY_LOW, ahead of ReflectionConverter at PRIORITY_VERY_LOW, XStream.java:957-964), the documented protection is silently lost.",
+      "title": "Internal blacklist for known gadget types is inert on default XStream instances (insecureWarning cleared before unmarshalling)",
+      "trace": "1) `new XStream()` -> setupSecurity() adds AnyTypePermission.ANY and sets insecureWarning = true (XStream.java:693-700). 2) `fromXML(...)` -> unmarshal(...) sees insecureWarning true, sets it false and prints a warning, then calls marshallingStrategy.unmarshal (XStream.java:1480-1487). 3) During type resolution SecurityMapper allows every class (ANY permission, SecurityMapper.java:70-78); the converter lookup (DefaultConverterLookup.lookupConverterForType, DefaultConverterLookup.java:64-86) iterates by priority and calls InternalBlackList.canConvert(type) first among the low-priority converters (registration XStream.java:958-964; PrioritizedList orders equal/higher priorities first). 4) canConvert returns false for java.beans.EventHandler because insecureWarning is already false (XStream.java:2540-2545), so ReflectionConverter (PRIORITY_VERY_LOW) handles EventHandler and populates its target/action fields. 5) DynamicProxyConverter.unmarshal resolves the handler class through mapper.realClass and, after unmarshalling the EventHandler, writes it as the proxy's InvocationHandler (DynamicProxyConverter.java:100-134). 6) When the interface method is invoked during deserialization (e.g., a proxy used as a sorted-map/collection key), EventHandler.invoke reflectively calls the attacker-named method on the attacker-chosen target, e.g. ProcessBuilder.start() - the exact gadget documented in the repository's own CVE-2013-7285.html and faq.html (faq.html:699-706: 'Since XStream version 1.4.7 it does no longer handle an EventHandler automatically'). 7) The same loss of the blacklist also stops rejection of *$LazyIterator and javax.crypto.* types.",
+      "unverified": "Not runtime-confirmed (no code executed). The precise gadget invocation trigger (which parent container method is called during deserialization) and exact JDK-version behavior of Fields.locate(Proxy.class,...) were not exercised; the repository's own CVE-2013-7285 documentation and FAQ describe this gadget, but I could not verify any specific external CVE attribution (e.g. CVE-2019-10173) offline. It is also not verified whether a particular downstream application uses the default insecure configuration rather than calling setupDefaultSecurity.",
+      "weakness_type": "Deserialization of untrusted data (CWE-502) with an ineffective security control / dead-code blacklist (CWE-1173-class logic flaw)"
+    }
+  ],
+  "coverage_summary": "Source scope: 481 model-visible files, no binary/symlink/sensitive-name exclusions reported; P1 relation index reports all 481 source files indexed with 0 hash mismatches and no unsupported-analysis note beyond 'syntactic navigation only'. I reviewed the file inventory, then read in depth: XStream.java (constructors, setupSecurity/setupDefaultSecurity, permission APIs, unmarshal path, converter registration, InternalBlackList), the full security package, SecurityMapper, CachingMapper, DefaultConverterLookup/PrioritizedList, TreeUnmarshaller, DynamicProxyConverter, TreeMapConverter, ReflectionConverter, Primitive/Interface/Array/Wildcard/RegExp/TypeHierarchy permissions, XStreamer, and XML driver XXE hardening (Dom/JDom/JDom2/Dom4J disallow-doctype-decl present). Distribution docs (changes.html, security.html, faq.html, CVE pages) were used as intent/behavior evidence. Other modules (hibernate, jmh, benchmark) and most converters were only spot-checked; the snapshot contains no test sources, so no test-based verification was possible.",
+  "limitations": [
+    "No code was executed, compiled, or scanned; findings are source-evidence leads, not runtime-confirmed vulnerabilities.",
+    "The snapshot has no test directory (xstream/src/test absent), so expected security tests and their assertions could not be inspected.",
+    "External CVE/advisory data and upstream git history were unavailable by policy, so the mapping to a specific published CVE is inferred from in-repo documentation and code shape only.",
+    "Coverage of the hibernate, jmh and benchmark modules and of many individual converters was only opportunistic; a less prominent issue in those areas cannot be excluded.",
+    "The P1 index is syntactic navigation only (no data flow/reachability proof); all key edges were re-verified manually in source text."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CachingMapper caches positive and negative realClass results (CachingMapper.java:37-57), so SecurityMapper permission changes made after a class name has been cached (e.g., tightening via setupDefaultSecurity or allow/deny calls) are not re-evaluated; no XStream.addPermission path flushes this cache.",
+      "reason": "Real inconsistency, but it requires an unusual ordering (unmarshalling before configuring permissions) and mostly produces stale allow/deny decisions rather than enabling the documented default-state gadget; upstream keeps this design and it is a weaker, more speculative candidate than the dead internal blacklist."
+    },
+    {
+      "lead": "XStreamer.fromXML(driver, reader) defaults to new TypePermission[]{AnyTypePermission.ANY} (XStreamer.java:253-256) while the javadoc says it loads the instance 'with default permissions'.",
+      "reason": "XStreamer is an explicit utility for reading a serialized XStream configuration (inherently trusted-input API), and the ANY grant is a deliberate parameter default; no in-snapshot evidence that it is used on untrusted input, so it is not the strongest candidate."
+    },
+    {
+      "lead": "Plain `new XStream()` grants AnyTypePermission.ANY and only prints a warning (XStream.java:693-700, 1480-1487).",
+      "reason": "This insecure default is documented 1.4.x behavior; the distinct, fixable defect reported here is that the internal blacklist intended to mitigate known exploits in that mode is rendered inert by flag ordering."
+    },
+    {
+      "lead": "XStream.setupDefaultSecurity's whitelist (XStream.java:713-798) includes broad hierarchies (Throwable, Collection, Map, Map.Entry, Member, Number, interfaces/arrays) that might be exploitable by future gadgets.",
+      "reason": "No concrete bypass of the whitelist was identified in this snapshot; speculative without a demonstrated gadget class that passes the permission checks."
+    }
+  ],
+  "summary": "Snapshot is XStream 1.4.11-SNAPSHOT (pom.xml:17, changelog's \"Upcoming 1.4.x\" section) with 481 readable files: the main library (xstream/src/java, 359 files), plus distribution docs, hibernate/jmh/benchmark modules. Focused source review of the deserialization path found a single strong issue: the internal blacklist that is meant to reject known gadget types (java.beans.EventHandler, *$LazyIterator, javax.crypto.*) even when XStream's security framework is not initialized is gated on `insecureWarning`, but `XStream.unmarshal(...)` clears that flag immediately before doing the actual unmarshalling. The gate is therefore always false exactly when the blacklist is consulted, making those revocation checks dead code; a default-configured XStream instance can deserialize java.beans.EventHandler again, contradicting the project's own documentation (security.html, faq.html) and re-opening the documented EventHandler/dynamic-proxy gadget path (CVE-2013-7285-style) to remote code execution. This matches the CVE-2019-10173 class of defect fixed in the released 1.4.11, but that external attribution was not verified here."
+}

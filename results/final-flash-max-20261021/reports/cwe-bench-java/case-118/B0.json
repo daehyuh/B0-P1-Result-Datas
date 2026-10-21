@@ -1,0 +1,60 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The bytes parsed are the processor's input FlowFile content (line 180: loadDocument(session.read(flowFile), ...)), i.e. data-plane input that is routinely supplied by untrusted producers (HTTP listeners, file/site-to-site ingestion, queues fed by any upstream processor). The processor class is annotated @InputRequirement(INPUT_REQUIRED) and exposes the FlowFile to an XML parser as-is, so the attacker controls the full XML document, including any DOCTYPE/ENTITY declarations.",
+      "confidence": "medium",
+      "counterevidence_checked": "I confirmed the processor itself performs no entity hardening: no XMLConstants/DOCTYPE/external-entity constants, no EntityResolver, no XMLReader configuration, and its only onScheduled setup is EMF package registration plus JEXL initialization (lines 133-156). I searched the repository for the hardened equivalents (disallow-doctype-decl, external-general-entities, FEATURE_SECURE_PROCESSING, ACCESS_EXTERNAL_DTD) and they appear only in other components, showing that this processor is an outlier rather than a deliberately centralized global setting being applied. skip-validation=true was considered and does not mitigate entity resolution. I could not read the external MDHT library sources (dependency jar, binary not inspectable), so the precise default behavior of CDAUtil.load() is inferred rather than observed. I also considered whether a global JVM/system property in this snapshot disables entity processing (none was found in the tree).",
+      "id": "nifi-ccda-xxe",
+      "impact": "Where the dependency parser resolves external entities, a crafted CDA document can cause the NiFi process to read local files reachable by the NiFi OS user (for example configuration files that contain keystore/truststore locations and other sensitive properties) or to issue server-side requests to internal HTTP/HTTPS/file endpoints (SSRF), with the retrieved text potentially surfaced through the generated FlowFile attributes. Recursive/nested entities can also cause excessive resource consumption (denial of service) on the processor thread.",
+      "locations": [
+        {
+          "end_line": 297,
+          "path": "nifi-nar-bundles/nifi-ccda-bundle/nifi-ccda-processors/src/main/java/org/apache/nifi/processors/ccda/ExtractCCDAAttributes.java",
+          "start_line": 283
+        },
+        {
+          "end_line": 203,
+          "path": "nifi-nar-bundles/nifi-ccda-bundle/nifi-ccda-processors/src/main/java/org/apache/nifi/processors/ccda/ExtractCCDAAttributes.java",
+          "start_line": 158
+        }
+      ],
+      "prerequisites": "The ExtractCCDAAttributes processor (nifi-ccda-processors, part of the C-CDA bundle) must be deployed in a flow that processes attacker-influenced content. skip-validation defaults to true (line 90-93), so schema validation is normally bypassed; enabling validation would not disable entity resolution in any case. Exploitability also depends on the MDHT/EMF parser used by ipf-oht-mdht-uml-cda 1.2.0.201212201425 resolving external entities by default, which cannot be inspected in this snapshot (the jar is an external dependency, and binary files are not readable here).",
+      "root_cause": "ExtractCCDAAttributes.loadDocument() passes the raw FlowFile InputStream directly to the third-party MDHT parser (CDAUtil.load(inputStream)) without configuring the SAX/EMF parser to disallow DOCTYPE declarations, external general/parameter entities or external DTD loading, and without an EntityResolver. The class sets no XML-related security features anywhere (its onScheduled intentionally only sets an EMF registry property for JEXL). This is inconsistent with the project's own hardened pattern used elsewhere in the same snapshot (e.g. nifi-xml-processing StandardInputSourceParser/StandardDocumentProvider set FEATURE_SECURE_PROCESSING and disallow-doctype-decl; SafeXMLConfiguration sets external-general-entities/external-parameter-entities/load-external-dtd to false; TransformXml disables Saxon external entities; AbstractPolicyBasedAuthorizer.parseFingerprint disables external entities).",
+      "title": "ExtractCCDAAttributes parses untrusted FlowFile XML without XXE protections (external entities/DTD resolution enabled)",
+      "trace": "1) onTrigger takes the FlowFile (line 163) and calls loadDocument(session.read(flowFile), skipValidation) (line 180). 2) loadDocument calls CDAUtil.load(inputStream) with no parser hardening (line 287); the optional CDAUtil.validate() step at line 288 only runs if skip-validation is false and does not configure external-entity handling. 3) Entity/DTD expansion therefore happens inside the third-party parser using whatever resolution default it ships with; external file/URL content referenced from the XML can be pulled into the parsed document (or cause network requests / entity-expansion DoS). 4) processElement/addElement (lines 216-264) serialize mapped element values to Strings and add them to the attribute map. 5) session.putAllAttributes(flowFile, attributes) (line 191) stores those values as FlowFile attributes, which are then transferred to success (line 201) and can be routed/observed/exported by downstream components - giving a direct disclosure path for any data substituted by an external entity, in addition to the SSRF/DoS effects of the outbound fetch itself.",
+      "unverified": "The parser hardening behavior inside ipf-oht-mdht-uml-cda 1.2.0.201212201425 is not visible in the snapshot; the finding is a source-evidence lead that the parser is invoked unconfigured on attacker-controlled XML, not a runtime-confirmed exploit. Actual file paths readable from the NiFi process and the exact attribute names that would carry entity-expanded text were not exercised.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE) / unsafe XML parser configuration"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned Apache NiFi 1.16.2 source snapshot (7,332 visible files; 27 sensitive files filtered out by the tooling; test sources are not present in the tree). Coverage included the root/serving modules and bundles: nifi-commons (security, XML processing, utils), nifi-api/framework-api, nifi-bootstrap, nifi-nar-bundles (framework, standard/dbcp, ccda, cdc, hbase, scripting, web/security/UI, shell-authorizer), nifi-registry, minifi (bootstrap, c2, commons), c2 protocol, toolkit, stateless and hive/hadoop-related processor code. I searched broadly for XML parser creation and XXE hardening, process/shell execution, Java deserialization, JDBC/JNDI sinks, redirects, SQL string building, path/canonicalization checks, proxy-header handling, and JWT/OIDC/SAML/X.509 authentication configuration, then read the strongest candidate and several control implementations in full context. Not every one of the ~5,777 Java files or the front-end JavaScript was read line-by-line; the review prioritized security boundaries and attacker-reachable sinks.",
+  "limitations": [
+    "No execution, tests, or scanners were run; findings are source-evidence leads only and are not runtime-confirmed.",
+    "The third-party MDHT/EMF CDA parser is an external jar and was not inspectable, so its default external-entity resolution behavior is the key unverified assumption behind the selected candidate.",
+    "Test sources and VCS history are absent, so the vulnerable-vs-fixed lineage of any code could not be diffed and no regression tests could be consulted.",
+    "Front-end JavaScript/HTML (nifi-web-ui, content viewer, docs) was only spot-checked for XSS sinks; a UI-based issue could exist that I did not fully rule out.",
+    "The snapshot is a single release; later security fixes (for example around JDBC URL handling, proxy identity handling, or other CVEs in the 1.16.2 line) are not visible, and other genuine vulnerabilities fixed in later releases may be present but were not selected because their source-level exploit path was weaker or less clearly attacker-reachable."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ShellUserGroupProvider / NssShellCommands / OsxShellCommands build shell strings by unquoted String.format (e.g. \"getent passwd %s\", \"id -P %s\") and run them via ProcessBuilder(\"sh\", \"-c\", command); reachable from ShellUserGroupProvider.getUserByIdentity()/getGroup() with an authenticated identity or group id.",
+      "reason": "The inputs (user identity, group identifiers) are normally constrained by the configured authentication/identity provider and by administrator-defined policies, so attacker control is not established from the snapshot alone; this looks like a robustness/defense-in-depth issue (input quoting) rather than a demonstrable unauthenticated vulnerability, and I could not tie it to a concrete externally-controllable identity source in this tree."
+    },
+    {
+      "lead": "DBCPConnectionPool/HikariCPConnectionPool accept an arbitrary Database Connection URL with only NON_EMPTY validation, and database-driver-locations can load arbitrary JARs/URLs.",
+      "reason": "This is largely the intended administrator-configurable behavior and requires an already highly privileged user (configure controller services). It reads as a hardening opportunity (e.g. restricting dangerous in-URL options or driver locations) rather than a vulnerability reachable by an unprivileged attacker, so it was not selected."
+    },
+    {
+      "lead": "ObjectSerDe.deserialize() uses ObjectInputStream.readObject() on bytes, and GetHBase persists/loads ScanResult via this SerDe; GetHBase also deserializes a local state file.",
+      "reason": "The deserialization input comes from a configured DistributedMapCacheClient and a local state file, not from attacker-controlled FlowFile content; no attacker-controlled path to the serialized blob was traced."
+    },
+    {
+      "lead": "ProxiedEntitiesUtils.isBase64Encoded() checks for angle brackets that tokenizeProxiedEntitiesChain() has already consumed when splitting on '><', so base64-encoded (non-ASCII) DNs are not decoded on receipt.",
+      "reason": "The observable effect is broken reconstruction of non-ASCII identities (functional/identity-mapping defect), not impersonation or privilege escalation; the escaping path for '<'/'>' otherwise round-trips correctly."
+    },
+    {
+      "lead": "CaptureChangeMySQL.loadTableInfo() builds SQL with backtick-quoted database/table names taken from binlog/cache keys without escaping embedded backticks.",
+      "reason": "The values are supplied by the connected MySQL server, which is already a trusted component of the integration; impact is limited and the trigger requires a malicious/altered upstream database rather than normal attacker input."
+    }
+  ],
+  "summary": "Snapshot is the Apache NiFi 1.16.2 source tree (root pom version 1.16.2; several module poms carry the release-candidate SCM tag nifi-1.16.2-RC3). It contains the full server, framework, standard/extension NAR bundles, NiFi Registry, MiNiFi, C2, toolkit and stateless code (7,332 model-visible files, ~5,777 Java files), with test sources absent and no VCS history. I surveyed the XML/parsing surface, shell/process execution, Java deserialization, JDBC/JNDI, redirects, authorization filters, proxy-header handling, OIDC/JWT configuration and file/path handling. The strongest, most concrete data-triggered issue is an unhardened XML parse in the C-CDA processor: FlowFile content is handed to CDAUtil.load() with no DTD/external-entity restrictions, and parsed element values are then written back as FlowFile attributes (an exfiltration channel). I selected that single candidate; other plausible-looking leads were rejected or left unconfirmed and are listed below."
+}

@@ -1,0 +1,99 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker controls the complete HTTP request body sent to the deployed invoker context root (default `ejb-invoker`, app name `__ejb-invoker`) with `Content-Type: application/x-java-object` (MediaTypes.JAVA_OBJECT) and any path handled by EjbOverHttpResource, e.g. the POST `jndi/invoke`/`jndi/lookup` resources. The body bytes are handed directly to ObjectInputStream; the second-stage argument array (`argValues`) is likewise attacker-supplied and deserialized via ClassLoaderObjectInputStream in the `argDeserializer` lambda. For the legacy `@WebServlet(\"/ejb/*\")` path the attacker controls the JSON payload and the method/args used for reflection.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the feature is not on by default: EjbInvokerConfiguration.enabled defaults to false and the __ejb-invoker app is not deployed from the domain templates (no ejb-invoker-configuration entry/application in appserver/admin/*/domain.xml); EjbInvokerService.loads it only when enabled. Checked that when security-enabled=true, EjbInvokerContainerInitializer programmatically applies ServletSecurityElement with CONFIDENTIAL and the configured roles, which would make the container authenticate/authorize before body parsing; therefore the fully unauthenticated case depends on the default security-enabled=false. Checked that JAX-RS JSON readers (JsonbInvokeMethodMessageBodyReader/JsonbLookupMessageBodyReader) are used for application/json and do not deserialize Java objects, so the issue is specific to the x-java-object media type. Checked that the JNDI lookup path is restricted to java:global names with an existing application class loader. Verified there is no ObjectInputFilter/jdk.serialFilter usage anywhere in the tree.",
+      "id": "PAYARA-EJBHTTP-DESER-001",
+      "impact": "Remote code execution in the Payara server JVM under the server account when a deserialization gadget chain is present on the classpath, or at minimum attacker-controlled object graph instantiation and denial of service (deserialization bombs). Because the endpoint is meant to invoke EJBs, the same access also permits unauthenticated/targeted EJB method invocation and JNDI lookups in java:global namespaces of deployed applications when security is not enabled, i.e. access to server-side business logic without the authentication the feature's secure mode is supposed to enforce. No gadget chain or exploit was verified in this review.",
+      "locations": [
+        {
+          "end_line": 95,
+          "path": "appserver/ejb/ejb-http-remoting/endpoint/src/main/java/fish/payara/ejb/http/protocol/rs/ObjectStreamInvokeMethodMessageBodyReader.java",
+          "start_line": 81
+        },
+        {
+          "end_line": 84,
+          "path": "appserver/ejb/ejb-http-remoting/endpoint/src/main/java/fish/payara/ejb/http/protocol/rs/ObjectStreamMessageBodyReader.java",
+          "start_line": 75
+        },
+        {
+          "end_line": 162,
+          "path": "appserver/ejb/ejb-http-remoting/endpoint/src/main/java/fish/payara/ejb/http/endpoint/EjbOverHttpResource.java",
+          "start_line": 115
+        },
+        {
+          "end_line": 192,
+          "path": "appserver/ejb/ejb-http-remoting/endpoint/src/main/java/fish/payara/ejb/invoke/InvokeEJBServlet.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 92,
+          "path": "appserver/ejb/ejb-http-remoting/admin/src/main/java/fish/payara/ejb/http/admin/EjbInvokerConfiguration.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 93,
+          "path": "appserver/ejb/ejb-http-remoting/endpoint/src/main/java/fish/payara/ejb/invoke/EjbInvokerContainerInitializer.java",
+          "start_line": 64
+        },
+        {
+          "end_line": 26,
+          "path": "appserver/ejb/ejb-http-remoting/endpoint/src/main/webapp/WEB-INF/web.xml",
+          "start_line": 1
+        },
+        {
+          "end_line": 242,
+          "path": "appserver/ejb/ejb-http-remoting/admin/src/main/java/fish/payara/ejb/http/admin/SetEjbInvokerConfigurationCommand.java",
+          "start_line": 234
+        },
+        {
+          "end_line": 57,
+          "path": "appserver/ejb/ejb-http-remoting/admin/src/main/java/fish/payara/ejb/http/admin/Constants.java",
+          "start_line": 46
+        }
+      ],
+      "prerequisites": "An administrator must have enabled the EJB invoker (`set-ejb-invoker-configuration --enabled=true`, or the deprecated `enable-ejb-invoker`), which deploys the `__ejb-invoker` system application (default is disabled: `enabled` default `false`). Network access to the HTTP listener hosting the application is required. If `security-enabled` is left at its default `false`, no credentials are required at all; if it is set to true, any principal holding the configured invoker role can still reach the readers (and the same command creates a default `invoker`/`invoker` file-realm user when security is turned on, weakening that gate). The deserialization occurs during JAX-RS body parsing, before the resource method performs its per-invocation ProgrammaticLogin.",
+      "root_cause": "The payara EJB-over-HTTP feature accepts Java-serialized request bodies and deserializes them with a plain ObjectInputStream/ClassLoaderObjectInputStream and no class filtering, whitelist or JEP-290 ObjectInputFilter. In addition, the invoker application carries no declarative security constraint (the endpoint app's web.xml defines only login/error JSPs), and security is only applied programmatically when the invoker's `security-enabled` option is true, whose default is `false`. Consequently, once the invoker application is enabled, the serialized body is processed before any authentication/authorization decision, so an attacker who can reach the HTTP listener fully controls the bytes passed to readObject() and, through deserialization gadget behavior available on the server classpath, can influence server-side execution rather than only the intended EJB invocation.",
+      "title": "Unsafe Java deserialization of HTTP request bodies in the EJB-over-HTTP remoting endpoint (__ejb-invoker)",
+      "trace": "HTTP POST with a Java-serialized body and Content-Type `application/x-java-object` -> Jersey selects ObjectStreamInvokeMethodMessageBodyReader (or ObjectStreamMessageBodyReader for lookup) -> `new ObjectInputStream(entityStream).readObject()` executes on the raw, unauthenticated request bytes (line 85) with no resolveClass allow-list/filter -> for invoke requests, `request.argDeserializer` then runs `new ClassLoaderObjectInputStream(classloader, new ByteArrayInputStream((byte[]) args)).readObject()` (lines 87-89) under the application class loader; payara-web.xml sets class-loader delegate=true so server classpath types are reachable. The deprecated /ejb/* servlet follows the same pattern: it only checks roles when securityEnabled is true (lines 111-117) and otherwise invokes server-side EJB methods reflectively (lines 177-192). No JEP-290 filter or class whitelist exists anywhere in these classes or in the endpoint module; by contrast, the codebase shows the expected mitigation pattern in fish/payara/ejb/opentracing/OpenTracingIiopObjectInputStream.java (lines 62-72), which rejects all but explicitly allowed classes.",
+      "unverified": "I could not run the server or a payload, so exploitability (availability of a working gadget chain on the Payara 5 classpath, e.g. through Jackson/Hazelcast/JDK gadgets) is not runtime-confirmed. It is also unverified whether the benchmark's reference issue for this snapshot corresponds to this code, to another Payara CVE fixed in the same release window (e.g. an admin-console or REST-monitoring flaw), or whether an external container-level serialization filter is configured outside the source tree. The exact CVE identifier and fixed version could not be confirmed from repository content alone.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (with CWE-306 Missing Authentication for Critical Function as a contributing configuration default)"
+    }
+  ],
+  "coverage_summary": "Tools used: get_source_scope (12,030 visible files; no sensitive/oversize symlink exclusions; binary-like files skipped), list_files and search_code for targeted sweeps, and read_file for ~60 bounded source reads. Areas inspected include appserver/ejb/ejb-http-remoting (admin, client, endpoint, servlet, web.xml), appserver/payara-appserver-modules (microprofile jwt-auth, healthcheck, rest-monitoring, config-extensions/ldap, yubikey, openapi), nucleus/payara-modules (hazelcast-bootstrap/encryption, request tracing, phonehome, asadmin-audit/recorder), nucleus/admin REST/admingui authentication (AdminConsoleAuthModule, RestAdapter, SessionsResource), web-core deserialization/servlets (DefaultServlet, WebdavServlet, CGIServlet, session/zip handling), and the domain/default-web templates. Searches covered ObjectInputStream/readObject, ObjectInputFilter/resolveClass, Runtime.exec/ProcessBuilder, createStatement/SQL concatenation, TrustManager/HostnameVerifier, path traversal checks, getParameter/getHeader in fish.payara code, zip extraction, and CVE/security comments. No precomputed relation index and no src/test trees are present in the snapshot; line-level conclusions come from direct reading only.",
+  "limitations": [
+    "No code was compiled, executed, scanned, or exploited; all findings are static source evidence only.",
+    "No source-relation/symbol index was available (B0), so coverage is search- and read-driven rather than exhaustive over all 12,030 files; many large upstream GlassFish modules were sampled rather than fully read.",
+    "The snapshot contains no unit/integration tests, no VCS metadata, and no release notes, so the specific patched vulnerability and CVE mapping for this case could not be confirmed and the dataset's ground-truth target may be a different module.",
+    "Whether a usable deserialization gadget chain exists on the exact Payara 5.2022.4 classpath was not verified, and container/runtime-level serialization filters outside the source tree cannot be ruled out.",
+    "Counterevidence for the rejected REST-monitoring auth-bypass lead (whether the container still authorizes a request after validateRequest returns SUCCESS with an empty subject) was reasoned from web.xml role constraints, not tested."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "RestMonitoringAuthModule: after handler.handle(pvCallback) on a j_username/j_password POST it ignores PasswordValidationCallback.getResult(), registers the session and returns AuthStatus.SUCCESS even when credentials were rejected (rest-monitoring-service .../security/RestMonitoringAuthModule.java lines 146-177).",
+      "reason": "Looks like a real code defect (an auth check whose result is discarded), but the rest-monitoring app's web.xml requires the `rest-monitoring` role for /*, and the failed-validation path adds no CallerPrincipal/groups to the client subject, so container authorization would still yield 403. Impact could not be shown to be an actual bypass; service is also disabled by default (RestMonitoringConfiguration.enabled default false)."
+    },
+    {
+      "lead": "Admin-console download content sources interpolate request parameters into temp file paths and into REST command payloads (LogFilesContentSource.java lines 87-107, ClientStubsContentSource.java lines 85-102, LBConfigContentSource.java lines 104-112; `target`/`appName` also flow into the DAS `collect-log-files`/`get-client-stubs` commands).",
+      "reason": "These run behind the admin console's authenticated JASPIC module; even if traversal or SSRF is possible it requires admin credentials, and the server-side command effects were not fully traced. Not the strongest candidate."
+    },
+    {
+      "lead": "com.sun.enterprise.util.zip.ZipFile.explode() extracts archive entries with new File(explodeDir, entryName) and no `../` normalization (nucleus/common/common-util .../zip/ZipFile.java lines 110-164).",
+      "reason": "Classic Zip-Slip shape, but callers/deployment validation were not traced; exploitation would require deployment privileges (admin/deployer), and this is long-standing upstream GlassFish-derived code rather than the Payara-specific endpoint under review."
+    },
+    {
+      "lead": "PersonalizationTracer Tracer.extract(Format.Builtin.BINARY, ByteBuffer) deserializes an attacker-provided ByteBuffer with ObjectInputStream (nucleus/payara-modules/opentracing-adapter .../tracer/Tracer.java lines 213-223).",
+      "reason": "Reachable only when application code explicitly uses the OpenTracing BINARY format with untrusted bytes; no in-tree HTTP/IIOP caller passes untrusted data to it, so it is not remotely reachable by default."
+    },
+    {
+      "lead": "InvokeEJBServlet role check is inverted/ineffective (sets 403 but continues, and forbids when a caller lacks any single configured role) and the servlet only enforces roles when securityEnabled is true (lines 108-157).",
+      "reason": "Subsumed by the same EJB-invoker root cause and configuration default; reported as supporting evidence rather than as a separate candidate to avoid splitting one root cause."
+    },
+    {
+      "lead": "MP-JWT validation (JwtTokenParser/SignedJWTIdentityStore) accepts RS256/ES256 only, verifies signature, issuer, expiry and audience, and does not resolve keys from attacker-controlled JWT headers.",
+      "reason": "No signature/claim bypass found on inspection; JWKS/key locations come from server configuration, not request data."
+    }
+  ],
+  "summary": "This is the Payara Server 5.2022.4-SNAPSHOT source tree (~12,030 visible files, no src/test content and no VCS metadata). I reviewed Payara-specific security surfaces (EJB-over-HTTP remoting, admin REST/console authentication, REST monitoring, MP-JWT, Yubikey, Hazelcast cluster services, config sources, archive handling) and searched for untrusted-input sinks, unauthenticated endpoints, path handling, and deserialization. The strongest source-evidenced issue is unsafe Java deserialization in the EJB-over-HTTP remoting endpoint (`__ejb-invoker`): JAX-RS body readers call `ObjectInputStream.readObject()` on the raw request body with no class allow-list, and the feature's security is off by default, so when an administrator enables the invoker the endpoint can be reached without credentials and attacker-controlled serialized data is deserialized inside the server JVM. I found no evidence of a runtime exploit and cannot map this to a specific CVE identifier from inside the snapshot."
+}

@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the suite XML content, including the DOCTYPE internal subset, external DTD SYSTEM IDs and external entity declarations (e.g. <!ENTITY xxe SYSTEM \"file:///...\"> or an https:// collector URL used in a parameter-entity exfiltration chain). This XML is supplied through the normal TestNG entry points: -suiteXmlFiles/testng.xml (CommandLineArgs.suiteFiles -> TestNG.configure -> parseSuite -> Parser.parse), a testng.xml embedded in a -testjar artifact, a <suite-file> reference, or programmatic Parser/SuiteXmlParser usage by tools/IDE plugins (Converter uses loadClasses=false but still parses).",
+      "confidence": "high",
+      "counterevidence_checked": "Checked RuntimeBehavior.useSecuredUrlForDtd()/isUnsecuredUrl(): scheme \"http\" is rejected by default (testng.dtd.http property required to enable), so plain HTTP XXE is mitigated. Checked skipConsideringSystemId(): entity IDs that are empty, on beust.com/testng.org, malformed, non-existent or directories are replaced by the bundled TestNG DTD rather than fetched, so the file read is limited to existing paths. Checked that entity content must be well-formed content for the document to parse (binary files abort parsing, but blind parameter-entity exfiltration can still occur). Acknowledged that suite XML is a powerful configuration surface by design (listener/object-factory class names, script method selectors, and ${...} system-property expansion), so depending on deployment the XML author may already have code-execution capability; however the parser is also used with loadClasses=false and by tooling that only builds suite models, and XXE gives file/network access distinct from the designed configuration features. The JDK contract that SAXParser.parse(InputStream, DefaultHandler) registers the handler as EntityResolver is assumed from the API and supported by in-repo history (CHANGES entries GITHUB-2403/2022/2501 describing DTD/ENTITY fetching behavior), but was not runtime-verified.",
+      "id": "testng-xxe-suite-xml",
+      "impact": "Cross-boundary disclosure of arbitrary local files readable by the TestNG JVM (secrets, credentials, config) either blind (entity content drives a subsequent fetch to an attacker-controlled https URL) or directly (entity value lands in suite/test names, parameters or script expressions that are echoed into console output, logs and generated reports). Also arbitrary outbound network requests from the JVM (SSRF to internal https services, port scanning, request smuggling of local file contents into query strings) and DoS via blocking/huge entity URLs; http is blocked only for the initial URL and can be reached via a redirect from an allowed https URL.",
+      "locations": [
+        {
+          "end_line": 93,
+          "path": "testng-core/src/main/java/org/testng/xml/TestNGContentHandler.java",
+          "start_line": 63
+        },
+        {
+          "end_line": 183,
+          "path": "testng-core/src/main/java/org/testng/xml/TestNGContentHandler.java",
+          "start_line": 126
+        },
+        {
+          "end_line": 39,
+          "path": "testng-core/src/main/java/org/testng/xml/XMLParser.java",
+          "start_line": 16
+        },
+        {
+          "end_line": 22,
+          "path": "testng-core/src/main/java/org/testng/xml/SuiteXmlParser.java",
+          "start_line": 11
+        },
+        {
+          "end_line": 155,
+          "path": "testng-core/src/main/java/org/testng/xml/internal/Parser.java",
+          "start_line": 144
+        },
+        {
+          "end_line": 342,
+          "path": "testng-core/src/main/java/org/testng/TestNG.java",
+          "start_line": 321
+        }
+      ],
+      "prerequisites": "Victim runs TestNG (or a tool embedding Parser/SuiteXmlParser) on attacker-influenced suite XML. Default JVM properties suffice: only scheme \"http\" is blocked; file:// and https:// are allowed. The referenced local path must exist and be readable by the test JVM (non-existent paths/directories are replaced with the bundled TestNG DTD). For out-of-band file exfiltration the JVM needs egress to the attacker's HTTPS endpoint (https is allowed; a redirect from it to http is also followed).",
+      "root_cause": "XMLParser creates a SAXParser with validation enabled but never disables external general/parameter entities or DOCTYPE processing (testng-core/src/main/java/org/testng/xml/XMLParser.java:16-39). The TestNGContentHandler passed as the DefaultHandler is therefore also used as the EntityResolver (SAXParser.parse(InputStream, DefaultHandler) contract) and its resolveEntity() routes the attacker-controlled systemId into m_redirectionAwareResolver, which opens a URLConnection and returns the fetched bytes as the entity's InputSource (TestNGContentHandler.java:64-93, 126-150). The only guard, isUnsecuredUrl(), rejects just scheme \"http\" (lines 174-183), and skipConsideringSystemId() only diverts empty/TestNG-domain/non-existent-file IDs; an existing local file or an https URL passes straight through. HTTP redirects returned by an allowed URL are followed without re-checking the scheme (lines 74-89).",
+      "title": "XXE / SSRF in TestNG suite-XML parsing via unrestricted entity resolver (file:// and https:// system IDs)",
+      "trace": "TestNG.configure()/run() -> parseSuite()/parseSuiteFiles() (TestNG.java:293-315, 321-342, 383-394) -> Parser.parse() (Parser.java:144-155) -> SuiteXmlParser.parse() -> XMLParser.parse(InputStream, DefaultHandler) -> static SAXParser.parse() with validating parser -> parser encounters DOCTYPE/entity reference -> TestNGContentHandler.resolveEntity(publicId, systemId). skipConsideringSystemId() returns false for an existing file:// path; isUnsecuredUrl() returns false for any scheme other than http; m_redirectionAwareResolver then does getResourceAsStream(url.getPath()) and, on miss, url.openConnection().getInputStream(), returning the file/remote content as the entity replacement text. The content is expanded into the parsed document (e.g. suite/test names, parameter values, <script> expressions) or, for parameter entities, used to build a further SYSTEM URL fetched by the same resolver, enabling blind exfiltration.",
+      "unverified": "No code was executed and no payload was sent. The exact observability of expanded entity data depends on where the reference is placed in the document; blind exfiltration requires attacker-controlled HTTPS egress and a file whose content can be embedded into a URL. Whether a given deployment treats suite XML as untrusted is environment-specific.",
+      "weakness_type": "XML External Entity (XXE) leading to arbitrary local file read, SSRF and out-of-band data exfiltration"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 459-file, read-only TestNG snapshot (modules testng-core, testng-core-api, testng-asserts, testng-ant, testng-collections, testng-runner-api, etc.). Traced the XML suite parsing pipeline end to end (CommandLineArgs -> TestNG.configure/run -> Parser -> SuiteXmlParser -> XMLParser -> TestNGContentHandler -> EntityResolver/resolver -> URLConnection), and inspected the related DTD/URL helpers (RuntimeBehavior, TestNGURLs). Also searched the whole tree for other XML parser factories, SAX feature hardening (none present), openConnection/getResourceAsStream, Runtime.exec/ProcessBuilder, ObjectInputStream, URLClassLoader, Class.forName, setAccessible, file writes, jar handling (JarFileUtils), YAML loading, report generation paths (SuiteHTMLReporter/XMLSuiteResultWriter), and build/dependency versions. Reported only the entity-resolution issue; listed other leads as rejected.",
+  "limitations": [
+    "Static review only: no code execution, tests, scanners or payloads; findings are source-evidence leads, not runtime-confirmed.",
+    "The snapshot excludes test sources and most resources/META-INF (e.g. the testng-1.0.dtd resource and the ServiceLoader registration for YamlParser are not present), so some runtime wiring (YAML parser discovery, bundled DTD availability) could not be verified from source.",
+    "Large classes (TestNG.java, TestInvoker.java, SuiteRunner.java, Parameters.java, MethodInvocationHelper.java, some reporters) were examined via targeted searches and partial reads rather than exhaustively line-by-line.",
+    "The JDK behavior that SAXParser.parse(InputStream, DefaultHandler) registers the DefaultHandler as EntityResolver is assumed from the Java SAX API, not demonstrated in this run; in-repo CHANGES entries about DTD/ENTITY fetching support the assumption.",
+    "Impact observability (where expanded entity text surfaces) was reasoned from control flow, not executed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unsafe SnakeYAML deserialization: Yaml.parse() builds an org.yaml.snakeyaml.Constructor (snakeyaml 1.21 per versions.properties) and loads suite YAML with it, which in SnakeYAML 1.x can instantiate arbitrary classes via !! tags (potential RCE if a gadget is on the classpath).",
+      "reason": "Reachability unproven from this snapshot: YamlParser is only discovered via ServiceLoader<ISuiteParser>, and no META-INF/services/org.testng.xml.ISuiteParser registration is exposed in the snapshot (it may have been filtered out). Also a YAML suite file is the same configuration-trust surface as XML suites. No gadget class in-repo."
+    },
+    {
+      "lead": "Zip-Slip-style path traversal in JarFileUtils.testngXmlExistsInJar(): jar entry names are used directly in new File(tempDir, jeName) and Files.copyFile(), so an entry such as ../x.xml is copied outside the temp directory.",
+      "reason": "Limited to entries accepted by Parser.canParse (must end in .xml/.yaml), and running a -testjar already executes code from the same attacker-controlled jar, so the boundary is weak; no evidence it is the intended issue."
+    },
+    {
+      "lead": "Unsanitized suite/test names used in output paths: SuiteHTMLReporter.getOutputDirectory() and XMLSuiteResultWriter/XMLReporter build paths from xmlSuite.getName()/test names (e.g. new File(m_outputDirectory + File.separatorChar + xmlSuite.getName())), allowing directory creation/HTML report writes outside the report root with ../ names.",
+      "reason": "Impact is limited to report artifacts (Utils.writeFile sanitizes file names but not directory names); requires report generation and attacker-controlled suite naming, which is a weaker boundary than the parser issue."
+    },
+    {
+      "lead": "TestNGContentHandler.expandValue() expands ${...} in <parameter> values from System.getProperty/System.getenv, allowing an XML author to pull process environment values into test parameters.",
+      "reason": "Documented TestNG feature for system-property interpolation; it is not an authentication/authorization boundary and does not by itself cross a trust boundary beyond the already powerful suite-XML surface."
+    },
+    {
+      "lead": "Suite XML can name object-factory, listener and script-selector classes/expressions that TestNG loads and executes.",
+      "reason": "By-design TestNG functionality (XmlSuite object-factory, <listeners>, <script> method selectors); it is relevant only as context for the trust assumptions around suite XML, not a distinct vulnerability with source evidence of a flaw."
+    }
+  ],
+  "summary": "TestNG 7.5 source snapshot (459 readable files, multi-module). The strongest issue found is an XML External Entity (XXE) / SSRF / arbitrary-local-file-read flaw in the suite-XML parsing path: the SAX parser is created with DTD validation and without disabling external entities, and the registered DefaultHandler/EntityResolver resolves any attacker-supplied SYSTEM identifier through java.net.URLConnection, explicitly allowing file:// (any existing file) and all schemes except plain http://. A crafted testng.xml (or <suite-file>/testjar XML parsed by the same code) can therefore make the JVM read local files and/or fetch arbitrary URLs, with out-of-band parameter-entity exfiltration possible to an attacker HTTPS endpoint. I found no other issue of comparable source evidence and impact; secondary leads (unsafe SnakeYAML Constructor, jar-entry path handling, report-path construction from suite names, ${...} property expansion) are listed as rejected/unconfirmed."
+}

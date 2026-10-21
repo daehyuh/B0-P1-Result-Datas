@@ -1,0 +1,72 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The 'token' query parameter on the registration entry points (/realms/{realm}/login-actions/register via LoginActionsService.registerPage, /realms/{realm}/login-actions/processRegister via LoginActionsService.processRegister, and the OIDC registration page request), plus all form fields submitted with the registration (email must merely equal the token's eml claim, also attacker-chosen). The JWT payload fields typ=ORGIVT, org_id, eml, exp, nonce, reduri and the signature are fully attacker-supplied and are never cryptographically bound to the server.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified in source that the central action-token handler does verify (LoginActionsService.handleActionToken lines 551-617 build a TokenVerifier with realm URL/IS_ACTIVE/ACTION_TOKEN_BASIC_CHECKS and call verifier.verify()), but both registration handlers discard its Response (lines 767, 791), and AuthorizationEndpoint.register (lines 240-257) is the only caller that checks it - so the /registrations entry point is protected while the registration form POST path is not. Verified TokenVerifier semantics in core/TokenVerifier.java: getToken()->parse() does not verify; verifySignature()/verify() is required. Verified the token claims used for the membership decision are read from the same request (Organizations.java:150-159; RegistrationUserCreation.java:300-321) and that nothing binds the earlier verified token to the later parse. Checked OrganizationMemberValidator (new user skips domain validation) and JpaOrganizationProvider.addManagedMember (no domain/e-mail check). Checked that the organization target is ID-based only (getById), so a valid UUID is required. Checked RedirectUtils for the known open-redirect hardening (UNSAFE_PATH_PATTERN / areWildcardsAllowed) - appears to contain the post-CVE fix, so not reported. Searched for server-side code/EL/deserialization/XML sinks (ExpressionFactory/ELProcessor, ObjectInputStream, DocumentBuilderFactory, Yaml, TransformerFactory) and found only expected or admin/test-gated code.",
+      "id": "kc-org-invite-token-unverified",
+      "impact": "Unauthorized authorization-bypass: an attacker-controlled account is added as a managed member of an arbitrary organization in the realm, without holding a valid invitation. Depending on realm configuration this can grant organization-scoped claims/scopes in tokens, access to organization-restricted clients/resources, and a foothold tied to the organization lifecycle; the same unverified token also controls the post-registration redirect target (reduri), yielding an open-redirect. The invitation token's expiry/type/e-mail checks are performed on unverified, attacker-chosen values, so they provide no security guarantee.",
+      "locations": [
+        {
+          "end_line": 159,
+          "path": "services/src/main/java/org/keycloak/organization/utils/Organizations.java",
+          "start_line": 150
+        },
+        {
+          "end_line": 350,
+          "path": "services/src/main/java/org/keycloak/authentication/forms/RegistrationUserCreation.java",
+          "start_line": 290
+        },
+        {
+          "end_line": 83,
+          "path": "services/src/main/java/org/keycloak/authentication/forms/RegistrationPage.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 794,
+          "path": "services/src/main/java/org/keycloak/services/resources/LoginActionsService.java",
+          "start_line": 756
+        },
+        {
+          "end_line": 285,
+          "path": "services/src/main/java/org/keycloak/authentication/FormAuthenticationFlow.java",
+          "start_line": 268
+        }
+      ],
+      "prerequisites": "1) ORGANIZATION preview feature enabled and organizations enabled for the realm (RegistrationPage/RegistrationUserCreation are guarded by Profile.isFeatureEnabled(Feature.ORGANIZATION); Organizations.checkEnabled/isEnabledAndOrganizationsPresent guard the invite/registration paths). 2) A reachable registration form stage: realm registration allowed (default-style case) or any valid-token flow from which the attacker can keep the auth session and POST the form; session_code/execution/client_id/tab_id can be read from the rendered form. 3) The target organization UUID must be known or leaked (I found no unauthenticated endpoint that lists org IDs; account/admin APIs expose IDs only for authorized users, but IDs also travel inside invite links/e-mails and are not treated as secrets). 4) A syntactically valid JWT signed with any key (e.g., alg=RS256 with a real kid, arbitrary signature) containing typ=ORGIVT, future exp, a nonce UUID, eml equal to the registration e-mail, and the chosen org_id.",
+      "root_cause": "Organizations.parseInvitationToken() reads the token query parameter and calls TokenVerifier.create(token, InviteOrgActionToken.class).getToken(). TokenVerifier.getToken() only parses the JWS payload (core/src/main/java/org/keycloak/TokenVerifier.java:399-426); signature/issuer/realm checks only run in verify() (TokenVerifier.java:433-485), which is never called here. RegistrationUserCreation.validateOrganizationInvitation() then trusts the unverified claims (org_id, eml, exp, typ) from that same request, sets the organization into the session context, and success() calls OrganizationProvider.addManagedMember() with the token's org_id. The registration flow's only would-be gate, LoginActionsService.preHandleActionToken(), performs real verification inside handleActionToken() (LoginActionsService.java:601-615) but its returned error Response is discarded at LoginActionsService.java:767 and 791, so an invalid/forged token does not stop processing. The token is even re-propagated into the form action URL (FormAuthenticationFlow.getActionUrl line 277-282), which is why the request-supplied token is re-read on POST.",
+      "title": "Organization invitation token accepted without signature verification, allowing self-registration into an arbitrary organization",
+      "trace": "1) Attacker starts a registration flow and obtains a valid session_code/execution/client_id/tab_id (e.g., via the registration page or prompt=create). 2) Attacker builds an InviteOrgActionToken-shaped JWT: {alg:RS256,kid:<valid-realm-kid>}.{typ:ORGIVT, exp:<future>, nonce:<uuid>, jti:<id>, sub:<any>, eml:<attacker email>, org_id:<target-org-uuid>, reduri:<attacker URL>}.<arbitrary signature>. 3) Attacker POSTs the registration form to /realms/{realm}/login-actions/processRegister?...&token=<forged>. LoginActionsService.processRegister calls preHandleActionToken(forged) whose signature verification fails, but the returned error Response is ignored (line 791). 4) registerRequest() proceeds (if registration is allowed or an org context exists), the form flow reaches RegistrationUserCreation.validateOrganizationInvitation(), which calls Organizations.parseInvitationToken() on the same request (no verify()), accepts the token because exp/typ/email checks are all attacker-satisfiable, and stores it in the session attribute (lines 300-321). 5) RegistrationUserCreation.success() invokes addOrganizationMember() -> provider.addManagedMember(orgModel from token.org_id, new user) (lines 337-349) and sets the auth-session redirect URI from token.reduri (line 347). 6) Result: the freshly created account is a managed member of the attacker-chosen organization without any legitimate invitation; the post-registration redirect is attacker-controlled. The OrganizationMemberValidator does not block this: for a new user (user==null) it skips the member check and the domain check for unmanaged users (OrganizationMemberValidator.java:61-73,111-118), and JpaOrganizationProvider.addManagedMember performs no domain/e-mail validation (JpaOrganizationProvider.java:170-173).",
+      "unverified": "Not runtime-confirmed and not executed. Whether this snapshot is the upstream parent of a specific fix/CVE could not be checked in this environment. Practical exploitation depends on reaching the registration form stage (registration enabled, or an existing valid-token flow that can then be swapped) and on knowing/obtaining the target organization UUID. The ORGANIZATION feature is a preview feature and must be explicitly enabled. No automated data/control-flow analysis was available to enumerate every alternative path into RegistrationUserCreation.",
+      "weakness_type": "CWE-347 Improper Verification of Cryptographic Signature -> CWE-863 Incorrect Authorization (authentication/authorization bypass)"
+    }
+  ],
+  "coverage_summary": "Source scope reports 5,866 model-visible files (binary-like files skipped; no sensitive-name/symlink exclusions). The P1 relation index is partial: 5,812 files / 4,829 Java files indexed, 54 source files missing, only 27 files 'parsed' by the cross-file parser, 87,470 unresolved calls, and it is explicitly syntax/name-based with no control flow, no data flow, no semantic resolution, and unverified Spring annotation/DI semantics. I therefore used the index only for navigation and verified edges in source text. Inspected areas: the full organization feature (admin/account resources, browser/broker authenticators, invitation resource, Organizations util, OrganizationMemberValidator, OIDC/SAML membership mappers), the registration and action-token flows (LoginActionsService, FormAuthenticationFlow, RegistrationPage, RegistrationUserCreation), core TokenVerifier, redirect validation, selected admin permission evaluators, and a sweep for common RCE/deserialization/XXE/EL sinks. The repository has ~4,829 Java files and most integration test sources are absent from the snapshot (e.g., testsuite/.../tests/base has no files), so tests could not be used as evidence of intended behavior; this is not a full-coverage audit.",
+  "limitations": [
+    "Static source review only: no code execution, tests, scanners, or exploit payloads were run; the finding is a lead, not runtime-confirmed.",
+    "The P1 index is syntax-based (no data/control-flow, no semantic resolution) and omits 54 source files; index CALLS/CONTAINS edges were treated as navigation hints and all relevant edges were re-verified in source.",
+    "Most integration tests are not present in the snapshot, so expected security behavior for the organization invitation flow could not be corroborated by repository tests.",
+    "Exploitability is conditional: ORGANIZATION preview feature must be enabled, the realm must have organizations enabled and a reachable registration form stage, and the attacker must know/obtain the target organization UUID (no unauthenticated org-ID listing endpoint was found).",
+    "Whether this snapshot is the direct parent of a specific upstream fix (e.g., a CVE) cannot be verified in this environment, and no external ground truth was consulted.",
+    "The review targeted security-critical flows; the remaining ~4.8k Java files were not exhaustively read."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "OrganizationsResource.getOrganizations (services/src/main/java/org/keycloak/organization/admin/resource/OrganizationsResource.java:189-201) constructs OrganizationMemberResource with auth=null and does not call auth.realm().requireManageRealm(), unlike every sibling method.",
+      "reason": "Plausible authorization inconsistency on an already admin-authenticated surface (possible low-privilege-admin membership disclosure), but the impact is much weaker than the invite-token bypass and I could not confirm the intended permission model for this path; kept as an unconfirmed lead, not submitted as a second candidate."
+    },
+    {
+      "lead": "RegistrationPage.render trusting the same unverified invitation token (services/.../RegistrationPage.java:60-80) and the discarded preHandleActionToken responses (LoginActionsService.java:767,791).",
+      "reason": "Same root cause as the submitted candidate (unverified token trusted in registration), so intentionally folded into one candidate rather than split."
+    },
+    {
+      "lead": "Search for RCE/deserialization/XXE/expression-language sinks (ObjectInputStream, DocumentBuilderFactory, TransformerFactory, Yaml, ExpressionFactory/ELProcessor, ScriptEngine, Runtime.exec).",
+      "reason": "Only expected usages found: serialization filters around Kerberos/Twitter legacy code, XML parsing in SAML/DBus utilities, and admin-gated scripting providers; none showed an attacker-controlled path, so no candidate."
+    },
+    {
+      "lead": "Open-redirect/valid-redirect-URI validation (services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java).",
+      "reason": "Code already contains the UNSAFE_PATH_PATTERN/areWildcardsAllowed hardening (post-CVE-2024-8883 shape); no bypass identified in the inspected logic."
+    }
+  ],
+  "summary": "Keycloak 999.0.0-SNAPSHOT (26.2.0-dev, Quarkus 3.20). Targeted static review of the organization feature, registration/action-token flows, redirect validation, core token verification, and selected admin authorization code. The strongest source-supported candidate is the organization invitation-token trust path: the token is accepted from the HTTP request without ever verifying its signature/issuer, and the registration flow uses attacker-controlled claims (org_id, eml, reduri) to add the self-registered user as a managed member of an arbitrary organization. The one place in the registration POST handlers that would verify the token (preHandleActionToken) discards the error response, while the later parse (Organizations.parseInvitationToken) uses TokenVerifier.getToken(), which by construction only parses. This is reported as one root cause with its registration call sites, not split into multiple candidates."
+}

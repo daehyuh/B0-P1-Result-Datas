@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated tenant-level user can list modules and agent nodes, submit attacker-chosen values in `installCommand`, `startCommand`, `stopCommand`, `checkCommand`, or `uninstallCommand` through `/api/module/update`, and submit attacker-chosen node identifiers and module lists through `/api/cluster/node/update`. The controller methods contain no `@RequiresRoles` annotation, and the service methods do not perform a role or tenant-ownership check.",
+      "confidence": "medium",
+      "counterevidence_checked": "The `/api` routes are not anonymous: `AuthenticationFilter` and `TenantAuthenticatingFilter` must succeed, so the candidate requires a valid account and tenant membership. Module commands are intentionally administrator-defined shell commands, so command execution by an authorized administrator is expected; the security defect is the missing role/ownership enforcement on the API. The module refresh is asynchronous and requires a configured installer agent. I also checked whether the module update alone propagates, because `AgentServiceImpl.updateModuleConfig` has a restrictive condition; the node-update path avoids relying on that path by directly invoking `AgentClusterNodeOperator.updateModuleConfig`. No runtime confirmation was performed.",
+      "id": "case-159-agent-module-authz-rce",
+      "impact": "Arbitrary operating-system command execution as the installer/agent process user on affected agent hosts. This can compromise data-collection tasks, alter or exfiltrate managed source data, and expose source credentials or further host access. The same missing authorization also permits tampering with global module/package configuration across tenants.",
+      "locations": [
+        {
+          "end_line": 82,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/controller/ModuleController.java",
+          "start_line": 52
+        },
+        {
+          "end_line": 61,
+          "path": "inlong-manager/manager-pojo/src/main/java/org/apache/inlong/manager/pojo/module/ModuleRequest.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 100,
+          "path": "inlong-manager/manager-service/src/main/java/org/apache/inlong/manager/service/module/ModuleServiceImpl.java",
+          "start_line": 57
+        },
+        {
+          "end_line": 282,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/controller/InlongClusterController.java",
+          "start_line": 238
+        },
+        {
+          "end_line": 133,
+          "path": "inlong-manager/manager-service/src/main/java/org/apache/inlong/manager/service/cluster/node/AgentClusterNodeOperator.java",
+          "start_line": 116
+        },
+        {
+          "end_line": 256,
+          "path": "inlong-manager/manager-service/src/main/java/org/apache/inlong/manager/service/cluster/node/AgentClusterNodeOperator.java",
+          "start_line": 221
+        },
+        {
+          "end_line": 519,
+          "path": "inlong-agent/agent-installer/src/main/java/org/apache/inlong/agent/installer/ModuleManager.java",
+          "start_line": 487
+        },
+        {
+          "end_line": 39,
+          "path": "inlong-agent/agent-common/src/main/java/org/apache/inlong/agent/utils/ExcuteLinux.java",
+          "start_line": 34
+        }
+      ],
+      "prerequisites": "A valid low-privileged Manager account with an allowed tenant header, at least one installer agent configured to poll the Manager, and a target module/node that the attacker can identify through the no-role list endpoints. The attacker needs the target node's current version, type, IP, parent cluster, and module list so that the update passes the version/type checks and triggers module-config recomputation. A later agent configuration refresh is required.",
+      "root_cause": "The Manager's `/api/module/*` and `/api/cluster/node/*` APIs rely on the global authentication/tenant filters but do not enforce INLONG_ADMIN or resource-owner authorization. Module command fields are stored without server-side role checks, and `AgentClusterNodeOperator.updateOpt`/`updateModuleConfig` rebuilds an agent's module configuration from those stored fields. The installer then executes `installCommand`, `startCommand`, `stopCommand`, `checkCommand`, and `uninstallCommand` verbatim through `/bin/sh -c`.",
+      "title": "Missing authorization on agent-module and cluster-node management permits installer command execution",
+      "trace": "1. `ModuleController.listByCondition`/`get` exposes module IDs and command configuration without a role check. 2. `ModuleController.update` calls `ModuleServiceImpl.update`, which persists attacker-controlled command fields into the module's `extParams` without authorization. 3. `InlongClusterController.updateNode` lacks a role check and calls `InlongClusterServiceImpl.updateNode`; `AgentClusterNodeOperator.updateOpt` then calls `updateModuleConfig` for the target IP/cluster even when `isInstall` is false. 4. `updateModuleConfig` reads the modified module row, builds a new `ModuleConfig`, and writes it to the agent task configuration. 5. The installer's `ManagerFetcher` retrieves the changed configuration; `ModuleManager.updateModule`/`restartModule`/`startModule` invokes the stored command. 6. `ExcuteLinux.exeCmd` executes that string with `/bin/sh -c`.",
+      "unverified": "Not runtime-confirmed. I did not execute the Manager or installer, verify the deployed role assignments, or prove that a particular production agent has an assigned module and that its refresh cycle occurs. The exact database version increment and cache-refresh timing also remain unverified.",
+      "weakness_type": "Missing Authorization (CWE-862) leading to OS Command Injection / RCE (CWE-78)"
+    }
+  ],
+  "coverage_summary": "Reviewed the repository at the source-scope level: 6,184 visible files. The relation index reports 6,090 indexed files, 4,431 parsed Java files, 95 omitted files, and 94 source files missing from the index; its capabilities are syntax/navigation only, with no control-flow, data-flow, semantic resolution, or runtime reachability analysis. I inspected the Manager authentication filters, Shiro realm/filter configuration, module/package controllers and services, cluster-node controllers/services/mappers, agent installer configuration and command execution, and performed broad source searches for command execution, SQL interpolation, deserialization, XML/YAML parsing, JDBC connection handling, file operations, and uploads. I did not inspect every one of the 6,184 files individually, and the 94 files absent from the relation index were not covered by index-assisted navigation.",
+  "limitations": [
+    "Static source review only; no build, tests, runtime checks, or exploit execution were performed.",
+    "The candidate depends on a configured installer agent and an assigned module; deployment state was not available.",
+    "The P1 relation index is partial and syntactic, with 94 source files missing and no data-flow or control-flow analysis; all candidate edges were verified only against source text where possible.",
+    "The exact role assignments of a deployed tenant user and the target agent's refresh timing remain unverified.",
+    "This candidate is a lead, not a runtime-confirmed vulnerability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Plaintext SSH passwords in `ClusterNodeResponse` returned by `/api/cluster/node/get/{id}` and `/api/cluster/node/list`",
+      "reason": "The source strongly indicates an authorization and sensitive-data exposure issue: these endpoints have no `@RequiresRoles` check, the node mapper has no tenant predicate, and `ClusterNodeResponse.password` is populated from the stored entity. I did not submit it separately because the command-execution authorization chain has greater impact; this disclosure is a related lead and could be a distinct finding."
+    },
+    {
+      "lead": "JDBC URL attack or SSRF through data-node connection testing and sink URLs",
+      "reason": "`DataNodeController.testConnection` accepts arbitrary URLs and invokes driver connections, and URL validation is limited. However, the strongest demonstrated effect from source alone is outbound connection/SSRF; I could not substantiate a concrete driver-level RCE or confirm a dangerous parameter bypass, so this remains unconfirmed."
+    },
+    {
+      "lead": "Unsafe XML or YAML decoding in the Transform SDK",
+      "reason": "`XmlSourceDecoder` parses with `DocumentHelper.parseText` without an explicit XXE-hardening configuration, and `YamlSourceDecoder` uses `new Yaml()` on untrusted input. I found no in-repository server path that invokes these decoders on untrusted payloads, so the reachability required for a strong finding is not established."
+    },
+    {
+      "lead": "MyBatis `${orderField}`/`${orderType}` interpolation",
+      "reason": "Although several mappers use `${}` in ORDER BY clauses, the user-facing list paths call `OrderFieldEnum.checkOrderField` and `OrderTypeEnum.checkOrderType`, which replace input with fixed values. I did not identify a user-reachable mapper call that bypasses those checks."
+    },
+    {
+      "lead": "OpenAPI authentication disabled by default",
+      "reason": "`openapi.auth.enabled=false` is an explicit default, and the OpenAPI filter/realm deliberately maps requests to the admin user when disabled. This is a deployment-dependent security weakness rather than a source-confirmed bypass, so it was not selected."
+    }
+  ],
+  "summary": "The strongest source-supported candidate is an authorization failure in the InLong Manager agent-management path. Module and cluster-node write APIs are gated only by web/tenant authentication, not by INLONG_ADMIN or resource ownership. A low-privileged tenant user can alter an existing agent module's shell command fields and then update an agent node, causing the manager to rebuild that node's module configuration. The installer agent subsequently passes the stored command strings to `/bin/sh -c`, yielding command execution on the agent/installer host. The same node APIs also expose node metadata and passwords, but that disclosure is being reported only as a related lead rather than as a second candidate. This was verified statically only."
+}

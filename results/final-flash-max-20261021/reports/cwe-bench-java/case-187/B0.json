@@ -1,0 +1,98 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The full HTTP request body of `POST /kylin/api/cache/gluten_cache` (and `.../gluten_cache_async`) is bound to `List<String> cacheCommands`; every element is attacker-chosen text and is executed verbatim as a Spark SQL statement. No credentials, session, project name, ACL, or internal header are required by the code path.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked all deployed security configurations: Java `SecurityConfig` (profiles testing/ldap/custom) lists `\"/api/cache*/**\"` in the permitAll matcher; `src/server`, `src/query-booter`, `src/common-booter`, `src/data-loading-booter`, `src/ops-booter`, `src/rec-booter` kylinSecurity.xml chains contain `<intercept-url pattern=\"/api/cache*/**\" access=\"permitAll\"/>` (and `/api/jobs/gluten_cache` permitAll in server/query XML). Confirmed there is no `@PreAuthorize`/ACL check in the controller or service, that `GlutenCacheRequestLimits` is only a concurrency counter, and that no filter (QueryNodeFilter/ResourceGroupCheckerFilter/ReloadAuthoritiesInterceptor) enforces authentication or caller identity on these routes. Also verified `/api/cache/gluten_cache` is handled locally rather than routed, so routing cannot be treated as a compensating control.",
+      "id": "kylin-gluten-cache-unauthenticated-rpc",
+      "impact": "Unauthenticated arbitrary SQL/statement execution on the Kylin query engine: cross-project/cross-table reads and writes, `INSERT OVERWRITE`/`CREATE TABLE AS`/`DROP`/`ALTER` against Hive/internal tables and HDFS locations reachable by the Kylin service account, metadata destruction and query-engine DoS. Because arbitrary Spark SQL is executed, deployments that allow Hive/Spark UDF or `USING JAR`/reflection features (`java_method`) can be escalated to server-side code execution. The HTTP response exposes only success/failure text, so bulk exfiltration through the response is indirect, but integrity/availability and code-execution risk remain critical.",
+      "locations": [
+        {
+          "end_line": 75,
+          "path": "src/query-server/src/main/java/org/apache/kylin/rest/controller/GlutenCacheController.java",
+          "start_line": 46
+        },
+        {
+          "end_line": 103,
+          "path": "src/query-service/src/main/java/org/apache/kylin/rest/service/GlutenCacheService.java",
+          "start_line": 62
+        },
+        {
+          "end_line": 172,
+          "path": "src/query-service/src/main/java/org/apache/kylin/rest/service/GlutenCacheService.java",
+          "start_line": 154
+        },
+        {
+          "end_line": 85,
+          "path": "src/common-server/src/main/java/org/apache/kylin/rest/config/SecurityConfig.java",
+          "start_line": 74
+        },
+        {
+          "end_line": 313,
+          "path": "src/server/src/main/resources/kylinSecurity.xml",
+          "start_line": 305
+        },
+        {
+          "end_line": 303,
+          "path": "src/query-booter/src/main/resources/kylinSecurity.xml",
+          "start_line": 299
+        },
+        {
+          "end_line": 307,
+          "path": "src/common-booter/src/main/resources/kylinSecurity.xml",
+          "start_line": 303
+        },
+        {
+          "end_line": 164,
+          "path": "src/server/src/main/java/org/apache/kylin/rest/QueryNodeFilter.java",
+          "start_line": 160
+        }
+      ],
+      "prerequisites": "Network reachability to a Kylin query-service or standalone (all-in-one) HTTP endpoint (`kylin-server` depends on `kylin-query-server`, and the standalone server exposes the same port to users). No Gluten-specific config gate is enforced in the controller/service, and the Sparder Spark session must be initialized (normal for a query node). The Java `SecurityConfig` permitAll list (profile testing/ldap/custom) and the XML chains for profiles testing/ldap/custom, sandbox and saml all contain `/api/cache*/**` -> permitAll; `/api/jobs/gluten_cache` is likewise permitAll in the XML chains and forwards raw commands to query nodes.",
+      "root_cause": "The Gluten cache controller exposes RPC endpoints that accept fully attacker-controlled Spark SQL commands and are explicitly placed in the security whitelist with `permitAll`, with no authentication, authorization, project-ACL, or caller-identity check anywhere in the controller/service path. The service executes each supplied string with `SparkSession.sql(cacheCommand).collectAsList()` on the query engine's Sparder session.",
+      "title": "Unauthenticated arbitrary Spark SQL execution via Gluten cache endpoints (/api/cache/gluten_cache, /api/cache/gluten_cache_async)",
+      "trace": "1) Anonymous client sends `POST /kylin/api/cache/gluten_cache` with body `[\"<spark-sql>\"]` (JSON). 2) Spring Security matches `/api/cache*/**` against the permitAll rule (SecurityConfig.java:83; server/query/common-booter kylinSecurity.xml profiles), so no authentication is requested. 3) `GlutenCacheController.glutenCache(...)` (lines 56-63) forwards the list to `GlutenCacheService.glutenCache(...)`. 4) `GlutenCacheService.glutenCacheExecute(...)` calls `sparkSession.sql(cacheCommand).collectAsList()` (line 82; async variant line 168), i.e., attacker text is compiled and executed as Spark SQL with the server's privileges. 5) `QueryNodeFilter` explicitly treats these URIs as locally-processed RPCs (`notRoutePostApiSet`, lines 160-163) and adds no authentication. The related `/api/jobs/gluten_cache` endpoint (data-loading JobController) also forwards raw `cache_commands` after only a project-existence check.",
+      "unverified": "I did not run the server, so runtime confirmation is absent; whether the query HTTP port is network-restricted in a given deployment is environment-dependent (though the application-level authentication is definitely absent). Whether Spark SQL reflection/UDF features yield direct OS command execution depends on the Spark/Hive configuration. It is also unconfirmed whether this exact issue corresponds to a published CVE/known fix; the conclusion is based solely on the inspected source.",
+      "weakness_type": "CWE-306 Missing Authentication for Critical Function (leading to arbitrary SQL/command execution, CWE-94/CWE-78 impact)"
+    }
+  ],
+  "coverage_summary": "Files: 4,112 model-visible source files in the assigned tree (no test sources present; binary-like files excluded by the harness filters; nothing excluded for size or sensitive names). I inventoried the REST surface across common-server, metadata-server, data-loading-server, query-server, ops-server and rec-server; read the security configuration for every deployment profile (common-booter, server, query-booter, data-loading-booter, ops-booter, rec-booter kylinSecurity.xml, plus Java SecurityConfig and filters/interceptors); and traced the query-engine, spark-submit, file-service, user-service and HDFS/Zip utilities around user-controlled inputs. Highest-priority paths were read end-to-end; the remaining unread files were not required for the selected trace.",
+  "limitations": [
+    "No runtime execution, deployment, or exploit testing was performed; the finding is static source analysis only and is a lead, not a confirmed vulnerability.",
+    "Whether a given deployment exposes the query-service/standalone HTTP port to untrusted networks is environment-dependent; the application-level missing authentication is present regardless.",
+    "Exact exploitation impact of arbitrary Spark SQL (data overwrite scope, availability of reflection/UDF-based OS command execution) depends on Spark/Hive configuration and privileges and was not executed.",
+    "Whether this matches a specific published CVE/known fix commit is unknown; no CVE labels, advisories, patches, or external data were consulted per the review rules.",
+    "The snapshot has no test sources, so test-based corroboration was unavailable."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Command injection into spark-submit via project/model-level `kylin.engine.spark-conf.*` (e.g., unquoted `spark.files` in `--files`, or single-quote breakout in `--conf '<k>=<v>'` in DefaultSparkBuildJobHandler.appendSparkConf), where checkCommandInjection only blocks backticks and `$(` and misses `;`, quotes, `&`, `|`, newlines.",
+      "reason": "Requires project ADMINISTRATION permission to write project configs (or model overrides), so it is not remotely unauthenticated; a partial mitigation (`checkCommandInjection`) already exists, and it is uncertain whether this state is already the post-CVE-2022-24697/2023-2907 code. Kept as a secondary lead, not the primary candidate."
+    },
+    {
+      "lead": "Arbitrary file read via `FileService.getMetadataBackupFromTmpPath` / `POST /api/system/metadata_backup_tmp_file` (attacker-supplied `tmp_file_path`), and write-to-HDFS via `/api/system/broadcast_metadata_backup` (attacker-supplied `backup_dir` + `from_host`).",
+      "reason": "Read path requires the exact file length to match `tmp_file_size`, and the endpoint is authenticated in the Java profiles (permitAll only in the sandbox XML profile); impact is file read/write rather than direct code execution. Possible real issue but weaker and less clearly the curated case."
+    },
+    {
+      "lead": "SSRF via `NBasicController.decodeHost` / OpsController remote diag endpoints (`host` parameter forwarded to `restTemplate.exchange`).",
+      "reason": "Requires authentication for the read/download variants and depends on non-microservice mode; response-forwarding SSRF is medium impact and the path is not obviously the strongest curated case."
+    },
+    {
+      "lead": "Path traversal in keytab handling (`ProjectService.generateTempKeytab`/`backupAndDeleteKeytab`, `NProjectController.updateProjectKerberosInfo`): attacker-controlled principal used in `new File(confHome, principal + suffix)`.",
+      "reason": "Requires project admin and write content is constrained to a `_tmp.keytab`/`.keytab` suffix; impact limited compared with the primary candidate."
+    },
+    {
+      "lead": "`NUserController.updateUserWithoutAuth` (`POST /api/user/update_user`, permitAll) invoking `userService.updateUser` with an attacker-controlled `ManagedUser`.",
+      "reason": "In the default `testing` profile `KylinUserService.updateUser` would process the body, but the endpoint is designed for the custom/IAM profile whose `OpenUserService` implementations reject `updateUser`; the `testing` profile is a documented non-production mode, so this is ambiguous and was not selected."
+    },
+    {
+      "lead": "`HiveCmdBuilder` writes SQL into an unquoted-heredoc (`cat >file<<EOL`) and only escapes backticks, not `$(`; user-influenced Hive identifiers/partition date formats could reach this path (HiveTransactionTableHelper/SparkCleanupTransactionalTableStep).",
+      "reason": "Requires Hive-level privileges or specific table metadata to inject `$(` into generated DDL, so exploitability is indirect and uncertain compared with the unauthenticated endpoint."
+    },
+    {
+      "lead": "SSRF via `SparderUIService` `server` cookie/parameter used to build `restTemplate.exchange(scheme://server/requestURI...)`.",
+      "reason": "Only reachable when `routeService.needRoute()` is true (multi-tenant + resource-group enabled) and Spark-UI ACL is disabled by default; narrower preconditions."
+    }
+  ],
+  "summary": "Reviewed the Apache Kylin 5.1.0-SNAPSHOT source snapshot (4,112 files; main sources only, no test sources) with focus on HTTP-input -> dangerous-sink traces, security configuration across booters/profiles, and query-engine services. The strongest candidate is a missing-authentication issue on the new Gluten cache RPC endpoints: `/api/cache/gluten_cache` and `/api/cache/gluten_cache_async` are `permitAll` in every security profile, and they pass a raw `List<String>` request body directly to `SparkSession.sql(...)` on the query node's Sparder session. Any unauthenticated client that can reach a Kylin query/standalone HTTP port can run arbitrary Spark SQL with the Kylin service account (data manipulation/overwrite, cross-tenant reads, DDL, potential UDF-based code execution, DoS). Other plausible but weaker leads are listed as rejected."
+}

@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Unauthenticated HTTP POST bodies: (1) a multipart upload of a .zip/.tar/.tar.gz/.tgz/.kmz file to the default importing controller (POST /command/core/create-importing-job then POST /command/core/importing-controller?controller=default-importing-controller&subCommand=load-raw-data&jobID=N), where the archive entry names are fully attacker-controlled (e.g. '../../../../<path>'); (2) the multipart form field 'download' whose value is an attacker URL whose path contains traversal segments (e.g. http://attacker/x/../../../../<path>), because the fetched body is saved to allocateFile(rawDataDir, url.getPath()); (3) a tar upload to POST /command/core/import-project, whose entry names reach FileProjectManager.untar(). Command.java and the servlet layer implement no authentication or CSRF token, and import job IDs are a simple incrementing counter (ImportingManager.createJob lines 196-208), so a cross-site POST can guess jobIDs.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that allocateFile does not normalize or confine the child path: new File(dir, name) with a '../..'-containing or absolute child is not restricted (the only '?' handling and -N de-duplication are cosmetic); verified explodeArchive writes entry contents with saveStreamToFile immediately after allocateFile for both TarInputStream and ZipInputStream; verified saveStream uses url.getPath() for the local name; verified FileProjectManager.untar writes tar entries without validation; verified there is no canonical-path check, allow-list, or sanitizer in these classes; verified the endpoints are unauthenticated and job IDs are sequential; verified that Commons FileUpload strips path components from a multipart *upload file name* (so the archive-name/URL-path vectors, not the upload filename, are the exploitable ones). Counterweight: the default 127.0.0.1 bind reduces direct remote reachability, and target-path writability is environment-dependent, so impact is deployment-dependent.",
+      "id": "openrefine-import-path-traversal",
+      "impact": "Arbitrary file write with attacker-chosen content and attacker-chosen absolute/relative target path, limited to the permissions of the OpenRefine process. This can overwrite or plant files in the user's home, workspace, project directories or application resources (data destruction, forging project/workspace data, and potentially code execution if a writable path that is later loaded/executed is targeted). The write side effect is independent of whether the file is later parsed successfully.",
+      "locations": [
+        {
+          "end_line": 455,
+          "path": "main/src/com/google/refine/importing/ImportingUtilities.java",
+          "start_line": 437
+        },
+        {
+          "end_line": 679,
+          "path": "main/src/com/google/refine/importing/ImportingUtilities.java",
+          "start_line": 610
+        },
+        {
+          "end_line": 408,
+          "path": "main/src/com/google/refine/importing/ImportingUtilities.java",
+          "start_line": 401
+        },
+        {
+          "end_line": 187,
+          "path": "main/src/com/google/refine/io/FileProjectManager.java",
+          "start_line": 162
+        }
+      ],
+      "prerequisites": "The OpenRefine HTTP service must be reachable by the attacker (default bind is 127.0.0.1, so this requires an exposed/forwarded instance, or a local attacker, or a browser-driven CSRF-style request against localhost). The attacker needs to create an import job (or guess its sequential ID) and send the multipart request; the write target must be inside a directory writable by the OpenRefine process; content size is limited by the upload/download.",
+      "root_cause": "Attacker-controlled names are used directly as filesystem paths in the import pipeline. ImportingUtilities.allocateFile(File dir, String name) only strips anything after '?' and de-duplicates collisions; it never rejects '..' segments or absolute paths and never verifies that the resolved target stays under dir. explodeArchive() passes tar/zip entry names from archiveIS (TarEntry.getName()/ZipEntry.getName()) to allocateFile() and then writes the decompressed stream there, and saveStream() passes the path component of the attacker-supplied URL (url.getPath()) to allocateFile() before writing the fetched body. FileProjectManager.untar() contains the same pattern for the project-import endpoint (new File(destDir, tarEntry.getName()) followed by FileOutputStream).",
+      "title": "Path traversal / Zip Slip in import file handling allows arbitrary file write",
+      "trace": "ImportingControllerCommand.doPost (main/src/com/google/refine/commands/importing/ImportingControllerCommand.java:57) -> DefaultImportingController.doLoadRawData (DefaultImportingController.java:100-121) -> ImportingUtilities.loadDataAndPrepareJob (ImportingUtilities.java:101) -> retrieveContentFromPostRequest (ImportingUtilities.java:167-399): upload part at lines 360-385 -> postProcessRetrievedFile (line 527) -> tryOpenAsArchive (line 583, chooses ZipInputStream/TarInputStream by file name/content type) -> explodeArchive (line 610) -> allocateFile (line 437) -> saveStreamToFile (line 506) writes entry content; or the 'download' field at lines 257-351 -> saveStream (line 401) -> allocateFile (line 437) -> saveStreamToFile. Project import: ImportProjectCommand.internalImport (ImportProjectCommand.java:98-127, gzip flag decided by the uploaded file name) -> ProjectManager.importProject -> FileProjectManager.importProject/untar (FileProjectManager.java:150-187) -> FileOutputStream on the traversal path. No canonical-path or '..'/absolute-path check exists anywhere on these paths (searching getCanonicalPath finds only extensions/jython/module/MOD-INF/controller.js).",
+      "unverified": "No runtime reproduction, build, or test execution was performed. The exact reachability of each trigger in a given deployment (bind address, reverse proxy, OS permissions, workspace layout) is unverified. It is also unverified which of the several import-related weaknesses in this old snapshot is the intended reference issue. The sibling pattern in FileProjectManager.untar is included as the same weakness type (archive-entry path traversal) rather than as a separate candidate.",
+      "weakness_type": "CWE-22 Path Traversal (Zip Slip) / arbitrary file write"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 952-file snapshot (main core Java under main/src: commands, importing/importers, exporters, model/operations, expr/GREL, io, util, server startup; extensions database/gdata/jython/wikidata/pc-axis/sample; main/webapp JS/HTML; poms and config). No test sources are present in the snapshot, so no tests were reviewed. The P1 relation index reports complete coverage (952/952 source files indexed, 0 missing, not SAST and not a reachability/exploitability oracle); it was used only for navigation, and every candidate edge/location used here was verified against source text. Review was source-only and read-only: no code, build, scanner, or exploit was executed. Dependency/vendored-library CVEs (POI 3.8, commons-fileupload 1.2.1, velocity 1.5, rhino 1.7.10, jackson 2.9.7) and the bulk of front-end JS/vendored assets were not assessed in depth.",
+  "limitations": [
+    "No runtime confirmation: all findings are static leads; no build, test, scanner, or exploit was executed.",
+    "Default server bind is 127.0.0.1, so remote impact depends on a non-default bind, reverse proxy, or browser-based local access; OS permissions and import/workspace layout determine which paths are writable.",
+    "Cannot determine from source alone which import-related weakness (path traversal/write vs file:// read vs XML XXE) is the benchmark's intended reference issue.",
+    "Test sources and likely CI/release metadata are absent from the snapshot, so intent and fix history could not be checked.",
+    "Coverage of front-end/vendored JS and third-party dependency CVEs was limited to spot checks.",
+    "The P1 index is navigational only (no data-flow, reachability, or exploitability proof); index labels were not treated as verdicts."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Arbitrary local file read via non-HTTP URL schemes in the same 'download' handler (ImportingUtilities.java:331-350): URLConnection is used for any scheme not http/https, so 'file:///etc/passwd' (and ftp/jar/etc.) is fetched server-side and stored in the import workspace, where it can be previewed.",
+      "reason": "Real and source-evidenced, but requires response read-back/serving of the preview to exfiltrate and is a distinct root cause (missing URL-scheme allow-list) from the path-confinement issue; kept as an unconfirmed lead rather than a second candidate."
+    },
+    {
+      "lead": "XXE in the XML importer: XmlImporter.createXMLStreamReader (XmlImporter.java:322-328) creates an XMLInputFactory without setting XMLInputFactory.SUPPORT_DTD / IS_SUPPORTING_EXTERNAL_ENTITIES to false, so a crafted DOCTYPE/external entity in imported XML can read local files (reflected into parsed data) or trigger SSRF.",
+      "reason": "Plausible and common in this era, but exploitability depends on the StAX implementation/JDK defaults and I could not verify runtime behavior; not selected over the path-traversal candidate."
+    },
+    {
+      "lead": "No authentication/CSRF protection on command endpoints (Command.java; all commands registered without tokens).",
+      "reason": "Architectural property of this local app rather than a single localized flaw; relevant only as an enabler for the selected candidate."
+    },
+    {
+      "lead": "Unescaped header/project-name output in HtmlTableExporter (HtmlTableExporter.java:66, 96) could yield stored XSS in exported HTML.",
+      "reason": "Lower confidence and weaker impact than the selected finding; not traced end-to-end through response Content-Type/Content-Disposition."
+    },
+    {
+      "lead": "SQL string construction in the database extension (DatabaseUtils.java / MariaDB|MySQL|PgSQLDatabaseService.java).",
+      "reason": "The attacker supplies the connection credentials/configuration as well, so there is no clear trust-boundary crossing beyond the attacker's own database access."
+    },
+    {
+      "lead": "SSRF via URL import and reconciliation-service URLs (ImportingUtilities URL fetch, GuessTypesOfColumnCommand).",
+      "reason": "Fetching user-specified URLs is an intended feature; the file-scheme and path-traversal aspects are covered above."
+    }
+  ],
+  "summary": "OpenRefine 3.2-SNAPSHOT review of the import/ingest pipeline found a concrete, source-evidenced path-traversal/arbitrary-file-write weakness: file names taken from attacker-controlled archive entries (tar/zip) and from attacker-supplied download URLs are used directly to build local output paths, with no confinement to the import raw-data directory. The same unsanitized archive-entry pattern exists in the project-import untar routine. I selected this as the single strongest candidate; the non-HTTP URL scheme read (file:// local file disclosure) and the XML importer XXE are plausible but were not selected and are listed as rejected leads. No code was executed; all findings are static."
+}

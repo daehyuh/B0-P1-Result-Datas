@@ -1,0 +1,99 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the XML/SOAP message being verified: it can insert `<ds:KeyInfo><ds:KeyValue><ds:RSAKeyValue><Modulus>…</Modulus><Exponent>…</Exponent></ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo>` (or the DSA/EC equivalent) into the Signature and sign the `ds:SignedInfo`/references with the matching private key. No special privileges are needed; only the ability to send a signed message that an application passes to the streaming inbound API.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the sibling paths: (i) the no-KeyInfo path creates a DefaultToken and DOES install the configured key via `setPublicKey` (SecurityTokenFactoryImpl.java:82-94); (ii) the X509Data path also installs the configured key via `setPublicKey` because those token types are not `KeyValueToken`, so only the KeyValue path is affected; (iii) `AbstractInboundSecurityToken.getKey()` has a documented fallback to the \"\" key-table entry for user-set keys, but `getPubKey` does not consult the key table, so the configured key stored by `setSecretKey(\"\", key)` is unreachable for asymmetric signature verification; (iv) `testAndSetInvocation` only guards recursion, not key selection; (v) HMAC/KeyName paths need `getSecretKey` and are unaffected; (vi) the file uses the configured key elsewhere (`OutboundXMLSec` sets it as the token public key), showing the property is intended as key material, not metadata; (vii) `KeyValueTokenSecurityEvent` is emitted and could let a careful application reject KeyValue tokens (partial mitigation, application-dependent).",
+      "id": "santuario-stax-keyvalue-key-pinning-bypass",
+      "impact": "Signature-verification / trust-anchor bypass in the streaming API: a message signed with an attacker-generated key pair can be processed as a valid signed message even though the application configured a different trusted verification key. Applications that rely on the library to pin the verification key (the purpose of `setSignatureVerificationKey`) can be tricked into accepting forged/attacker-signed content. The impact is limited to applications that accept the resulting security events without independently rejecting `KeyValue` tokens. This is a source-level lead only; it was not executed or runtime-confirmed.",
+      "locations": [
+        {
+          "end_line": 253,
+          "path": "src/main/java/org/apache/xml/security/stax/impl/securityToken/SecurityTokenFactoryImpl.java",
+          "start_line": 239
+        },
+        {
+          "end_line": 143,
+          "path": "src/main/java/org/apache/xml/security/stax/impl/securityToken/SecurityTokenFactoryImpl.java",
+          "start_line": 112
+        },
+        {
+          "end_line": 67,
+          "path": "src/main/java/org/apache/xml/security/stax/impl/securityToken/RsaKeyValueSecurityToken.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 69,
+          "path": "src/main/java/org/apache/xml/security/stax/impl/securityToken/DsaKeyValueSecurityToken.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 115,
+          "path": "src/main/java/org/apache/xml/security/stax/impl/securityToken/ECKeyValueSecurityToken.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 301,
+          "path": "src/main/java/org/apache/xml/security/stax/impl/processor/input/AbstractSignatureInputHandler.java",
+          "start_line": 283
+        },
+        {
+          "end_line": 348,
+          "path": "src/main/java/org/apache/xml/security/stax/impl/processor/input/AbstractSignatureInputHandler.java",
+          "start_line": 336
+        },
+        {
+          "end_line": 183,
+          "path": "src/main/java/org/apache/xml/security/stax/impl/securityToken/AbstractInboundSecurityToken.java",
+          "start_line": 152
+        },
+        {
+          "end_line": 351,
+          "path": "src/main/java/org/apache/xml/security/stax/ext/XMLSecurityProperties.java",
+          "start_line": 345
+        }
+      ],
+      "prerequisites": "Application uses the streaming inbound API (`InboundXMLSec.processInMessage` / `XMLSec.getInboundWSSec`) with `XMLSecurityProperties.setSignatureVerificationKey(trustedPublicKey)` set as the trust anchor, and treats completion of processing without an exception / the emitted SignedElementSecurityEvent (and KeyValueTokenSecurityEvent) as proof that the message was signed by the trusted key. The attacker message must include a `ds:KeyValue` (RSA/DSA/EC) inside the Signature's KeyInfo and be signed with the corresponding private key.",
+      "root_cause": "In `SecurityTokenFactoryImpl.setTokenKey`, the configured `securityProperties.getSignatureVerificationKey()` is installed on the token as its public key only when the token type is NOT `KeyValueToken` (`if (key instanceof PublicKey && !SecurityTokenConstants.KeyValueToken.equals(token.getTokenType()))`). For RSA/DSA/EC `ds:KeyValue` tokens the configured key is instead put into the secret-key table (`setSecretKey(\"\", key)`), while `RsaKeyValueSecurityToken`/`DsaKeyValueSecurityToken`/`ECKeyValueSecurityToken.getPublicKey()` build the public key from the untrusted message whenever the token's `publicKey` field is null. The asymmetric verification path never consults the secret-key table: `AbstractInboundSecurityToken.getPubKey(...)` returns `getPublicKey()`, and `AbstractSignatureInputHandler.SignatureVerifier.createSignatureAlgorithm(...)` calls `inboundSecurityToken.getPublicKey(...)` for every `isAsymmetric()` token and initializes the JCE Signature with it. Consequently a message that merely includes a `ds:KeyValue` in the Signature's KeyInfo causes the library to verify the signature with the key embedded in that untrusted message rather than with the application's pinned key. The same factory uses the configured key when there is no KeyInfo (DefaultToken -> setPublicKey) and for X509 tokens, so the behavior is inconsistent and KeyInfo-controlled.",
+      "title": "StAX signature verification uses attacker-supplied ds:KeyValue public key instead of the configured verification key",
+      "trace": "1) `XMLSignatureInputHandler.handle` -> `verifySignedInfo` -> `newSignatureVerifier` -> `XMLSignatureVerifier` ctor -> `retrieveSecurityToken` -> `SecurityTokenFactoryImpl.getSecurityToken(KeyInfoType, KeyUsage_Signature_Verification, ...)` (SecurityTokenFactoryImpl.java:51-80). 2) The attacker's KeyInfo contains KeyValue, so `getSecurityToken(KeyValueType,...)` (line 112-143) creates `RsaKeyValueSecurityToken` and calls `setTokenKey(...)` (line 239-253). 3) `setTokenKey` fetches the app-pinned key via `securityProperties.getSignatureVerificationKey()` (line 243) but because `key instanceof PublicKey` and `token.getTokenType() == KeyValueToken`, the public-key branch is skipped and the key is stored with `setSecretKey(\"\", key)` (lines 247-252); the token's `publicKey` field stays null. 4) `SignatureVerifier.createSignatureAlgorithm` (AbstractSignatureInputHandler.java:286-300) sees `inboundSecurityToken.isAsymmetric() == true` and calls `inboundSecurityToken.getPublicKey(algorithmURI, Asym_Sig, id)` -> `AbstractInboundSecurityToken.getPubKey` (lines 152-155) -> `RsaKeyValueSecurityToken.getPublicKey()` (lines 55-67), which builds an RSAPublicKey from the message's `Modulus`/`Exponent` and returns it. 5) The JCE Signature is initialized for verification with this attacker key (line 300); `doFinal()` (lines 336-348) canonicalizes SignedInfo, calls `signerOutputStream.verify(signatureType.getSignatureValue().getValue())`, and only throws on mismatch. 6) Because the attacker signed the same SignedInfo with the matching private key, verification succeeds; the reference digests chosen by the attacker also match, the SignedElementSecurityEvents are emitted, and no exception reaches the application. The configured verification key was never used.",
+      "unverified": "Whether the `!KeyValueToken.equals(token.getTokenType())` clause is the original upstream Santuario 2.0.3 code or the modification introduced for this case (no upstream copy or history is available in the sandbox); whether downstream consumers (e.g. WSS4J) override the `securityTokenFactory` via security-config and thus avoid this code path; whether applications in scope inspect and reject `KeyValueTokenSecurityEvent`; no runtime execution, build, or test confirmation was performed.",
+      "weakness_type": "Improper trust of attacker-controlled key material leading to signature verification bypass (CWE-287/CWE-345/CWE-347)"
+    }
+  ],
+  "coverage_summary": "Reviewed the P1 source-relation scope (548/548 files indexed; no files missing from the index; no SAST/oracle data) and then verified candidates against source text. I read in detail: the core signature path (`Reference`, `Manifest`, `SignedInfo`, `XMLSignature`, `SignatureAlgorithm`, `SignatureBaseRSA/DSA/ECDSA`, `IntegrityHmac`, `MessageDigestAlgorithm`, `JCEMapper`), the JSR-105 module (`DOMReference`, `DOMSignedInfo`, `DOMXMLSignature`, `DOMSignatureMethod`, `DOMHMACSignatureMethod`, `DOMURIDereferencer`, `DOMRetrievalMethod`, `ApacheTransform/ApacheCanonicalizer`), canonicalization and transforms, resolvers and key resolvers, and the StAX inbound path (`InboundXMLSec`, `XMLSecurityInputProcessor`, `AbstractSignatureInputHandler`, `AbstractSignatureReferenceVerifyInputProcessor`, `SecurityTokenFactoryImpl` and the security-token classes, `XMLEncryptedKeyInputHandler`, `ConfigurationProperties`, `security-config.xml`). `XMLCipher` (~3.6k lines) and `AbstractDecryptInputProcessor` (~850 lines) were reviewed only at their security-relevant entry points, not line-by-line.",
+  "limitations": [
+    "No tests are present in the snapshot and no build/execution was performed; all conclusions are static source analysis and candidates are leads, not confirmed vulnerabilities.",
+    "Whether the `!KeyValueToken` clause in `setTokenKey` is the original upstream code or the change under review could not be established (no repository history, upstream copy, patch, or external lookup is available in this run).",
+    "The OSS-Fuzz/SAST-style index provides only navigation hints; no data-flow, reachability, or exploitability proof was available or claimed.",
+    "Large encryption/decryption sources (`XMLCipher`, `AbstractDecryptInputProcessor`, `AbstractEncryptOutputProcessor`) were only partially inspected; a defect there would not have been found.",
+    "Environment/consumer behavior (e.g. whether WSS4J or another consumer replaces the default `securityTokenFactory`, or whether applications reject `KeyValueTokenSecurityEvent`) could materially change the impact and was not verifiable from this snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XMLUtils/SignedInfo/RetrievalMethodResolver parse untrusted bytes with DTDs allowed when secureValidation=false (`XMLUtils.createDocumentBuilder(false, secureValidation)`, `Canonicalizer.canonicalize(byte[])`), an XXE surface.",
+      "reason": "The DTD-disallow is tied to the documented `secureValidation` flag and to caller-controlled parsing of fetched resources; with the flag enabled (the documented hardened mode) DTDs are disallowed and FEATURE_SECURE_PROCESSING is set. I could not demonstrate an attacker-controlled path that reaches the parser while secure validation is off and yields concrete disclosure; upstream-consistent design, so not submitted."
+    },
+    {
+      "lead": "`XIncludeHandler` (stax/config) parses included documents with an unhardened `XMLReaderFactory.createXMLReader()` and resolves `href` through `ClassLoaderUtils.getResource`, which can be file:/http: URLs.",
+      "reason": "Its only caller is `org.apache.xml.security.stax.config.Init`, which parses the library's own classpath `security-config.xml`, not attacker-supplied XML; not attacker-reachable in a normal deployment."
+    },
+    {
+      "lead": "`ResolverDirectHTTP.engineResolveURI` reads the whole HTTP response into memory without a size limit; `Utils.readBytesFromStream` is likewise unbounded.",
+      "reason": "Resource-exhaustion concern only, and external HTTP resolution is forbidden when secure validation is enabled; impact and attacker prerequisites are weak compared with the selected candidate."
+    },
+    {
+      "lead": "HMAC output-length handling (IntegrityHmac/DOMHMACSignatureMethod) and ECDSA/DSA XMLDSIG<->ASN.1 conversion bounds.",
+      "reason": "Verified the minimum-output-length checks are present in both implementations and full-length MAC comparison is used; conversion routines perform length checks. No bypass found in source."
+    },
+    {
+      "lead": "Custom CanonicalizationMethod / SignedInfo rewriting (CVE-2013-2172 class) and same-document wrapping attacks.",
+      "reason": "Verified the mitigations are present: `SignedInfo.reparseSignedInfoElem`, `DOMCanonicalizationMethod.isC14Nalg`, StAX `reparseSignedInfo`, `XMLUtils.protectAgainstWrappingAttack`, and the forbidden XSLT/file/http resolver checks under secure validation."
+    },
+    {
+      "lead": "KeyInfoReference/RetrievalMethod external URI dereferencing (SSRF/local file read) and unbounded/insecure XML parsing of fetched resources.",
+      "reason": "Resolver selection honors `secureValidation` (file/http resolvers rejected) and RetrievalMethod chaining is blocked; with secure validation off, dereferencing external keys is an intentional (if risky) capability of the API, not a clearly exploitable defect I could tie to attacker-controlled verification."
+    }
+  ],
+  "summary": "Repository: Apache Santuario XML Security for Java 2.0.3-SNAPSHOT (548 files: 389 main Java sources, resources, samples; no tests present). I reviewed the signature/verification paths (DOM and JSR-105 core, DOM/JCP), canonicalization, resolvers, key resolution, and the streaming (StAX) inbound processors, plus the XML Encryption entry points at a high level. The strongest source-supported issue is in the StAX (streaming) inbound signature path: a message-supplied `ds:KeyValue` overrides the application-configured signature verification key, so key pinning is silently not applied and a forged message signed with an attacker key can pass verification. I am submitting exactly one candidate (a lead, not a runtime-confirmed vulnerability). Other suspicious areas were checked and rejected or left unconfirmed (see rejected leads)."
+}

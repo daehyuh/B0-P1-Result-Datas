@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote peer fully controls the first bytes of the TLS stream: content-type byte, version bytes and record/SSLv2 length bytes. Crafted input such as a non-TLS first byte (0x00/0x40, so headerLength=3) with byte offset+4 in {2,3} makes the ByteBuffer overload's SSLv2 branch compute (shortBE & 0x3FFF)+3 <= 3 and return NOT_ENOUGH_DATA (-1).",
+      "confidence": "low",
+      "counterevidence_checked": "1) SslHandler.decodeJdkCompatible validates with getEncryptedPacketLength(ByteBuf, offset, true) and returns on NOT_ENOUGH_DATA before calling the engine (SslHandler.java:1350-1365), so the negative value is normally filtered out; I could not construct a bypass for this guard. 2) In jdkCompatibilityMode=false the engine derives packetLength = min(MAX_VALUE, len) (positive), so that path is unaffected. 3) The DTLS branch exists only in the ByteBuf overload, but for 0x16-prefixed DTLS-like input the ByteBuffer overload computes a positive SSLv2 length or NOT_ENCRYPTED, not -1, so that asymmetry does not by itself produce the negative value. 4) The JDK/Conscrypt engines do not use this overload. 5) `assert packetLength > 0` in SslHandler is a no-op at runtime and does not guard the engine call.",
+      "id": "netty-ssl-record-length-validation",
+      "impact": "A malformed TLS/SSLv2-prefixed record that is not correctly validated can reach native code with a negative length; in a native (OpenSSL/BoringSSL) SSLEngine this risks out-of-bounds/native memory corruption and JVM crash (remote denial of service), which is consistent with the snapshot's TLS packet-validation weakness. Exact exploitability was not verified and no crash was executed.",
+      "locations": [
+        {
+          "end_line": 488,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslUtils.java",
+          "start_line": 414
+        },
+        {
+          "end_line": 1227,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 1196
+        },
+        {
+          "end_line": 1269,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 1264
+        },
+        {
+          "end_line": 651,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 629
+        },
+        {
+          "end_line": 1385,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslHandler.java",
+          "start_line": 1337
+        }
+      ],
+      "prerequisites": "Server/client using SslProvider.OPENSSL or otherwise a ReferenceCountedOpenSslEngine (native SSLEngine) through SslHandler; input must reach ReferenceCountedOpenSslEngine.unwrap with such bytes at the current srcs offset (jdkCompatibilityMode default true or handshake not finished). Reachability via SslHandler is the unresolved part: SslHandler.decodeJdkCompatible pre-validates the same bytes with the ByteBuf overload (probeSSLv2=true), which also returns NOT_ENOUGH_DATA and returns early, so I could not demonstrate a concrete path that bypasses that guard (direct engine API usage, a path where `this.packetLength > 0` reuse, or a future/alternate caller would be required).",
+      "root_cause": "SslUtils.getEncryptedPacketLength(ByteBuffer[], int) (the overload used only by the native SslEngine) returns SslUtils.NOT_ENOUGH_DATA (-1) from its SSLv2/fallback branch when the computed packet length is <= the header length. ReferenceCountedOpenSslEngine.unwrap checks only `packetLength == SslUtils.NOT_ENCRYPTED` (-2), not `NOT_ENOUGH_DATA` (-1), and does not otherwise require packetLength > 0. The negative value then survives `packetLengthDataOnly > capacity` and `len < packetLength`, so `pendingEncryptedBytes = Math.min(packetLength, remaining)` becomes negative and is handed to the native length-taking call in writeEncryptedData (SSL.bioSetByteBuffer(..., len, ...)), i.e. a malformed TLS/SSLv2-prefixed record is not correctly validated before being passed to the native SSLEngine.",
+      "title": "OpenSSL unwrap path accepts SslUtils NOT_ENOUGH_DATA (-1) as a packet length and can pass a negative BIO length to native code",
+      "trace": "Remote bytes -> SslUtils.getEncryptedPacketLength(ByteBuffer[], int) SSLv2 branch (SslUtils.java:472-485) -> NOT_ENOUGH_DATA (-1) -> ReferenceCountedOpenSslEngine.unwrap rejects only NOT_ENCRYPTED (-2) (ReferenceCountedOpenSslEngine.java:1200-1203) -> packetLengthDataOnly = -6 passes `> capacity` (1205-1221) and `len < packetLength` is false (1223-1227) -> pendingEncryptedBytes = min(-1, remaining) = -1 (1267) -> writeEncryptedData(src, -1) -> native SSL.bioSetByteBuffer(networkBIO, addr, -1, false) (629-633).",
+      "unverified": "Reachability of ReferenceCountedOpenSslEngine.unwrap with a srcs buffer that yields SslUtils.NOT_ENOUGH_DATA; no runtime reproduction, unit test, or native-crash confirmation was performed. The precise upstream fix diff for this version window was not available, so I cannot confirm that this exact site is the one that was patched.",
+      "weakness_type": "CWE-20 Improper Input Validation / CWE-787 Out-of-bounds Write (native memory corruption via length field)"
+    }
+  ],
+  "coverage_summary": "Main-source-only snapshot (2231 files, no tests, no VCS history, no C sources). Deep reading in handler/ssl (SslHandler, SslUtils, ReferenceCountedOpenSslEngine, SslClientHelloHandler, SniHandler), codec-http (HttpObjectDecoder, HttpUtil, HttpHeaderValidationUtil, HttpObjectAggregator, HttpPost*RequestDecoder, multipart/disk classes, WebSocket08/00 decoders, SPDY raw decoder), codec-http2 (DefaultHttp2ConnectionDecoder, HpackDecoder, DefaultHttp2FrameReader), codec (Bzip2/Snappy/Zlib/LZ4 paths, LengthFieldBasedFrameDecoder), codec-dns, codec-xml, codec-mqtt/memcache/redis sampling, transport NIO/domain-socket and NetUtil/platform helpers, handler-proxy. Buffer, resolver-dns, native-transport Java wrappers and example/microbench/testsuite main sources were only sampled, not exhaustively reviewed. Files were read via bounded ranges; binary-like files were skipped by the harness.",
+  "limitations": [
+    "No tests, build outputs, commit history or patch metadata are present, so I could not diff the snapshot against the fixed revision; the version string (4.1.118.Final-SNAPSHOT) only bounds the snapshot to the late-2024/early-2025 development window and I deliberately did not use external CVE/ground-truth lookups.",
+    "The submitted candidate's exploitability is unproven: the only callers I examined (SslHandler) pre-validate with the ByteBuf overload and return early on NOT_ENOUGH_DATA, so I could not demonstrate a concrete reachable path to a negative packetLength in the native engine.",
+    "Native/OpenSSL behavior (SSL.bioSetByteBuffer / SSL_read) cannot be verified from this Java-only snapshot; no code execution or crashing input was attempted.",
+    "Large portions of the repository (buffer internals, transport/resolver, native transport Java wrappers, examples) were only sampled, so an unrelated vulnerability in those areas could have been missed.",
+    "The review was time-boxed and read a subset of the 2231 files; the true root cause for this case, if in an unread or only-sampled file, may not be represented by this candidate."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SslClientHelloHandler allocates ctx.alloc().buffer(handshakeLength) up-front (handler/src/main/java/io/netty/handler/ssl/SslClientHelloHandler.java:140-165); SniHandler default constructors pass maxClientHelloLength=0 (no limit), so a ~6-byte record claiming handshake length 0xFFFFFF can force a ~16MB allocation per connection.",
+      "reason": "Source evidence is clear, but the value is hard-capped by the 24-bit handshake length / MAX_CLIENT_HELLO_LENGTH, the parameter is configurable, and AbstractSniHandler applies a handshake timeout; this appears to be the intended post-hardening design (the limit/timeout API is already present), so it is weaker as the case's root cause than the TLS length-validation gap."
+    },
+    {
+      "lead": "XmlDecoder.decode copies the entire readable ByteBuf into a fresh byte[] (codec-xml/src/main/java/io/netty/handler/codec/xml/XmlDecoder.java:45-49) and passes it to Aalto.",
+      "reason": "Generic decoder memory behavior; no validation bypass found, Aalto's factory is not configured for external entities in this path and I found no CWE-611-style resolvable entity handling. Also no bound/misuse relation to a specific attacker-controlled sink."
+    },
+    {
+      "lead": "SpdyHeaderBlockRawDecoder allocates new byte[length] from wire values (codec-http/src/main/java/io/netty/handler/codec/spdy/SpdyHeaderBlockRawDecoder.java:127-196).",
+      "reason": "Allocations are preceded by maxHeaderSize/headerSize checks and readable-byte checks (lines 111-129, 160-195); the class already contains the hardened logic. Not supported as a vulnerability."
+    },
+    {
+      "lead": "HttpPostRequestDecoder / multipart disk storage maybe allowing path traversal via attacker filename (DiskFileUpload).",
+      "reason": "Temp names come from PlatformDependent.createTempFile(prefix, postfix, baseDir) with postfix derived from a constant/hash, and base directories are caller-configured; no attacker-controlled path component reaches the file API."
+    },
+    {
+      "lead": "HttpProxyHandler builds CONNECT requests with DefaultHttpHeadersFactory...withValidation(false).",
+      "reason": "Used for the client-side CONNECT line and caller-supplied headers; no server-side trust boundary crossed, and the username/password are Base64-encoded before use."
+    },
+    {
+      "lead": "HTTP/1 Content-Length / Transfer-Encoding handling (codec-http HttpObjectDecoder, HttpUtil.normalizeAndGetContentLength).",
+      "reason": "Reviewed duplicate/combined Content-Length handling, sign rejection, chunking and chunk-size overflow paths; the code matches strict validation and I found no smuggling-style bypass."
+    },
+    {
+      "lead": "HAProxyMessageDecoder, codec-dns name decompression, HpackDecoder/Http2 Content-Length, WebSocket frame decoder, Snappy/Bzip2 decoders as DoS sources.",
+      "reason": "Existing size/depth/overflow guards were present and consistent with the hardened implementations (v2MaxHeaderSize, loop pointer checks, MAX_DECOMPRESSED_DATA_SIZE, HPACK table limits, framesize policy); no concrete missing check could be demonstrated."
+    }
+  ],
+  "summary": "Netty 4.1.118.Final-SNAPSHOT main-source snapshot (Java only, 2231 files; no tests/build history). I reviewed authentication/TLS, HTTP/1, HTTP/2, DNS, XML, compression, SOCKS/proxy, multipart and SPDY parsing paths. The single strongest source-evidenced lead is in the TLS record-length validation chain: the ByteBuffer overload of SslUtils.getEncryptedPacketLength used by the OpenSSL (tcnative) engine can return the sentinel NOT_ENOUGH_DATA (-1), but ReferenceCountedOpenSslEngine.unwrap only rejects NOT_ENCRYPTED (-2); a negative length then propagates into the native BIO length. I could not prove a concrete SslHandler-mediated call path that bypasses SslHandler's own pre-validation, so this remains an unconfirmed lead (low confidence), not a confirmed vulnerability. Other suspicious areas (SniHandler/ClientHello preallocation, XmlDecoder heap copy, SPDY/multipart/DNS parsers) were checked and rejected as explained below."
+}

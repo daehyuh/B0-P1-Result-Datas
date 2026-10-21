@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The SSH server host key is chosen by whoever answers the TCP connection to the configured git host (network man-in-the-middle, spoofed DNS/host, or compromised intermediary). It is attacker-controlled at handshake time and is never validated by the plugin.",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched the snapshot for `known_hosts`, `HostKeyVerifier`, `ServerHostKeyVerifier`, and any host-key strategy/configuration: no matches, so no alternative verification path exists. The `// TODO: host key check` comment confirms the omission was known. `StrictHostKeyChecking=no` is written unconditionally in both Unix and Windows wrappers. The trust-all `EasyX509TrustManager`/`EasySSLProtocolSocketFactory` classes accept any single-certificate chain but have no callers anywhere in the snapshot (dead code) and were not made the candidate. `acceptSelfSignedCertificates` is assigned but never read. JGit being disabled by default (README) and known-hosts checks still applying to already-known hosts are the main mitigating factors.",
+      "id": "ssh-host-key-not-verified",
+      "impact": "Man-in-the-middle impersonation of the git server. The attacker can obtain SSH username/password credentials that ssh/git supplies during authentication (via SSH_ASKPASS scripts or the JGit credentials provider), read repository/build content, and serve modified repository content that Jenkins subsequently checks out and builds/executes (integrity and supply-chain compromise, potential code execution in the build). SSH private key material itself is not disclosed, but credentials transmitted to the rogue endpoint are.",
+      "locations": [
+        {
+          "end_line": 54,
+          "path": "src/main/java/org/jenkinsci/plugins/gitclient/trilead/TrileadSessionFactory.java",
+          "start_line": 23
+        },
+        {
+          "end_line": 2060,
+          "path": "src/main/java/org/jenkinsci/plugins/gitclient/CliGitAPIImpl.java",
+          "start_line": 2034
+        },
+        {
+          "end_line": 175,
+          "path": "src/main/java/org/jenkinsci/plugins/gitclient/JGitAPIImpl.java",
+          "start_line": 160
+        }
+      ],
+      "prerequisites": "An SSH-based git remote is used. Either (a) JGit or JGit-with-Apache-HTTP is configured, which globally installs the custom TrileadSessionFactory in JGitAPIImpl's constructor, or (b) the command-line implementation is used with an SSHUserPrivateKey-style credential so the generated GIT_SSH wrapper runs. The server host key is not already pinned in the agent account's known_hosts (typical for ephemeral/containerized agents; note JGit itself is documented in README as disabled by default, and JGit import path here requires no known_hosts at all). The attacker must be able to intercept or be the endpoint of the SSH connection.",
+      "root_cause": "The plugin performs no SSH host key pinning or verification. JGit is redirected to a custom session factory that opens `com.trilead.ssh2.Connection` and calls `con.connect()` without providing a `ServerHostKeyVerifier` (source comment `// TODO: host key check`). For command-line git, `launchCommandWithCredentials` installs a generated `GIT_SSH` wrapper that is invoked with `-o StrictHostKeyChecking=no`, which auto-accepts previously unknown host keys and does not enforce known-host pinning.",
+      "title": "SSH host key verification disabled/absent in git client SSH transports (JGit trilead factory and command-line git wrappers)",
+      "trace": "CLI path: fetch_()/clone()/push()/submoduleUpdate() -> launchCommandWithCredentials (CliGitAPIImpl:1716-1738 for SSHUserPrivateKey) -> createUnixGitSSH (2047-2059) or createWindowsGitSSH (2034-2044) writes `ssh -i <key> -l <user> -o StrictHostKeyChecking=no ...` as `GIT_SSH`; ssh then accepts the presented host key before authentication. JGit path: JGitAPIImpl constructor sets `SshSessionFactory.setInstance(new TrileadSessionFactory())` (line 168) -> TrileadSessionFactory.getSession creates `new Connection(uri.getHost(), port)` and calls `con.connect()` (line 29) with no verifier -> authentication uses SmartCredentialsProvider / CredentialsProviderImpl (lines 32-48), so SSH credentials are offered to the unverified peer.",
+      "unverified": "trilead-ssh2 `Connection.connect()` no-verifier semantics were inferred from the inline TODO and the API contract (library source is not in the snapshot) rather than executed; JGit/JGitApache reachability depends on the missing `Git` factory class and caller configuration; whether real agents lack the host key in known_hosts is deployment-dependent; no runtime or exploit testing was performed.",
+      "weakness_type": "CWE-295 / CWE-345: improper validation of SSH host key (man-in-the-middle / authentication bypass)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 63 model-visible files (46 Java, other resources/pom/readme), 0 excluded by size/symlink/sensitivity filters, with a NUL-byte binary refusal policy applied equally to B0 and P1. get_relation_scope reports all 63 source files indexed, 46 Java files parsed with 0 parse errors, 1209 symbols, 3083 call sites/2226 edges, 2367 unresolved calls, and explicitly no control-flow, data-flow, semantic resolution or Spring security verification; index labels are navigation hints only. I listed every file, read the credential/transport-relevant sources in full or in large ranges (CliGitAPIImpl credential/temp/launch paths, JGitAPIImpl init/submodule/credential paths, all of trilead/*, jgit/PreemptiveAuthHttpClientConnection*, Netrc, GitAPI/GitTool/GitClient, EasySSL classes), and verified the host-key finding against source text rather than index labels.",
+  "limitations": [
+    "Static review only: no compilation, tests, scanners or exploit execution; the candidate is a lead, not a runtime-confirmed vulnerability.",
+    "The P1 index has no data/control-flow or semantic resolution and 2367 unresolved calls; callers outside the snapshot (git plugin, Jenkins core, JGit 4.5.7, trilead-ssh2) could not be inspected, so complete reachability cannot be proven.",
+    "The snapshot is a subset of the plugin (no test sources; classes such as the org.jenkinsci.plugins.gitclient.Git entry point are absent), so wiring between the implementations and callers is partially inferred.",
+    "Third-party library semantics (trilead Connection.connect() without a verifier, JGit URIish string forms, OpenSSH StrictHostKeyChecking=no behavior) were reasoned from source comments/API expectations; not verified by running code.",
+    "JGit implementations are documented as disabled by default and the CLI path requires an SSH private-key credential, so real-world exposure depends on deployment configuration.",
+    "No external advisory/CVE data was consulted, per review instructions; the finding is based solely on the assigned source snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "EasyX509TrustManager / EasySSLProtocolSocketFactory accept any single-certificate (self-signed) chain — classic trust-all TLS pattern",
+      "reason": "Both classes are unreachable in this snapshot: no caller references them (searched whole tree), so they are dead code/hardening debt rather than an exploitable path in this plugin."
+    },
+    {
+      "lead": "PreemptiveAuthHttpClientConnectionFactory.create(URL, Proxy) discards the proxy argument (innerCreate(url, null))",
+      "reason": "Functional defect (proxy not honored), not a security boundary violation; no attacker-controlled impact identified."
+    },
+    {
+      "lead": "Credential-bearing temp scripts (GIT_ASKPASS/SSH_ASKPASS .bat/.sh) are only chmod/executable-restricted; on Windows no explicit ACL is applied to the askpass file unlike the SSH key file",
+      "reason": "Owner-only permissions are set on Unix (rw-------, setExecutable(true,true)); Windows behavior depends on default %TEMP%/workspace@tmp ACLs that cannot be verified from source, so impact is unproven."
+    },
+    {
+      "lead": "Default credentials fallback (SmartCredentialsProvider, CliGitAPIImpl submoduleUpdate) may supply the job's default credential to any URL, e.g. submodule URLs from .gitmodules",
+      "reason": "Requires the caller (git plugin, outside this snapshot) to set a default credential and to enable submodule update; scope and reachability unverified, and it is partially documented intended behavior."
+    },
+    {
+      "lead": "GitURIRequirementsBuilder.withUri returns empty requirements for unrecognized URIs, which could weaken credential-domain filtering in callers",
+      "reason": "No in-repo caller; enforcement happens in other plugins, so no concrete vulnerable path in this snapshot."
+    },
+    {
+      "lead": "acceptSelfSignedCertificates field assigned from GitClient.untrustedSSL but never read",
+      "reason": "Dead field; no code path consumes it, so no security effect."
+    }
+  ],
+  "summary": "Reviewed the git-client plugin 2.8.4 source snapshot (63 files: 46 Java sources plus resources/pom) using the source scope and the P1 relation index. The strongest distinct issue traced is that neither SSH transport performed by the plugin verifies the SSH server host key: the JGit path connects through a custom SshSessionFactory that calls trilead `Connection.connect()` with no `ServerHostKeyVerifier` (with an explicit `// TODO: host key check`), and the command-line path generates `GIT_SSH` wrapper scripts that pass `-o StrictHostKeyChecking=no`. A network man-in-the-middle able to answer the connection can therefore present any host key, authenticate against the Jenkins build (capturing SSH username/password credentials that git/ssh sends), and return attacker-controlled repository content that Jenkins checks out and builds. No other candidate in the snapshot combined reachable code, attacker-controlled input and credible impact; the trust-all EasySSL classes are present but unreachable in this snapshot."
+}

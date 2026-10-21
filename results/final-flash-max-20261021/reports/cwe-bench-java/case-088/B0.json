@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An attacker who holds any valid FF4j web API credential — including an intentionally read-only user/apiKey created through `ApiConfig.createUser(name, password, true, false, null)` / `createApiKey(key, true, false, null)` whose permissions are only {READ} — controls the HTTP method/path/body sent to the API. Example targets: `POST /<context>/api/ff4j/store/clear`, `POST /<context>/api/ff4j/propertyStore/clear`, `POST /<context>/api/ff4j/store/createSchema` and `POST /<context>/api/ff4j/store/groups/{group}/enable|disable`.",
+      "confidence": "high",
+      "counterevidence_checked": "• If ApiConfig.isAutorize() is false, no authorization filter is registered at all — but that is the explicitly unsecured mode; the flaw applies exactly when the operator enables the documented authorization feature. • @PermitAll/@DenyAll are method-level only and do not apply to these endpoints. • Registering Jersey's own RolesAllowedDynamicFeature would enforce class-level annotations for methods lacking one, but the store resources declare class-level ROLE_READ, so a READ-only principal would still satisfy the fallback for /clear and /createSchema. • The filter also silently allows annotated methods when the request SecurityContext is not an FF4jSecurityContext (the `instanceof` guard at lines 82-98 falls through to `return`), which is a related fail-open facet, not a mitigation. • No source in the snapshot registers an additional role-checking mechanism (Jersey feature, servlet filter) for these paths.",
+      "id": "FF4J-WEBAPI-RBAC-001",
+      "impact": "Privilege escalation from read-only API access to full write/admin-equivalent operations: deletion of all feature flags and all properties (configuration/integrity loss, which can silently re-enable or disable protected functionality), execution of schema DDL, cache flushes, and group-wide enable/disable of features. The read-only/write separation that ApiConfig and the `@RolesAllowed` annotations are meant to provide is ineffective.",
+      "locations": [
+        {
+          "end_line": 99,
+          "path": "ff4j-webapi-jersey2x/src/main/java/org/ff4j/web/api/security/FF4jAuthorizationFilter.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 125,
+          "path": "ff4j-webapi-jersey2x/src/main/java/org/ff4j/web/api/security/FF4jAuthorizationFilter.java",
+          "start_line": 109
+        },
+        {
+          "end_line": 146,
+          "path": "ff4j-webapi/src/main/java/org/ff4j/web/api/resources/FeatureStoreResource.java",
+          "start_line": 128
+        },
+        {
+          "end_line": 104,
+          "path": "ff4j-webapi/src/main/java/org/ff4j/web/api/resources/PropertyStoreResource.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 99,
+          "path": "ff4j-webapi/src/main/java/org/ff4j/web/api/resources/GroupResource.java",
+          "start_line": 50
+        },
+        {
+          "end_line": 115,
+          "path": "ff4j-core/src/main/java/org/ff4j/web/ApiConfig.java",
+          "start_line": 101
+        }
+      ],
+      "prerequisites": "(1) The web API is deployed in the intended secured mode, i.e. an ApiConfig subclass with `setAutorize(true)` so that FF4jApiApplicationJersey2x registers both FF4jAuthenticationFilter and FF4jAuthorizationFilter (lines 92-95 and 127-137). (2) The attacker possesses a valid credential accepted by FF4jAuthenticationFilter (HTTP Basic or apiKey); READ-only is sufficient. (3) No additional container/Jersey role enforcement (e.g. Jersey `RolesAllowedDynamicFeature` or servlet-level role constraints) is layered on top.",
+      "root_cause": "In `FF4jAuthorizationFilter.filter()`, authorization is only evaluated when the *resource method* itself carries `@RolesAllowed` (`isRolesAllowed()` checks `info.getResourceMethod().getAnnotation(RolesAllowed.class)`); if the method has no method-level annotation the filter simply returns and the request is allowed, regardless of the class-level `@RolesAllowed`. Additionally, `getRoles()` unions the class-level and method-level role arrays and the decision is `allowed if the user holds ANY role in the union`, so a class-level `READ` satisfies a method-level `WRITE`. The store resources declare only class-level `@RolesAllowed(ROLE_READ)` while exposing destructive POST endpoints (`/clear`, `/createSchema`, cache clear) with no method-level `WRITE` annotation, and `GroupResource` declares class-level READ with method-level WRITE on enable/disable — in all these cases a READ-only principal is accepted.",
+      "title": "Read-only API credentials can perform destructive/write operations because role enforcement ignores class-level @RolesAllowed and ORs class+method roles",
+      "trace": "1. FF4jApiApplicationJersey2x.init(): `apiConfig.isAutorize()` → `enableAuthenticationFilter()` and `enableAuthorizationFilter()` register both filters for the JAX-RS application.\n2. Attacker sends `Authorization: Basic base64(user:pass)` for a read-only user and `POST .../ff4j/store/clear`.\n3. FF4jAuthenticationFilter validates the credential (`apiConfig.getUsers().get(lap[0])` + password compare) and builds `new FF4jSecurityContext(user, BASIC, permissionSet)` where permissionSet is {READ}; it stores it as the request SecurityContext.\n4. FF4jAuthorizationFilter.filter() runs: `isDenyAll()` false, `isPermitAll()` false, `isRolesAllowed()` is false because `FeatureStoreResource.clearFeatures()` has no method-level `@RolesAllowed` → the role-check block is skipped and the method returns, authorizing the request.\n5. Jersey invokes `FeatureStoreResource.clearFeatures()` → `getFeatureStore().clear()`, which empties the entire feature store (`FeatureStore.clear()` documented as \"Empty features set\", implemented e.g. InMemoryFeatureStore/AbstractFeatureStore).\n6. The same pattern reaches `PropertyStoreResource.clearProperties()`, both `createSchema()` endpoints (DB DDL), the cache-clear POSTs, and (through the union in `getRoles()`) `GroupResource.operationEnable/operationDisable`: class-level {READ} ∪ method-level {WRITE} = {READ, WRITE}, so the READ-only principal matches.",
+      "unverified": "Runtime confirmation was not possible (no execution): the exact filter ordering relative to FF4jAuthenticationFilter, and the absence of externally configured role enforcement in any particular deployment, are assumptions. The conclusion that class-level annotations are bypassed is based on reading `FF4jAuthorizationFilter.isRolesAllowed()/filter()/getRoles()` only; a deployment that registers extra security would change the exploitability but not the flawed code.",
+      "weakness_type": "Improper authorization / privilege escalation (CWE-863; also CWE-862, CWE-602-adjacent)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 580-file multi-module snapshot (ff4j-core, ff4j-web, ff4j-webapi, ff4j-webapi-jersey2x, ff4j-security-spring/shiro, ff4j-config-properties/yaml, ff4j-aop, ff4j-jmx, ff4j-cli, ff4j-utils-json, ff4j-strategy-drools and the ~25 store modules). Deep review focused on the web/API trust boundary: FF4jApiApplicationJersey2x, FF4jAuthenticationFilter, FF4jAuthorizationFilter, FF4jSecurityContext( Holder), ApiConfig, all ff4j-webapi resources and domain beans, ff4j-web servlets/controllers/ConsoleOperations/ConsoleRenderer/FileUtils, plus JDBC/Neo4j/Mongo/Cassandra/Elastic/CouchDB/Redis stores, XmlParser/YamlParser/PropertiesParser, MappingUtil, PropertyFactory and FF4j core. The submitted candidate was traced end-to-end in source (filter → resource → store.clear()).",
+  "limitations": [
+    "No code execution, compilation, deployment or runtime test was performed; all conclusions are source-reading based, and no runtime confirmation is claimed.",
+    "Third-party JavaScript/CSS assets under ff4j-web (jQuery, jqPlot, bootstrap, DataTables) and generated/minified resources were only spot-checked, not audited in depth.",
+    "Every store backend (HBase, Cassandra, Elastic, CouchDB, GCP, AWS SSM/DynamoDB, Consul, Redis/Lettuce, Ignite, Hazelcast, Neo4j, etc.) was not fully read line-by-line; injections into those backends were sampled via grep.",
+    "The presence/absence of container- or application-level additional security (Jersey RolesAllowedDynamicFeature, Spring Security URL rules, servlet filters) in real deployments is unknown from this snapshot and affects the practical exploitability of the submitted candidate.",
+    "No repository history, patch or advisory metadata was available (no .git), so it was not possible to confirm which code change introduced the flaw or whether a fix exists upstream."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Attacker-controlled Java class names passed to Class.forName(...).newInstance()/constructor invocation in the console and API (ConsoleOperations.createFeature/updateFlippingStrategy, FeaturesController.buildFlippingStrategy→MappingUtil.instanceFlippingStrategy, PropertyFactory.createProperty via `pType`/PropertyApiBean.type, FeatureResource upsert via `flippingStrategy.type`, plus XML/YAML/Properties config import).",
+      "reason": "Real unsafe-reflection pattern (CWE-470) with several HTTP entry points, but full code-execution impact depends on a suitable gadget class/constructor being present on the classpath and on casts/interfaces restricting what is invoked; reachability also normally requires console/API write access (or an exposed console). It is a strong secondary lead but a lower-confidence, gadget-dependent security impact than the deterministic authorization bypass, so it is not submitted."
+    },
+    {
+      "lead": "Web console edit gating (`adminGroups` → `enableEdit`) is enforced only in Thymeleaf views (AbstractController.makeWebContext lines 219-228; view templates use th:if=\"${enableEdit}\"), while FeaturesController/PropertiesController/HomeController/SettingsController perform enable/disable/delete/create/permission changes without any server-side admin check.",
+      "reason": "Plausible broken access control (client-side-only enforcement) and state-changing GET operations without CSRF tokens, but the FF4j sample security model expects the console to be protected by the embedding application (e.g. Spring Security + ff4j.consoleAdmin.authenticated), so intent and threat model are ambiguous; left unconfirmed."
+    },
+    {
+      "lead": "HTML injection/XSS in the deprecated embedded console (ConsoleRenderer renders feature/property ids, descriptions, fixed values and event data into HTML without encoding; notFound() echoes pathInfo).",
+      "reason": "Attacker control over stored names exists but impact is confined to the legacy/deprecated `ConsoleServlet` UI and mostly affects an admin session; lower severity and less certain than the API authorization bypass."
+    },
+    {
+      "lead": "Unbounded multipart import in HomeController/ConsoleServlet (`new ServletFileUpload(new DiskFileItemFactory()).parseRequest(req)` with no size limits) enabling resource exhaustion.",
+      "reason": "Denial-of-service only, requires console access; not the strongest issue."
+    },
+    {
+      "lead": "Dynamic SQL built by JdbcQueryBuilder.buildWhereClause/buildClauseIn (string concatenation of action/host/name/source filters marked 'FIXME Stop dynamic query').",
+      "reason": "Filters in EventQueryDefinition are not populated from HTTP parameters in any reviewed web entry point (only from/to timestamps are), so the concatenated values are not attacker-controlled — rejected as not reachable."
+    }
+  ],
+  "summary": "The strongest source-backed issue is a broken authorization enforcement in the FF4j Jersey web API: the read/write role separation advertised by ApiConfig/`@RolesAllowed` is not actually enforced, so a credential that only has the READ role can invoke state-changing/destructive API operations (including clearing the whole feature and property stores). The flaw is rooted in `FF4jAuthorizationFilter`, which only evaluates method-level `@RolesAllowed` annotations (class-level annotations are ignored unless the method also has one) and, when a method-level annotation exists, unions class-level and method-level roles with OR semantics (so `@RolesAllowed(READ)` at class level satisfies a method-level `@RolesAllowed(WRITE)`). Destructive endpoints such as `FeatureStoreResource.clearFeatures()`/`createSchema()` and `PropertyStoreResource.clearProperties()`/`createSchema()` carry no method-level `@RolesAllowed(WRITE)`, and `GroupResource` enable/disable carry WRITE only as a method annotation while the class declares READ."
+}

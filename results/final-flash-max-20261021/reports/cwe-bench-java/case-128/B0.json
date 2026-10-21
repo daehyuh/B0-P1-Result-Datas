@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The caller controls the target realm/client identifiers and the keystore configuration (format, aliases, caller-chosen store/key passwords). The attacker is a realm admin account (or client service account) holding only the read-only clients role/permission (e.g. AdminRoles.VIEW_CLIENTS, or the FGAP \"view\" scope for the Clients resource type) - a role commonly granted to support/helpdesk staff. No manage/configure permission is needed.",
+      "confidence": "low",
+      "counterevidence_checked": "Checked that this is not a path issue: AdminRoot/ClientResource route and realm checks are correct, so the caller still needs an authenticated admin token for the target realm - the flaw is the strength of the permission check, not authentication. Checked for compensating checks: no masking/stripping helper is applied (unlike IdentityProviderResource.getIdentityProvider(), which calls StripSecretsUtils.stripSecrets(), showing the codebase does use this defense elsewhere). Checked the analog operations in the same class: generate/generate-and-download use requireConfigure and upload uses requireManage, so nothing else compensates for the weak check. Counterevidence that weakens the finding: Keycloak's admin model arguably treats \"view\" as including client credential material - ClientResource.getClientSecret() also uses requireView, ClientResource.get() explicitly sets the client secret for viewers, and installation providers are readable with view - so this may be intended upstream behavior/hardening gap rather than a deliberate defect; no test or comment in the snapshot asserts that a view-only user must not read the private key; I could not compare against upstream/fixed sources (no network, no sibling conditions, no patch data), so this is a source-evidence lead, not a confirmed vulnerability.",
+      "id": "CAND-1",
+      "impact": "Disclosure of a client's private key (and full keystore) to a principal that is supposed to be read-only. The key can be used to impersonate the client: sign client assertions (private_key_jwt / client-jwt) or SAML documents with the client's signing key and, depending on client configuration, obtain tokens/access as that client (e.g. service-account access, assertion replay against other relying parties trusting the same key). This crosses the documented privilege boundary between viewing client configuration and managing client credentials.",
+      "locations": [
+        {
+          "end_line": 288,
+          "path": "services/src/main/java/org/keycloak/services/resources/admin/ClientAttributeCertificateResource.java",
+          "start_line": 260
+        },
+        {
+          "end_line": 110,
+          "path": "services/src/main/java/org/keycloak/services/resources/admin/ClientAttributeCertificateResource.java",
+          "start_line": 100
+        },
+        {
+          "end_line": 69,
+          "path": "services/src/main/java/org/keycloak/services/util/CertificateInfoHelper.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 371,
+          "path": "services/src/main/java/org/keycloak/services/resources/admin/ClientAttributeCertificateResource.java",
+          "start_line": 332
+        }
+      ],
+      "prerequisites": "1) An admin account (or client credentials) with view-clients-equivalent access to the target realm/client. 2) The target client must have a private key stored in Keycloak, which occurs when an administrator uploaded a keystore/private key (upload/upload-certificate) or imported one for a SAML client or an OIDC client using private_key_jwt; then the key is persisted in the client attribute \"<attr>.private.key\". 3) The endpoint returns the key material as long as the caller supplies its own keystore passwords (getKeystore) or simply parses the JSON response (getKeyInfo).",
+      "root_cause": "In ClientAttributeCertificateResource, both the key-info read endpoint and the /download keystore endpoint authorize with auth.clients().requireView(client) (read-only role / FGAP view scope), even though they return the client's stored private key: getKeyInfo() returns CertificateRepresentation built by CertificateInfoHelper.getCertificateFromClient(), which copies the client attribute \"<attr>.private.key\" into rep.privateKey; getKeystore() reads the same private key and writes it as a private-key entry into the returned JKS/PKCS12 keystore. By contrast, every operation that creates or writes key material in the same resource requires a stronger permission: generate() -> requireConfigure, generate-and-download() -> requireConfigure, upload()/upload-certificate() -> requireManage. There is no separate check that the admin holds manage/configure rights, no masking of privateKey, and no re-authentication requirement.",
+      "title": "Client private key material (and keystore download) readable with only view-clients permission",
+      "trace": "HTTP request -> AdminRoot.authenticateRealmAdminRequest (bearer admin token, realm resolved from token issuer) -> ClientResource.getCertficateResource() -> ClientAttributeCertificateResource.  For GET /admin/realms/{realm}/clients/{id}/certificates/{attr}: getKeyInfo() calls auth.clients().requireView(client) (line 106) and returns CertificateInfoHelper.getCertificateFromClient(client, attributePrefix) (line 108), which copies client attribute \"<attr>.private.key\" into CertificateRepresentation.privateKey (CertificateInfoHelper lines 62-66).  For POST .../certificates/{attr}/download: getKeystore(config) calls auth.clients().requireView(client) (line 268), reads info.getPrivateKey() into privatePem (line 273), and getKeystore(config, privatePem, certPem) stores it as a private-key entry (PemUtils.decodePrivateKey + keyStore.setKeyEntry, lines 339-346) in the returned keystore bytes (lines 362-367). Only requireView gates the response; nothing verifies manage/configure authority or strips the private key.",
+      "unverified": "Not runtime-confirmed. I did not (and must not) execute the endpoint. Whether the project considers read-only admins entitled to client private keys is unresolved; the finding rests on the permission asymmetry inside the same resource class and on the explicit endpoint description that it returns the private key. Impact also depends on the target client actually having a key stored in Keycloak and on its client-authentication configuration.",
+      "weakness_type": "Improper authorization / exposure of sensitive credential material (CWE-863, CWE-200; key material exposure)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 5,870-file snapshot through listing, literal search, and bounded reading (no execution, no network, no patch/ground-truth data). High-risk areas covered: admin REST resources and their permission evaluators (services/.../resources/admin/**, .../permissions/**), OIDC endpoints/grants/PKCE/redirect/logout/DPoP, client registration and DCR auth, SAML broker (SAMLEndpoint) and saml-core signature/XML utilities, XML parser hardening (DocumentUtil/StaxParserUtil), LDAP federation filter escaping and empty-password bind, theme/resource path traversal (ResourceLoader/FolderTheme/ClassLoaderTheme), OID4VC issuance/proof validation, token exchange V1/V2, FGAP v1/v2 and partial evaluation, core JOSE/JWE/JWS primitives, IdentityBrokerService/account REST binding, organizations admin resources, and .github CI scripts. No precomputed source-relation index was available (B0).",
+  "limitations": [
+    "No upstream/fixed-version comparison, no git history, no CVE/patch metadata, and no sibling or runtime data were available, so I could not confirm whether the permission checks I flagged differ from the upstream 26.2.5 release or from a later fix.",
+    "Presentation layers that often hold exploitable logic were absent from the snapshot (.tsx React components and .ftl FreeMarker templates are not present), so admin/account console UI behavior (including how private keys are gated in the UI) could not be inspected.",
+    "Coverage is breadth-first and sampling-based: many of the ~5,870 files (model providers, cache, operator, fips crypto, most tests) were not read line-by-line; a subtle planted defect in uninspected files could have been missed.",
+    "The single submitted candidate is a lead with low confidence: the observable code behavior is clear (private key material returned under requireView), but it may reflect Keycloak's intended read-only credential-visibility model rather than a defect, and it was not runtime-confirmed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "FGAP v2 / admin permissions consolidation (FGAPPolicyEvaluator, FGAPEvaluation, FGAPDecision, PartialEvaluator, JpaUserPartialEvaluationProvider, UserPermissionsV2/GroupPermissionsV2/ClientPermissionsV2/RolePermissionsV2): complex new (2025) fine-grained authorization code where a subtle logic bug could yield privilege escalation or list-filtering bypass.",
+      "reason": "I traced the main evaluation paths (resource-type policies, scope aliases, deny logic, group/partial-evaluation filters) but could not demonstrate a concrete incorrect outcome from source alone; the code is internally consistent with its schema (scope aliases, resource-type resources, isAdminSameRealm checks) and all requireX methods throw on failure. Unconfirmed lead, no defensible trace, so not submitted."
+    },
+    {
+      "lead": "TwitterIdentityProvider uses ObjectInputStream on the twitter_token auth note without a DelegatingSerializationFilter (unlike KerberosSerializationUtils/KeycloakPrincipal/KeycloakSecurityContext).",
+      "reason": "The serialized value is written server-side from the OAuth1 request token returned by the IdP (authSession.setAuthNote(TWITTER_TOKEN, Base64.encodeObject(requestToken))); I found no path for an attacker to supply that byte stream. Hardening opportunity, not an attacker-reachable deserialization flaw."
+    },
+    {
+      "lead": "SAML artifact-binding second pass (ArtifactBinding.containsUnencryptedSignature returning true after the flag is set; containsUnencryptedSignature-based signature relaxation) could accept unsigned assertions.",
+      "reason": "The ArtifactResponse envelope is signature-verified first (SAMLEndpoint.handleSamlArt, verifySignature on the ArtifactResponse), the embedded Response/assertion is covered by that verification, and a signed assertion is still validated with getIDPKeyLocator() in handleLoginResponse. Appears to be the intended design; no concrete bypass identified."
+    },
+    {
+      "lead": "DefaultTokenContextEncoderProvider.getTokenContextFromTokenId throws IllegalArgumentException for malformed jti contexts (potential 500/DoS in resolveLightweightAccessTokenRoles).",
+      "reason": "Reachable value is the server-generated jti of a signature-verified token; I found no path for an attacker to obtain a validly-signed token with an attacker-chosen jti, so the malformed input is not attacker-controlled."
+    },
+    {
+      "lead": "Various 'sensitive read with view permission' endpoints (ClientResource.getClientSecret/getClientRotatedSecret/getInstallationProvider, ClientScopeEvaluateResource example token endpoints) as alternative authorization findings.",
+      "reason": "These follow the same view-includes-secrets pattern as the submitted candidate and appear deliberate in Keycloak's role model (getClientSecret is view, rotate is configure/manage). Not submitted separately to avoid splitting one root cause/permission-model question into multiple candidates."
+    }
+  ],
+  "summary": "Snapshot is a Keycloak 26.2.5 source tree (pom.xml 26.2.5, Quarkus 3.20.1) containing 5,870 visible files (UI .tsx/.ftl presentation files and some docs are not present in the assigned snapshot). I reviewed the admin REST API and its permission evaluators (v1 and v2/FGAP), OIDC token/authorization/logout endpoints, PKCE/redirect-URI validation, client registration, SAML broker and saml-core signature verification, LDAP federation and escaping, theme/resource path handling, OID4VC issuance and proof validation, token exchange (V1/V2), JOSE/JWE primitives, and the CI workflow scripts. Most classic hardening (path traversal in ResourceLoader, SAML response/assertion signature checks, PKCE validation, redirect scheme checks, LDAP filter escaping, OTP/recovery-code single-use, LDAP empty-password bind rejection) is present. The strongest concrete issue found is an authorization weakness around client private-key material: endpoints that return the client's stored private key only require the read-only \\\"view clients\\\" permission, while all adjacent key-material-mutating endpoints require manage/configure. I submit that single candidate as a lead; the other suspicious spots I checked are listed as rejected leads."
+}

@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The JSON value deserialized into a java.time type is fully attacker-controlled (request body/field). A numeric token with an extreme exponent or a very long significand (e.g. 1e999999999 or many digits) is valid JSON and selects the ID_NUMBER_FLOAT/ID_NUMBER_INT branches handled directly in the module.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked: string inputs are less affected because _countPeriods() rejects exponent characters before BigDecimal construction, so exploitation uses numeric tokens; DecimalUtils.toBigDecimal on the serialization side only receives getNano()/getNano()-style in-range values; parser.getLongValue() for integer tokens returns the parser's long directly and is not the expensive path. The ultimate arithmetic cost is in the JDK BigDecimal implementation, and later Jackson versions address it globally via StreamReadConstraints.maxNumberLength, so this snapshot relies entirely on missing local validation. Javadoc/README files contain no injection or additional relevant claims.",
+      "id": "jsr310-unbounded-decimal-dos",
+      "impact": "Denial of service: a single small request can consume gigabytes of heap and large amounts of CPU (or kill the JVM with OutOfMemoryError), making services that deserialize java.time values unavailable.",
+      "locations": [
+        {
+          "end_line": 174,
+          "path": "datetime/src/main/java/com/fasterxml/jackson/datatype/jsr310/deser/InstantDeserializer.java",
+          "start_line": 168
+        },
+        {
+          "end_line": 286,
+          "path": "datetime/src/main/java/com/fasterxml/jackson/datatype/jsr310/deser/InstantDeserializer.java",
+          "start_line": 280
+        },
+        {
+          "end_line": 57,
+          "path": "datetime/src/main/java/com/fasterxml/jackson/datatype/jsr310/deser/DurationDeserializer.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 102,
+          "path": "datetime/src/main/java/com/fasterxml/jackson/datatype/jsr310/DecimalUtils.java",
+          "start_line": 83
+        }
+      ],
+      "prerequisites": "Application registers JavaTimeModule or JSR310Module (typical for java.time support) and binds untrusted JSON to Instant/OffsetDateTime/ZonedDateTime/Duration (or the value passes through these deserializers). Default deserialization features; no size limits on individual JSON numbers; process heap/CPU can be driven by the attacker.",
+      "root_cause": "JSR-310 deserializers accept an attacker-controlled JSON number token and pass it to java.math.BigDecimal operations with no bound on exponent/scale/precision. InstantDeserializer.deserialize() calls parser.getDecimalValue() and immediately delegates to _fromDecimal(), which calls value.longValue() and DecimalUtils.extractNanosecondDecimal(value, seconds) -> value.subtract(new BigDecimal(integer)).multiply(ONE_BILLION).intValue(). DurationDeserializer has the same pattern. A tiny JSON float such as 1e999999999 parses cheaply into a BigDecimal with a huge negative scale, but converting it to long/BigInteger (and later the scale-alignment inside subtract) obliges the JDK to materialize a 10^999999999 BigInteger (hundreds of MB, extreme CPU); analogous huge positive scales/very long digit strings increase memory and CPU with attacker-chosen magnitude. No length/precision/scale validation is performed in the module before these calls, and Jackson 2.9 has no global number-length constraint (StreamReadConstraints arrived much later).",
+      "title": "Unbounded BigDecimal exponent/scale in java.time numeric deserialization can exhaust memory/CPU (DoS)",
+      "trace": "InstantDeserializer.deserialize(): case JsonTokenId.ID_NUMBER_FLOAT -> parser.getDecimalValue() (line 171) -> _fromDecimal(context, value) (line 280): long seconds = value.longValue() (line 282) then DecimalUtils.extractNanosecondDecimal(value, seconds) (line 283) -> value.subtract(new BigDecimal(integer)).multiply(ONE_BILLION).intValue() (line 101). For a value such as 1e999999999, longValue()/subtract() must scale the unscaled value by 10^999999999, allocating/processing a multi-hundred-MB BigInteger (exponentiation by squaring), stalling or OOMing the thread/process. DurationDeserializer lines 54-56 reproduce the identical flow.",
+      "unverified": "Not runtime-tested (no execution permitted), and exactly how individual JDK 8 updates shortcut longValue() saturation is implementation-dependent; the subsequent subtract/multiply in DecimalUtils.extractNanosecondDecimal (scale alignment to 10^N) is the part most likely to force huge BigInteger allocation. I did not confirm that every deployment exposes a java.time type directly to attacker-controlled numbers.",
+      "weakness_type": "CWE-400 / CWE-770 Uncontrolled Resource Consumption (denial of service)"
+    }
+  ],
+  "coverage_summary": "Source scope: 459 model-visible files; 71 Java files under src/main/java across parameter-names, datatypes, datetime (all read in full), 4 pom.xml files, 4 README.md files, .travis.yml, _config.yml, .gitattributes/.gitignore, and the remaining generated javadoc HTML/CSS/JS tree (spot-checked by searches for eval/onerror/javascript: payloads; javadoc files are stock generated output). Searches for Runtime/ProcessBuilder/readObject/ScriptEngine/System.getProperty/new String/reflection-injection patterns returned nothing suspicious. No tests are present in the snapshot (src/test directories are absent), so a test name/assertion review was not possible.",
+  "limitations": [
+    "No code execution, unit tests, fuzzing, or dependency scanning was permitted/available; the DoS lead is a static-analysis hypothesis, not runtime-confirmed.",
+    "Javadoc HTML/CSS files (most of the 459 files) were only spot-checked, not read line-by-line.",
+    "Generated PackageVersion.java files are not present in the snapshot (created at build time), so their absence/presence could not be verified.",
+    "No upstream/GitHub diff or patch metadata was accessible, so I could not confirm whether any line in the snapshot is a deviation from the matching upstream commit.",
+    "Behavior relies on JDK-internal BigDecimal fast paths that differ across JDK 8 update releases, so the precise cost of some inputs (e.g. whether longValue() saturates before the expensive scale alignment) is uncertain."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ParameterNamesAnnotationIntrospector.findParameterName(): missing null check after getParameters() (lines 39-50) -> params[i] can NPE when owner is neither constructor nor method, since getParameters() returns null (lines 52-61).",
+      "reason": "Reachability unproven: AnnotatedParameter owners in databind are AnnotatedConstructor/AnnotatedMethod, so the null branch appears defensive-only; MalformedParametersException is already caught. Robustness bug, not clearly attacker-reachable, so not submitted as the single candidate."
+    },
+    {
+      "lead": "LocalDateDeserializer numeric coercion (lines 117-119): LocalDate.ofEpochDay(getLongValue()) accepts integer tokens, which can misinterpret a plain number as an epoch day; LocalDateTime/LocalTime throw on raw integer timestamps.",
+      "reason": "Behavioral/round-trip issue rather than a security boundary violation; values are still validated by java.time (DateTimeException). No confidentiality/integrity/availability impact demonstrated."
+    },
+    {
+      "lead": "JavaTimeModule/JSR310Module _findFactory inner loop uses continue instead of skipping mismatched methods when matching ZoneId.of(String).",
+      "reason": "For ZoneId there is only one one-argument static factory of(String), so the faulty matching never selects a dangerous method; no security impact."
+    },
+    {
+      "lead": "VALUE_EMBEDDED_OBJECT branches cast parser.getEmbeddedObject() to the target temporal type without checking the class (e.g. InstantDeserializer lines 217-220).",
+      "reason": "Embedded objects are not produced from untrusted text JSON; a ClassCastException in a theoretical binary-format case is not an attacker-controlled exploit in this snapshot."
+    },
+    {
+      "lead": "Dependency on Jackson 2.9.7 BOM versions (jackson-databind/jackson-core) that have known polymorphic-deserialization gadget advisories.",
+      "reason": "The vulnerable code lives in the dependency (jackson-databind), not in this repository's snapshot, and the fix would be a version bump; I could not tie it to this repository's own source evidence. Also, no local code was observed enabling default typing."
+    }
+  ],
+  "summary": "Reviewed the assigned jackson-modules-java8 snapshot (root pom 2.9.8-SNAPSHOT; modules parameter-names, datatypes, datetime). I read every Java source file in the three modules in full (deserializers, serializers, key (de)serializers, module registration, type modifier, Optional/stream support) plus the poms, READMEs and CI/config files, and spot-checked the generated javadoc tree for injected scripts/links. The sources match the known upstream 2.9.x implementation; I found no clearly injected backdoor, unsafe reflection, command execution, file/network access, or added trust-boundary violation. The strongest source-grounded lead is an unbounded numeric-input issue in the java.time numeric deserialization path: attacker-supplied JSON float tokens are passed straight to BigDecimal APIs whose exponent/scale is not bounded, and the module then forces expensive BigInteger conversions (longValue(), subtract(...).multiply(10^9)), enabling memory/CPU exhaustion (CWE-400/CWE-770). I submit that single candidate and list the other observed quirks as rejected/unconfirmed leads."
+}

@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated API client with WRITE policy on any bucket supplies the flow object in the POST /buckets/{bucketId}/flows JSON body. BucketItem.identifier is deserialized from JSON and, when non-null, is used as the flow ID (only @NotBlank is enforced). The identifier can therefore contain '/', '..' and absolute-looking path text (e.g. '../../../../conf'). The same identifier must also appear percent-encoded in the URL for the subsequent snapshot (POST /buckets/{bucketId}/flows/{flowId}/versions) or delete (DELETE /buckets/{bucketId}/flows/{flowId}) calls because BucketFlowResource.verifyPathParamsMatchBody requires body and path IDs to match.",
+      "confidence": "medium",
+      "counterevidence_checked": "Bucket identifiers are server-generated (StandardServiceFacade.createBucket rejects a provided identifier and sets a UUID), so only the flow identifier is attacker-controlled. The Git provider sanitizes names via FileUtils.sanitizeFilename and the bundle persistence provider sanitizes bundle coordinates, which confirms the project's own convention and makes the unsanitized flow provider an outlier rather than intended behavior. Validation on the identifier is only @NotBlank, and StandardFlowSnapshotContext only enforces notBlank/version>0. verifyPathParamsMatchBody forces the URL {flowId} to equal the malicious body identifier, so the identifier cannot be silently replaced on the snapshot/delete calls. Access requires an authenticated principal with bucket WRITE (authorizeBucketAccess) plus the default filesystem persistence provider; the Database/Git providers are not affected in the same way. I could not execute Java, the Jetty/Jersey percent-encoded-slash behavior was not runtime-verified, and I could not confirm this corresponds to the repository's specific fixing commit/CVE from the snapshot alone.",
+      "id": "CAND-1",
+      "impact": "A user with only bucket-WRITE can, without any registry-internal misconfiguration: (a) cause the Registry process to recursively delete the contents of an arbitrary directory it can access (registry conf/, flow_storage, log/data directories, etc.) via cleanDirectory on the traversed flow directory; (b) write attacker-controlled content to an arbitrary directory in a file named '<positive-int>/<int>.snapshot' (directories are auto-created), which can overwrite any pre-existing file matching that pattern and plants attacker-controlled data on disk; (c) read files matching '<int>.snapshot' from arbitrary directories via the version-content endpoint. This is a confidentiality/integrity/availability compromise of the Registry host's file system from a normally low-privileged registry account.",
+      "locations": [
+        {
+          "end_line": 111,
+          "path": "nifi-registry/nifi-registry-core/nifi-registry-framework/src/main/java/org/apache/nifi/registry/provider/flow/FileSystemFlowPersistenceProvider.java",
+          "start_line": 73
+        },
+        {
+          "end_line": 161,
+          "path": "nifi-registry/nifi-registry-core/nifi-registry-framework/src/main/java/org/apache/nifi/registry/provider/flow/FileSystemFlowPersistenceProvider.java",
+          "start_line": 131
+        },
+        {
+          "end_line": 184,
+          "path": "nifi-registry/nifi-registry-core/nifi-registry-framework/src/main/java/org/apache/nifi/registry/provider/flow/FileSystemFlowPersistenceProvider.java",
+          "start_line": 181
+        },
+        {
+          "end_line": 244,
+          "path": "nifi-registry/nifi-registry-core/nifi-registry-web-api/src/main/java/org/apache/nifi/registry/web/service/StandardServiceFacade.java",
+          "start_line": 236
+        },
+        {
+          "end_line": 1201,
+          "path": "nifi-registry/nifi-registry-core/nifi-registry-web-api/src/main/java/org/apache/nifi/registry/web/service/StandardServiceFacade.java",
+          "start_line": 1190
+        },
+        {
+          "end_line": 536,
+          "path": "nifi-registry/nifi-registry-core/nifi-registry-framework/src/main/java/org/apache/nifi/registry/service/RegistryService.java",
+          "start_line": 503
+        },
+        {
+          "end_line": 624,
+          "path": "nifi-registry/nifi-registry-core/nifi-registry-framework/src/main/java/org/apache/nifi/registry/service/RegistryService.java",
+          "start_line": 620
+        },
+        {
+          "end_line": 48,
+          "path": "nifi-registry/nifi-registry-core/nifi-registry-framework/src/main/java/org/apache/nifi/registry/service/mapper/FlowMappings.java",
+          "start_line": 39
+        }
+      ],
+      "prerequisites": "NiFi Registry with the default FileSystemFlowPersistenceProvider (conf/providers.xml 'Flow Storage Directory' ./flow_storage) and the default flow persistence provider selected; attacker holds a WRITE policy on at least one bucket (the code path authorizes bucket WRITE before accepting the flow); the deployment must route percent-encoded slashes in path parameters to Jersey (Jetty 9.4.x default URI compliance accepts ambiguous path separators), or the attacker must otherwise get the traversal string into the {flowId} path parameter.",
+      "root_cause": "StandardServiceFacade.createFlow deliberately accepts a client-supplied flow identifier for backwards compatibility with NiFi (identifier is only generated when null; the existing comment notes the identifier check was removed). BucketItem.identifier is only @NotBlank-validated, so values containing path separators and '..' pass validation and are stored in the DB by RegistryService.createFlow/FlowMappings. RegistryService.createFlowSnapshot then builds a StandardFlowSnapshotContext whose flowId is that identifier, and FileSystemFlowPersistenceProvider (the default provider in conf/providers.xml) concatenates bucketId/flowId/version directly into java.io.File paths without normalization or containment verification.",
+      "title": "NiFi Registry: client-supplied flow identifier used as filesystem path allows path traversal (write/read/delete outside flow storage)",
+      "trace": "1) POST /buckets/{bucketId}/flows with body identifier='../../../../<target>' and revision.version=0 -> StandardServiceFacade.createFlow (lines 236-244) keeps the supplied identifier (only null is replaced with a UUID) -> RegistryService.createFlow (lines 325-368) -> FlowMappings.map sets FlowEntity.id from the identifier -> DatabaseMetadataService stores it. 2) POST /buckets/{bucketId}/flows/{flowId}/versions with a snapshot -> RegistryService.createFlowSnapshot loads the flow by that ID (line 566), verifies version, then builds StandardFlowSnapshotContext with flowId from snapshotMetadata (StandardFlowSnapshotContext.Builder line 151) and calls flowPersistenceProvider.saveFlowContent(context, content) (line 624). 3) FileSystemFlowPersistenceProvider.saveFlowContent builds new File(flowStorageDir, bucketId) -> new File(bucketDir, flowId) -> new File(flowDir, version) -> new File(versionDir, version + '.snapshot') and writes attacker-controlled snapshot bytes (lines 73-111), escaping the storage root via the '..' components. 4) DELETE of that flow (or of its bucket) invokes RegistryService.deleteFlow -> flowPersistenceProvider.deleteAllFlowContent(existingFlow.getBucketId(), existingFlow.getId()) (line 530), which calls org.apache.commons.io.FileUtils.cleanDirectory(flowDir) on the traversed path, deleting the entire contents of an arbitrary directory. 5) getFlowContent/getSnapshotFile (lines 114-129, 181-184) similarly read '<dir>/<version>/<version>.snapshot' and deleteFlowContent (lines 164-179) deletes it.",
+      "unverified": "Not runtime-confirmed: no build, server, or HTTP PoV was executed. The exact behavior of Jetty 9.4.50 / Jersey when a percent-encoded '/' appears in the {flowId} path parameter was not tested; if that is rejected, the snapshot/delete-triggered sinks would need another way to deliver the encoded identifier. The mapping of this bug to the dataset's ground-truth CVE/fix commit is inferred, not verified.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot (7,821 model-visible files of a 7,852-file tree; 31 sensitive-name/path exclusions; all src/test files are excluded from the visible tree, so no PoV tests could be inspected). Search-driven coverage included the c2 client/protocol modules, MiNiFi bootstrap/C2 server and framework, nifi-registry core (web-api, framework, providers, client, bundle-utils), nifi-framework/nifi-web-api, nifi-commons (security, xml-processing, web-utils), and the standard-bundle processors. I read the full call chains for the submitted finding (REST resource -> facade -> service -> persistence provider) plus the rejected leads. The 5 MiB/binary filter did not hide any non-test source I tried to read; no build, test execution, or network activity was performed.",
+  "limitations": [
+    "All src/test content is excluded from the visible snapshot, so the repository's own security tests/PoV tests and any test-only resources could not be used as evidence.",
+    "No compilation, static-analysis tool, or runtime execution was performed; conclusions are source-level only and the Jetty/Jersey percent-encoded-slash behavior required to place '..' in a path parameter was not executed/verified.",
+    "The full NiFi repository (7,800+ files across NiFi, Registry, MiNiFi, C2, toolkit) cannot be exhaustively reviewed; module selection was driven by grep hits and by known security-relevant areas, so other genuine issues may exist uninspected (e.g., large processor bundles, UI JavaScript XSS, dependency-level issues).",
+    "The mapping of this snapshot to a specific upstream fixing commit/CVE is inferred from dependency versions (Jetty 9.4.50.v20221201, Jackson 2.14.1, etc., indicating a Dec-2022 1.20.0-SNAPSHOT state) and could not be confirmed; the submitted candidate is therefore a lead, not a confirmed CVE match."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "MiNiFi C2 server FileSystemConfigurationCache.resolveChildAndVerifyParent (minifi/minifi-c2/.../FileSystemConfigurationCache.java lines 70-77, 86-113): the containment check compares child.toAbsolutePath().getParent() with the un-normalized parent, so single '..' path components pass and can escape pathRoot. Reachable unauthenticated via GET /c2/config?class=... (default authorizations.yaml allows ROLE_ANONYMOUS).",
+      "reason": "Real traversal, but the substituted path always ends with the fixed filename 'config.text.yml' (+'.v<version>'), so under the default provider only files named config.text.yml* outside the cache root can be read (and only provider-download paths can write). Impact is materially narrower than CAND-1, and no authorization boundary beyond the default-anonymous C2 endpoint is crossed."
+    },
+    {
+      "lead": "MiNiFi C2 client UpdateAssetCommandHelper.assetPersistFunction (minifi/minifi-nar-bundles/.../UpdateAssetCommandHelper.java lines 47-68) and TransferDebugOperationHandler temp-dir prefix: C2-supplied asset 'file' name is passed to Paths.get(assetDirectory, assetFileName) with no normalization, allowing arbitrary file write on the agent.",
+      "reason": "The C2 server is the configured, trusted management authority for the agent and can already push configuration that determines agent execution; the marginal privilege boundary crossed is unclear, so this is not a defensible CVE-strength finding without further threat-model evidence."
+    },
+    {
+      "lead": "NiFi Registry client ClientUtils.getExtensionBundleVersionContent (nifi-registry-client/.../ClientUtils.java lines 29-45): the filename is parsed from the server's Content-Disposition header with lastIndexOf('=') and passed straight to new File(outputDirectory, filename), so a malicious/maliciously-configured Registry can write outside the target directory.",
+      "reason": "Client-side traversal dependent on trusting a remote Registry that is already trusted to supply extension bundles (code that NiFi loads), so marginal impact is low; also no in-repo validation/containment contract to violate."
+    },
+    {
+      "lead": "Non-hardened JAXB parsing of remote/embedded XML: minifi-toolkit ConfigMain.transformTemplateToSchema (JAXBContent unmarshal of template input) reached from NiFiRestConfigurationProvider, and JAXBExtensionManifestParser.parse of NAR-contained extension-manifest.xml.",
+      "reason": "Both parse content from parties already trusted to supply executables/templates in their respective flows (configured NiFi REST source, installed NAR), so the security boundary is weak; other JAXB call sites in the snapshot were already migrated to StandardXMLStreamReaderProvider/StandardDocumentProvider."
+    },
+    {
+      "lead": "General audit of nifi-web-api authorization/parameter-reference handling (ParameterContextResource, AuthorizeControllerServiceReference) and of the C2 Jackson serializer (no polymorphic/default typing).",
+      "reason": "These areas contain recent-looking hardening (effective-value authorization, READ+WRITE checks on controller-service references, secure XML providers) and no concrete bypass was established from source within the review budget."
+    }
+  ],
+  "summary": "Apache NiFi 1.20.0-SNAPSHOT (Dec-2022-era) source review. After broad searching and tracing of attacker-controlled input into security-sensitive sinks across the NiFi core, MiNiFi/C2, and NiFi Registry modules, the strongest source-verified candidate is a path traversal in the NiFi Registry flow-persistence path: the flow identifier supplied by an API client is persisted verbatim and then used unvalidated as filesystem path components by the default FileSystemFlowPersistenceProvider. This allows an authorized (bucket-WRITE) user to make the Registry read/write/delete files outside its configured flow-storage directory. Other suspicious spots (MiNiFi C2 cache \"..\" check, C2 asset persistence, registry client Content-Disposition handling, residual JAXB parsing) were traced and are reported only as rejected/unconfirmed leads because their reachable impact or trust boundary is weaker."
+}

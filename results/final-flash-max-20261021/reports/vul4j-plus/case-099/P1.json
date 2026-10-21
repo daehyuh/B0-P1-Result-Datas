@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `s` argument to Utility.decode(s, true) is fully attacker-controlled in two realistic ways: (1) directly, for any application that decodes BCEL-encoded compressed class data; (2) internally, via org.apache.bcel.util.ClassLoader.loadClass(): a class name containing the documented `$$BCEL$$` token is passed to createClass(), which takes the substring after the token (`real_name`, ClassLoader.java:112-113) and decodes it as a compressed class (ClassLoader.java:116). Class names/strings of this shape are attacker-influenced in class-loading and deserialization-style gadget paths, and the encoded payload only needs to be a valid gzip stream with >3x expansion (e.g., DEFLATE of repeated zero bytes).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked for any earlier bound/ratio validation on the compressed stream or buffer: none exists in decode or its callers. Checked whether the exception is caught: createClass catches only IOException (ClassLoader.java:119) and loadClass has no handler, so AIOOBE escapes. Checked whether the gzip expansion ratio can actually exceed 3:1: yes, DEFLATE of highly repetitive input routinely exceeds it by orders of magnitude. Verified the write index (`count`) is bounded only by decompressed stream length and the array length is fixed at allocation time. Surfaced the more-recently-changed sibling code: the JavaReader escape handling (Utility.java:59-77) is a separate read/validation weakness (MAP_CHAR[i] indexing for `$`+char>0xFF, NumberFormatException on malformed two-char escapes) but is DoS-only and not the same root cause. Also examined and did not select the constant-pool-size gap, Code.code_length allocation, and unknown-attribute length allocation (see rejected leads).",
+      "id": "cand-1",
+      "impact": "Attacker-triggerable uncaught ArrayIndexOutOfBoundsException in a bytecode-decoding/class-loading path: denial of service (failed/crashed request or loading thread; the target class is never defined). Because Java bounds-checks array stores, there is no memory corruption or direct code execution from this flaw; the out-of-bounds store aborts with an exception. A large compressed input can additionally force a large `bytes.length * 3` allocation (secondary memory-amplification effect). If the caller catches only checked exceptions or uses a fail-open wrapper around class loading, the exception may also induce an unexpected failure/fallback path.",
+      "locations": [
+        {
+          "end_line": 668,
+          "path": "src/main/java/org/apache/bcel/classfile/Utility.java",
+          "start_line": 647
+        },
+        {
+          "end_line": 663,
+          "path": "src/main/java/org/apache/bcel/classfile/Utility.java",
+          "start_line": 656
+        },
+        {
+          "end_line": 129,
+          "path": "src/main/java/org/apache/bcel/util/ClassLoader.java",
+          "start_line": 111
+        }
+      ],
+      "prerequisites": "Application must invoke Utility.decode(..., uncompress=true) on untrusted data, or use the deprecated org.apache.bcel.util.ClassLoader with a class name containing `$$BCEL$$` (or a subclass of it that forwards untrusted names). Attacker must supply a valid gzip payload whose decompressed size exceeds 3x its compressed size; no privileges are required.",
+      "root_cause": "Utility.decode(String, boolean) allocates the decompression buffer from the compressed size, not the decompressed size: `final byte[] tmp = new byte[bytes.length * 3];` (Utility.java:658) and then copies every decoded byte with an unchecked array store `tmp[count++] = (byte) b;` (Utility.java:662). No bound check, no growth, and no relationship is enforced between the compressed and decompressed lengths, although DEFLATE can exceed a 3:1 expansion ratio arbitrarily.",
+      "title": "Unbounded gzip decompression write into fixed 3x scratch buffer in Utility.decode (out-of-bounds array write)",
+      "trace": "ClassLoader.loadClass(className) sees `className.contains(\"$$BCEL$$\")` -> createClass(className) (ClassLoader.java:152-153) -> real_name = substring after token (line 113) -> Utility.decode(real_name, true) (line 116) -> JavaReader decodes escapes into `bytes` (Utility.java:649-655) -> GZIPInputStream over `bytes`, `tmp = new byte[bytes.length * 3]` (657-658) -> loop `while ((b = gis.read()) >= 0) tmp[count++] = (byte) b;` (661-662) writes past `tmp` once decompressed size > 3x compressed size -> ArrayIndexOutOfBoundsException is thrown. createClass catches only IOException (ClassLoader.java:119-122), and loadClass has no catch, so the unchecked exception propagates out of the class-loading call.",
+      "unverified": "No runtime execution was performed, so the exception is not run-time-confirmed. The exact gzip payload (DEFLATE expansion >3x through the JavaReader-encoded string) is argued from source and DEFLATE behavior, not executed. Whether a given application actually calls Utility.decode with attacker-controlled data (or uses the deprecated BCEL ClassLoader) is deployment-dependent. The snapshot contains no test sources, so no test harness/regression assertion could be inspected.",
+      "weakness_type": "Out-of-bounds write (CWE-787) / uncaught ArrayIndexOutOfBoundsException (DoS)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 472-file snapshot (src/main/java, src/examples, src/conf, src/changes, build files). Deep-reviewed: classfile parsing/serialization (ClassParser, ConstantPool, Constant/ConstantUtf8, Attribute and subclasses, Code, Unknown, JavaClass), Utility (encode/decode/JavaReader/JavaWriter, signature helpers), generic code generation (ConstantPoolGen, InstructionList, ClassGen/MethodGen spot checks, LocalVariableGen), util (ClassLoader, JavaWrapper, ClassPath, JavaWrapper) and verifier entry points (Verifier, ControlFlowGraph spot checks). The P1 source-relation index was used only for navigation (decode callers, symbol lookup); every relation used was re-verified in source text. No test sources are present in the snapshot, and no build/test/scan was executed.",
+  "limitations": [
+    "No code was compiled, executed, or fuzzed; the out-of-bounds write and its exception are source-derived, not runtime-confirmed.",
+    "P1 index coverage is complete for the 472 files but is syntactic only (no dataflow/reachability proof); it was used for navigation, not as evidence.",
+    "The snapshot contains no src/test files, so intended behavior and any regression coverage for Utility.decode could not be inspected.",
+    "Very large classes (Pass2Verifier ~78KB, InstConstraintVisitor ~118KB, ExecutionVisitor, InstructionFactory, ClassGen/MethodGen high-complexity paths) were only spot-checked rather than exhaustively audited; an unrelated issue there cannot be excluded.",
+    "Impact is bounded to denial of service in Java (bounds-checked array store); no memory corruption or direct code execution is claimed, and no exploit payload was constructed or run."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ConstantPoolGen can grow past the JVM limit of 65535 constant-pool entries (unbounded `size *= 2` in ConstantPoolGen.adjustSize, src/main/java/org/apache/bcel/generic/ConstantPoolGen.java:563-570), and ConstantPool.dump writes the count with file.writeShort(constantPool.length) (src/main/java/org/apache/bcel/classfile/ConstantPool.java:233), which truncates for pools >65535.",
+      "reason": "Real hardening gap but no literal out-of-bounds write or read: the backing arrays grow with the index, and the consequence is a malformed/truncated generated class file (integrity/DoS on the consumer), requiring an application to generate >65535 constants from untrusted input. Impact is more speculative than the selected finding, so it was not selected."
+    },
+    {
+      "lead": "JavaReader.read() indexes MAP_CHAR[i] with an untrusted char (src/main/java/org/apache/bcel/classfile/Utility.java:64-76) when an encoded string contains '$' followed by a character >0xFF, and Integer.parseInt throws NumberFormatException for malformed two-hex-digit escapes.",
+      "reason": "Same method family as the selected candidate but a different defect (out-of-bounds read/input-validation exception, DoS-only, thrown before any state change). Not selected."
+    },
+    {
+      "lead": "Code attribute constructor allocates `new byte[code_length]` directly from the class-file field (src/main/java/org/apache/bcel/classfile/Code.java:65-66), so a crafted/negative code_length causes NegativeArraySizeException or a large allocation (OOM) while parsing an untrusted class file; Unknown/Deprecated/Synthetic attributes similarly allocate `new byte[length]` from the declared u4 length (e.g., src/main/java/org/apache/bcel/classfile/Unknown.java:80-85).",
+      "reason": "Parser allocation-amplification/DoS pattern rather than a write past a buffer; typical resource-exhaustion behavior, weaker security impact and weaker evidence of a distinct defect than the selected candidate."
+    },
+    {
+      "lead": "Spot-checked InstructionList/Select branch handling (setPositions, findHandle, getByteCode) and ClassParser/ConstantPool index handling for attacker-controlled out-of-bounds indexing.",
+      "reason": "No concrete attacker-controlled out-of-bounds access was identified in the inspected code: indices used in loops are derived from u2 counts or array sizes, constant-pool access is bounds-checked via getConstant(int,tag), and getByteCode writes to a growing ByteArrayOutputStream."
+    }
+  ],
+  "summary": "Apache Commons BCEL 6.6.0-SNAPSHOT (472 visible source files, no test sources). The strongest source-evidenced issue is a heap out-of-bounds array write in org.apache.bcel.classfile.Utility.decode(String, boolean): when the `uncompress` flag is true, a scratch buffer is sized as 3x the *compressed* input length (Utility.java:658) but the entire gzip output is copied into it with an unchecked `tmp[count++] = (byte) b` (Utility.java:662). Any payload with a DEFLATE expansion ratio above 3:1 drives `count` past `tmp.length`, producing an out-of-bounds array store / uncaught ArrayIndexOutOfBoundsException. The library itself reaches this method with attacker-controlled data: org.apache.bcel.util.ClassLoader.loadClass() routes any class name containing the documented `$$BCEL$$` token to createClass(), which calls `Utility.decode(real_name, true)` on the encoded remainder (ClassLoader.java:111-116) and only catches IOException (line 119), so the runtime exception escapes the class-loading API. Impact is denial of service in Java (no memory corruption); the same method is also public API for applications that decode untrusted BCEL-encoded class strings."
+}

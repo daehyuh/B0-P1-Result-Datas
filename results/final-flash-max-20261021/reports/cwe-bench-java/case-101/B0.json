@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The file paths are derived from S3 object keys returned by ListObjects/ListNextBatchOfObjects (S3ObjectSummary.getKey()) at line 1410-1427. Keys are attacker-influenced whenever the downloaded bucket/prefix is writable by a third party (shared/multi-tenant bucket, user-supplied objects) or when a custom/malicious S3-compatible endpoint supplies the listings. Keys with `../` segments are legal S3 object names. The destination directory itself is chosen by the application, not by the attacker.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the guard exists and blocks the plain `../../../etc/passwd`-style escape when the canonical target does not share the destination string prefix; the bypass therefore depends on selecting a prefix-matching sibling target. Checked that no additional normalization/validation exists downstream: repo-wide search shows getCanonicalPath() appears only in leavesRoot, and no other containment check exists in TransferManager, DownloadCallable, DownloadS3ObjectCallable, ServiceUtils.downloadToFile, or the crypto download modules. Checked that File(parent, child) does not reset to an absolute child path on Unix (absolute-looking keys are joined under the destination and do not trivially escape). No VCS metadata is present in the snapshot, so the upstream fix (e.g., appending a separator or using java.nio.file.Path.startsWith) could not be diffed or confirmed; the finding rests on the source semantics of the check as written, not on a confirmed CVE patch mapping.",
+      "id": "case-101-cand-1",
+      "impact": "Arbitrary file write outside the intended download directory (constrained to paths whose canonical form string-prefix-matches the destination, or unbounded when the destination canonical path is a short/root prefix). Consequences include overwriting files the application did not intend to touch (data corruption/destruction, integrity violation, potentially planting files in other directories if those paths share the prefix and are writable), which in some deployments can escalate to code execution or configuration tampering. This is an attacker-controlled remote-input-to-local-file sink in a widely used download API.",
+      "locations": [
+        {
+          "end_line": 1423,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/transfer/TransferManager.java",
+          "start_line": 1420
+        },
+        {
+          "end_line": 1477,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/transfer/TransferManager.java",
+          "start_line": 1470
+        },
+        {
+          "end_line": 1519,
+          "path": "aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/transfer/TransferManager.java",
+          "start_line": 1513
+        }
+      ],
+      "prerequisites": "1) Application calls TransferManager.downloadDirectory(bucket, prefix, destinationDirectory, ...) against a bucket/endpoint whose object keys can be chosen by the attacker. 2) A target path outside the destination whose canonical path string shares the destination's canonical-path prefix must be chosen (e.g., sibling directory named with the destination name plus a suffix, or destination with a short/root canonical path). 3) The SDK process must have write permission to that sibling path (mkdirs() is called for missing parents). No authentication or signing bypass is needed.",
+      "root_cause": "TransferManager.downloadDirectory() iterates S3 object summaries and writes each object to `new File(destinationDirectory, summary.getKey())` (line 1472) after validating the key with leavesRoot(). leavesRoot() returns `!new File(localBaseDirectory, key).getCanonicalPath().startsWith(localBaseDirectory.getCanonicalPath())` (line 1515). Because the comparison is a raw String prefix check with no path-separator boundary (e.g., no `+ File.separator` and no java.nio.file.Path.startsWith), any object key whose canonicalized path begins with the same characters as the destination directory is accepted even when it is outside that directory. Example: destination `/home/u/downloads` plus key `../downloads-evil/payload` canonicalizes to `/home/u/downloads-evil/payload`, which `startsWith(\"/home/u/downloads\")` matches, so the guard returns false and the download proceeds to that outside path. If the destination canonical path is \"/\" (or a very short prefix), the guard is effectively vacuous. The check is the only containment control in this code path; there is no second validation in prepareDownload/DownloadCallable/S3CryptoModule paths (repo-wide search for getCanonicalPath() finds only this one occurrence in main code).",
+      "title": "S3 TransferManager.downloadDirectory containment check bypass (path traversal) in aws-java-sdk-s3",
+      "trace": "Public API downloadDirectory (line 1382) -> listing loop collects S3ObjectSummary entries (lines 1397-1437) -> guard `if (leavesRoot(destinationDirectory, s.getKey()))` (line 1420) -> leavesRoot does unanchored startsWith on canonical paths (line 1515) -> for a key such as `../downloads-evil/payload` the guard evaluates false and execution continues -> `File f = new File(destinationDirectory, summary.getKey())` (line 1472) -> parentFile.mkdirs() (line 1475) -> prepareDownload(...) (line 1487) -> DownloadCallable writes the object bytes to that File (ServiceUtils.downloadToFile / DownloadCallable). Result: file write outside the requested destination directory.",
+      "unverified": "Not executed or reproduced (read-only review). The exact set of prefix-matching escape targets depends on the runtime destination path and filesystem (case-insensitive/symlink behavior). The CVE-to-commit mapping (e.g., CVE-2022-31159) is inferred from the snapshot version/date and was not verifiable without network/VCS access; the code-level flaw itself is directly visible in the cited lines.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-184 Incomplete List of Disallowed Inputs (unsound path-containment validation)"
+    }
+  ],
+  "coverage_summary": "Snapshot: aws-sdk-java v1 monorepo, 111,341 text source files (version 1.12.260 per root pom and CHANGELOG top entry dated 2022-07-13). No test sources are present in the snapshot (src/test listings are empty), so only main/generator sources were reviewable. I focused on the hand-written security-relevant core (aws-java-sdk-core) and S3 (aws-java-sdk-s3) modules plus SNS message validation, and ran cross-repository searches for XXE/XML factories, deserialization (ObjectInputStream/XMLDecoder/Jackson default typing), process execution, TLS trust/hostname verification, randomness, credential handling (IMDS/container/process/profile), presigning, canonical request/signing, and file-writing sinks (FileOutputStream/RandomAccessFile/createTempFile/getCanonicalPath/mkdirs/getKey-derived paths). Tracing the file-write sinks led to the TransferManager downloadDirectory/leavesRoot finding, which is the single candidate submitted. The roughly 300 generated service modules were not exhaustively read line-by-line.",
+  "limitations": [
+    "No VCS history, diff, or patch is available in the snapshot, so the vulnerable/fixed relationship and any CVE mapping (e.g., CVE-2022-31159) could not be verified; the finding is based on the semantics of the code as written.",
+    "No execution, tests, or scanners were run (read-only review); no runtime confirmation of exploitability.",
+    "The snapshot contains no test sources, so intended-behavior or regression tests could not be consulted.",
+    "Large parts of the repository (hundreds of generated service clients/models, code generator, bundle/OSGi packaging) were only searched, not exhaustively reviewed; an injected or previously unknown issue in an unreviewed module cannot be excluded.",
+    "The TransferManager bypass is constrained: it requires a destination-prefix-matching sibling target (or a short/root destination path) and write permission at that target, and it requires the application to run downloadDirectory against attacker-influenced object keys."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ApacheConnectionManagerFactory.TrustingSocketFactory/TrustingX509TrustManager trusts all certificates (aws-java-sdk-core/src/main/java/com/amazonaws/http/apache/client/impl/ApacheConnectionManagerFactory.java lines 139-145, 208-227).",
+      "reason": "Trust-all is only reachable when SDKGlobalConfiguration.isCertCheckingDisabled() is true, which requires the documented, non-default system property `com.amazonaws.sdk.disableCertChecking`; the code logs a warning and the property is explicitly documented as test-only. Not attacker-controlled and not a vulnerability by itself."
+    },
+    {
+      "lead": "ProcessCredentialsProvider executes a configured command via `sh -c`/`cmd.exe /C` (aws-java-sdk-core/src/main/java/com/amazonaws/auth/ProcessCredentialsProvider.java lines 64-78, 209-214).",
+      "reason": "Command originates from the local AWS profile's documented `credential_process` setting (local trust boundary), matching AWS CLI behavior. No remote/attacker-controlled path to the command was identified."
+    },
+    {
+      "lead": "AmazonHttpClient follows server-supplied 307 Location and rebuilds/re-signs the request for the redirect host (aws-java-sdk-core/src/main/java/com/amazonaws/http/AmazonHttpClient.java lines 1401-1415, 1998-2003, 2027-2028).",
+      "reason": "This is the intentional S3 cross-region redirect mechanism; the request is re-signed for the redirect URI (the secret key is never transmitted) and no containment/allow-list was expected by the design comment. Could allow outbound requests to a hostile host on custom endpoints, but no credential/secret disclosure or source-evidenced exploit chain was established; rejected as a weaker lead than the TransferManager issue."
+    },
+    {
+      "lead": "SNS message verification (SignatureVerifier, SigningCertUrlVerifier, SnsMessageManager).",
+      "reason": "Checks are present and coherent: HTTPS-only, host pinned to the expected SNS endpoint, certificate validity and CN verified with DefaultHostnameVerifier, signature checked via SignatureChecker before unmarshalling. No bypass found in the reviewed code."
+    },
+    {
+      "lead": "XXE in XML parsing utilities (XmlUtils, XpathUtils, RegionMetadataParser) and Jackson usage.",
+      "reason": "XmlUtils disables DTD and external entities; XpathUtils/RegionMetadataParser disable doctype/external general and parameter entities, XInclude, and entity expansion (with explicit XXE-hardening code). No polymorphic/default typing usage found (`enableDefaultTyping` absent). No evidence of a bypass in the reviewed code."
+    },
+    {
+      "lead": "Path traversal when a caller supplies the destination file itself (AmazonS3Client.getObject(..., File), ServiceUtils.downloadToFile, ProfilesConfigFileWriter stash files).",
+      "reason": "In these paths the file path is chosen by the application, not derived from remote keys; stash names use UUID.randomUUID(). No remote-input-to-path issue established."
+    }
+  ],
+  "summary": "Reviewed the aws-java-sdk v1 snapshot (pom/CHANGELOG identify version 1.12.260, 2022-07-13) as a defensive source review. The strongest traceable issue found is in the S3 TransferManager directory-download path: object keys returned by the service are used directly to build local file paths, and the only containment guard (`leavesRoot`) is an unsound string-prefix check on canonical paths (`startsWith` without a separator boundary). A crafted key that resolves to a sibling path sharing the destination's path prefix (e.g., `../<dest-name>-evil/payload`) passes the guard and is written outside the requested destination directory. Other reviewed areas (XXE hardening, JSON parsing, TLS setup, SNS message signature verification, S3 crypto, credential providers, presigning) showed expected/engineered behavior; those leads are listed as rejected. Candidate status is a lead only; no runtime verification was performed."
+}

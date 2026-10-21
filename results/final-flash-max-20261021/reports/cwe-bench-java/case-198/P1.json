@@ -1,0 +1,112 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client able to authenticate to the Emissary HTTP server (Digest auth; the shipped config src/main/config/jetty-users.properties defines the default account emissary with password emissary123, which is also documented in README.md, and the 'emissary' role satisfies EmissaryServer.buildSecurityHandler's auth constraint). The attacker must also be able to run an HTTP endpoint that answers POST /emissary/WorkSpaceClientSpaceTake.action, and must know a pick-up space namespace key (e.g. 'http://host:port/FilePickUpClient'), which is exposed by the authenticated directory/places APIs (e.g. /emissary/TransferDirectory.action, /api/places). All exploited strings (workSpaceName, and inside the returned XML: workFileName, outputRoot, eatPrefix, errorCount) are form/XML values supplied by the attacker.",
+      "confidence": "medium",
+      "counterevidence_checked": "The endpoints are not unauthenticated: EmissaryServer.buildSecurityHandler maps '/*' to a Digest constraint (EmissaryServer lines 557-580) so an attacker needs credentials; the shipped default credentials are weak/documented but operators are expected to change them. The file-operation path requires an IPickUpSpace: FilePickUpClient (CLUSTER mode) qualifies while the standalone FilePickUpPlace does not (the Namespace lookup cast in openTheSpace would fail), so standalone-only deployments are not affected. Renames are best-effort: cross-device moves fail and are logged/skipped, and the process needs read permission on the source file plus write permission on the target directory. The framework intentionally trusts bundles received from configured workspaces, so the key missing control is (a) absence of any check that the caller/spaceName is a configured workspace, in contrast to RegisterPeerAction/HeartbeatAdapter which call isStaticPeer, and (b) absence of path canonicalization for bundle paths even when the workspace is legitimate. No build, tests, or exploit code were run, so all behavior is inferred from source only.",
+      "id": "emissary-workspace-bundle-path-traversal",
+      "impact": "As the Emissary service account: arbitrary file read (content is loaded into the processing pipeline and written by output filters / potentially forwarded to peers), arbitrary file move/relocation and arbitrary directory creation outside the holding/done areas (renameTo), and arbitrary file deletion (move to holding area then delete, or delete in place). This is a confidentiality, integrity and availability impact on the host, and it is reachable from the network through authenticated HTTP endpoints. The same root cause gives SSRF (server makes POSTs to an arbitrary URL) and exposure of the Digest response for the Emissary account to an attacker-controlled host.",
+      "locations": [
+        {
+          "end_line": 61,
+          "path": "src/main/java/emissary/server/mvc/internal/WorkSpaceClientOpenWorkSpaceAction.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 183,
+          "path": "src/main/java/emissary/pickup/PickUpSpace.java",
+          "start_line": 84
+        },
+        {
+          "end_line": 79,
+          "path": "src/main/java/emissary/server/mvc/adapters/WorkSpaceAdapter.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 680,
+          "path": "src/main/java/emissary/pickup/WorkBundle.java",
+          "start_line": 623
+        },
+        {
+          "end_line": 294,
+          "path": "src/main/java/emissary/pickup/file/FilePickUpClient.java",
+          "start_line": 211
+        },
+        {
+          "end_line": 203,
+          "path": "src/main/java/emissary/pickup/file/FilePickUpClient.java",
+          "start_line": 171
+        },
+        {
+          "end_line": 451,
+          "path": "src/main/java/emissary/pickup/PickUpPlace.java",
+          "start_line": 384
+        },
+        {
+          "end_line": 482,
+          "path": "src/main/java/emissary/pickup/PickUpPlace.java",
+          "start_line": 475
+        },
+        {
+          "end_line": 143,
+          "path": "src/main/java/emissary/client/EmissaryClient.java",
+          "start_line": 134
+        }
+      ],
+      "prerequisites": "1) An IPickUpSpace implementation (FilePickUpClient, used in CLUSTER mode via src/main/config/places-CLUSTER.cfg) is running. 2) The attacker can authenticate (default/shipped credentials, any compromised node account, or a weak shared password). 3) The attacker controls a server reachable from the Emissary node. 4) For the file-operation impact, the targeted source file must exist/be readable and the rename target must be on the same filesystem with sufficient directory permissions; failed renames are logged and skipped. Digest credential exposure additionally requires the attacker server to issue a Digest challenge.",
+      "root_cause": "The work-space client protocol trusts both the workspace identity and the bundle contents. /emissary/WorkSpaceClientOpenWorkSpace.action (openSpaceWorker -> openTheSpace) takes the caller-supplied spaceName and calls IPickUpSpace.openSpace(spaceName) with no check that the caller/name is a configured workspace. PickUpSpace stores that arbitrary name, and the polling thread later calls WorkSpaceAdapter.outboundWorkSpaceTake(), which derives the target URL with KeyManipulator.getServiceHostUrl(space) and parses the HTTP response into a WorkBundle. WorkBundle.buildWorkBundle() accepts workFileName, outputRoot and eatPrefix with no validation, and FilePickUpClient/PickUpPlace then build local paths by string concatenation (new File(path), new File(holdingArea + \"/\" + base), new File(outputRoot + \"/\" + base)) without canonicalization or confinement checks, so absolute paths and '..' segments escape the intended holding/done/error areas.",
+      "title": "Path traversal / arbitrary file operations via attacker-controlled WorkBundle consumed by FilePickUpClient (enabled by unvalidated workspace URL in WorkSpaceClientOpenWorkSpace.action)",
+      "trace": "1) POST /emissary/WorkSpaceClientOpenWorkSpace.action with pickUpClientName='INITIAL.FILE_PICK_UP_CLIENT.INPUT.<pickup namespace key>' and workSpaceName='WORKSPACE.WORK_SPACE.INPUT.http://attacker/' -> WorkSpaceClientOpenWorkSpaceAction.openTheSpace (lines 49-60) looks up the client and calls openSpace(spaceName) with no peer/allowlist check. 2) PickUpSpace.openSpace (84-94) stores the attacker name; QueServer.run (src/main/java/emissary/pickup/QueServer.java lines 87-90) sees getSpaceCount()>0 and calls space.take(); PickUpSpace.take (143-183) calls tpa.outboundWorkSpaceTake(openSpaceName, myKey). 3) WorkSpaceAdapter.outboundWorkSpaceTake (59-79) builds the URL via KeyManipulator.getServiceHostUrl(space) ('http://attacker/') and POSTs with the shared HttpClient, then WorkBundle.buildWorkBundle(response) parses the attacker XML. Because EmissaryClient registers credentials for AuthScope(ANY_HOST,-1) (EmissaryClient lines 134-143), a Digest challenge from the attacker host is answered with the Emissary account's digest response (offline-crackable / credential exposure), and arbitrary internal hosts can be contacted (SSRF). 4) The parsed bundle is enqueued (PickUpSpace.take lines 170-178) and FilePickUpClient.processBundle (211-294) runs: path = bundle workFileName -> new File(path) (line 224); getInProcessFileNameFor (PickUpPlace 411-423) computes base by stripping the bundle eatPrefix, possibly throwing if shorter, then returns new File(holdingArea + \"/\" + base); renameToInProcessAreaAs (432-450) does dest.getParentFile().mkdirs() and source.renameTo(dest), so absolute paths or '..' segments escape the holding area (arbitrary move / directory creation / relocation of files the process can read). findFileInHoldingArea (FilePickUpClient 171-203) has the same concatenation pattern. 5) processDataFile (PickUpPlace 295-332) reads the file content into an agent (handleSimplePayload uses Executrix.readDataFromFile) for arbitrary file read into the pipeline, then calls handleFileSuccess(theFile, bundle outputRoot); renameFileToDoneArea (PickUpPlace 384-402) builds new File(outputRoot + \"/\" + base) from the attacker outputRoot (second arbitrary move), and when outputRoot is null deleteFileFromHoldingArea (475-482) deletes the file (arbitrary file deletion/availability impact).",
+      "unverified": "Runtime reachability and permission-dependent success of the renames were not executed/confirmed. It is unverified whether production deployments keep the shipped default credentials; if strong credentials are enforced, the attacker needs an authenticated account or a compromised node. The digest-credential exposure requires the attacker host to issue a Digest challenge and the HttpClient's any-host AuthScope behavior was inferred from source, not observed. Whether the read file content can be retrieved by the attacker depends on deployment output configuration and network reachability of output locations.",
+      "weakness_type": "CWE-22 Path Traversal (externally controlled file path); secondary CWE-918 SSRF and credential exposure via the same root cause"
+    }
+  ],
+  "coverage_summary": "Inspected the source tree at 516 readable files (407 Java under src/main/java, plus configs/resources/workflows). P1 relation scope: 450/516 files indexed, 407 Java files parsed with 0 parse errors, 66 source files omitted from the index (non-Java/resource/empty files), and the index explicitly reports no control-flow, no data-flow, and no semantic resolution; all indexed edges are syntactic candidates and were verified against source text before use. Reviewed the request-handling surface (all @Path endpoints in emissary.server.api / emissary.server.mvc / internal), the pickup/work-space protocol (PickUpPlace, PickUpSpace, FilePickUpClient, WorkSpace, WorkBundle, QueServer, FileDataServer), output path handling (DropOffUtil, AbstractFilter/DataFilter/JSON/XML filters, JournaledCoalescer), XML utilities (SaferJDOMUtil/JDOMUtil), command execution (Executrix, UnixCommandPlace, MultiFileUnixCommandPlace), client/HTTP code (EmissaryClient, HTTPConnectionFactory, adapters), directory/heartbeat/registration code, JNI repository, and server security configuration (EmissaryServer, jetty-users.properties, Docker/Helm/workflow files). No build or tests were run (no test sources are present in the snapshot, and src/main/resources/templates referenced by the MVC layer are not in the snapshot).",
+  "limitations": [
+    "No execution, build, tests, scanners, or runtime confirmation were performed; all claims are source-level inferences.",
+    "The P1 index is partial (450/516 files, 407 Java parsed, 9781 unresolved calls) and provides no control-flow or data-flow; unindexed files (66) and non-Java files were only inspected by direct reading.",
+    "The digest-authentication barrier and default-credential assumption depend on deployment configuration; the shipped defaults may be changed by operators.",
+    "Rename/move success depends on filesystem layout and process permissions and was not verified at runtime.",
+    "MVC mustache templates are absent from the snapshot, so any XSS/HTML-output paths in emissary.server.mvc could not be fully assessed.",
+    "Dependency versions in pom.xml were not deeply assessed for known CVEs, and no external vulnerability data was consulted."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE in JDOM-based parsing (CWE-611)",
+      "reason": "SaferJDOMUtil disables doctypes and external entities, and DirectoryXmlContainer/WorkBundle are the only string-XML parse sites; JDOMUtil.createDocument has no main-code callers."
+    },
+    {
+      "lead": "Command injection in Executrix/UnixCommandPlace/MultiFileUnixCommandPlace (CWE-78)",
+      "reason": "The executed command string comes from place configuration (EXEC_COMMAND); temp paths are generated internally and replacements use generated temp names, not request/payload data."
+    },
+    {
+      "lead": "Output path traversal via DropOffUtil TARGETBIN / view names (CWE-22)",
+      "reason": "Plausible but requires payload metadata manipulation (TARGETBIN, view names) that is normally set from trusted feeder paths or place configuration; weaker/less direct attacker control than the work-bundle chain, which is the same class of bug but network-controlled."
+    },
+    {
+      "lead": "Path traversal in /api/configuration/{name}",
+      "reason": "Configs.validate rejects blank, backslash, slash, '..', and trailing-dot names before ConfigUtil is called."
+    },
+    {
+      "lead": "Runtime.getRuntime().exec(args[1]) in WatcherThread",
+      "reason": "Standalone main() utility class; command comes from its own command line and it is not reachable from server or payload processing code (no callers)."
+    },
+    {
+      "lead": "Hardcoded/default credentials and https.useNoopHostnameVerifier=true in sample configs (CWE-798/CWE-295)",
+      "reason": "Configuration defaults shipped for sample deployments (documented in README) rather than a code-level flaw; mentioned only as an enabling condition for the candidate."
+    },
+    {
+      "lead": "EnvironmentAction / Environment exposure of system properties and env vars (CWE-200)",
+      "reason": "Authenticated, by-design admin console action; information disclosure but not an attacker-controlled sink and less severe than the candidate."
+    },
+    {
+      "lead": "JournalEntry.deserialize reads unbounded keyLen (possible OOM/NegativeArraySizeException)",
+      "reason": "Journal files are produced locally in the output directory and are not an attacker-supplied input in the reviewed flows."
+    },
+    {
+      "lead": "GitHub Actions script injection in cherrypick.yml/create-patch-branch.yml",
+      "reason": "Requires repository write permissions to trigger workflow_dispatch; CI-level issue outside the Java application trust boundary and not in the P1-indexed scope."
+    }
+  ],
+  "summary": "Reviewed the Emissary (gov.nsa.emissary 8.24.0-SNAPSHOT) source snapshot. The strongest, most source-evidenced issue is a trust-boundary failure in the distributed pick-up protocol: the authenticated endpoint /emissary/WorkSpaceClientOpenWorkSpace.action accepts a caller-supplied work-space name without checking it is a configured peer, causing a local FilePickUpClient to POST to an attacker-chosen URL and consume an attacker-authored WorkBundle whose workFileName/outputRoot/eatPrefix values are then used to build local file paths without canonicalization. This yields path traversal (arbitrary file read into the processing pipeline, arbitrary file move/directory creation, arbitrary file deletion as the Emissary account) plus SSRF and digest-credential exposure to the attacker's host. Other plausible leads were checked and rejected (details below). No runtime testing was performed; this is a source-level lead only."
+}

@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The classpath entry path/URL comes directly from job/tool configuration (ClasspathEntry DataBoundConstructor, line 64, via SecureGroovyScript's classpath list). Any user who can save a configuration containing such a field controls the URL, including http(s)://, file://, jar:http://..., etc.",
+      "confidence": "low",
+      "counterevidence_checked": "ScriptApproval.checking(ClasspathEntry) (lines 706-715) explicitly avoids hashClasspathEntry and documents that downloading is 'an attractive DoS vector' without an appropriate permission check, showing the authors were aware of the risk in the form-validation path; however, the configuring() path (reached on job save) still downloads. The fetched response body is only hashed and never returned to the requester (blind), and class directories are rejected (lines 726-730), which limits exfiltration and local-file usefulness. Configuration save itself requires item-level permission, so this may be viewed as an accepted trade-off of the classpath feature rather than an unauthenticated issue.",
+      "id": "classpath-url-fetch-ssrf",
+      "impact": "Blind SSRF from the Jenkins controller against internal-only HTTP services (the body is not returned, but requests with side effects/GET-based actions are issued), plus denial of service: no connect or read timeout and read-until-EOF means a hostile or slow endpoint can hold request/executor threads, and repeated configuration saves/builds can amplify this. It also provides a weak oracle (different hash/pending vs approved state) about reachable URL content for administrators, and lets arbitrary absolute local file paths be read (and discarded) by the controller process.",
+      "locations": [
+        {
+          "end_line": 82,
+          "path": "src/main/java/org/jenkinsci/plugins/scriptsecurity/scripts/ClasspathEntry.java",
+          "start_line": 68
+        },
+        {
+          "end_line": 242,
+          "path": "src/main/java/org/jenkinsci/plugins/scriptsecurity/scripts/ScriptApproval.java",
+          "start_line": 229
+        },
+        {
+          "end_line": 336,
+          "path": "src/main/java/org/jenkinsci/plugins/scriptsecurity/scripts/ScriptApproval.java",
+          "start_line": 315
+        },
+        {
+          "end_line": 694,
+          "path": "src/main/java/org/jenkinsci/plugins/scriptsecurity/scripts/ScriptApproval.java",
+          "start_line": 652
+        },
+        {
+          "end_line": 744,
+          "path": "src/main/java/org/jenkinsci/plugins/scriptsecurity/scripts/ScriptApproval.java",
+          "start_line": 724
+        },
+        {
+          "end_line": 155,
+          "path": "src/main/java/org/jenkinsci/plugins/scriptsecurity/sandbox/groovy/SecureGroovyScript.java",
+          "start_line": 146
+        },
+        {
+          "end_line": 418,
+          "path": "src/main/java/org/jenkinsci/plugins/scriptsecurity/sandbox/groovy/SecureGroovyScript.java",
+          "start_line": 402
+        }
+      ],
+      "prerequisites": "A user with permission to configure an item or configuration that stores a SecureGroovyScript/ClasspathEntry (Item/Configure-level access, not Jenkins.ADMINISTER), and a reachable target URL from the controller. No approval is required for the initial fetch: ScriptApproval.configuring downloads before deciding whether to add the entry to the pending list. The same fetch also happens on each script evaluation via SecureGroovyScript.evaluate -> using(entry), and getApprovedClasspathEntries/isEntryApproved surfaces per-URL rendering data to admins.",
+      "root_cause": "ClasspathEntry accepts any URL (ClasspathEntry.pathToURL, lines 68-82) and the approval check hashes the entry by fully reading it from the URL (ScriptApproval.Hasher.hashClasspathEntry, lines 229-242, called from checkAndConvertApprovedClasspath, lines 315-336). ScriptApproval.configuring(ClasspathEntry, ApprovalContext) (lines 652-694) invokes that check when a configuration is saved, and ScriptApproval.using(ClasspathEntry) (lines 724-744) does so on every evaluation; SecureGroovyScript.configuring (lines 146-155) and SecureGroovyScript.evaluate (lines 402-418) drive these calls. There is no allowlist of URL schemes/hosts and no connect/read timeout, so a user able to configure a script with classpath entries can force the controller to issue GETs to arbitrary internal URLs (or read arbitrary absolute local files, which are discarded after hashing) even if the entry is never approved.",
+      "title": "Controller-side URL fetch (blind SSRF / unbounded read) when configuring or using a ClasspathEntry",
+      "trace": "Job/config save -> SecureGroovyScript(configuring...) -> ScriptApproval.configuring(ClasspathEntry, ApprovalContext) -> checkAndConvertApprovedClasspath(entry.getURL()) -> DEFAULT_HASHER.hashClasspathEntry(url) -> url.openStream() read until EOF -> content discarded, hash stored/compared. Independently, SecureGroovyScript.evaluate -> ScriptApproval.using(entry) repeats the download before the URL is passed to ClasspathURLClassLoader.",
+      "unverified": "Whether the deployed Jenkins and calling plugins invoke SecureGroovyScript.configuring on save with an unprivileged (non-admin) user in the benchmark environment; whether isEntryApproved is invoked from Jelly view rendering (views absent from this snapshot); actual network behavior/timeouts and SSRF impact were not executed or runtime-confirmed; the benchmark's intended finding may instead be a sandbox-bypass issue that I could not substantiate from the visible code.",
+      "weakness_type": "Server-Side Request Forgery (CWE-918) / uncontrolled resource consumption on unauthenticated-to-admin fetch path"
+    }
+  ],
+  "coverage_summary": "All 49 model-visible files were listed and the security-relevant Java sources were read: sandbox (SandboxInterceptor, GroovyCallSiteSelector, GroovySandbox, ClassLoaderWhitelist, SandboxResolvingClassLoader, RejectASTTransformsCustomizer, SecureGroovyScript), whitelists (Whitelist, EnumeratingWhitelist, StaticWhitelist, ProxyWhitelist, AclAwareWhitelist, AnnotatedWhitelist, Jenkins/Generic/Blanket/Abstract), and scripts (ScriptApproval, ClasspathEntry, ApprovalContext, languages, listener/note/link), plus resources JS/properties. The P1 relation index reports 49/49 indexed files, 605 symbols, 1139 edges, no missing sources, but is syntactic navigation only. It contains no tests and no SAST findings.",
+  "limitations": [
+    "Snapshot omits src/test, Jelly views, and the whitelist definition resources (jenkins-whitelist, generic-whitelist); behavior of pre-approved signatures and view-level permission checks could not be verified.",
+    "No build, tests, or dynamic analysis were run (as required); the SSRF/DoS lead is source-reasoned, not runtime-confirmed.",
+    "The P1 index is syntactic/navigation-only and does not prove call reachability, data flow, or which plugin calls SecureGroovyScript.configuring/evaluate in a given Jenkins deployment.",
+    "Exact upstream version/patch state could not be compared against external references; dependency code (groovy-sandbox 1.32, Groovy runtime via Jenkins BOM) is not in the snapshot and was not reviewed, so sandbox bypasses residing in dependencies cannot be excluded.",
+    "Permission required to save a configuration containing a classpath entry depends on external plugins not present in the snapshot; impact of the URL-fetch path could therefore range from low to moderate."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Sandbox bypass candidates in SandboxInterceptor/GroovyCallSiteSelector (e.g., Script binding property reads returning super without a whitelist check at SandboxInterceptor lines 264-271; NUMBER_MATH_NAMES shortcut at lines 97-100; DGM/Map-closure/invokeMethod dispatch at lines 102-158)",
+      "reason": "Every one of these paths matches the documented sandbox design and the whitelist contract in Whitelist.permitsMethod ('call site selection is the responsibility of the caller'). No attacker-controlled chain in which a non-whitelisted JVM member is actually invoked could be traced in source; a bypass claim would be speculation without runtime confirmation."
+    },
+    {
+      "lead": "ScriptApproval AJAX/@JavaScriptMethod endpoints missing permission checks",
+      "reason": "All mutating JavaScriptMethods (approveScript, denyScript, approveSignature, aclApproveSignature, classpath approve/deny/clear, etc., lines 964-1239) call Jenkins.get().checkPermission(Jenkins.ADMINISTER). getClasspathRenderInfo (lines 1169-1181) has no explicit check but only exposes pending/approved paths and hashes; no concrete impact established."
+    },
+    {
+      "lead": "ProxyWhitelist reset/cache propagation (reset/addWrapper/precache, lines 78-182) could leave stale allow entries after approvals are removed",
+      "reason": "Traced reset propagation and cache invalidation (clearCache on EnumeratingWhitelist delegates, wrapper propagation); found no concrete scenario that yields a stale positive decision after an approval is removed."
+    },
+    {
+      "lead": "ClassLoaderWhitelist synthetic-member filters (isIllegalSyntheticField/Method/Constructor, lines 54-103) could admit unintended compiler-generated members",
+      "reason": "Conditions correspond exactly to the documented exclusions (this$ outer refs, enum $VALUES/$INIT, anonymous-class synthetic constructors); no additional dangerous synthetic member identified."
+    },
+    {
+      "lead": "Default approved-signature resources (jenkins-whitelist, generic-whitelist) may contain dangerous pre-approved signatures",
+      "reason": "Those resource files are absent from the assigned snapshot, so their contents cannot be inspected; this is a coverage gap, not evidence of a finding."
+    }
+  ],
+  "summary": "Reviewed all 49 model-visible files of the script-security snapshot (main Java sources plus a few resources; no tests, no Jelly views, and no whitelist definition resources are present). The strongest source-evidenced issue is a controller-side URL-fetch path in the classpath-entry approval subsystem: whenever a ClasspathEntry is configured (not even approved) or used during evaluation, ScriptApproval downloads the URL contents with no scheme/host restriction and no timeouts in order to hash them. This is reachable from a user who can configure a field backed by SecureGroovyScript/ClasspathEntry, and is a blind SSRF / DoS vector from the Jenkins controller. The sandbox interceptor and call-site selector were examined closely for a concrete sandbox bypass; the visible code matches the documented upstream design and no attacker-controlled bypass chain could be substantiated from source alone, so only the classpath-fetch lead is submitted, with low confidence."
+}

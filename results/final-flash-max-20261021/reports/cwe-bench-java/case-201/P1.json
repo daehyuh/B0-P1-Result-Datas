@@ -1,0 +1,95 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The value is supplied by the client in the custom index options, e.g. `CREATE CUSTOM INDEX <name> ON <ks>.<table>(...) USING 'com.stratio.cassandra.lucene.Index' WITH OPTIONS = {'directory_path':'<controlled path>', 'schema':'{...}'}` (the builder library exposes exactly this data path: `Index.directoryPath(String)` -> `option(sb, \"directory_path\", directoryPath)` inside the generated CQL statement, without escaping or validation). No escaping/normalization is applied server-side by `IndexOptions.parsePath`.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that this is not blocked anywhere in-repo: IndexOptions.validate (the Cassandra validation hook) calls parsePath only to parse the value, never rejecting or normalizing it, and it explicitly omits other checks; there is no allow-list, no `toRealPath`/`normalize`/startsWith(dataDir) containment test, and no restriction on the option name anywhere in plugin/ (IndexOptions.scala:159-170). Verified the deletion sink really is recursive (org.apache.commons.io.FileUtils.forceDelete) and is reached from the index invalidation task rather than from a benign path (FSIndex.scala:145, PartitionedIndex.scala:101, Index.scala:166-169, IndexService.scala:218-229). Verified the default path branch uses the table's data directory (Directories.getDirectoryForNewSSTables + 'lucene' + index name), which shows the option is the deviation from the intended location. Note the option is a documented feature (javadoc 'The path of the directory where the index files will be stored') and the builder advertises it, so this is a deliberate-but-unvalidated data path, not a hidden backdoor; I could not verify at runtime how Cassandra treats such option values, and the framework-side trust model for index options is assumed rather than proven.",
+      "id": "case-201-directory-path-traversal",
+      "impact": "Filesystem write outside the cluster's data directory plus recursive deletion of an arbitrary directory owned by the Cassandra process. A path such as the node's data directory, a keyspace/table data directory, the Cassandra config directory, or a log directory causes large-scale data/config destruction (availability/integrity loss) when the index is dropped; if the path is the node's data directory, the deletion also destroys data of tables unrelated to the index. No escalation gadget is needed - the destructive operation is unconditional in the index teardown code. Severity is bounded by the requirement to hold index-creation (ALTER) privilege on the table.",
+      "locations": [
+        {
+          "end_line": 170,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/IndexOptions.scala",
+          "start_line": 159
+        },
+        {
+          "end_line": 126,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/IndexOptions.scala",
+          "start_line": 114
+        },
+        {
+          "end_line": 72,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/index/FSIndex.scala",
+          "start_line": 59
+        },
+        {
+          "end_line": 146,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/index/FSIndex.scala",
+          "start_line": 143
+        },
+        {
+          "end_line": 103,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/index/PartitionedIndex.scala",
+          "start_line": 100
+        },
+        {
+          "end_line": 229,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/IndexService.scala",
+          "start_line": 218
+        },
+        {
+          "end_line": 169,
+          "path": "plugin/src/main/scala/com/stratio/cassandra/lucene/Index.scala",
+          "start_line": 166
+        },
+        {
+          "end_line": 100,
+          "path": "builder/src/main/java/com/stratio/cassandra/lucene/builder/index/Index.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 263,
+          "path": "builder/src/main/java/com/stratio/cassandra/lucene/builder/index/Index.java",
+          "start_line": 245
+        }
+      ],
+      "prerequisites": "The client must be allowed to create a custom index on the table (Cassandra requires ALTER on the table for CREATE/DROP INDEX); the option value is stored in the table's index metadata and re-read at runtime. The Cassandra OS user must have write/delete permission on the chosen path (typically true for its own data/config directories). The destructive step (recursive deletion) is triggered when the index is invalidated/dropped (Index.getInvalidateTask -> IndexService.delete -> PartitionedIndex/FSIndex.delete).",
+      "root_cause": "The index option `directory_path` is taken verbatim from the CQL index options and passed to `Paths.get(...)` with no canonicalization, no whitelist and no containment check against the Cassandra data directory. `IndexOptions.validate` (invoked by Cassandra through `Index.validateOptions` when the custom index is created) only calls `parsePath(...)` to make sure the string parses; it performs no path validation at all. The resulting Path becomes the Lucene filesystem root (`FSDirectory.open(path)` + IndexWriter) and is also the argument of `FileUtils.forceDelete(path.toFile)` when the index is closed/deleted, so dropping the index recursively deletes that whole directory tree.",
+      "title": "Unvalidated `directory_path` index option lets the index directory (and later recursive deletion) escape the Cassandra data directory (path traversal / arbitrary directory write and deletion)",
+      "trace": "CQL CREATE CUSTOM INDEX WITH OPTIONS={'directory_path': X} -> Index.validateOptions (Index.scala:377-389) -> IndexOptions.validate (IndexOptions.scala:114-126) -> parsePath -> `options.get(DIRECTORY_PATH_OPTION).map(Paths.get(_))` (IndexOptions.scala:159-170): X is accepted unchanged. At index instantiation, IndexOptions.path (line 68) is passed to `new PartitionedIndex(..., options.path, ...)` (IndexService.scala:78-85), and FSIndex.init creates `new NRTCachingDirectory(FSDirectory.open(path), ...)` with an IndexWriter in CREATE_OR_APPEND mode (FSIndex.scala:64-72), writing Lucene files under X (for partitioned indexes, under X + separator + partition number). On index invalidation, Index.getInvalidateTask (Index.scala:166-169) calls IndexService.delete (IndexService.scala:218-229), which calls lucene.delete -> PartitionedIndex.delete (line 101) `FileUtils.forceDelete(path.toFile)` when partitions > 1, or FSIndex.delete (line 145) `FileUtils.forceDelete(path.toFile)`, recursively removing the attacker-chosen directory.",
+      "unverified": "Not runtime-confirmed: no build/test execution and no Cassandra node was available, so the exact behaviour of FSDirectory/IndexWriter against a pre-populated non-Lucene directory and the exact Cassandra trigger points for getInvalidateTask (DROP INDEX vs ALTER/reload) were not executed. Cassandra's own validation of index-option values (and whether quoted index identifiers could additionally inject path separators through index.name) could not be inspected because the framework sources are outside this snapshot. Privilege assumptions for CREATE CUSTOM INDEX are taken from Cassandra's documented model, not verified here.",
+      "weakness_type": "Path traversal / uncontrolled pathname (CWE-22, CWE-73); unsafe resource deletion"
+    }
+  ],
+  "coverage_summary": "Read the complete 219-file list of the assigned snapshot (no filters excluded anything: get_source_scope reports 219/219 model-visible files, 0 excluded by name/size/symlinks/binary policy). Inspected in full or in relevant part: all plugin Java search conditions, builders and mappers, schema/analysis code, Schema/SchemaBuilder/SchemaAnalyzer/SchemaValidator, Index/IndexService/IndexQueryHandler/IndexPagingState/IndexPostProcessor, FSIndex/PartitionedIndex/RAMIndex/DocumentIterator, LuceneStorageProxy, IndexReader*/IndexWriter*, all Scala mapping and partitioning classes, ByteBufferUtils, column parsing, and the builder module (Builder/Index/Search/conditions/JSONBuilder). The P1 relation index parsed 165 Java files (~1940 edges, 1427 symbols) and explicitly implements no control-flow/data-flow or semantic resolution; per its scope report, Scala sources are not represented in the index (parsed_files == java_files), so Scala call paths (IndexOptions/FSIndex/IndexService/IndexQueryHandler) were verified by direct source reading, and index edges were used only as navigation hints. No build, tests, scanners or exploit payloads were executed; no Cassandra framework sources, dependency jars or external data were available.",
+  "limitations": [
+    "No execution: the finding and all leads are source-level only; Cassandra node behaviour (FSDirectory/IndexWriter on a pre-populated directory, exact DROP INDEX vs ALTER invalidation trigger) was not run or reproduced.",
+    "Cassandra core sources (QueryProcessor/QueryHandler/authorization, CqlIdentifier validation, index-option trust model) are outside the snapshot, so the privilege prerequisites for CREATE CUSTOM INDEX/DROP INDEX and the possible authorization lead could not be confirmed.",
+    "The P1 index has no data-flow/control-flow and does not model Scala, so call/reachability statements about Scala files rest on source reading, not index evidence.",
+    "Dependency-level issues (Jackson 2.13.2.2, Lucene 5.5.4, Cassandra 4.1.8 in pom.xml) were noticed while reading the build files but were not assessed for exploitability within this review.",
+    "The builder module's generated CQL and the testsAT module (only its pom.xml is present) could not be exercised, so client-side misuse scenarios remain unquantified."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unsafe class loading from the schema: ClasspathAnalyzerBuilder.analyzer() does `Class.forName(className)` then `getConstructor().newInstance()` on the `class_name`/`class` schema option (plugin/.../schema/analysis/ClasspathAnalyzerBuilder.java:47-56), and SnowballFilter builds a class name as `\"org.tartarus.snowball.ext.\" + language.toLowerCase() + \"Stemmer\"` from the `language` option (plugin/.../analysis/SnowballFilter.java:52-61). Externally controlled class selection (CWE-470) with static-initializer/constructor side effects; reported here as unconfirmed because the class is cast to Analyzer only after instantiation, exploitation as RCE depends on a gadget on the node classpath, and it also requires index schema privileges.",
+      "reason": "Plausible but weaker than the submitted candidate: impact is gadget-dependent and unproven, no in-repo validation defect beyond accepting a fully qualified class name."
+    },
+    {
+      "lead": "FSIndex companion object disables Lucene's query-clause safety limit: `BooleanQuery.setMaxClauseCount(Integer.MAX_VALUE)` (plugin/.../index/FSIndex.scala:192-195), so an unbounded number of clauses can be produced from a client-supplied search JSON or from a `lucene` condition query string (LuceneCondition.doQuery, LuceneCondition.java:79-88), potentially exhausting memory/CPU (CWE-400/770) for any user able to run SELECT ... WHERE expr(index, ...).",
+      "reason": "Appears to be a deliberate, long-standing tuning decision (explicit comment 'Disable max boolean query clauses limit'), and confirming a resource-exhaustion impact would require runtime measurement; treated as a hardening opportunity, not a demonstrated vulnerability."
+    },
+    {
+      "lead": "IndexQueryHandler.processStatement (plugin/.../IndexQueryHandler.scala:95-122) mirrors Cassandra's QueryProcessor.processStatement preamble and tail but contains no `statement.checkAccess(...)`/`statement.validate(...)` call, while processBatch is delegated to the real QueryProcessor. This raised the possibility of a missing-authorization (CWE-862) or missing-validation issue for statements processed through the replaced CQL handler.",
+      "reason": "Cannot be verified from this snapshot: the Cassandra 4.1 QueryProcessor/QueryHandler sources are outside the assignable source tree, and a total authorization bypass would have been immediately visible in production deployments; classified as an unverified lead, not a candidate."
+    },
+    {
+      "lead": "Unbounded coordinator-side memory use in IndexPostProcessor.collect/top (plugin/.../IndexPostProcessor.scala:52-114) and paging-state handling: search.paging hex is parsed straight into DecoratedKey/Clustering (IndexPagingState.scala:232-255) and drives searches, and sorted searches materialize all returned rows into a RAM index.",
+      "reason": "No clear security boundary is crossed (results remain constrained by the command's key range and row filter), and no size/limit check is attacker-controllable in a way that is verifiable statically; residual DoS concern only."
+    },
+    {
+      "lead": "CQL statement construction by string concatenation in the client-side builder: Index.build() concatenates names/options and wraps the schema JSON in single quotes without escaping (builder/.../index/Index.java:245-263).",
+      "reason": "The builder is a client-side convenience library; attacker control depends entirely on a caller passing untrusted values, which is not demonstrable from this snapshot."
+    }
+  ],
+  "summary": "Reviewed the 219-file snapshot of the Instaclustr/Stratio Cassandra Lucene Index plugin (C* 4.1.8 fork: builder, plugin Java+Scala, poms). I traced the untrusted-input surfaces reachable from CQL clients: the Lucene search JSON parsed from expr()/dummy-column predicates (SearchBuilder/ExpressionMapper), the client-supplied paging state hex (IndexPagingState.fromByteBuffer), WKT/regexp/lucene query strings, index options (schema, partitioner, directory_path, analyzers) supplied through CREATE CUSTOM INDEX, and the client-side CQL statement builder. One candidate is submitted: unvalidated use of the index option `directory_path` as the Lucene filesystem root, which lets an index-creating user place the index anywhere on the node filesystem and, when the index is later invalidated/dropped, recursively delete that directory (FileUtils.forceDelete). Other plausible leads (unsafe class loading via class_name/Snowball language, removed Lucene BooleanQuery clause limit, possible missing statement.checkAccess in the replacement CQL handler, unbounded post-processing memory) were checked and are listed as rejected/unconfirmed rather than separate candidates."
+}

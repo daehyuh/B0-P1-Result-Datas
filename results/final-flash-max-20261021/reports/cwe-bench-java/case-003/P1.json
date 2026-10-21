@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The value passed by the application into a method parameter annotated with @Path. Retrofit's API is designed for this value to come from runtime data (ids, usernames, file names, search terms). It is converted to a String by the configured `Converter<T, String>` (or Object.toString via BuiltInConverters.ToStringConverter, Converter.java:57-78 / BuiltInConverters.java:89-95) and then inserted directly. Example shapes: `@GET(\"v1/users/{id}/details\")` with `id = \"..\"`; `@GET(\"users/{name}\")` with `@Path(value=\"name\", encoded=true)` and `name = \"../../admin\"` (the changelog even records that `/` is intentionally not encoded for encoded=true).",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) With the default `encoded = false`, `/` and `%` are percent-encoded (RequestBuilder.java:103), so multi-segment injection requires `encoded = true`; the finding therefore relies mainly on `.`/`..` surviving (verified: `.` is not in the always-encode set at line 33 nor under the 0x20/0x7f range checks). (2) Null path values are rejected (ParameterHandler.java:95-98), and @Path names/templates are validated (ServiceMethod.java:725-734), but no value-side validation exists. (3) Searched the whole tree for \"traversal\", \"URL_PATH_TRAVERSAL\" and `\"..\"` — no guard anywhere. (4) OkHttp's HttpUrl dot-segment normalization (which makes the final URL drop the intended prefix) is a dependency behavior not present in the snapshot and was not runtime-verified; even if some layer forwarded a raw `..` path, common server/proxy normalization would still route it differently. (5) The @Path javadoc (http/Path.java:28-51) only promises URL encoding of values, which does not prevent dot-segment traversal and may lead developers to treat raw string values as safe.",
+      "id": "retrofit-path-param-traversal",
+      "impact": "A request issued through the app's Retrofit client can be diverted to a different path on the same configured host than the API interface intended (for example out of a per-tenant/user prefix). Where path prefixes are used for routing or authorization (gateway/microservice routing, servlet path-based access rules), this can bypass those checks, reach unintended internal endpoints, or issue state-changing calls against the wrong resource. Impact is bounded to the configured authority (no cross-host redirect via @Path), and depends on the application passing untrusted data into @Path and on path normalization.",
+      "locations": [
+        {
+          "end_line": 95,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 144,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 164,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 146
+        },
+        {
+          "end_line": 202,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 189
+        },
+        {
+          "end_line": 101,
+          "path": "retrofit/src/main/java/retrofit2/ParameterHandler.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 405,
+          "path": "retrofit/src/main/java/retrofit2/ServiceMethod.java",
+          "start_line": 388
+        }
+      ],
+      "prerequisites": "A service interface in the reviewed application declares a @Path parameter whose value can be influenced by an untrusted party, and the application does not independently sanitize it. With default encoding, traversal needs `..` segments (a single `..` removes one path segment, and multiple @Path parameters can chain). With `encoded = true`, a single value can inject `/` plus `..` segments. End-to-end request rewriting additionally depends on dot-segment normalization by OkHttp's HttpUrl (okhttp 3.10.0 is a declared dependency but its source is not in this snapshot) or by the receiving server/proxy — not verifiable here.",
+      "root_cause": "`RequestBuilder.addPathParam` (retrofit/src/main/java/retrofit2/RequestBuilder.java:89-95) performs a raw `relativeUrl.replace(\"{\" + name + \"}\", canonicalizeForPath(value, encoded))` with no rejection of `.`/`..` segments and no validation that the substituted value stays within its path segment. `canonicalizeForPath` (lines 97-144) percent-encodes only a fixed set (`PATH_SEGMENT_ALWAYS_ENCODE_SET = \" \\\"<>^`{}|\\\\?#\"`, line 33) plus `/` and `%` when `alreadyEncoded == false` (line 103); the dot character is never encoded, so `..` survives in both modes, and when `encoded = true` `/` and `%` also pass through verbatim, letting one parameter inject whole path segments. The composed relative URL is then handed to OkHttp in `build()` (lines 189-202) via either `urlBuilder.build()` (baseUrl.newBuilder(relativeUrl), line 149) or `baseUrl.resolve(relativeUrl)` (line 197), where dot-segments are collapsed, so the intended path prefix can be traversed away. No equivalent guard exists anywhere else in the tree (searches for \"traversal\", \"URL_PATH_TRAVERSAL\", and \"..\" return nothing).",
+      "title": "Path traversal via unvalidated @Path parameter value in RequestBuilder.addPathParam",
+      "trace": "ServiceMethod.parseParameterAnnotation (ServiceMethod.java:388-405) wires a @Path parameter to `new ParameterHandler.Path<>(name, converter, encoded)`; ParameterHandler.Path.apply (ParameterHandler.java:94-100) calls `builder.addPathParam(name, valueConverter.convert(value), encoded)`; RequestBuilder.addPathParam (line 94) replaces the `{name}` token in the developer-supplied template with the canonicalized attacker value; canonicalizeForPath (lines 97-144) leaves `.` (and, for encoded=true, `/` and `%`) unencoded; RequestBuilder.build (lines 189-202) resolves the modified relative URL against the fixed base URL, and OkHttp's URL resolution collapses `..` segments, so the final request path can be outside the intended endpoint. Note: `relativeUrl` is only mutated by @Path substitution or by @Url (`setRelativeUrl`, lines 73-75), and @Path and @Url are mutually exclusive (ServiceMethod.java:366-374), so this is the only route for parameter-driven path rewriting.",
+      "unverified": "No runtime test or exploit was executed. Whether OkHttp 3.10's HttpUrl collapses `..` segments before sending (dependency source absent), whether a given deployed proxy/server normalizes `..`, and whether any specific application passes attacker-controlled data into a @Path parameter are all unverified. The severity is deployment-dependent.",
+      "weakness_type": "Improper input validation / path traversal in URL construction (client-side request-path manipulation)"
+    }
+  ],
+  "coverage_summary": "All 184 assigned files were visible (no binary/sensitive/size exclusions reported). Key core paths were read in full or in relevant part: RequestBuilder, ParameterHandler, ServiceMethod, OkHttpCall, Utils, Converter, BuiltInConverters, ExecutorCallAdapterFactory, DefaultCallAdapterFactory, Platform, Response/Call/Callback; converters (gson, jackson, jaxb, simplexml, moshi, protobuf, scalars, wire, optionals); adapters (rxjava CallArbiter et al., rxjava2, guava, java8, scala); retrofit-mock; samples; pom/build scripts. The P1 relation index covers 182 of 184 files and parsed all 124 Java files with no parse errors, but has no control-flow or data-flow analysis and 1388 unresolved calls; its CALLS/CONTAINS edges for addPathParam -> canonicalizeForPath and ParameterHandler.Path.apply -> addPathParam were used only as navigation and were verified against source text. Not deeply reviewed: website assets, most README/CONTRIBUTING/prose files, and the pom module wiring beyond version/dependency inspection.",
+  "limitations": [
+    "The central `retrofit/src/main/java/retrofit2/Retrofit.java` (and `Retrofit.Builder`, which validates baseUrl and resolves string converters) is absent from the assigned snapshot even though other files reference the class, so the configuration/entry-point code could not be inspected and the snapshot is not self-contained.",
+    "No test sources are present in the snapshot, so existing test expectations around @Path/@Url handling could not be checked.",
+    "OkHttp/Okio (the actual URL canonicalization and request objects) and the StAX/JAXB runtime are dependencies whose sources are not in the snapshot; their dot-segment/DTD behavior is asserted from API knowledge, not verified here.",
+    "No code, tests, builds, or scanners were executed, and no runtime or network behavior was observed; the candidate is a source-evidence lead, not a confirmed vulnerability.",
+    "The relation index has no semantic resolution or data-flow; taint propagation from application inputs to @Path parameters is demonstrated by API design rather than traced in a concrete app in this snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Potential XXE in retrofit-converters/jaxb JaxbResponseConverter: `XMLInputFactory.newInstance()` is created with default properties (JaxbResponseConverter.java:29) and used to parse the response body (line 41) without disabling DTDs/external entities, so a malicious or compromised server (or MITM) returning XML could trigger external entity resolution on the client (file read/SSRF).",
+      "reason": "Real hardening gap, but attacker control in the normal threat model is the remote endpoint, not an untrusted request parameter, so impact requires a malicious/compromised server or TLS interception; the effective default behavior of the StAX provider on the runtime JDK is external to the snapshot and unverified. Kept as an unconfirmed secondary lead rather than the single candidate."
+    },
+    {
+      "lead": "SimpleXML converter delegates XML parsing to the third-party org.simpleframework.xml Persister/Serializer (SimpleXmlConverterFactory.java:37-45, SimpleXmlResponseBodyConverter.java:34-48), which may or may not resolve external entities.",
+      "reason": "Third-party library source is not in the snapshot; no evidence available either way."
+    },
+    {
+      "lead": "`@Url` accepts a full URL (ParameterHandler.RelativeUrl, ServiceMethod.java:362-386), so a caller-supplied value can point at any host (SSRF-style).",
+      "reason": "This is the documented purpose of @Url (override the base URL); it is only a vulnerability if the application passes untrusted input to it, which is application logic, not a defect in this snapshot."
+    },
+    {
+      "lead": "`@Query/@Field` with encoded=true and `@Header` values could allow query/header injection.",
+      "reason": "encoded=true explicitly means the value is already encoded; OkHttp header value validation is not verifiable from the snapshot, and no concrete injection path was found in the reviewed code."
+    },
+    {
+      "lead": "OkHttpCall.enqueue catch blocks swallow Throwable/Errors from callbacks with only printStackTrace (OkHttpCall.java:117-126, 133-138), potentially hiding OutOfMemoryError/fatal errors.",
+      "reason": "Robustness/error-handling concern with no attacker-controlled input or direct security impact; not a reportable finding here."
+    }
+  ],
+  "summary": "Assigned snapshot is a Retrofit (com.squareup.retrofit2) tree at version 2.4.0: 184 files (124 Java) covering the core retrofit module, adapters (guava/java8/rxjava/rxjava2/scala), converters (gson/jackson/jaxb/moshi/protobuf/scalars/simplexml/wire/optionals), retrofit-mock, samples, and build/CI scripts. The strongest source-evidenced issue is in the core request builder: @Path parameter values are substituted into the relative URL with no check against `.`/`..` path segments. `canonicalizeForPath` deliberately leaves `.` untouched (and leaves `/` and `%` untouched when `encoded = true`), so an attacker-influenced path parameter can move the request to a different path on the same host once the relative URL is resolved/canonicalized against the base URL. A weaker, unselected lead is the JAXB converter parsing response XML with an unhardened `XMLInputFactory` (potential client-side XXE). No runtime execution, tests, or external data were used; OkHttp (the URL canonicalizer) and the JAXB/StAX runtime are dependencies not present in the snapshot, so their exact behavior is unverified."
+}

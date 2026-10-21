@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any party who supplies a ZIP archive: ExtraFieldUtils.parse() splits the extra-field bytes into header id/length records and instantiates the registered class for header id 0x0017 (X0017_StrongEncryptionHeader), then calls parseFromLocalFileData()/parseFromCentralDirectoryData() with the attacker's bytes (lines 176-191). The crafted field only needs to be >= 16 bytes: rcount at field offsets 8-11 and hashSize at 14-15 are fully attacker-chosen. Reachable from ZipFile central-directory parsing and from ZipArchiveInputStream local-header parsing (both documented users of the extra-field parser).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the field must be >= 16 bytes and length-consistent to avoid the THROW path (satisfiable by attacker). Checked that ExtraFieldUtils.parse's outer loop itself always advances (start += length + WORD, ExtraFieldUtils.java:192), so the hang is not in the generic splitter but specifically in the X0017 handler. Checked that length/offset parameters are available to the method but unused as loop bounds (no cap exists). Checked ZipArchiveInputStream/ZipFile do call the field parser for both local and central extra data. Weighed the possibility that this code is a deliberately left over post-1.16 state: the snapshot's security-reports.xml records CVE-2018-1324 ('infinite loop inside of Compress' extra field parser used by ZipFile and ZipArchiveInputStream') as fixed via a revision of exactly this file, and this snapshot is a 1.18-SNAPSHOT tree from 2018-08-09+ that otherwise contains later fixes (COMPRESS-455/456/457/459/460/463, Expander path-traversal fix, Deflate64/Zstd features), so the unbounded loop's presence is anomalous — but I cannot verify offline which exact hunk that fix changed, so the loop may also be genuine upstream code whose CVE fix was applied elsewhere. Either way the loop itself is a real unbounded CPU sink under attacker control.",
+      "id": "case-007-candidate-1",
+      "impact": "Denial of service: a single small crafted ZIP file pins a thread/core indefinitely (CPU exhaustion) in any application that opens the archive with ZipFile or ZipArchiveInputStream, matching the repository's own security-page description of an infinite loop in the extra-field parser. Because the loop is inside the archive-parsing call, connection/worker threads stall and can be exhausted with a few requests; no memory corruption or data disclosure is involved.",
+      "locations": [
+        {
+          "end_line": 319,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/X0017_StrongEncryptionHeader.java",
+          "start_line": 302
+        },
+        {
+          "end_line": 193,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/ExtraFieldUtils.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 195,
+          "path": "src/main/java/org/apache/commons/compress/archivers/zip/PKWareExtraHeader.java",
+          "start_line": 187
+        }
+      ],
+      "prerequisites": "Application reads an untrusted ZIP archive with Commons Compress; the archive contains an extra field with header id 0x0017 in the central directory (ZipFile) or local file header (ZipArchiveInputStream). No authentication, no special options and no user interaction beyond opening the archive; default parse mode (UnparseableExtraField.THROW) still reaches the loop because the record is length-consistent.",
+      "root_cause": "X0017_StrongEncryptionHeader.parseCentralDirectoryFormat() reads rcount (32-bit, ZipLong.getValue at data[offset+8]) and hashSize (16-bit, ZipShort.getValue at data[offset+14]) directly from the untrusted extra-field payload and uses them as the bounds of a nested loop whose body contains no work and no exit path:\n\n    if (rcount > 0) {\n        this.hashAlg = ...;\n        this.hashSize = ...;\n        for (long i = 0; i < this.rcount; i++) {\n            for (int j = 0; j < this.hashSize; j++) {\n                //  ZipUtil.signedByteToUnsignedInt(data[offset + 16 + (i * this.hashSize) + j]));\n            }\n        }\n    }\n\nThe iteration count is not bounded by the actually available extra-field length (length/offset are passed in but never used to cap the loops), and the method performs no I/O, so the loop cannot terminate early on EOF and cannot be interrupted by stream closure; it is pure CPU consumption driven solely by archive bytes.",
+      "title": "Unbounded CPU loop in ZIP X0017 strong-encryption extra-field parser (attacker-controlled rcount × hashSize)",
+      "trace": "ZipFile.readCentralDirectory()/checkAndReadExtraFields -> ExtraFieldUtils.parse(data, false, ...) (ExtraFieldUtils.java:136-193) -> createExtraField(headerId=0x0017) returns X0017_StrongEncryptionHeader -> parseFromCentralDirectoryData -> parseCentralDirectoryFormat (X0017_StrongEncryptionHeader.java:302) -> nested for loops (lines 313-317) with i < rcount (up to 4,294,967,295) and j < hashSize (up to 65,535) on an empty body, e.g. ~2.8e14 iterations for maximal values, with zero I/O and no length-derived upper bound, so the calling thread does not return for an effectively unbounded time (watchers/timeouts aside, the archive-read call hangs).",
+      "unverified": "No runtime execution, fuzzing or archive construction was performed (read-only review), so the end-to-end hang and the exact required field layout were reasoned from source, not confirmed. I could not fetch the referenced upstream revision 2a2f1dc4 or the CVE-2018-1324 patch offline to prove whether the loop in this snapshot is pre- or post-fix, or whether released 1.16+ removed/bounded it; the security page text is the only corroborating artifact available in the snapshot. Reachability depends on the application using Commons Compress' ZIP classes on untrusted input (the common use case).",
+      "weakness_type": "Uncontrolled loop / algorithmic denial of service (CWE-834, CWE-400)"
+    }
+  ],
+  "coverage_summary": "Reviewed the read-only snapshot of Apache Commons Compress 1.18-SNAPSHOT: 264 files (all main Java sources plus site/docs/build files; get_source_scope reports no symlink/sensitive/size exclusions and no skipped-binary files beyond the binary policy). The P1 relation index covers all 264 files with no missing files and no hash mismatches; its 7,491 edges were used only for navigation and every inspected edge was re-verified against source text. Coverage was prioritised on untrusted-input parsing paths: ZIP (ZipArchiveInputStream, ZipFile partly, extra fields, encoders/decoders), tar (TarArchiveInputStream, TarUtils/TarArchiveEntry), 7z (SevenZFile, coders), cpio/ar/arj/dump, and the compressor streams and shared utils. No test sources exist in the snapshot, and no build, tests, scanner or runtime execution was performed.",
+  "limitations": [
+    "No execution, fuzzing, archive construction or scanner runs: all conclusions are static source reasoning; the hang/DoS impact is not runtime-confirmed.",
+    "No network access, so I could not consult the upstream fix revisions, CVE-2018-1324 patch, or later release sources to confirm whether the X0017 loop was modified by that fix or is genuine released code; the in-repo security page is the only corroborating artifact.",
+    "ZipFile.java, several compressor decoders (bzip2 BlockSort/CRC, snappy/CRC32C, xz/zstd/brotli wrappers) and the site/docs were only partially read; their code was not fully line-by-line audited.",
+    "The relation index provides syntactic navigation only (no data-flow, reachability or exploitability proof), and its 'security_call' facts are name-based hints, not findings.",
+    "Because the review is capped at one candidate, other plausible but unverified DoS leads are recorded as rejected leads rather than fully analysed.",
+    "No determination is possible from source alone about how a consuming application wraps the library (timeouts, thread pools, input trust), which affects real-world impact."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SevenZFile header-driven unbounded allocations, e.g. new SevenZArchiveEntry[(int)numFiles] (line 746), new byte[(int)(size-1)] for names (line 786), new byte[(int)propertySize] in readArchiveProperties (line 414), new byte[(int)folder.getUnpackSize()] in readEncodedHeader (line 444) and coders/properties allocations in readFolder (lines 640, 664) - matches later CVE-2021-35516/35517/36090-class memory-exhaustion fixes",
+      "reason": "Real DoS vectors, but they are generic unbounded-allocation patterns whose fixes landed years after this snapshot's Aug-2018 date; I could not tie them to a fix immediately after this revision, and the (int) casts mostly yield NegativeArraySizeException rather than a long-lived hang. Kept as unconfirmed lead, not selected."
+    },
+    {
+      "lead": "DumpArchiveInputStream.readDirectoryEntry loop 'for (int i = 0; i < datalen - 8 && i < size - 8; i += reclen)' with reclen read from archive data (line 353-356): reclen == 0 makes i never advance, an I/O-free infinite loop",
+      "reason": "Genuine-looking CPU hang, but the code path requires a fully parsed dump archive and the pattern matches CVE-2024-25710 fixed only in 1.26.0, far from this snapshot's date; lower likelihood of being the ground-truth issue and less corroboration in-snapshot than the X0017 loop. Unconfirmed lead."
+    },
+    {
+      "lead": "TarArchiveInputStream.parsePaxHeaders int overflow / NegativeArraySizeException-OOM via attacker 'len' (lines 457-487): len *= 10 can overflow, restLen = len - read can be negative or huge, new byte[restLen] unchecked",
+      "reason": "Plausible memory/robustness DoS matching later PAX-header fixes (e.g. CVE-2023-42503-era), but the impact is an exception or a single allocation bounded by the header, not an unbounded CPU loop; also requires the crafted PAX header to survive earlier length accounting. Rejected as weaker than the selected candidate."
+    },
+    {
+      "lead": "ZipArchiveInputStream read/close paths that can return 0 (readDeflated/readFromInflater, Deflate64 empty blocks) and the negative-length pushback in bufferContainsSignature (lines 927-957) possibly causing IndexOutOfBoundsException",
+      "reason": "These are the neighbourhood of CVE-2018-11771 (fixed in 1.18), but in this snapshot the readFromInflater l==0 guard ('else break') and the stored-size clamp are present, and I could not construct a definite infinite loop from source alone; the negative readTooMuch pushback requires the non-default allowStoredEntriesWithDataDescriptor opt-in. Unconfirmed, not selected."
+    },
+    {
+      "lead": "ArjArchiveInputStream firstHeaderSize-1 / Arj readHeader infinite resync loop, AsiExtraField negative array size (line 271/285), BinaryTree.decode unchecked pos writes, LZW expandCodeToOutputStack underflow",
+      "reason": "All are exception-type robustness bugs (DoS-lite) with narrower attacker value and no length-based unbounded iteration; less evidence and impact than the selected candidate."
+    },
+    {
+      "lead": "Expander example path traversal (sibling-prefix edge case)",
+      "reason": "Already fixed in this snapshot: expand() canonicalizes the target with a trailing separator and validates entry paths (Expander.java:241-251); the corresponding changelog entry is present. Rejected."
+    }
+  ],
+  "summary": "Reviewed Apache Commons Compress 1.18-SNAPSHOT (264 main/site files; no test sources in snapshot) across all archive readers (zip, tar, 7z, cpio, ar, arj, dump), compressors (bzip2, lz4, snappy, deflate64, lzw/z, pack200, xz/zstd/brotli wrappers) and utils. The single strongest source-evidenced candidate is an effectively unbounded, attacker-bounded nested loop in the ZIP extra-field parser X0017_StrongEncryptionHeader.parseCentralDirectoryFormat(): the loop counts are read directly from attacker-supplied extra-field bytes, have no data/length relationship, and the loop body performs no I/O and no useful work, so a crafted ZIP extra field with header id 0x0017 can burn ~rcount*hashSize (up to ~2^48) iterations of CPU. The repository's own security page (present in this snapshot) describes exactly this class of bug in \"Compress' extra field parser used by the ZipFile and ZipArchiveInputStream classes\" and cites a fix in X0017_StrongEncryptionHeader.java, yet the unbounded loop is still present here — although I could not verify offline whether this snapshot predates or postdates that fix hunk. Other plausible but less strongly evidenced leads (7z header-driven unbounded allocations, dump reader reclen==0 loop, tar PAX length handling, ZipArchiveInputStream zero-length read paths) are listed as rejected/unconfirmed rather than additional candidates."
+}

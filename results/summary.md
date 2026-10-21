@@ -1,24 +1,20 @@
-# B0·P1 실험 최종 결과
+# Current results: Flash Max
 
-기준일: 2026-10-08. 아래 적중 수는 사례별 최종 판정값이다. 지정 취약점의 근본 원인을 맞힌 경우만 적중으로 센다. 다른 후보를 제출한 경우는 지정 타깃 미적중이지, 그 후보가 실제 취약점이 아니라는 뜻은 아니다.
+| Dataset | Cases | CodeQL | B0 (source only) | P1 (VulRIS) | P1−B0 (cases; pp) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Vul4J | 79 | 11 (13.92%) | 13 (16.46%) | 13 (16.46%) | +0; +0.00 pp |
+| VJBench | 42 | 4 (9.52%) | 16 (38.10%) | 16 (38.10%) | +0; +0.00 pp |
+| Vul4J+ | 140 | 17 (12.14%) | 39 (27.86%) | 46 (32.86%) | +7; +5.00 pp |
+| CWE-Bench-Java | 213 | 41 (19.25%) | 52 (24.41%) | 51 (23.94%) | -1; -0.47 pp |
 
-| 데이터셋·모델 설정 | 판정 사례 | B0 적중 | P1 적중 | 차이(P1−B0) |
-| --- | ---: | ---: | ---: | ---: |
-| Vul4J · Flash High | 79 | 10 (12.66%) | 15 (18.99%) | +5 |
-| Vul4J · Flash Max | 79 | 10 (12.66%) | 11 (13.92%) | +1 |
-| Vul4J · Pro Max | 79 | 11 (13.92%) | 13 (16.46%) | +2 |
-| VJBench · Flash Max Top-1 | 공통 41 | 19 (46.34%) | 19 (46.34%) | 0 |
-| Vul4J+ · Flash Max Top-1 | 140 | 45 (32.14%) | 59 (42.14%) | +14 |
-| CWE-Bench-Java · Flash Max Top-1 | 212 | 97 (45.75%) | 92 (43.40%) | −5 |
+The current representative setting is Flash Max (`deepseek-flash`, reasoning effort `max`). B0 reads the prepared source; P1 also queries VulRIS relation records. Vul4J uses the original multi-candidate protocol (at most 10 candidates); VJBench, Vul4J+, and CWE-Bench-Java use at most one candidate per submission.
 
-Vul4J는 79개 사례에 세 모델 설정을 적용했다. VUL4J-1은 연결 패치·테스트와 CVE 설명의 충돌을 확인한 뒤, 지정 CVE의 원인을 기준으로 기존 답변을 다시 판정했다. VJBench case-039의 CVE·수정 커밋 연결도 사후 정정했다. 두 정답 수정은 응답 확인 후 이루어져 선택 편향 가능성이 있다.
+The metric is case-level reference-cause and affected-path matching. All 213 CWE-Bench-Java cases have final binary labels, including case-173. Datasets are reported separately because Vul4J and Vul4J+ overlap. The final adopted submissions form a retrospective collection.
 
-VJBench case-019의 기존 B0/P1 입력에는 Java 파일이 없었다. 수정된 소스로 P1만 다시 실행해 적중했으나 B0는 재실행하지 않았다. 따라서 유효한 공통 입력 41건의 B0/P1 적중은 각각 19/41이고, P1 전체 결과는 20/42다. 분모가 다른 19/41과 20/42를 직접 비교해 P1이 우세하다고 주장하지 않는다. 사례별 최신 판정은 [2026-10-08 VJBench 판정표](vjbench/top1-full-adjudication-20261008.csv)와 [설명](vjbench/top1-full-adjudication-20261008.md)에 있다.
+P1 and B0 tie on Vul4J and VJBench. P1 identifies seven more Vul4J+ cases (+5.00 pp), and one fewer CWE-Bench-Java case (−0.47 pp). These results show dataset-dependent effects of relation-assisted exploration rather than uniform improvement.
 
-Vul4J+는 191개 중 SpotBugs 경고 전용 50개와 정답 충돌 1개를 제외했다. CWE-Bench-Java는 213개 중 정답을 확정할 수 없는 case-173을 제외했다. CWE-Bench-Java P1 92건은 내용 기준 적중이며, 필수 응답 형식까지 요구하면 91건이다. 이 데이터셋은 결과 확인 후 논문의 본문 세 자료 비교에서 제외됐지만, 반대 결과이므로 이 요약에는 유지한다.
+CodeQL counts come from the completed recorded baseline (CLI 2.23.2, Java pack 1.8.1, `java-security-extended.qls`, `build-mode=none`). Exact source-version parity with the corrected LLM inputs has not been established for every case. Report CodeQL values as descriptive baseline results rather than a controlled same-input estimate of the relation index's contribution.
 
-필수 형식에 맞지 않은 응답은 동일 조건에서 한 차례 별도로 실행해 최종 판정값을 정했다. 최초 응답과 별도 실행 기록은 감사 자료로 보존했다. 사례별 최종 적중 수와 최초 실행에서 측정한 토큰·시간·추정 비용을 같은 요청 집합의 수치로 해석하지 않는다. 재실행 원자료는 [형식 오류 감사 자료](format-retries/README.md)에, VJBench 사례별 최신 판정은 [VJBench 최종 판정표](vjbench/top1-full-adjudication-20261008.csv)에, Vul4J+ 최종 판정은 [Vul4J+ 최종 사례표](vul4j-plus/final-score-cohort-140.json)에 보관한다.
+[Case rows, reports, judgments, and hashes](final-flash-max-20261021/).
 
-동일한 지정 취약점 기준으로 비교한 CodeQL 결과와 사례별 판정표는 [CodeQL 비교 자료](codeql/README.md)에 별도로 정리했다. CWE-Bench-Java의 CodeQL 실행은 일부 미완료이므로 완료된 데이터셋과 합산하지 않는다.
-
-Vul4J의 세 행은 같은 사례를 반복하며 Vul4J+와도 일부 겹친다. 자료별 프롬프트와 후보 제출 규칙도 다르므로 여섯 행을 합친 전체 적중률은 산출하지 않는다. P1은 Vul4J 세 설정과 Vul4J+에서 적중 수가 많았고, VJBench의 공통 41건에서는 같았으며, CWE-Bench-Java에서는 적었다. 따라서 일반적인 성능 우위나 비용 절감을 이 결과만으로 주장하지 않는다.
+Other dated result files preserve historical records. They are not the current adjudications or representative model settings.

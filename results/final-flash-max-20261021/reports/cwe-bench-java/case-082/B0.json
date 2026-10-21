@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `j_username` request parameter of the OpenID processing URL (`/j_spring_openid_security_check`), URL-encoded, e.g. `j_username='><script>...` . The OpenID filter copies it verbatim into the HttpSession under SPRING_SECURITY_LAST_USERNAME (lines 75-76, 98-104). The default generated login page then renders that stored value inside `<input ... value='...'>` (line 126).",
+      "confidence": "medium",
+      "counterevidence_checked": "The default documented login page is described as a convenience 'not intended for production' (docbkx/appendix-namespace.xml), which lowers the exposure; the ordinary form-login path is protected because AuthenticationProcessingFilter escapes the username before storing it (line 76), so the taint requires the OpenID (or NTLM) filter; the OpenID filter only matches its configured processing URL; TextUtils.escapeEntities exists and is used elsewhere, indicating the omission is a bug rather than a deliberate encoding contract; the errorMsg reflection path (lines 100/117) is only exploitable when a provider's exception message contains attacker input and default hideUserNotFoundExceptions=true masks most username-bearing messages.",
+      "id": "XSS-DEFAULT-LOGIN-PAGE",
+      "impact": "Script execution in the application's origin on its login page: theft/rewriting of submitted credentials (e.g. repointing the form action), execution of authenticated same-origin operations using the victim's current session state, and phishing-style UI manipulation. Login-page XSS is a credential-compromise primitive even though the victim is not yet authenticated.",
+      "locations": [
+        {
+          "end_line": 137,
+          "path": "core/src/main/java/org/springframework/security/ui/webapp/DefaultLoginPageGeneratingFilter.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 104,
+          "path": "openid/src/main/java/org/springframework/security/ui/openid/OpenIDAuthenticationProcessingFilter.java",
+          "start_line": 68
+        },
+        {
+          "end_line": 77,
+          "path": "core/src/main/java/org/springframework/security/ui/webapp/AuthenticationProcessingFilter.java",
+          "start_line": 70
+        },
+        {
+          "end_line": 449,
+          "path": "ntlm/src/main/java/org/springframework/security/ui/ntlm/NtlmProcessingFilter.java",
+          "start_line": 444
+        }
+      ],
+      "prerequisites": "Namespace configuration that (a) enables form login with the internally generated login page (e.g. `<http auto-config=\"true\">` or `<form-login/>` without `login-page`, which also makes formLoginEnabled true so the username input is rendered) and (b) enables `<openid-login/>` (or the NTLM filter) so that a component stores an unescaped last username. The victim must load a crafted link to the OpenID processing URL (a redirect to `/spring_security_login?login_error` is produced automatically by the failure handling); no authentication is required since the request is processed by the OpenID/processing filter before authorization.",
+      "root_cause": "DefaultLoginPageGeneratingFilter.generateLoginPageHtml writes the session attribute SPRING_SECURITY_LAST_USERNAME (and the stored AuthenticationException message) directly into HTML without output encoding (line 126: append(usernameParameter).append(\"' value='\").append(lastUser); lines 100/117 for errorMsg). The form-login filter stores this attribute HTML-escaped via TextUtils.escapeEntities, but OpenIDAuthenticationProcessingFilter.setLastUsername stores the raw `j_username` request parameter unescaped into the same attribute, so a value containing a single quote can break out of the single-quoted input attribute and inject markup/script.",
+      "title": "Reflected XSS via unescaped last-username in generated default login page (OpenID filter taint source)",
+      "trace": "1) Attacker crafts GET/POST to `/j_spring_openid_security_check?j_username=%27%3E%3Cscript%3E...%3C%2Fscript%3E`.\n2) OpenIDAuthenticationProcessingFilter.attemptAuthentication sees no `openid.identity`, reads the raw parameter via obtainUsername(req) and calls setLastUsername(username, req) (lines 71-78), which stores the raw value in the session (lines 98-104).\n3) It throws OpenIDAuthenticationRequiredException; unsuccessfulAuthentication routes to the configured failure URL. With the generated page the default is `/spring_security_login?login_error` (FormLoginBeanDefinitionParser lines 29-36, 140-149).\n4) The browser follows the redirect; DefaultLoginPageGeneratingFilter.isLoginUrlRequest matches and generateLoginPageHtml reads lastUser from the session (line 98) and appends it unencoded into the value attribute of the username input (line 126), executing the injected script in the application origin.",
+      "unverified": "No runtime confirmation was performed. The full template/config matrix (auto-config + openid-login combinations, container parameter decoding of the quote character, and provider-specific exception messages for the errorMsg sink) was reasoned from source only; CSRF protection of the OpenID processing URL (none in this version) and the actual reachable configurations in deployed apps were not verified.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation (Cross-site Scripting)"
+    }
+  ],
+  "coverage_summary": "Coverage was based on the 925 model-visible files reported by get_source_scope (binary-like files skipped, no symlinks or >5MiB files excluded; the snapshot contains no test sources). I read the core authentication/authorization pipeline (HttpSessionContextIntegrationFilter, AbstractProcessingFilter/AuthenticationProcessingFilter, SessionFixationProtectionFilter/SessionUtils, Basic/Digest/X509/pre-auth filters, ExceptionTranslationFilter, AbstractSecurityInterceptor/FilterSecurityInterceptor, vote classes, ProviderManager, DAO/LDAP/JAAS/CAS providers), the URL matching and firewall stack (FilterChainProxy, DefaultHttpFirewall/RequestWrapper, DefaultFilterInvocationDefinitionSource, Ant/RegexUrlMatcher, UrlUtils/RedirectUtils), remember-me services, ACL module classes (BasicLookupStrategy, AclImpl, AclAuthorizationStrategyImpl, JdbcMutableAclService), token/encoding utilities (EncryptionUtils, MessageDigestPasswordEncoder, Sha512DigestUtils, SecureRandomFactoryBean, KeyBasedPersistenceTokenService), and the namespace parsers that wire the default login page, logout and session-fixation behavior. Modules reviewed more lightly: samples/sandbox/itest code, portlet interceptor, taglibs output, JBoss/Jetty/Catalina/Resin adapters, and the docbkx documentation.",
+  "limitations": [
+    "The snapshot contains no unit/integration test sources, so no test-based behavioral evidence was available.",
+    "No code was executed and no exploit was built; all findings are static source leads, so the XSS and redirect chains are not runtime-confirmed.",
+    "The exposure of the XSS depends on application configuration (generated default login page plus an OpenID/NTLM filter that stores an unescaped username); I could not enumerate deployed configurations or verify container-level parameter handling in this environment.",
+    "The errorMsg sink's exploitability depends on provider-specific exception messages and the non-default hideUserNotFoundExceptions setting; only the last-username sink was traced end-to-end.",
+    "Samples, sandbox and documentation were skimmed rather than exhaustively read; a defect confined to those areas could have been missed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Open redirect in LogoutFilter: request parameter `logoutSuccessUrl` is taken unvalidated and passed to RedirectUtils.sendRedirect (which allows absolute http(s) targets), with a Referer-header fallback (core/.../ui/logout/LogoutFilter.java lines 131-146). Reachable pre-auth because the logout filter runs before FilterSecurityInterceptor.",
+      "reason": "Real taint-to-redirect flow, but the class javadoc explicitly documents this parameter/Referer fallback as intended default behavior, so it may be judged a design weakness rather than a defect; kept as a secondary lead behind the XSS."
+    },
+    {
+      "lead": "Open redirect after successful login via the `spring-security-redirect` request parameter resolved by TargetUrlResolverImpl (lines 58-78) and passed to RedirectUtils (absolute http URLs are sent to sendRedirect).",
+      "reason": "Same documented-parameter design concern as the logout case, and it additionally requires the victim to complete a login on the real application; lower impact/exploitability than the XSS candidate."
+    },
+    {
+      "lead": "DigestProcessingFilter never verifies that the client-supplied `uri` in the Authorization header matches the requested URI, and nc/cnonce are not tracked, so a captured digest header can be replayed against a different URI (core/.../ui/digestauth/DigestProcessingFilter.java lines 260-311).",
+      "reason": "Requires capture of a victim's Authorization header within the nonce validity window (a pre-existing protocol-level weakness); no in-repository evidence of a concrete capture path, so it was not selected."
+    },
+    {
+      "lead": "RememberMeBeanDefinitionParser uses a fixed default key \"SpringSecured\" (line 26) and RememberMeAuthenticationProvider compares only key hashCodes (line 66).",
+      "reason": "Weak-default/hardening issue; forging the token still requires knowledge of the stored password/hash, and the hashCode comparison is not remotely reachable with attacker-constructed tokens in this code."
+    },
+    {
+      "lead": "SwitchUserProcessingFilter.redirectToFailureUrl echoes `failed.getMessage()` to the response writer without escaping or content type (lines 302-311); UsernameNotFoundException messages can embed the supplied `j_username`.",
+      "reason": "Requires the optionally-configured switch-user filter and, per its documented placement, an already privileged (supervisor/admin) caller, substantially reducing impact relative to the login-page XSS."
+    },
+    {
+      "lead": "CasProcessingFilterEntryPoint builds the CAS service URL with encodeServiceUrlWithSessionId=true by default (line 60/73), potentially appending jsessionid to the service parameter.",
+      "reason": "Hardening/session-ID-leakage concern in a third-party CommonUtils call; no local code path shows the value being logged or exposed by this repository."
+    }
+  ],
+  "summary": "Review of the Spring Security 2.0.6.RELEASE source snapshot (925 files, no test sources present). I traced authentication, authorization, remember-me, URL-matching/firewall, logout, CAS, OpenID, NTLM, ACL and encoding code paths. The strongest source-evidenced issue is an unescaped-output (XSS) defect in the internally generated login page: the last-username value read from the session is concatenated into an HTML attribute without encoding, and the OpenID authentication filter stores the raw `j_username` request parameter into that same session attribute (the form-login filter escapes it, so the protection was applied asymmetrically). A second attacker-controlled source exists in the NTLM filter. Several weaker candidates (open redirects, digest-authentication replay, weak default remember-me key, switch-user failure output) were considered and are listed as rejected/unconfirmed leads. Findings are static leads only; nothing was executed or runtime-confirmed."
+}

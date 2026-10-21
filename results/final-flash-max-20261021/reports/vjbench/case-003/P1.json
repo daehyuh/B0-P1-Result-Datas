@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Request parameters / headers that become redirect targets: `from` on the login form-processing endpoint (`AuthenticationProcessingFilter2.determineTargetUrl`, line 50), `redirectTo` JSON field in `ParametersDefinitionProperty._doBuild` (line 160), `pattern`/`path` query parameters in `DirectoryBrowserSupport.serveFile` (lines 160-164), and the `Referer` request header in `Jenkins.doIconSize` (line 3616, used unvalidated). An attacker only needs to induce a victim to follow a crafted link (or submit a crafted POST; `@RequirePOST`/crumb only constrains CSRF, not the redirect target).",
+      "confidence": "low",
+      "counterevidence_checked": "`isSafeToRedirectTo` does reject absolute URIs (`isAbsoluteUri`) and values beginning with `//`, so plain `https://evil` and `//evil` are blocked; the three main call sites do use the helper (so the earlier 1.651.2-style hardening was partially applied); `AuthenticationProcessingFilter2` validates before returning the target URL (the earlier `session.setAttribute(\"from\", ...)` value is not read anywhere else in the tree). `Jenkins.doIconSize` may be upstream behavior. I could not verify from source how browsers resolve `\\`-containing Location URLs (external knowledge), nor prove this is the dataset's intended defect. No test sources exist in the snapshot to confirm intended behavior.",
+      "id": "cand-001-open-redirect-validation-gap",
+      "impact": "Open redirect / post-authentication redirect to an attacker site. Enables credible phishing (a fake Jenkins login page reached immediately after a real login), referrer/token leakage, and can be chained with SSO/credential-harvesting flows. No RCE or direct data compromise claimed.",
+      "locations": [
+        {
+          "end_line": 1480,
+          "path": "core/src/main/java/hudson/Util.java",
+          "start_line": 1455
+        },
+        {
+          "end_line": 67,
+          "path": "core/src/main/java/hudson/security/AuthenticationProcessingFilter2.java",
+          "start_line": 49
+        },
+        {
+          "end_line": 166,
+          "path": "core/src/main/java/hudson/model/ParametersDefinitionProperty.java",
+          "start_line": 159
+        },
+        {
+          "end_line": 166,
+          "path": "core/src/main/java/hudson/model/DirectoryBrowserSupport.java",
+          "start_line": 159
+        },
+        {
+          "end_line": 3619,
+          "path": "core/src/main/java/jenkins/model/Jenkins.java",
+          "start_line": 3609
+        }
+      ],
+      "prerequisites": "Jenkins reachable by the victim (any security setting; the login `from` path applies whenever a security realm with form login is used). Victim must click/be navigated to a crafted URL on the Jenkins host; for `redirectTo`/`pattern` the request is processed under the relevant permission context (e.g., after authentication). Browser must treat backslashes as path separators for http/https URLs.",
+      "root_cause": "`hudson.Util.isSafeToRedirectTo(String)` only rejects URIs that `isAbsoluteUri()` classifies as absolute (scheme before any of '#','?','/') and URIs literally starting with '//'. It does not reject backslash variants such as `/\\evil.example/` or `\\/\\/evil.example/`. Browsers normalize '\\' to '/' when resolving special-scheme URLs, so such values become scheme-relative (protocol-relative) references to an attacker host. The inconsistent javadoc in the same file (lines 1462/1465) instructs callers to use `isAbsoluteOrSchemeRelativeUri`, a helper that does not exist anywhere in this snapshot, indicating the stricter helper/check that this code should call was removed or never wired in. Call sites that redirect to attacker-influenced values rely solely on this check.",
+      "title": "Open redirect: redirect-target validation (`Util.isSafeToRedirectTo`) does not reject backslash-based scheme-relative URIs referenced by its own javadoc helper",
+      "trace": "1) `AuthenticationProcessingFilter2.determineTargetUrl` reads `request.getParameter(\"from\")` and, after successful login, calls `Util.isSafeToRedirectTo(targetUrl)`; only absolute URIs and values starting with `//` are rejected. A value like `/\\evil.example/` passes, is returned as the target URL, and the container emits `302 Location: /\\evil.example/`. 2) Same pattern in `ParametersDefinitionProperty._doBuild` (`redirectTo`) and `DirectoryBrowserSupport.serveFile` (`pattern`/`path`). 3) `Jenkins.doIconSize` takes `req.getHeader(\"Referer\")` and calls `rsp.sendRedirect2(ref)` with no validation at all. In user agents that normalize '\\' to '/' when resolving the Location URL, the response resolves to `//evil.example/`, taking the freshly authenticated user to an attacker-controlled page.",
+      "unverified": "Browser normalization of backslash-prefixed/protocol-relative redirect targets is not provable from the snapshot; whether upstream intentionally shipped this exact validation body (and only later added `isAbsoluteOrSchemeRelativeUri`) could not be established, since no git history, tests, or upstream patches are available and the pom/changelog version markers in the tree are inconsistent with the code content. No runtime confirmation was performed.",
+      "weakness_type": "CWE-601 URL Redirection to Untrusted Site ('Open Redirect'); redirect target validation gap"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned source snapshot with the P1 relation index used only for navigation. get_source_scope: 8,829 model-visible files, binary files skipped by NUL detection; get_relation_scope: partial index, 948 Java files parsed/8,359 indexed, 470 omitted files, no control-flow or data-flow, no semantic resolution, Spring/annotation links unverified. I inspected authentication/session code (HudsonFilter, BasicAuthenticationFilter/Processor, TokenBasedRememberMeServices2, AuthenticationProcessingFilter2, HttpSessionContextIntegrationFilter2, HudsonPrivateSecurityRealm, ApiTokenProperty, WhoAmI), authorization (ACL, SidACL, AuthorizationStrategy, Permission, ItemGroupMixIn, Items, User/View/Computer/Run/Job permission methods), CSRF (CrumbFilter, DefaultCrumbIssuer, CrumbIssuer), redirect handling, DirectoryBrowserSupport, console annotation/deserialization code (ConsoleNote, AnnotatedLargeText, ConsoleAnnotationOutputStream, UrlAnnotator), XStream2/ClassFilter usage, XML parsing (XMLUtils, RestrictiveEntityResolver, XmlFile, PluginManager), CLI commands and CLI transports (CLI, CLIAction, CliProtocol/CliProtocol2, CLICommand, CliManagerImpl, Connection), update-center/download paths (UpdateCenter verifyChecksums, UpdateSite, DownloadService, InstallPluginCommand), JNLP agent secret handling, FilePath/Slave path checks, ParametersAction/ParametersDefinitionProperty/BuildAuthorizationToken, and logging endpoints. `.jelly` view files and test sources are absent from the snapshot, so view-level XSS and intended-behavior tests could not be checked; the `war` web.xml config, message catalogs and poms were reviewed only for context.",
+  "limitations": [
+    "No git history/patches, no tests, and no build execution: I could not confirm which code is upstream-intended versus modified, and no finding is runtime-confirmed.",
+    "Version metadata is inconsistent (poms/changelog say 1.625.4-SNAPSHOT / 1.624, while files contain backports marked for 1.651.2 and later features), so CVE/version-based reasoning was deliberately avoided.",
+    "Jelly/Groovy view files and JavaScript are essentially absent from the snapshot, so XSS and view-level authorization issues could not be assessed.",
+    "The external remoting library (2.53.4) that implements channel deserialization/filtering is not in the snapshot; CLI/remoting deserialization leads could not be validated.",
+    "P1 index edges are syntactic navigation candidates only; no data-flow or reachability proof exists, and 470 files were omitted from the index.",
+    "Browser URL-normalization behavior underlying the selected open-redirect lead is external knowledge and was not verified by executing anything."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CLI/remoting Java deserialization surface (core/src/main/java/hudson/cli/CliProtocol.java, CliProtocol2.java, CLIAction.java; cli/src/main/java/hudson/cli/Connection.java readObject uses ClassFilter.DEFAULT).",
+      "reason": "Unauthenticated CLI-over-TCP/HTTP channels that deserialize peer objects are visible in source, but filtering, whitelisting and gadget-chain behavior live in the external `org.jenkins-ci.main:remoting` 2.53.4 dependency (not part of this snapshot), so exploitability cannot be evidenced from the reviewed files; treated as an unconfirmed hardening lead, not the selected candidate."
+    },
+    {
+      "lead": "ConsoleNote.readFrom (core/src/main/java/hudson/console/ConsoleNote.java:209-238) deserializes gzip/base64 data embedded in build logs using the 2-arg ObjectInputStreamEx (no explicit class filter).",
+      "reason": "Attacker-influenced data path is plausible (build output), but whether the 2-arg ObjectInputStreamEx applies a class filter is defined in the out-of-tree remoting dependency; not verifiable here."
+    },
+    {
+      "lead": "ParametersAction.filter short-circuit `if (this.run == null) return parameters;` (core/src/main/java/hudson/model/ParametersAction.java:260-287) skips undefined-parameter filtering.",
+      "reason": "The surrounding SECURITY-170-style filtering, system properties and name validation are present, and the early return is consistent with the log message that dereferences `run.getParent()`; likely intentional upstream code rather than an injected defect. No attacker-controlled path to an unfiltered parameters list reaching a build environment could be demonstrated."
+    },
+    {
+      "lead": "Computer.updateByXml parses submitted XML with `Jenkins.XSTREAM2.fromXML(source)` without `XMLUtils.safeTransform` (core/src/main/java/hudson/model/Computer.java:1455-1458), unlike sibling `updateByXml` implementations.",
+      "reason": "Requires Computer.CONFIGURE; XStream's configured driver is not visible to be XXE-prone, and the same shape appears in `View.createViewFromXML`, so this is likely upstream inconsistency rather than the injected defect."
+    },
+    {
+      "lead": "LogRecorderManager.doNewLogRecorder / LogRecorder.doConfigSubmit/doClear/doDoDelete lack explicit permission checks (core/src/main/java/hudson/logging/*).",
+      "reason": "Investigated and rejected: the entry point `jenkins.model.Jenkins.getLog()` (core/src/main/java/jenkins/model/Jenkins.java:2077-2084) calls `checkPermission(ADMINISTER)` before binding `/log`, matching the access-control comment on LogRecorder; endpoints are therefore admin-gated."
+    },
+    {
+      "lead": "Jenkins.doIconSize redirects to the raw `Referer` header (core/src/main/java/jenkins/model/Jenkins.java:3609-3619).",
+      "reason": "A distinct root cause (unvalidated header rather than URI-classification gap); kept as a secondary sink mentioned in the candidate, not submitted separately per the one-candidate cap."
+    }
+  ],
+  "summary": "Snapshot is a Jenkins core tree (group org.jenkins-ci.main, poms/version metadata say 1.625.4-SNAPSHOT) containing core Java sources, CLI sources, war resources and message catalogs (8,829 files; 948 Java files parsed by the P1 index). Version metadata is internally inconsistent with code content: the tree contains post-1.651.2-era security backports (e.g., `@RestrictedSince(\"1.651.2 / 2.TODO\")` in Util.java, `jenkins.CLI` kill switch, ParametersAction SECURITY-170 filter, SHA-1 checksum verification for plugin/core downloads), which makes commit/version-based identification unreliable. After tracing the highest-value trust boundaries (authentication filters, ACL/SidACL, security realms, CLI endpoints, XStream/XML parsing, update-center signature checks, JNLP secret checks, DirectoryBrowserSupport, console annotations), the only source-level inconsistency that indicates a missing/removed hardening step is in redirect-target validation: `hudson.Util.isAbsoluteUri`'s javadoc tells callers to use a helper named `isAbsoluteOrSchemeRelativeUri`, but that helper exists nowhere in the tree, and the implemented `isSafeToRedirectTo` check (`!isAbsoluteUri(uri) && !uri.startsWith(\"//\")`) omits backslash handling. Several web endpoints feed attacker-controllable URLs into this check and then redirect. I submit that as a single lead; everything else evaluated was either already hardened in this tree or not supportable from the snapshot alone."
+}

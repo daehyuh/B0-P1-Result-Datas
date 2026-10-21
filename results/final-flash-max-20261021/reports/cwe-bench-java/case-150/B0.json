@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the bytes of an XML file that the application imports: an XIIDM network file, a CGMES/CIM-RDF XML file or archive, or a file consumed by the CIM anonymizer tool. They can add a DOCTYPE with internal/external entity declarations and reference the entities in element/attribute values that the importer parses.",
+      "confidence": "medium",
+      "counterevidence_checked": "Looked for any repo-level mitigation: no SUPPORT_DTD / IS_SUPPORTING_EXTERNAL_ENTITIES / FEATURE_SECURE_PROCESSING / jdk.xml.* / System.setProperty usage exists anywhere; ACCESS_EXTERNAL_DTD is used only in the three hardened parsers listed above. SafeZipInputStream in the CGMES paths limits archive size/entries but does not affect XML entity resolution. Jackson usage does not enable default typing, SnakeYAML 2.4 defaults to SafeConstructor, and no other remote-input sinks (sockets/HTTP clients) exist in the snapshot, so this remains the strongest concrete issue. Some deployments that set JVM-wide JAXP restrictions or use a hardened StAX provider would be unaffected.",
+      "id": "xxe-stax-unhardened-factories",
+      "impact": "When the parser resolves an external entity, the importing process can be made to read local files and to issue outbound network requests chosen by the attacker (SSRF from the importer host). Entity expansion also enables resource-exhaustion denial of service. Local file contents can surface in parsed values/logs/error messages or in re-exported models depending on how the application uses the imported network, giving partial information disclosure.",
+      "locations": [
+        {
+          "end_line": 37,
+          "path": "commons/src/main/java/com/powsybl/commons/xml/XmlReader.java",
+          "start_line": 30
+        },
+        {
+          "end_line": 89,
+          "path": "cgmes/cgmes-model/src/main/java/com/powsybl/cgmes/model/NamespaceReader.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 329,
+          "path": "cgmes/cgmes-conversion/src/main/java/com/powsybl/cgmes/conversion/CgmesImport.java",
+          "start_line": 230
+        },
+        {
+          "end_line": 91,
+          "path": "iidm/iidm-serde/src/main/java/com/powsybl/iidm/serde/XMLImporter.java",
+          "start_line": 39
+        },
+        {
+          "end_line": 67,
+          "path": "cim-anonymiser/src/main/java/com/powsybl/cim/CimAnonymizer.java",
+          "start_line": 66
+        }
+      ],
+      "prerequisites": "The application imports XML network files from a source an attacker can influence (upload, shared folder, third-party data exchange). Default JDK StAX behavior (DTD processing and external entity resolution enabled) or any provider that resolves external entities unless told otherwise. For the CGMES paths, default import parameters apply (iidm.import.cgmes.cgm-with-subnetworks=true and iidm.import.cgmes.cgm-with-subnetworks-defined-by=MODELING_AUTHORITY), so CgmesOnDataSource/NamespaceReader and MultipleGridModelChecker run on every import/format detection.",
+      "root_cause": "Multiple XML import code paths instantiate javax.xml.stream.XMLInputFactory with default properties and never apply the external-entity restrictions used elsewhere in the project (factory.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, \"\"), ACCESS_EXTERNAL_SCHEMA, XMLInputFactory.SUPPORT_DTD=false / IS_SUPPORTING_EXTERNAL_ENTITIES=false). The JDK StAX defaults keep DTD support and external entity resolution enabled, so a DOCTYPE/entity in the imported file is processed by the parser. Sites: (1) commons XmlReader, used for all XIIDM network imports; (2) cgmes-model NamespaceReader, used to probe every candidate CGMES file; (3) cgmes-conversion CgmesImport.MultipleGridModelChecker, used by default during CGMES import; (4) iidm-serde XMLImporter exists() probe; (5) cim-anonymiser CimAnonymizer. Contrast: cgmes-model FullModel (lines 30-35), commons XmlModuleConfigRepository (lines 41-43) and iidm-serde NetworkSerDe schema validation (lines 127-130) do set ACCESS_EXTERNAL_DTD/SCHEMA to \"\", and no global JAXP/JDK property is set anywhere in the repository.",
+      "title": "XXE: XML import paths create StAX XMLInputFactory without disabling DTD/external entities",
+      "trace": "XIIDM: Importer.importData -> AbstractTreeDataImporter.importData (iidm-serde/.../AbstractTreeDataImporter.java:164) -> NetworkSerDe.read(ReadOnlyDataSource,...) (NetworkSerDe.java:809-824) -> createTreeDataReader (NetworkSerDe.java:558-560) -> createXmlReader (NetworkSerDe.java:574-579) -> new XmlReader (XmlReader.java:36-37), which calls XML_INPUT_FACTORY_SUPPLIER (XmlReader.java:30, plain XMLInputFactory::newInstance). XMLImporter.exists uses the same pattern (XMLImporter.java:39, 64-91) during format detection. CGMES: CgmesImport.exists (CgmesImport.java:129) -> CgmesOnDataSource.exists()/names() (CgmesOnDataSource.java:82-127) -> loadInputStreamAndGetNamespace -> NamespaceReader.namespaces1/base (NamespaceReader.java:47-49, 68-81) using the unhardened supplier at NamespaceReader.java:89; and CgmesImport.importData (lines 154-168, parameter default Boolean.TRUE at lines 710-719) -> MultipleGridModelChecker.separateByModelingAuthority (lines 250-251) -> readModelingAuthority (lines 302-329) -> createXMLStreamReader + getElementText. Contrast hardening: FullModel.java:30-35, XmlModuleConfigRepository.java:41-43, NetworkSerDe.java:127-130.",
+      "unverified": "Not executed or runtime-confirmed. Exploitability depends on the JDK StAX provider actually resolving the declared external entities with default properties (the JDK implementation keeps DTD support and external entity resolution enabled) and on how the consuming application exposes the parsed data; no end-to-end payload was tested, and no deployment configuration (global JAXP properties) is available in the snapshot.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference"
+    }
+  ],
+  "coverage_summary": "Scope reported by get_source_scope: 2923 text files (no binary/sensitive/symlink exclusions). I inventoried the file tree and searched the whole snapshot for XML parser construction (DocumentBuilderFactory/SAXParserFactory/XMLInputFactory/TransformerFactory/newDocumentBuilder/createXMLStreamReader), archive handling (ZipInputStream/ZipFile/TarArchiveInputStream/SafeZipInputStream), deserialization (ObjectInputStream), command execution (ProcessBuilder/Runtime.exec), dynamic class loading (Class.forName/newInstance), crypto/random, YAML/Jackson configuration, path construction (Paths.get/Path.of/resolve) and the GitHub Actions workflows. I read in detail the XML import chains (commons/xml, iidm-serde NetworkSerDe/XMLImporter/AbstractTreeDataImporter), the CGMES model and conversion entry points (CgmesOnDataSource, NamespaceReader, FullModel, CgmesImport, CreateMissingContainersPreProcessor), datasource/archive classes, cim-anonymiser, psse legacy reader, triple-store RDF4J read/query paths, and the .github workflows. Reviewed text only; no code was executed.",
+  "limitations": [
+    "Static review only: no build, execution, or dependency resolution; JDK StAX default behavior is assumed from the JDK/JAXP specification, not verified at runtime.",
+    "Not every one of the 2923 files was read line by line; computational modules (loadflow, security-analysis, sensitivity, shortcircuit, dynamic-simulation, iidm-impl, math internals) were searched for risky patterns but not fully reviewed.",
+    "Externally configured protections (JVM-wide javax.xml.accessExternalDTD, custom StAX providers, or hosting-service sandboxing) are outside the repository and could change exploitability.",
+    "No CVE/advisory data was consulted (per instructions), so this candidate is aligned to source evidence rather than a known finding identifier."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "GitHub Actions expression injection in .github/workflows/fork-build-tests.yml lines 64-68: attacker-controlled ${{ github.event.pull_request.head.ref }} (and head.repo.full_name) interpolated directly into a run: shell script, allowing a fork PR author to inject shell metacharacters/command substitution.",
+      "reason": "Genuine injection (CWE-94), but impact in this workflow is limited: permissions are {} (no scopes), no secrets are available to pull_request runs, and the same job already executes the fork's own build/test code. Escalation into the privileged workflow_run (.github/workflows/fork-sonar.yml, which holds SONAR_TOKEN and write permissions) would require additional unverified steps (artifact tampering, $GITHUB_ENV value injection). Not selected as the single strongest impact."
+    },
+    {
+      "lead": "Java deserialization in math/src/main/java/com/powsybl/math/matrix/SparseMatrix.java:487-496 (new ObjectInputStream(...).readObject()).",
+      "reason": "Unsafe-deserialization pattern, but no in-repository call path was found that feeds it untrusted data; it is a public utility API without callers in the snapshot, so attacker control is unproven."
+    },
+    {
+      "lead": "Groovy script evaluation in contingency-dsl/action-ial/dsl/scripting/dynamic-simulation (e.g. AbstractDslContingenciesProvider.java:33, GroovyScriptPostProcessor.java:82).",
+      "reason": "Executing user-provided Groovy scripts is a documented, intended feature (DSL for contingencies/actions); the scripts are trusted configuration, not untrusted data crossing a boundary."
+    },
+    {
+      "lead": "CimAnonymizer copies zip entry names verbatim into the output archive (CimAnonymizer.java:304-311).",
+      "reason": "Zip-slip style names can only matter if a consumer later extracts the produced archive; this code never writes entry contents to the filesystem, so no concrete impact in this snapshot."
+    },
+    {
+      "lead": "CreateMissingContainersPreProcessor writes fixesFolder.resolve(basename + \".zip\") using a basename derived from the input model URI (lines 101-114).",
+      "reason": "The name comes from URI.getAuthority(), which cannot contain '/', so no path traversal or arbitrary file write could be established."
+    }
+  ],
+  "summary": "Repository is powsybl-core (6.8.0-SNAPSHOT), a Java power-grid data library. The strongest source-supported issue is XXE (CWE-611): several XML import paths parse attacker-suppliable XML with a default (unrestricted) StAX XMLInputFactory, while other parsers in the same codebase are explicitly hardened with ACCESS_EXTERNAL_DTD/ACCESS_EXTERNAL_SCHEMA, showing the restriction is intended but omitted in these paths. Impact is local-file disclosure (partial), SSRF from the importing host, and entity-expansion DoS. One candidate submitted; the GitHub Actions expression injection found in .github/workflows/fork-build-tests.yml is reported as a rejected lead because its impact is limited (permissions:{} and no secrets, and fork code already executes in that job), and the other leads were rejected for lack of a concrete untrusted input path."
+}

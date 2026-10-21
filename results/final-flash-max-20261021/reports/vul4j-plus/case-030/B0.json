@@ -1,0 +1,86 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "HTTP request headers and multipart part metadata: the `Content-Type` header (the request is treated as multipart whenever it contains the substring `multipart/form-data`, per Dispatcher.wrapRequest line 801, even when the value is malformed), the multipart part `filename`/`Content-Disposition` value (used verbatim in JakartaStreamMultiPartRequest.addFileSkippedError), and the request Content-Length/size used to trigger the size-limit path. All are fully attacker-controlled and unauthenticated.",
+      "confidence": "high",
+      "counterevidence_checked": "(1) The resource bundle supplies fixed text for `struts.messages.upload.error.SizeLimitExceededException` and `struts.messages.upload.error.IOException`, so those two exception types do not fall back to attacker text; all other upload exception simple names (e.g., InvalidContentTypeException, FileSizeLimitExceededException, stream IO exceptions) have no bundle key, so the raw default message is used - verified by reading struts-messages.properties completely. (2) An OGNL sandbox exists (SecurityMemberAccess with excluded classes/packages), but the OGNL context exposes the container (ActionContext.CONTAINER) and the exclusion sets are shared by reference, so the S2-045-style payload can clear them; regardless, evaluating request-controlled text as an expression is itself the boundary violation. (3) Upload filenames are path-stripped by getCanonicalName, but that is unrelated to this sink. (4) PellMultiPartRequest returns an empty error list, so it does not reach the sink. (5) The `jakarta` parser path depends on commons-fileupload 1.3.2 embedding the Content-Type in the exception message; the `jakarta-stream` in-tree path does not depend on that.",
+      "id": "struts-multipart-error-ognl-eval",
+      "impact": "Remote code execution (or at minimum arbitrary OGNL expression evaluation) in the JVM/web-application security context, potentially pre-authenticated, via a single crafted multipart request. Because the evaluated expression runs on the Struts value stack with OGNL context access, it can also lead to file manipulation, information disclosure, and denial of service. This corresponds to a critical, actively exploited class of Struts vulnerabilities (S2-045/S2-046, CVE-2017-5638).",
+      "locations": [
+        {
+          "end_line": 120,
+          "path": "core/src/main/java/org/apache/struts2/dispatcher/multipart/JakartaMultiPartRequest.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 266,
+          "path": "core/src/main/java/org/apache/struts2/interceptor/FileUploadInterceptor.java",
+          "start_line": 258
+        },
+        {
+          "end_line": 737,
+          "path": "core/src/main/java/com/opensymphony/xwork2/util/LocalizedTextUtil.java",
+          "start_line": 714
+        },
+        {
+          "end_line": 168,
+          "path": "core/src/main/java/com/opensymphony/xwork2/util/TextParseUtil.java",
+          "start_line": 154
+        },
+        {
+          "end_line": 807,
+          "path": "core/src/main/java/org/apache/struts2/dispatcher/Dispatcher.java",
+          "start_line": 794
+        },
+        {
+          "end_line": 357,
+          "path": "core/src/main/java/org/apache/struts2/dispatcher/multipart/JakartaStreamMultiPartRequest.java",
+          "start_line": 344
+        },
+        {
+          "end_line": 515,
+          "path": "core/src/main/java/org/apache/struts2/dispatcher/multipart/JakartaStreamMultiPartRequest.java",
+          "start_line": 504
+        },
+        {
+          "end_line": 294,
+          "path": "core/src/main/java/com/opensymphony/xwork2/ognl/OgnlValueStack.java",
+          "start_line": 232
+        }
+      ],
+      "prerequisites": "Application uses Struts multipart handling with the default configuration (`struts.multipart.parser=jakarta`, `struts.multipart.maxSize=2097152`; `fileUpload` is part of defaultStack/defaultStack variants in struts-default.xml lines 299/332). The invoked mapped action must implement `ValidationAware` (e.g., extend `ActionSupport`, line 33) so `FileUploadInterceptor` calls `validation.addActionError(findText(...))`; practically every typical Struts action does. For the fully in-tree filename vector, the optional `struts.multipart.parser=jakarta-stream` must be configured and the request must exceed the size limit; for the default `jakarta` parser, the parsed exception message must contain the attacker value (behavior of the bundled commons-fileupload 1.3.2, whose source is not in this snapshot).",
+      "root_cause": "Upload error handling feeds attacker-influenced exception text into an expression evaluator. `JakartaMultiPartRequest.parse` catches parsing exceptions and `buildErrorMessage` (line 119) creates a `LocalizedMessage` whose default message is the raw `e.getMessage()`; `JakartaStreamMultiPartRequest` does the same (line 514) and, in `addFileSkippedError` (lines 350-353), explicitly puts the raw multipart part filename into that exception message. `FileUploadInterceptor.intercept` (lines 260-265) passes this default message to `LocalizedTextUtil.findText(...)`. In `LocalizedTextUtil.getDefaultMessage` (lines 714-737, evaluation at line 729) the message is run through `TextParseUtil.translateVariables(message, valueStack)`, which extracts every `${...}`/`%{...}` substring and evaluates it as OGNL via `OgnlTextParser.evaluate` -> `OgnlValueStack.findValue` -> `OgnlUtil.getValue` (OgnlValueStack lines 232-294). There is no escaping or non-evaluating path for defaults (if the message key is only present for `SizeLimitExceededException`/`IOException`; all other exception class names miss the bundle), and the OGNL context exposes the Struts container/member-access used in the known S2-045 payloads to override the `SecurityMemberAccess` exclusions.",
+      "title": "OGNL evaluation of attacker-controlled multipart upload error messages enables remote code execution",
+      "trace": "StrutsPrepareAndExecuteFilter.serviceAction -> PrepareOperations.wrapRequest -> Dispatcher.wrapRequest (Content-Type contains `multipart/form-data`) -> new MultiPartRequestWrapper -> JakartaMultiPartRequest.parse catches FileUploadException, calls buildErrorMessage(e, ...) storing e.getMessage() as default message -> wrapper.addError -> FileUploadInterceptor.intercept sees multiWrapper.hasErrors() and calls LocalizedTextUtil.findText(clazz, textKey, locale, defaultMessage, args) -> getDefaultMessage substitutes the attacker text and calls TextParseUtil.translateVariables(message, valueStack) -> OgnlTextParser.evaluate -> OgnlValueStack.findValue/ognlUtil.getValue -> OGNL expression evaluation on the current value stack/context. Parallel path: JakartaStreamMultiPartRequest.processUpload -> addFileSkippedError(itemStream.getName(), request) -> synthetic FileSizeLimitExceededException whose message contains the raw filename -> buildErrorMessage -> same evaluation sink.",
+      "unverified": "Not runtime-confirmed and no exploit/test was executed. Commons-fileupload/OGNL/XStream sources are not in the snapshot, so the exact exception message text for the default `jakarta` parser could not be read here; the requirement that the action implement ValidationAware for the FileUploadInterceptor sink could not be checked against a concrete application configuration (only the framework defaults and ActionSupport). No test sources are present to corroborate the fix behavior.",
+      "weakness_type": "CWE-917 Expression Language Injection / CWE-94 Code Injection (OGNL injection leading to RCE)"
+    }
+  ],
+  "coverage_summary": "Scope contained 1700 model-visible files (core 811 files, plus plugins, apps, bundles, poms); binary/symlink/sensitive filters were applied per the scope report and excluded nothing relevant. I read the multipart package (JakartaMultiPartRequest, JakartaStreamMultiPartRequest, MultiPartRequestWrapper), FileUploadInterceptor, Dispatcher.wrapRequest and the filter/PrepareOperations entry points, LocalizedTextUtil, TextParseUtil/OgnlTextParser, OgnlValueStack/OgnlUtil/SecurityMemberAccess, DefaultActionMapper, struts-default.xml, default.properties and struts-messages*.properties, the REST plugin handler/registration files, and sampled other interceptors/result classes for competing issues. Not exhaustively read: most of the 811 core files, most plugins (json, convention, tiles, portlet, etc.), apps and bundles.",
+  "limitations": [
+    "No test sources are present in the snapshot, so vulnerable/fixed behavior could not be corroborated by tests.",
+    "Third-party dependency sources used in the trace (commons-fileupload 1.3.2, OGNL 3.1.12, XStream) are not part of the snapshot and were not inspected.",
+    "Static review only: no build, test, scanner, or runtime execution was performed; the finding is a candidate, not a confirmed vulnerability.",
+    "Exact reachable set of upload exception classes and their messages in the default `jakarta` parser depends on the dependency version and was not enumerated.",
+    "Git history/patches were not available, so the snapshot's exact position relative to upstream security fixes was inferred from the 2.5.6-SNAPSHOT version and code state."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "REST plugin unwhitelisted XStream deserialization: `XStreamHandler.toObject` calls `new XStream().fromXML(in, target)` (plugins/rest/.../handler/XStreamHandler.java lines 43-50) and is reachable through `ContentTypeInterceptor.intercept` (lines 52-65) for `application/xml` bodies when the REST plugin is deployed (registered in plugins/rest/src/main/resources/struts-plugin.xml line 35). This is a plausible severe issue, but it is scoped to applications that deploy the optional REST plugin and is not the single strongest candidate in this snapshot, so it is not submitted as a second candidate.",
+      "reason": "Plugin-scoped and needs an application using the REST content-type interceptor; the multipart OGNL sink is in core with default configuration."
+    },
+    {
+      "lead": "Namespace injection in DefaultActionMapper: with `struts.mapper.alwaysSelectFullNamespace=true`, `parseNameAndNamespace` takes the namespace directly from the request URI (DefaultActionMapper.java lines 355-360) without validation, and result parameters are subsequently OGNL-evaluated by `StrutsResultSupport.conditionalParse` (lines 218-225).",
+      "reason": "Requires a non-default constant plus application result/URL configuration that feeds the namespace into `${...}`/`%{...}` evaluation; the end-to-end exploit chain is not established from this snapshot alone, making the evidence weaker than the multipart sink."
+    },
+    {
+      "lead": "Static resource path traversal via DefaultStaticContentLoader (findStaticResource lines 198-224).",
+      "reason": "The implementation checks `resourceUrl.getFile().endsWith(pathEnding)` before opening the stream and cleanupPath/buildPath normalize the resource path; no bypass was identified in source."
+    },
+    {
+      "lead": "DebuggingInterceptor / web console command execution.",
+      "reason": "Gated on `struts.devMode=true`, which is an explicit developer configuration rather than a default-exposed trust-boundary violation."
+    }
+  ],
+  "summary": "This is an Apache Struts 2.5.6-SNAPSHOT source snapshot (1700 files, no test sources, 811 core files plus plugins/apps/bundles). The strongest source-evidenced issue is the multipart upload error-message OGNL injection: exception messages produced while parsing a `multipart/form-data` request (which embed attacker-controlled values such as the `Content-Type` header or a part filename) are carried into `LocalizedMessage` as the *default message*, and are then evaluated as OGNL by `LocalizedTextUtil` -> `TextParseUtil.translateVariables` -> `OgnlValueStack.findValue` -> `OgnlUtil.getValue` when `FileUploadInterceptor` adds the upload error to a ValidationAware action. This is the root cause behind the Struts S2-045/S2-046 class of vulnerabilities (CVE-2017-5638) and is consistent with the snapshot's version/timing. A second, fully in-tree instance of attacker-controlled message construction exists in the optional `jakarta-stream` parser (`addFileSkippedError` builds an exception message from the raw multipart filename), which removes any dependence on third-party message contents for the filename vector. The chain uses default configuration (`struts.multipart.parser=jakarta`, `struts.multipart.maxSize=2097152`, `fileUpload` in defaultStack) and is reachable pre-authentication wherever a `ValidationAware`/`ActionSupport` action is mapped with the default interceptor stack."
+}

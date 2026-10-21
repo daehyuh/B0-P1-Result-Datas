@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The whole PNG byte stream is attacker-controlled. The interlace-method byte is the 13th byte of the IHDR chunk payload (bytes[12] of the chunk data, i.e. file offset 8+4+4+12 = 28 in a minimal PNG). Setting it to 0x02, or to any value 0x80-0xFF (which becomes a negative int), is sufficient; IHDR is constructed before any CRC/IDAT/IEND validation, so the rest of the file only needs a PNG signature and a well-formed chunk header.",
+      "confidence": "high",
+      "counterevidence_checked": "Confirmed the check is genuinely dead (no int is both <0 and >=2) rather than merely permissive. Confirmed InterlaceMethod has exactly two constants (NONE, ADAM7) and that values()[method] is the only consumer, so no later validation exists. Confirmed PngChunkIhdr is instantiated for every IHDR in getImageSize/getImageInfo/getBufferedImage and is not gated by an exclusion list. Confirmed readByte returns a sign-extended byte, so both positive in-range-looking values (2..127) and negative values (0x80..0xFF) bypass the check. Checked that the PngImageParser path does not wrap RuntimeException the way JpegDecoder does. Considered whether other PNG parsers/validators sanitize the byte first; none do. Considered that this is a robustness/DoS class bug, not memory corruption, and rated impact accordingly.",
+      "id": "png-ihdr-interlace-method-index",
+      "impact": "Denial of service: a ~30-byte crafted PNG causes an uncaught ArrayIndexOutOfBoundsException in any consumer that reads untrusted PNGs (including the common size/info probing calls), aborting the request/thread or potentially the process if unhandled. The declared exception contract of the API is also violated, so callers cannot handle it as a malformed image. In Java the access is bounds-checked, so there is no memory corruption or code-execution impact; this is an availability-only finding.",
+      "locations": [
+        {
+          "end_line": 56,
+          "path": "src/main/java/org/apache/commons/imaging/formats/png/chunks/PngChunkIhdr.java",
+          "start_line": 52
+        },
+        {
+          "end_line": 201,
+          "path": "src/main/java/org/apache/commons/imaging/formats/png/PngImageParser.java",
+          "start_line": 148
+        },
+        {
+          "end_line": 262,
+          "path": "src/main/java/org/apache/commons/imaging/formats/png/PngImageParser.java",
+          "start_line": 256
+        },
+        {
+          "end_line": 81,
+          "path": "src/main/java/org/apache/commons/imaging/common/BinaryFunctions.java",
+          "start_line": 74
+        },
+        {
+          "end_line": 27,
+          "path": "src/main/java/org/apache/commons/imaging/formats/png/InterlaceMethod.java",
+          "start_line": 24
+        }
+      ],
+      "prerequisites": "Application (or downstream library) parses an untrusted PNG with Commons Imaging and does not catch RuntimeException/Throwable. Any of `Imaging.getImageSize`, `Imaging.getImageInfo`, `Imaging.getBufferedImage`, or direct `PngImageParser` use reaches the defect; `getImageSize` is a metadata-only dimension probe and is enough. No image data needs to be decoded and no special heap size is needed.",
+      "root_cause": "In PngChunkIhdr the 13th byte of the attacker-supplied IHDR chunk is read as the interlace method and then used directly as an index into InterlaceMethod.values(). The intended guard is written as `if (method < 0 && method >= InterlaceMethod.values().length)`. No int can satisfy both comparands, so the guard is dead code and the array access at line 56 is completely unvalidated. Note the value is also sign-extended: BinaryFunctions.readByte returns `(byte)(0xff & result)`, so IHDR method bytes 0x80-0xFF become negative ints (e.g. 0xFF -> -1) and byte 0x02 stays 2; `InterlaceMethod` has only NONE(0) and ADAM7(1), so any value other than 0/1 throws ArrayIndexOutOfBoundsException.",
+      "title": "PNG IHDR 'InterlaceMethod' byte used as enum-array index; bounds check is dead because it uses && instead of ||",
+      "trace": "1) Imaging.getImageSize(bytes)/getImageInfo(bytes) -> getImageParser (src/main/java/org/apache/commons/imaging/Imaging.java:704-730); guessFormat matches the PNG magic (Imaging.java:274-275, MAGIC_NUMBERS_PNG) and returns PngImageParser. 2) PngImageParser.getImageSize (line 255-262) calls readChunks(byteSource, {IHDR}, true); getImageInfo (line 325-337) keeps IHDR in its whitelist; getBufferedImage (line 480-498) also keeps IHDR. 3) readChunks (lines 148-201) reads a 4-byte chunk length, the chunk type, the chunk data and the CRC, then constructs `new PngChunkIhdr(length, chunkType, crc, bytes)` at lines 185-186 before returning. 4) The PngChunkIhdr constructor (lines 38-57) reads width/height/bitDepth/colorType/compression/filter and then `final int method = readByte(\"InterlaceMethod\", ...)` at line 52. 5) readByte sign-extends the byte (BinaryFunctions.java:74-81). 6) The guard at line 53 (`method < 0 && method >= 2`) can never be true, so line 56 executes `InterlaceMethod.values()[method]` with method outside {0,1} -> ArrayIndexOutOfBoundsException (or NegativeArraySizeException-like index failure for negative values) thrown from an unchecked array access. 7) Unlike JpegDecoder.visitSOS (src/main/java/org/apache/commons/imaging/formats/jpeg/decoder/JpegDecoder.java:164-172), which explicitly wraps RuntimeException, the PNG path has no such catch, so the exception escapes the public API that only declares ImageReadException and IOException.",
+      "unverified": "No code was executed and no crafted file was run, so the crash is demonstrated by source reasoning only. I could not consult patches, JIRA/commit history, or issue/CVE IDs (out of scope for this run), so whether this specific defect corresponds to an upstream fix record is unverified. The exact exception type for all negative index values and the behavior of any caller-side RuntimeException handling outside this repository were not observed.",
+      "weakness_type": "CWE-129 Improper Validation of Array Index (dead bounds check; CWE-480 incorrect operator) causing out-of-bounds array read / uncaught ArrayIndexOutOfBoundsException (DoS)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot of Apache Commons Imaging (375 model-visible files; source_root_files 375; 0 over-5MiB, symlink, or sensitive-name exclusions; binary files unreadable by the tools). All src/main/java tree categories were listed and searched; I read the PNG parser/chunks/scanline filters, TIFF reader/directory/data readers/photometric interpreters/field types, CCITT and LZW/PackBits decompressors, JPEG parser/segments/decoder/rewriters, GIF parser and LZW, BMP/ICO/ICNS/PSD/PCX/DCX/PNM/WBMP/XBM/XPM/RGBE/ICC/palette/ImageBuilder/Imaging facade and build/release metadata. No tests are present in the snapshot, so none were reviewed. Coverage is broad but inspection was targeted rather than exhaustive line-by-line over all 375 files; site documentation and generated metadata were only skimmed.",
+  "limitations": [
+    "No code execution, fuzzing, or reproduction was performed (prohibited by the run conditions), so all impact statements are static source analysis, not runtime confirmation.",
+    "No repository history, patches, JIRA/CVE/OSV identifiers, or external ground truth were consulted; the relationship between this snapshot and any upstream fix is unknown.",
+    "Not every one of the 375 files was read end-to-end; whole classes of parsers (e.g. some BMP/ICO/JPEG-rewrite paths, palette writers, Exif/Iptc rewriters) were only skimmed for reachable attacker-controlled indexing/allocation.",
+    "Only one candidate could be submitted, so several real-looking unchecked-index/unbounded-allocation leads listed above were deliberately not submitted and remain unconfirmed.",
+    "Severity judgments assume a typical consumer parsing untrusted image bytes and not catching Throwable/Error; an application with a top-level exception barrier would see reduced impact."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unbounded/negative allocation in PNG chunk parsing: PngImageParser.readChunks (lines 153-165) passes the file-declared 4-byte chunk length straight to BinaryFunctions.readBytes -> new byte[length] (BinaryFunctions.java:89-104) without comparing it to the remaining byte-source length or rejecting negatives; a tiny PNG with an IDAT/IHDR-length 0x7FFFFFFF can trigger OutOfMemoryError, and 0xFFFFFFFF triggers NegativeArraySizeException. The same pattern exists in PsdImageParser.readImageResourceBlocks (line 207-214) and IcnsImageParser.readIcnsElement (line 192-203). Rejected as the single candidate only because it is a resource-exhaustion hardening gap whose impact depends on heap size, whereas the IHDR defect is a provable dead bounds check with deterministic impact.",
+      "reason": "Real but lower-certainty-impact resource exhaustion; kept as lead, not selected."
+    },
+    {
+      "lead": "RgbeInfo.decompress (src/main/java/org/apache/commons/imaging/formats/rgbe/RgbeInfo.java:171-195) writes up to 127 bytes per packet into a fixed per-scanline buffer out[position++] with no position bound check, so a crafted 'RADIANCE' file causes an out-of-bounds write (ArrayIndexOutOfBoundsException) via Imaging.getBufferedImage; the same method was recently touched by the IMAGING-219 hang fix listed in src/changes/changes.xml, which leaves this loop invariant unenforced.",
+      "reason": "Strong OOB-write lead but format is niche and source evidence is slightly weaker than the provably dead boolean bound on the IHDR index."
+    },
+    {
+      "lead": "TIFF DataReaderStrips.interpretStrip optimized 8-bit/24-bit paths (src/main/java/org/apache/commons/imaging/formats/tiff/datareaders/DataReaderStrips.java:110-162) index bytes[k++] without verifying that the strip's decompressed data length covers pixelsPerStrip, even though the in-code comment acknowledges the 'each strip exactly fills out the rows' assumption; attacker-controlled StripByteCounts (TIFF reader stores it verbatim, TiffReader.getTiffRawImageData) yields an out-of-bounds read/ArrayIndexOutOfBoundsException.",
+      "reason": "Plausible and evidence-backed, but requires more crafted TIFF structures and overlaps the generic 'missing decoder bounds check' class."
+    },
+    {
+      "lead": "CCITT T.4/T.6 decompression (src/main/java/org/apache/commons/imaging/common/itu_t4/T4AndT6Compression.java:387-435 and 542-590) lets fillRange()/the 1-D branch write referenceLine past row width because run lengths from Huffman codes are not bounded; reachable from TIFF compression=3/4.",
+      "reason": "Same missing-bounds-check family as the selected candidate; not individually verified as thoroughly."
+    },
+    {
+      "lead": "MyLzwDecompressor.initializeTable (src/main/java/org/apache/commons/imaging/common/mylzw/MyLzwDecompressor.java:66-74) allocates table[0..(1<<(codeSize+2))-1] into a 4096-entry array while GifImageParser.readImageDescriptor (line 388) passes the raw LZW-minimum-code-size byte without range validation, so values >= 11 (or values whose +2 shift wraps) over-index the array; PackBits.decompress (src/main/java/org/apache/commons/imaging/common/PackBits.java:43-67) and PcxImageParser 8bpp/3-plane and 24/32bpp paths (lines 418-456) have analogous missing length validation.",
+      "reason": "Additional unchecked-index candidates; not selected to respect the single-candidate limit and because none was traced as end-to-end as the IHDR case."
+    }
+  ],
+  "summary": "Repository: Apache Commons Imaging (Sanselan successor), source snapshot 375 files (src/main/java, resources, site/build files; no tests present). This is pure-Java image parsing/writing code, so the realistic security class is availability (uncaught runtime exceptions, unbounded allocation, hangs) triggered by hostile image files that the host application parses. After surveying the format parsers (PNG, TIFF incl. CCITT/LZW/PackBits, GIF/LZW, JPEG, BMP/ICO/ICNS/PSD/PCX/DCX/PNM/WBMP/XBM/XPM/RGBE/ICC/palette/utility code), I selected the single strongest, most provable defect: the PNG IHDR parser uses a dead bounds check (`&&` where `||` was intended) before indexing the `InterlaceMethod` enum array with an attacker-controlled byte, producing an uncaught ArrayIndexOutOfBoundsException from common, metadata-only APIs. Several other real but lower-evidence/overlapping problems (unbounded chunk allocation, RGBE decompression over-write, TIFF fast-path out-of-bounds reads, GIF LZW code-size) are noted as rejected leads; none of them were runtime-confirmed."
+}

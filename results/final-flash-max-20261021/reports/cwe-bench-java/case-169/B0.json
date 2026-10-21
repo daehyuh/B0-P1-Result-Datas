@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A network attacker (MITM on a hostile/shared network, rogue or compromised HTTPS/PAC proxy — note WDM itself supports wdm.proxy / HTTPS_PROXY — DNS or BGP manipulation, or a compromised mirror/CDN) fully controls the bytes WebDriverManager receives over HTTPS because neither the certificate chain nor the hostname is validated. The attacker controls the JSON/text content of the driver listing and version endpoints and the driver archive body.",
+      "confidence": "medium",
+      "counterevidence_checked": "The relaxed TLS handling might be intended to survive corporate proxies/self-signed certificates, which would lower its 'maliciousness'; however (a) there is no config key or API to opt into/out of it (unlike wdm.proxy, wdm.avoidExternalConnections, etc.), (b) it is undocumented in docs/index.html, the CHANGELOG (searched certificate/SSL/trust/insecure/handshake/PKIX — no entries) and comments, and (c) even under that charitable reading it unconditionally accepts any certificate from any host and performs no certificate-hostname check, so the security property is entirely lost. I also verified the custom connection manager is the one actually used (it is passed via builder.setConnectionManager at line 130 after setConnectionManagerShared, and useSystemProperties() at line 135 does not replace it), and that the code path is exercised by default setup (WebDriverManager.java 412-416).",
+      "id": "wdm-tls-validation-bypass",
+      "impact": "Remote code execution on machines running WebDriverManager (driver binaries downloaded and executed by Selenium), including CI/CD runners; theft of the GitHub token (Authorization header) and any other credentials/headers sent over the intercepted connections; integrity loss for all driver/version metadata. No integrity backstop exists in the codebase (no checksum/signature verification was found).",
+      "locations": [
+        {
+          "end_line": 109,
+          "path": "src/main/java/io/github/bonigarcia/wdm/online/HttpClient.java",
+          "start_line": 95
+        },
+        {
+          "end_line": 135,
+          "path": "src/main/java/io/github/bonigarcia/wdm/online/HttpClient.java",
+          "start_line": 130
+        },
+        {
+          "end_line": 416,
+          "path": "src/main/java/io/github/bonigarcia/wdm/WebDriverManager.java",
+          "start_line": 412
+        },
+        {
+          "end_line": 164,
+          "path": "src/main/java/io/github/bonigarcia/wdm/online/Downloader.java",
+          "start_line": 127
+        }
+      ],
+      "prerequisites": "The victim runs the library normally and it performs an HTTPS fetch (default behaviour whenever a driver is not already cached/resolved): e.g. the CfT last-known-good JSON (wdm.chromeLastGoodVersionsUrl), geckodriver listing/geckodriver-support JSON, commands.properties (fetched online by default: wdm.commandsPropertiesOnlineFirst=true), or any driver URL. The attacker only needs to be positioned on the TLS path (or be the configured proxy / a compromised mirror); no credentials or special flags on the victim side.",
+      "root_cause": "In the HttpClient constructor the project intentionally installs a trust-all TLS strategy into the pooled connection manager used for all of its HTTPS traffic: `SSLContexts.custom().loadTrustMaterial(null, TrustStrategy -> true)` accepts any server certificate for any host, and the custom HostnameVerifier (`hostname.equalsIgnoreCase(session.getPeerHost())`) does not compare the presented certificate/SAN to the requested host, so hostname verification is also effectively absent. There is no configuration switch, comment, or documentation indicating this relaxed mode is required or opt-in; it replaces the JDK/Apache default validation unconditionally (HttpClient.java lines 90-135).",
+      "title": "WebDriverManager's HttpClient disables TLS certificate and hostname validation, enabling MITM substitution of downloaded driver executables (and GitHub token exposure)",
+      "trace": "HttpClient constructor (HttpClient.java 87-136) builds a PoolingHttpClientConnectionManager carrying DefaultClientTlsStrategy(trustAllContext, nonValidatingHostnameVerifier) and installs it with builder.setConnectionManager(cm) (line 130); every request then uses this client. WebDriverManager.setup() creates it (WebDriverManager.java 414) and hands it to Downloader (415). Downloader.download -> downloadAndExtract (Downloader.java 85-95, 127-164) streams the response into a temp file and extracts it (extract/unZip/unTarGz, lines 184-309), setting the extracted binary executable (311-315); WebDriverManager.exportDriver (WebDriverManager.java 1281-1290) then points Selenium at that path so the substituted driver binary is executed in the victim's/JVM's user context (often CI). Additionally, the same client fetches commands.properties (VersionDetector.getOnlineInputStream 435-450) whose content is turned into shell commands — including the string-built `bash -c \"type -p \" + firstCommand` at VersionDetector.java 227-232 — giving MITM-to-command-execution if browser-path detection is used, and openGitHubConnection (WebDriverManager.java 1580-1592) sends `Authorization: token <GITHUB_TOKEN>` over the same unvalidated channel, exposing the token to the interceptor.",
+      "unverified": "Not runtime-confirmed: I did not execute the library or a MITM proxy. Intent is ambiguous — the block could be a deliberate proxy workaround (or a recent regression from the httpclient5 bump recorded in the 6.0.1 changelog) rather than the benchmark's injected/known defect; a maintainer response could classify it as by-design. I could not consult upstream history, tests (absent from this scope), or advisories to confirm whether this was later fixed, and I did not verify how the hidden test suite exercises this path.",
+      "weakness_type": "Improper Certificate Validation (CWE-295) / Missing Hostname Verification (CWE-297), leading to download/execute of attacker-controlled code (CWE-494)"
+    }
+  ],
+  "coverage_summary": "Reviewed all 41 Java files under src/main/java (full read of the security-relevant ones: online/HttpClient, online/Downloader, online/UrlHandler, online/Parser, online GitHub/S3/Gson helpers, versions/VersionDetector, versions/Shell, WdmServer, WdmAgent, WebDriverManager core resolution/download/export paths, all managers, Config and the other config classes, cache classes, docker classes, webdriver classes), plus pom.xml, all resources (webdrivermanager.properties, commands.properties, versions.properties), CHANGELOG.md, .github workflows and Docker files; docs/index.html was spot-checked (server section, configuration tables, known issues). Runtime, tests, git history and external advisories were out of scope.",
+  "limitations": [
+    "No test sources, build artifacts, git history/diff, or dependency-vulnerability database were available, so I could not confirm whether the trust-all TLS block is upstream-intended, a recent regression, or the case's injected defect.",
+    "No runtime, network, or scanner execution was performed (and is disallowed), so all findings are source-level leads, not confirmed exploits.",
+    "docs/index.html (217 KB generated documentation) was only spot-checked, not read line-by-line; CHANGELOG.md was searched but not exhaustively read.",
+    "Dependency CVEs (Javalin 4.6.8/Jetty, httpclient5 5.4.3, docker-java 3.5.0, logback, gson) were not assessed against advisory data because external lookups are out of scope.",
+    "Archive-extraction behaviour (zip/tar traversal) was analysed statically only; I did not verify which repository/mirror archives or server modes are realistic in a given deployment."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unsafe archive extraction: Downloader.unZip (Downloader.java 207-243) writes entries to new File(compressedFile.getParentFile(), name) with no `../`/canonical-path check, and unTarGz (273-309) concatenates destDir + entry.getName() the same way — a Zip-Slip/tar traversal that can write outside the temp/cache folder if an attacker ever controls an archive (malicious mirror, MITM enabled by the TLS finding, or WdmServer URL overrides).",
+      "reason": "Real missing validation, but in normal operation the archive comes from official/trusted repositories; without the TLS bypass or server mode the attacker model is weaker and it may be longstanding upstream implementation. Kept out to avoid splitting one network-trust story into multiple candidates."
+    },
+    {
+      "lead": "WdmServer (WdmServer.java 127-276) applies every query-string parameter as a global `wdm.*` system property (`System.setProperty`, line 252) on an unauthenticated Javalin server that binds all interfaces (docker/Dockerfile runs it as root on 4444). An attacker can redirect driver downloads, change cachePath/resolution paths, or point commandsPropertiesUrl at attacker content.",
+      "reason": "This is the documented, by-design API of the server ('you can parametrize these URLs using all the configuration keys', docs/index.html line 2238), so it is a design/privilege-assumption weakness rather than a clear defect; it also only affects deployments that explicitly run server mode."
+    },
+    {
+      "lead": "XXE: WebDriverManager.loadXML (WebDriverManager.java 1571-1578) uses DocumentBuilderFactory without disabling DTD/external entities and is used on remote XML (EdgeDriverManager.getDriversFromXml 261-311, msedgedriver storage listing).",
+      "reason": "The XML source is a Microsoft endpoint by default; exploitation needs the URL to be attacker-controlled (or MITM, again dependent on the TLS finding). Also serves only legacy Edge listing behaviour, so weaker evidence than the primary candidate."
+    },
+    {
+      "lead": "Shell command construction from remotely fetched data: VersionDetector.getBrowserPath builds `new String[]{\"bash\",\"-c\",\"type -p \" + firstCommand}` (VersionDetector.java 227-232) from commands.properties, which by default is fetched online (wdm.commandsPropertiesOnlineFirst=true; getOnlineInputStream 435-450).",
+      "reason": "Reachable only through browser-path/version detection and requires controlling the online properties file (again MITM-enabled); it is a downstream consequence of the same trust-boundary failure rather than an independent root cause."
+    }
+  ],
+  "summary": "This is the WebDriverManager 6.0.2-SNAPSHOT library (driver downloader for Selenium). I reviewed all 41 main Java sources plus pom, resources, changelog, docs and workflows. The strongest single issue is that the library's own HTTP client is built with a trust-all TLS configuration and a non-validating hostname verifier, so every HTTPS fetch WebDriverManager performs (driver-listing JSON, version files, commands.properties, and the driver archives themselves) is MITM-able, and the fetched archives become executables that Selenium later runs — a concrete code-execution path. I found no checksum/signature verification anywhere in the repo, so this TLS bypass is the codebase's only integrity control. Secondary plausible-but-weaker leads (unsafe archive extraction in Downloader, unauthenticated WdmServer config injection, XXE in loadXML, shell command built from remotely fetched commands.properties) are listed as rejected/unconfirmed rather than candidates."
+}

@@ -1,0 +1,113 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated remote HTTP client controls the request: it can call any `/openapi/**` route (no Authorization header needed when `openapi.auth.enabled=false`; e.g. the seeded routes exposed by InstallerController, OpenDataNodeController, OpenInLongGroupController) and then reuse the issued JSESSIONID cookie against `/api/**` endpoints. No user-controlled file/SQL/command input is required; the attacker only controls the HTTP request sequence.",
+      "confidence": "medium",
+      "counterevidence_checked": "The comment on application.properties:60 shows that unauthenticated /openapi/** access itself is the documented effect of `openapi.auth.enabled=false`, so I did not treat openapi exposure alone as a vulnerability; the finding is the cross-surface session reuse. I verified the web gate is the custom AuthenticationFilter (not Shiro authc) and that it performs no realm/session-origin check; verified roles are derived only from the subject principal (WebAuthorizingRealm); verified the seeded default admin has INLONG_ADMIN and tenant `public` exists so the tenant filter does not block; verified `SecretToken` no-arg construction yields matching credentials; and confirmed ShiroConfig does not disable session storage or isolate the openapi chain. I also checked that password hashing (HashedCredentialsMatcher), MyBatis order-by interpolation (OrderFieldEnum/OrderTypeEnum reset the values before ${} use), MySQL JDBC URL filtering (MySQLSensitiveUrlUtils) and the service-level checkUser() authorizations are present, i.e. I did not pick those weaker leads.",
+      "id": "inlong-openapi-session-admin-bypass",
+      "impact": "Full compromise of the InLong Manager control plane from an unauthenticated network position: create/modify/delete users (including changing other users' passwords/account types, giving persistent takeover), clusters, cluster nodes with SSH credentials, data nodes, groups/streams/sinks and SaaS modules. Agent-installer flows and module install/start/stop commands are driven by these records, so the bypass can also lead to arbitrary command execution on managed agent hosts (ExcuteLinux.exeCmd on the installer) when the attacker updates/assigns modules; tenant isolation is also defeated because the principal is the global admin.",
+      "locations": [
+        {
+          "end_line": 61,
+          "path": "inlong-manager/manager-web/src/main/resources/application.properties",
+          "start_line": 53
+        },
+        {
+          "end_line": 146,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/auth/InlongShiroImpl.java",
+          "start_line": 112
+        },
+        {
+          "end_line": 94,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/auth/openapi/OpenAPIFilter.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 78,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/auth/openapi/OpenAPIAuthenticatingRealm.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 44,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/auth/openapi/SecretToken.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 87,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/auth/web/AuthenticationFilter.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 76,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/auth/web/WebAuthorizingRealm.java",
+          "start_line": 68
+        },
+        {
+          "end_line": 72,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/auth/ShiroConfig.java",
+          "start_line": 45
+        },
+        {
+          "end_line": 95,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/controller/UserController.java",
+          "start_line": 90
+        },
+        {
+          "end_line": 557,
+          "path": "inlong-manager/manager-web/sql/apache_inlong_manager.sql",
+          "start_line": 551
+        },
+        {
+          "end_line": 623,
+          "path": "inlong-manager/manager-web/sql/apache_inlong_manager.sql",
+          "start_line": 622
+        }
+      ],
+      "prerequisites": "1) Manager deployed with shipped defaults (`inlong.auth.type=default`, `openapi.auth.enabled=false`, application.properties:54,61) so InlongShiroImpl and OpenAPIFilter are active. 2) Network reachability to the manager HTTP port (server.port=8083; context path /inlong/manager). 3) The standard init SQL is loaded so the built-in `admin` user exists with account_type=0 and an INLONG_ADMIN row in inlong_user_role, and tenant `public` exists (DEFAULT_USER/DEFAULT_TENANT in BasicAuth). Under these conditions the tenant filter (TenantAuthenticatingFilter, applied to both chains) also passes for tenant `public` because the default admin has the INLONG_ADMIN inlong role.",
+      "root_cause": "The manager uses a single Shiro SecurityManager/session for two different authentication surfaces. `/openapi/**` is handled by OpenAPIFilter, which (with the shipped default `openapi.auth.enabled=false`) logs the request in with an empty SecretToken; OpenAPIAuthenticatingRealm.doDefaultAuth then authenticates the built-in `admin` account and grants it INLONG_ADMIN/INLONG_OPERATOR/TENANT_ADMIN/TENANT_OPERATOR. Shiro persists the authenticated subject in the HTTP session (default DefaultSubjectDAO/session storage enabled), and the web chain's gate (AuthenticationFilter on `/**`) only checks `subject.isAuthenticated()` without verifying which realm produced the session. Consequently the openapi-created session is reused for `/api/**`, and role checks are resolved from that principal by WebAuthorizingRealm.",
+      "title": "Unauthenticated OpenAPI login creates a default-admin Shiro session that is accepted by the Manager web APIs",
+      "trace": "1. Request to `/inlong/manager/openapi/...` is matched by the Shiro chain `/openapi/**/*` -> authAPI,authTenant (InlongShiroImpl.java:135-136). 2. OpenAPIFilter.doFilter runs; since openAPIAuthEnabled is false, parseBasicAuth returns `new SecretToken()` without reading credentials (OpenAPIFilter.java:90-94) and subject.login(token) is invoked (line 69). 3. OpenAPIAuthenticatingRealm.doDefaultAuth loads BasicAuth.DEFAULT_USER (\"admin\") and sets roles INLONG_ADMIN/INLONG_OPERATOR/TENANT_ADMIN/TENANT_OPERATOR, returning SimpleAuthenticationInfo(userInfo, token.getCredentials(), ...) (OpenAPIAuthenticatingRealm.java:65-78); the credentials check passes because the token credential (default \"defaultKey\", SecretToken.java:34) equals the info credential. 4. Shiro's DefaultWebSecurityManager/DefaultWebSessionManager persist the authenticated subject into the servlet session and set JSESSIONID (ShiroConfig.java:45-72; DefaultSubjectDAO session storage is not disabled anywhere). 5. The same client calls `/api/...` with the cookie. AuthenticationFilter, the only web gate for `/**` (InlongShiroImpl.java:139), sees `subject.isAuthenticated()==true` and forwards the stored principal (AuthenticationFilter.java:65-69, 89-97). 6. TenantAuthenticatingFilter re-logins TenantToken(admin, public); TenantAuthenticatingRealm finds the seeded inlong_user_role row and grants INLONG_ADMIN. 7. `@RequiresRoles(INLONG_ADMIN)` checks resolve roles via WebAuthorizingRealm.doGetAuthorizationInfo from the subject principal (WebAuthorizingRealm.java:68-76) and pass, so admin-only endpoints such as /api/user/register, /api/user/delete, /api/cluster/*, /api/module/* (module CRUD has no role annotation at all) and /api/user/update (service check only compares DB account_type, UserServiceImpl.update:229-268) are reachable.",
+      "unverified": "I could not execute the request flow. The chain assumes standard Shiro semantics that are not visible in this repository (HttpSession-backed subject persistence after subject.login and authenticated=true on later requests with the same cookie); if a deployment sets `openapi.auth.enabled=true` or replaces the session manager/chain definitions, the bypass does not apply. The exact set of admin-only endpoints reachable after the tenant filter's re-login depends on which role row wins in TenantAuthenticatingRealm.addRole (with the shipped seed only INLONG_ADMIN exists for admin/public; adding a tenant_user_role row for admin would demote the effective role to TENANT_ADMIN, still allowing all un-annotated and TENANT_ADMIN endpoints). Also not verified: reverse-proxy restrictions, whether the deployment filters /openapi on the network, and database state differing from the init SQL.",
+      "weakness_type": "Improper Authentication / Authentication Bypass (CWE-287, CWE-863); session privilege confusion across trust boundaries"
+    }
+  ],
+  "coverage_summary": "Assigned source scope: 6,209 files (4,454 Java files; also TS/Go/C++/Python/SQL/config), all model-visible; no sensitive-name or size exclusions reported. The P1 relation index covers 6,115 files with 94 source files missing from the index, 95 omitted files, and explicitly does not implement control flow, data flow, semantic resolution, or runtime reachability (118,901 unresolved calls; index status \"partial\"), so it was used only for navigation. I reviewed in depth the manager-web authentication stack (Shiro config, web/OpenAPI/tenant filters and realms, session handling, SQL seeds), controller authorization annotations across the manager, user/tenant/role services, workflow approval checks, MyBatis mappers (including all `${}` order-by uses), JDBC URL handling and SQL builders in the sink/node resource operators, the agent/installer command execution paths, the audit service HTTP API and query layer, and two sort-connector deserialization sinks. Other large areas (TubeMQ server, dataproxy/audit-proxy codecs, dashboard frontend, Go/C++/Python SDKs, most sort connectors) were sampled rather than reviewed exhaustively.",
+  "limitations": [
+    "Shiro session-persistence behavior (principal stored in HTTP session and treated as authenticated on later requests, cookie issuance on a filter-level login) is framework behavior external to this repository; it was not executed or unit-verified, so the selected candidate remains a source-based lead.",
+    "The P1 relation index is partial and syntactic only: 94 source files are absent from the index, calls are name-based candidates, and no data-flow or reachability analysis exists, so absence of index records for an area does not mean that area is clean.",
+    "Runtime configuration can change the verdict: `openapi.auth.enabled=true`, a reverse proxy restricting /openapi, a different session manager (e.g. stateless/no-session storage), or database state without the seeded admin/role rows would break the chain.",
+    "I did not run builds, tests, scanners, or exploit payloads; no target was contacted; all statements are source-evidence-based.",
+    "Large code areas (TubeMQ, dataproxy/audit-proxy decoders, dashboard frontend, non-Java SDKs, many Flink connectors) were only sampled, so additional issues may exist outside the reviewed paths."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Missing @RequiresRoles on ModuleController/ModuleServiceImpl (module install/start/stop/uninstall commands executed by the agent-installer via /bin/sh -c)",
+      "reason": "Source evidence for missing annotations is clear, but the same pattern appears across many controllers (PackageController, DataNodeController, cluster node endpoints), so it is not distinguishable as an injected defect, and exploitation requires the module to already be assigned to an agent cluster node; lower impact and more conditional than the selected candidate."
+    },
+    {
+      "lead": "Unsafe Java deserialization of stream records in the StarRocks sort connector (InstantiationUtil.deserializeObject on NestedRowData segment bytes, v1.13 and v1.15 sink files)",
+      "reason": "The sink is a genuine deserialization sink, but the bytes are only reached when the record is a Flink NestedRowData with a single segment and a configured table serializer; no producer of the Java-serialized DDL map exists in this snapshot, so attacker control and reachability could not be established from source."
+    },
+    {
+      "lead": "Command execution helpers ShellExecutorImpl/ExcuteLinux (sh -c) and manager SSH install flow (execRemote builds wget/tar/cp commands)",
+      "reason": "Call sites observed in-source pass fixed constants, config values or the caller's own SSH credentials; the only request-derived values are the connection fields, which are sent as separate exec args, and the referenced exec_cmd.exp/ssh_key_cmd.exp scripts are not present in the snapshot to verify expect-level interpolation."
+    },
+    {
+      "lead": "JDBC URL handling in manager sink/node resource operators (potential JDBC deserialization/SSRF)",
+      "reason": "The dedicated hardening is present in this snapshot (MySQLSensitiveUrlUtils.filterSensitive removes/overrides autoDeserialize, allowLoadLocalInfile, allowUrlInLocalInfile with repeated URL-decoding and whitespace stripping; UrlVerificationUtils validates prefix/port in the major call sites), and the remaining SQL builders run only against data sources the caller already has credentials for."
+    },
+    {
+      "lead": "MyBatis `${orderField} ${orderType}` interpolation in five DAO mappers",
+      "reason": "Every user-facing call site I traced invokes OrderFieldEnum.checkOrderField/OrderTypeEnum.checkOrderType first, which overwrite non-allowlisted values with create_time/valid directions before the mapper is called."
+    },
+    {
+      "lead": "Hive/MySQL/Oracle/… SQL builders concatenating schema/table/column names into DDL executed via createStatement",
+      "reason": "Inputs are the caller's own sink configuration and the SQL executes against the caller-configured target database; no cross-privilege or manager-host impact could be evidenced, so it was rejected as an unconfirmed lead."
+    },
+    {
+      "lead": "inlong-dashboard / agent / dataproxy / TubeMQ / SDK components",
+      "reason": "Sampled only (no dangerous sinks surfaced in targeted searches); these large areas were not exhaustively traced and may contain issues I did not reach."
+    }
+  ],
+  "summary": "Apache InLong (2.2.0-SNAPSHOT) manager/web review. The strongest source-evidenced issue is an authentication-bypass/privilege-confusion chain in the Shiro configuration: the shipped default `openapi.auth.enabled=false` makes `/openapi/**` log the caller in as the built-in default admin with all roles, and because the OpenAPI filter and the web filter share one Shiro SecurityManager/session, that session is accepted by the web chain (`/api/**`) whose gate only checks `subject.isAuthenticated()`. This yields unauthenticated access to management APIs as the seeded `admin`/INLONG_ADMIN principal. Other reviewed areas (MyBatis order-by `${}` guarded by OrderFieldEnum, MySQL JDBC URL filtering, per-service `checkUser` authorization, module command execution, sort connectors) contained no comparably evidenced exploitable chain."
+}

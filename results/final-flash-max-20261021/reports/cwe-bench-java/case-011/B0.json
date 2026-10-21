@@ -1,0 +1,54 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "filePath is the caller-supplied/attacker-influenced path parameter of a public API explicitly intended to validate untrusted paths; the attacker influences the string passed as filePath (and possibly baseDirPath) but does not need control of library internals.",
+      "confidence": "medium",
+      "counterevidence_checked": "getCanonicalPath() does neutralize plain '..' sequences and symlinks pointing outside the base, so the classic traversal string is rejected; the remainder is the string-boundary flaw. The method is only a boolean helper, so real impact requires a caller that uses it as an access-control gate; that is its documented purpose. An alternative containment formulation (File.equals(File) or Path.normalize().startsWith(Path) plus separator check) would fix it, confirming the flaw is in boundary handling rather than canonicalization.",
+      "id": "path-containment-prefix-bypass",
+      "impact": "Bypass of the library's path-traversal containment check, enabling unauthorized read/write/delete of files outside the intended base directory in applications that rely on this sanitizer, i.e. the exact vulnerability class the method claims to remediate.",
+      "locations": [
+        {
+          "end_line": 26,
+          "path": "src/main/java/io/whitesource/cure/FileSecurityUtils.java",
+          "start_line": 21
+        }
+      ],
+      "prerequisites": "Application uses isFileOutsideDir as its path-traversal guard before file read/write/delete and the attacker can choose a path that resolves outside the base dir but shares the base directory's canonical string as a prefix (sibling directory with an extended name, e.g. base '/srv/app/data' and target '/srv/app/data-private/secret'). On Windows the separator/8.3/case handling assumptions of raw startsWith add further edge cases.",
+      "root_cause": "FileSecurityUtils.isFileOutsideDir (src/main/java/io/whitesource/cure/FileSecurityUtils.java:21-26) returns !file.getCanonicalPath().startsWith(baseDir.getCanonicalPath()). String.startsWith performs a raw character-prefix comparison with no check for a path-separator boundary (and no normalization of trailing separators). getCanonicalPath does resolve '.'/'..' and symlinks, but it does not make the prefix comparison component-aware, so a sibling directory whose name extends the base name (base '/srv/app/data', file '/srv/app/data_evil/x') yields canonical strings where the file path starts with the base path string and the method returns false ('inside').",
+      "title": "isFileOutsideDir path-containment check bypassable via shared path prefix",
+      "trace": "caller passes attacker path P and base B -> new File(P).getCanonicalPath() and new File(B).getCanonicalPath() computed -> raw startsWith(B_canon) evaluated -> if P_canon begins with B_canon as a string (sibling dir 'data-private' when base is 'data'), the expression evaluates false -> isFileOutsideDir returns false (treated as inside) -> downstream code that gates access on this boolean performs the operation on a path outside the intended base directory.",
+      "unverified": "No caller code exists in this snapshot (only the library is present), so the concrete downstream sink and whether filePath is truly attacker-controlled in a specific deployment were not observed. Exploitability on case-insensitive/Windows filesystems and 8.3 short-name behavior was reasoned from the API, not executed.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-20 improper input validation (path equivalence boundary)"
+    }
+  ],
+  "coverage_summary": "All 7 files reported by get_source_scope were enumerated. Fully read: README.md, src/main/java/io/whitesource/cure/Encoder.java (409 lines), FileSecurityUtils.java, SecureObjectInputStream.java, src/main/resources/WssAllowListForLog.json. pom.xml was read through line 120 of 211 (dependency/build section; no later build logic expected to change the finding). .gitignore was not read. No test sources exist in the snapshot, so there is no in-repo evidence of how these sanitizers are invoked; the assessment is based on the public API contracts and their own Javadoc/README claims.",
+  "limitations": [
+    "No callers, tests, or downstream sinks are present in the snapshot, so concrete exploitability of isFileOutsideDir depends on unobserved application code; the finding is a source-evidence lead, not a runtime-confirmed vulnerability.",
+    "pom.xml lines 121-211 and .gitignore were not inspected.",
+    "Windows-specific path semantics (case-insensitivity, 8.3 names, alternate separators) were reasoned about, not tested; no code was executed per the review constraints.",
+    "Deserialization whitelist behavior was assessed against standard ObjectInputStream semantics (resolveClass vs resolveProxyClass) without runtime validation."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SecureObjectInputStream.isSubpackage (src/main/java/io/whitesource/cure/SecureObjectInputStream.java:60-68): uses FilenameUtils.removeExtension(className) + String.startsWith(pack) with no '.' boundary, so a package such as 'com.foo' also admits classes in 'com.foobar', weakening the deserialization class whitelist; resolveProxyClass is also not overridden, so proxy descriptors bypass resolveClass.",
+      "reason": "Real boundary weakness, but exploitation additionally requires an attacker-usable gadget class in an unintended package that shares the whitelist prefix (fail-closed when the default two-arg constructor is used with an empty package set). Impact is therefore conditional on caller configuration, whereas the path-containment flaw breaks the method's core documented guarantee. Kept as a secondary lead, not the selected candidate."
+    },
+    {
+      "lead": "Encoder.escapeForbiddenCharacters / replaceForbiddenCharsWithSafeChar (Encoder.java:27-73): allow-list entries are concatenated directly into a regex character class '[^...]', and the replacement string comes from parsed JSON.",
+      "reason": "The controlling inputs are the library's own resource file or a caller-supplied properties file, not a remote attacker; malformed allow-list/replacement values cause exceptions or mis-sanitization but no demonstrated attacker-controlled path in this snapshot."
+    },
+    {
+      "lead": "Encoder.forOsCommand (Encoder.java:96-120, 380-392) escapes special characters with '^' on Windows and '\\' on Unix but does not handle quote/percent or direct-process-invocation contexts.",
+      "reason": "Escaping-completeness concerns are context-dependent (shell vs direct exec) and no reachable sink or attacker-controlled command-string assembly exists in the snapshot; too speculative to report."
+    },
+    {
+      "lead": "Encoder logging helpers forLogContent/forCrlf (Encoder.java:128-237) do not encode '&', quotes, or Unicode line separators.",
+      "reason": "Sanitization is intentionally context-limited to newline removal and a few substitutions; no controlled sink (e.g. HTTP header or HTML attribute) is present in the snapshot to establish impact."
+    },
+    {
+      "lead": "FileSecurityUtils.normalize returns null for invalid paths (FilenameUtils.normalize can return null).",
+      "reason": "Possible NPE/robustness issue for callers, but no attacker-controlled path to a security impact is demonstrated."
+    }
+  ],
+  "summary": "The snapshot (7 files: pom.xml, README.md, .gitignore, and three main-source Java files plus one resource JSON) is the CureKit remediation library, advertised as providing sanitizers against path traversal, OS command injection, XSS, and deserialization attacks. The single strongest source-supported issue is the path-containment guard in FileSecurityUtils.isFileOutsideDir: it compares canonical paths with a bare String.startsWith, so any path whose canonical form merely shares the base directory's string prefix (e.g. /srv/app/data_evil/secret vs base /srv/app/data, or on Windows C:\\\\base-evil vs C:\\\\base) is misclassified as being inside the base directory. Because this method exists specifically to be the traversal guard for downstream file operations, the misclassification defeats that guard for attacker-influenced file paths. Other suspicious spots (SecureObjectInputStream package-prefix matching, Encoder escaping heuristics) are weaker and are listed as rejected leads."
+}

@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the JSON body of POST /instances, including healthUrl, managementUrl, name, and metadata. Registration only rejects non-absolute URIs, so an arbitrary HTTP(S) destination is accepted. The response returns the generated instance ID, after which the attacker can address the exposed health proxy for that instance.",
+      "confidence": "medium",
+      "counterevidence_checked": "The design intentionally polls client-provided URLs, so some exposure is accepted when registration is trusted. Spring Security is present only at test scope in the server module, while the sample secure configuration demonstrates that operators are expected to add authorization. Even with authorization, the code does not bind the supplied URL to the authenticated client or constrain its host, and the health proxy reflects the response. I did not find a scheme/host allowlist, URL ownership check, or private-address guard in the inspected server code.",
+      "id": "SBA-SSRF-REGISTRATION",
+      "impact": "An attacker can use the admin server as an internal network proxy, probe services, and read responses from internal endpoints such as cloud metadata or management interfaces. The admin server's network position and configured instance credentials can amplify the attack, and repeated registrations can also create outbound request load.",
+      "locations": [
+        {
+          "end_line": 84,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/web/InstancesController.java",
+          "start_line": 76
+        },
+        {
+          "end_line": 99,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/domain/values/Registration.java",
+          "start_line": 91
+        },
+        {
+          "end_line": 58,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/services/StatusUpdateTrigger.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 78,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/services/StatusUpdater.java",
+          "start_line": 69
+        },
+        {
+          "end_line": 106,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/domain/entities/Instance.java",
+          "start_line": 105
+        },
+        {
+          "end_line": 104,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/web/servlet/InstancesProxyController.java",
+          "start_line": 94
+        },
+        {
+          "end_line": 39,
+          "path": "spring-boot-admin-starter-server/pom.xml",
+          "start_line": 30
+        }
+      ],
+      "prerequisites": "The /instances and /instances/{id}/actuator/** routes must be reachable. The default server starter does not include Spring Security; secured deployments require registration credentials, but those clients can still choose arbitrary URLs. The downstream destination must speak HTTP(S) and be reachable from the admin server.",
+      "root_cause": "Registration validation only checks that the supplied URL is an absolute URI. The POST /instances endpoint then stores the attacker-chosen health URL, and registration events automatically trigger a server-side HTTP request to it. The server additionally exposes the health endpoint through /instances/{id}/actuator/**, which streams the target response back to the caller. There is no host/scheme allowlist, private-address restriction, or binding between a registered URL and an authorized client.",
+      "title": "Untrusted instance registration permits server-side request forgery and reflected internal responses",
+      "trace": "POST /instances with an attacker-selected absolute healthUrl -> InstancesController registers it -> InstanceRegisteredEvent -> StatusUpdateTrigger calls StatusUpdater -> InstanceWebClient issues a GET to the healthUrl. The same health URL is stored as the HEALTH endpoint, so GET /instances/{id}/actuator/health rewrites to the attacker URL and the servlet/reactive proxy streams the response status, headers, and body back. Endpoint detection also accepts arbitrary absolute hrefs from an attacker-controlled actuator index, allowing the proxy to target additional internal URLs.",
+      "unverified": "No runtime request was executed. The exact behavior of WebClient for non-HTTP schemes and the deployment's authorization configuration were not confirmed. The strongest demonstration is HTTP(S)-based SSRF with the health proxy; endpoint-index-based arbitrary targets are source-supported but were not executed.",
+      "weakness_type": "CWE-918: Server-Side Request Forgery (SSRF)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 643 visible files, including 204 Java sources. Focused on server registration, repository/event flow, status and endpoint discovery, servlet and reactive proxy controllers, WebClient filters and credential providers, notification code, UI Java, cloud discovery, client registration, samples, build files, and workflows. Used directory listing and targeted source searches across Java, JavaScript, JSON, YAML, and POM files. No test source or .vue component source is present in the assigned snapshot; compiled frontend assets and runtime behavior were not inspected.",
+  "limitations": [
+    "No code, tests, containers, or exploit payloads were executed; all impact statements are source-level inferences.",
+    "The repository snapshot omits .vue frontend components and test sources, so UI rendering, click paths, and test-encoded security expectations could not be verified.",
+    "Deployment security is external to the library: whether /instances requires authentication and which client identities are authorized depends on the operator's Spring Security configuration.",
+    "Dependency-level vulnerabilities in the Maven/NPM dependency graphs were not independently audited.",
+    "Network-level behavior of Reactor Netty, servlet containers, proxies, and browsers (URI normalization, header framing, content rendering) was not confirmed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Managed-instance responses are proxied inline with attacker-controlled Content-Type, potentially enabling same-origin stored XSS.",
+      "reason": "The raw streaming and header forwarding are real, but exploitation requires an administrator to navigate to the crafted proxy URL, and browser/security-header behavior was not runtime-verified. It remains a plausible separate issue rather than the strongest confirmed source finding."
+    },
+    {
+      "lead": "Content-Length is forwarded when the proxy drops a request body, potentially causing request smuggling.",
+      "reason": "The header-filter and body-dropping mismatch exists in source, but Reactor Netty may normalize or regenerate framing headers. Exploitability was not verified and is more conditional than the registration SSRF."
+    },
+    {
+      "lead": "Absolute URL injection through the proxy path builder could bypass the selected instance.",
+      "reason": "The URI builder treats paths and AntPathMatcher tokenization may collapse double slashes, so the required absolute URI is not established from source alone."
+    },
+    {
+      "lead": "Login redirectTo permits an open redirect in the sample security configuration.",
+      "reason": "The sample sets a target URL parameter without visible validation, but impact is limited to phishing and the issue is in sample configuration rather than the reusable server core."
+    },
+    {
+      "lead": "Instance-auth service-map credentials can be sent to a client that claims another service name.",
+      "reason": "This is a serious deployment-specific credential-binding weakness, but it depends on service-map configuration and the same registration trust boundary; it is not the clearest single candidate."
+    }
+  ],
+  "summary": "The strongest source-supported issue is an SSRF/trust-boundary flaw in instance self-registration: the server accepts an arbitrary absolute health/management URL, registers it, immediately polls it, and exposes proxied responses to that URL. The default starter-server module has no authentication dependency and no URL/network allowlist, so an untrusted registrant can make the admin server reach internal or metadata endpoints and, via the health proxy, read the response. Deployments that secure registration reduce exposure, but a malicious authenticated client still controls the target host."
+}

@@ -1,0 +1,92 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Indirect in this repository. Job ids are caller-supplied (`Request.setId(List<String>)` / `setId(String...)`, AbstractRequest.java:88-117) and are converted to filesystem paths by `DefaultJobStatusStore.encode`/`getJobFolder`; `.` and `..` are not encoded, so a caller that forwards an externally supplied id (job-status lookups, extension-job ids, replay/history ids) can select a directory. The XML consumed by `fromXML` is file content (status.xml / log*.xml / history files) that is server-written in the normal flow, but can be attacker-influenced or attacker-placed where a write primitive or a filesystem attachment named `status.xml`/`log.xml` exists at the traversed location. The direct XML-to-object path is implemented entirely in this repository (JobStatusSerializer.read/write, XStreamFileLoggerTail.read).",
+      "confidence": "medium",
+      "counterevidence_checked": "Marshalling is protected (SafeTreeMarshaller.convert skips values failing XStreamUtils.isSerializable, SafeReflectionProvider filters fields), but that does not constrain unmarshalling; SafeTreeUnmarshaller.convert catches Throwable and returns null only after the converter has already run. The XStream security call is explicitly commented out (SafeXStream.java:83-86), and XStreamUtils defaults to `true` for unknown classes (line 101-103), so no allowlist applies at any point. Path-traversal reachability requires attacker-influenced job ids and a placeable XML file; no platform code is present in this snapshot to prove either, so the finding is not runtime-confirmed. The stale checkstyle exclusions for org/xwiki/job/internal/xstream/SafeReflectionConverter.java and XStreamUtils.java in xwiki-commons-job-default/pom.xml (lines 77-81) hint that a security fix around job XStream deserialization added classes in this exact area, but this is contextual evidence only and may be a leftover from an earlier module refactor.",
+      "id": "CAND-1",
+      "impact": "Remote code execution in the server JVM (XStream gadget instantiation from attacker-influenced XML) and/or arbitrary file/directory read-delete outside the job storage directory via `..` path traversal. The delete path (`FileUtils.deleteDirectory(getJobFolder(id))`) without containment validation can destroy arbitrary directories writable by the server (data loss / DoS).",
+      "locations": [
+        {
+          "end_line": 120,
+          "path": "xwiki-commons-core/xwiki-commons-xstream/src/main/java/org/xwiki/xstream/internal/SafeXStream.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 118,
+          "path": "xwiki-commons-core/xwiki-commons-xstream/src/main/java/org/xwiki/xstream/internal/XStreamUtils.java",
+          "start_line": 92
+        },
+        {
+          "end_line": 125,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/JobStatusSerializer.java",
+          "start_line": 68
+        },
+        {
+          "end_line": 220,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/DefaultJobStatusStore.java",
+          "start_line": 203
+        },
+        {
+          "end_line": 341,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/DefaultJobStatusStore.java",
+          "start_line": 271
+        },
+        {
+          "end_line": 459,
+          "path": "xwiki-commons-core/xwiki-commons-job/xwiki-commons-job-default/src/main/java/org/xwiki/job/internal/DefaultJobStatusStore.java",
+          "start_line": 439
+        },
+        {
+          "end_line": 77,
+          "path": "xwiki-commons-core/xwiki-commons-logging/xwiki-commons-logging-common/src/main/java/org/xwiki/logging/internal/tail/XStreamFileLoggerTail.java",
+          "start_line": 45
+        },
+        {
+          "end_line": 89,
+          "path": "xwiki-commons-core/xwiki-commons-extension/xwiki-commons-extension-api/src/main/java/org/xwiki/extension/job/history/internal/DefaultExtensionJobHistorySerializer.java",
+          "start_line": 85
+        }
+      ],
+      "prerequisites": "1) The deployment runs the XWiki Commons job/logging stack with the default filesystem `JobManagerConfiguration.getStorage()` (permanent directory). 2) The attacker can influence a job id or job-status lookup id (or otherwise control the path used by getJobFolder) and can get a file named status.xml or log.xml with attacker XML at a path reachable from the storage directory (or an existing status/log file can be modified). 3) The classpath contains any XStream gadget chain (very common on XWiki/Java 8 deployments of this era).",
+      "root_cause": "`SafeXStream` wraps the real XStream (1.4.12) but never enables XStream's security framework: `setupDefaultSecurity(this)` is commented out (SafeXStream.java:83-86), only marshalling is protected (SafeTreeMarshaller/SafeReflectionProvider commit to skipping unserializable values), and XStreamUtils.isSerializable(Class) defaults to allowing any java.io.Serializable class (XStreamUtils.java:92-118). The unmarshalling side (SafeXStream.unmarshal -> SafeTreeUnmarshaller.convert) only swallows exceptions; it does not restrict which classes can be instantiated/deserialized. Job statuses and job logs are read back from disk with this instance (`JobStatusSerializer.read` -> xstream.fromXML(file/stream), `XStreamFileLoggerTail.read` -> xstream.fromXML(reader), `DefaultExtensionJobHistorySerializer.read` -> xstream.fromXML). The file location is computed from job id elements by `DefaultJobStatusStore.encode`, which URL-encodes but leaves '.' intact, so an id element `..` produces path traversal (`getJobFolder`, DefaultJobStatusStore.java:330-341); the same class also recursively deletes `getJobFolder(id)` in `remove` without containment checks (DefaultJobStatusStore.java:439-459).",
+      "title": "Unrestricted XStream deserialization of job status/log XML (SafeXStream without type allowlist) reachable through weakly-encoded job-id file paths",
+      "trace": "Caller supplies a job id (e.g., containing `..`) -> DefaultJobStatusStore.getJobStatus/loadStatus or save/remove -> encode() leaves `..` intact -> new File(folder, \"..\") -> path outside the intended jobs storage -> JobStatusSerializer.read(statusFile) -> SafeXStream/XStream.fromXML(file) (no allowlist; security commented out) -> XStream instantiates converter/reflection classes from the XML -> gadget chain executes (RCE), or alternatively JobStatusStore.remove recursively deletes the traversed directory (data destruction). The same unchecked deserialization is used for job logs (XStreamFileLoggerTail.read -> fromXML) and extension job history (DefaultExtensionJobHistorySerializer.read).",
+      "unverified": "No runtime execution or exploit was performed; XStream version is read from pom.xml (1.4.12) and no specific gadget chain was validated. Whether platform callers expose attacker-controlled job ids and whether an attacker-writable path can be reached with a status.xml/log.xml file were not verifiable from this snapshot (platform code and tests are outside the reviewed source). The CVE/CWE mapping and any claim of a specific real-world advisory were not verified.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (enabled by CWE-22 path traversal in job-id to path mapping)"
+    }
+  ],
+  "coverage_summary": "Coverage: 1372 repository-relative files were in scope; all tests were excluded by the source filter, so no src/test artifacts were available. I read or searched the security-relevant modules: xwiki-commons-xstream (SafeXStream, XStreamUtils, Safe* converters/providers/unmarshaller), xwiki-commons-job (JobStatusSerializer, DefaultJobStatusStore, DefaultJobManager, requests/annotations), xwiki-commons-logging-common (XStreamFileLoggerTail), xwiki-commons-extension (job history serializer, repository/path utilities, extension handlers), xwiki-commons-filter + filter-xml (DefaultXMLParser, XStreamParameterManager, XML input stream utils), xwiki-commons-xml (XMLUtils, XMLReaderFactory, LocalEntityResolver, HTML cleaner filters), xwiki-commons-velocity (engine config, SecureIntrospector/Uberspector, tools, include event handler), xwiki-commons-script safe wrappers, and xwiki-commons-crypto password/key handling. Build files/poms were reviewed for dependency versions (XStream 1.4.12, BC 1.66) and for plugin/checkstyle references that hint at changed files. Not every one of the 1372 files was read line-by-line; modules such as cache, classloader (legacy), component, configuration, context, diff, displayer, environment, observation, properties, repository API, stability, text, and tools received search-level rather than full review.",
+  "limitations": [
+    "No code execution, build, tests, or scanners were run; all conclusions are static source evidence and not runtime-confirmed.",
+    "All src/test trees are absent from the exposed snapshot, so the fix's regression tests could not be inspected to confirm the vulnerable functions.",
+    "No patch, advisory, CVE mapping, or external data was consulted (per assignment); the association with any specific CVE/advisory is unverified.",
+    "Attacker controllability of job ids and the ability to place a status.xml/log.xml file rely on XWiki Platform callers and deployment configuration that are not part of this repository.",
+    "The stale checkstyle exclusions for missing org/xwiki/job/internal/xstream/SafeReflectionConverter.java and XStreamUtils.java in xwiki-commons-job-default/pom.xml were treated as a hint only; they may originate from an earlier refactor rather than the security fix.",
+    "Binary-like or over-limit files were not readable; none were identified as relevant security code.",
+    "Only one candidate is submitted because of the per-review cap; the other leads above are unconfirmed and were not independently validated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "filter-xml direct untrusted-XML deserialization: DefaultXMLParser.unserializeParameter does Class.forName(attribute value) and XStreamParameterManager unSerializes with NoWarningXStream (plain XStream, security warning explicitly suppressed) — xwiki-commons-filter-xml.",
+      "reason": "Real insecure-deserialization surface with direct XML control, but it is a deliberate generic filter-parameter design; no source evidence in this snapshot ties it to a fix, and required platform privilege for XAR/filter XML input cannot be established from this repository. Kept as secondary suspicion only."
+    },
+    {
+      "lead": "XXE: LocalEntityResolver returns null for unknown entities (falling back to remote/file resolution) and DefaultXMLReaderFactory / XMLInputFilterStreamUtils create parsers with no external-entity hardening.",
+      "reason": "Plausible CWE-611, but no in-repo caller was traced that both uses these parsers on attacker XML without other mitigations, and the resolver's null fallback is documented upstream behavior; insufficient evidence to prefer over the XStream lead."
+    },
+    {
+      "lead": "Velocity include restriction bypass in RestrictParseLocationEventHandler (URI normalize + startsWith check) and Velocity/script safe wrappers.",
+      "reason": "No concrete bypass was demonstrated: `..` segments are normalized away, encoded/backslash variants are not shown to be decoded by the downstream Velocity resource loader, and no deviation from the expected implementation was found in SecureIntrospector/SafeCollection/SafeList/SafeIterator."
+    },
+    {
+      "lead": "DefaultJobStatusStore path traversal considered as a standalone CWE-22 finding.",
+      "reason": "Not split into a separate candidate because it is the enabling precondition of the same job-status storage/serialization root cause; on its own the impact (write/delete under the permanent directory, read of status.xml outside the store) is bounded and attacker controllability of job ids is unproven in this repository. It is included in the main candidate's trace."
+    },
+    {
+      "lead": "Unsafe HTML cleaner / XSS filter behavior in xwiki-commons-xml (LinkFilter, AttributeFilter, ControlCharactersFilter, XWikiDOMSerializer).",
+      "reason": "Code matches expected filtering design (external-link noopener/noreferrer, control-character stripping, attribute sanitization via the htmlcleaner fork); no bypass or missing check with attacker-controlled HTML was identified."
+    }
+  ],
+  "summary": "Reviewed the xwiki-commons 12.6.6 source snapshot (1372 main-source/build files; all tests excluded by the source filter). The strongest evidence-supported lead is unsafe XStream deserialization in the job/XStream stack: `SafeXStream` extends XStream 1.4.12 but deliberately does not enable XStream's security framework (allowlist is commented out with a TODO), and its unmarshalling path has no type restrictions, while `JobStatusSerializer` / `XStreamFileLoggerTail` / extension job-history deserialize XML read from filesystem locations that are derived from weakly-encoded job ids (`DefaultJobStatusStore.encode` leaves `.` unencoded, so `..` path components survive). This is a CWE-502/CWE-22 combination whose worst case is remote code execution through XStream gadget instantiation. Weakness is in library code; attacker control depends on callers that accept externally supplied job ids and on being able to place a `status.xml`/`log.xml` file at a reachable path, so the candidate is a lead, not a confirmed exploit. Other suspicions (filter-xml XStream, XXE, Velocity include check) were examined and are listed as rejected/unconfirmed leads."
+}

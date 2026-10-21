@@ -1,0 +1,62 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the JSON type-id string (e.g. the @class property, or the first element of a wrapper array) in a payload read from an untrusted source. This is reachable whenever the embedding application calls ObjectMapper.enableDefaultTyping()/enableDefaultTypingAsProperty() (ObjectMapper.java 1354-1412, which hard-wires JsonTypeInfo.Id.CLASS, line 1391/1408) or applies @JsonTypeInfo(use = Id.CLASS/MINIMAL_CLASS) to a type/property. Class name and generic form (ClassNameIdResolver._typeFromId, lines 54-84) are fully attacker-chosen; no privilege is needed beyond delivering the JSON.",
+      "confidence": "medium",
+      "counterevidence_checked": "Most classic gadgets are already covered in this snapshot: TemplatesImpl (lines 38-39), JdbcRowSetImpl (41), FileHandler/UnicastRemoteObject (43-44), Spring ApplicationContext/PointcutAdvisor subclasses via the superclass loop (83-93), c3p0 JNDI classes (48-49), tomcat-dbcp2 BasicDataSource and BCEL ClassLoader (51-52). Validation is genuinely invoked before bean construction (BeanDeserializerFactory 144-148), so this is not a missing-call issue. Jackson's own documentation/API contract warns that default typing must not be used with untrusted input, so the weakness only materializes in that (common but misconfigured) mode, and the exploitability of the specific datasource classes could not be verified by executing code here. The denylist mechanism is inherently incomplete, so this is a real-but-configuration-dependent weakness rather than a guaranteed RCE for every user.",
+      "id": "subtype-denylist-incomplete-dbcp2",
+      "impact": "Attacker-controlled instantiation of arbitrary classpath beans through the polymorphic type id, breaking the intended security boundary of the denylist. For the named DBCP2 datasource classes this yields JNDI lookup/JNDI injection from a setter, which is the known route to remote code execution in default-typing deployments; in weaker configurations it still gives unexpected instance creation and server-side network access (SSRF-like JNDI/LDAP calls).",
+      "locations": [
+        {
+          "end_line": 53,
+          "path": "src/main/java/com/fasterxml/jackson/databind/jsontype/impl/SubTypeValidator.java",
+          "start_line": 26
+        },
+        {
+          "end_line": 99,
+          "path": "src/main/java/com/fasterxml/jackson/databind/jsontype/impl/SubTypeValidator.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 148,
+          "path": "src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java",
+          "start_line": 141
+        },
+        {
+          "end_line": 850,
+          "path": "src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java",
+          "start_line": 845
+        }
+      ],
+      "prerequisites": "Application deserializes untrusted JSON with polymorphic default typing or class-based type ids enabled. The target class (e.g. a DBCP2 datasource class) must be on the application classpath. For the strongest JNDI-based impact, a JNDI-triggering property/chain must be usable in the runtime (JDK/JNDI settings, reachable attacker-controlled LDAP/RMI server, or local deserialization chain); without that, the attacker still achieves attacker-chosen bean instantiation and setter invocation.",
+      "root_cause": "SubTypeValidator relies on a static, hard-coded denylist (DEFAULT_NO_DESER_CLASS_NAMES, lines 26-53) plus a narrow org.springframework.* superclass-name check (lines 83-93) as the only validation before a resolved subtype is turned into a bean deserializer. The list blocks org.apache.tomcat.dbcp.dbcp2.BasicDataSource (line 51) and com.sun.org.apache.bcel.internal.util.ClassLoader (line 52) but not the DBCP2 datasource/JNDI wrappers org.apache.commons.dbcp2.datasources.PerUserPoolDataSource, SharedPoolDataSource, TransactionAwareDataSourceProxy or their org.apache.tomcat.dbcp.dbcp2.datasources.* equivalents (all confirmed absent by full-text search). validateSubType (lines 67-99) therefore returns normally for these classes and BeanDeserializerFactory proceeds to build and use their bean deserializers.",
+      "title": "Incomplete subtype denylist in SubTypeValidator allows JNDI-capable DBCP2 datasource beans to be deserialized via attacker-controlled type ids",
+      "trace": "Untrusted JSON -> ObjectMapper/DefaultTypeResolverBuilder (Id.CLASS) -> AsPropertyTypeDeserializer._deserializeTypedForId (lines 103-120) or AsArrayTypeDeserializer -> TypeDeserializerBase._findDeserializer (lines 148-188) -> ClassNameIdResolver._typeFromId -> TypeFactory.findClass (TypeFactory.java 242-283, Class.forName) -> DeserializerCache.findValueDeserializer (line 135) / _createDeserializer (line 317) -> BeanDeserializerFactory.createBeanDeserializer (line 99) -> _validateSubType (line 145) -> SubTypeValidator.validateSubType: the fully-qualified name is neither in _cfgIllegalClassNames nor an org.springframework.* class with a blocked superclass simple name, so no exception is raised -> buildBeanDeserializer builds the bean deserializer and JSON properties are bound through setters/fields of the attacker-named class.",
+      "unverified": "Which exact class(es) the next upstream fix for this 2.7.9.3-SNAPSHOT added could not be confirmed without history/advisories; the DBCP2 datasource family is the most plausible batch (later upstream SubTypeValidator versions also add Ignite CacheJndiTm*, Hikari, commons-dbcp and logback classes, all equally absent here). The JNDI-triggering semantics of the named classes come from background knowledge, not from files in this repository (those libraries are not vendored). No runtime confirmation was performed and no scanner/build was run.",
+      "weakness_type": "Deserialization of untrusted data via incomplete denylist (CWE-502 / CWE-184)"
+    }
+  ],
+  "coverage_summary": "All 399 model-visible source files were in scope (single src/main/java tree plus attic/, pom.xml, README, CI config); binary-like files and over-5MiB files: 0 excluded. I inspected the polymorphic deserialization chain end-to-end (ObjectMapper default typing, DefaultTypeResolverBuilder, StdTypeResolverBuilder, AsProperty/AsArray/AsWrapper/AsExternal type deserializers, TypeDeserializerBase, ClassNameIdResolver/MinimalClassNameIdResolver, TypeFactory.findClass, DeserializerCache, BeanDeserializerFactory), the SubTypeValidator denylist in full, XML/DOM extension handling, and searched for dangerous sinks (ProcessBuilder, ObjectInputStream, ScriptEngine, exec, JNDI, reflection-based class loading) and for all later-known blocked class names (dbcp, dbcp2 datasources, hikari, ignite, logback, hibernate). No tests, git history, dependency jars, or advisories are present in the snapshot.",
+  "limitations": [
+    "No git history, tags, tests, or upstream diff is available, so the exact fix commit/CVE intended for this 2.7.9.3-SNAPSHOT tree could not be identified.",
+    "No code was executed, built, or scanned; conclusions are from static reading only.",
+    "The specific gadget behavior of third-party classes (DBCP2/tomcat-dbcp2 datasources, etc.) is background knowledge; those libraries are not in this repository, so impact is described conservatively.",
+    "Denylist completeness cannot be proven from inside the repository; only the absence of specific names in SubTypeValidator is source-verified.",
+    "Files under attic/ are legacy copies and were not assessed for runtime relevance (not part of the Maven source tree)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Validation is skipped for Throwable subtypes (BeanDeserializerFactory returns buildThrowableDeserializer at line 113-114 before _validateSubType) and for abstract types materialized via materializeAbstractType (lines 121-131); createBuilderBasedDeserializer (lines 150-160) also builds without _validateSubType.",
+      "reason": "These are source-visible gaps in the same denylist design, but no attacker-controlled gadget class reachable through those branches was demonstrated, and the ordering matches upstream long-lived code; treated as unconfirmed secondary leads, not the submitted root cause."
+    },
+    {
+      "lead": "XML external entity handling in ext/DOMDeserializer.",
+      "reason": "The parser factory already sets FEATURE_SECURE_PROCESSING and setExpandEntityReferences(false) (lines 27-40); no source evidence of XXE."
+    },
+    {
+      "lead": "Arbitrary class loading via TypeFactory.findClass/Class.forName (lines 242-283).",
+      "reason": "This is the intended mechanism for Id.CLASS polymorphic typing and is supposed to be constrained by SubTypeValidator; it is not an independent vulnerability, only the delivery path for the candidate above."
+    }
+  ],
+  "summary": "The snapshot is jackson-databind 2.7.9.3-SNAPSHOT (399 source files, all under src/main/java plus attic/docs; no tests). The security-critical path is polymorphic deserialization: ObjectMapper.enableDefaultTyping() uses JsonTypeInfo.Id.CLASS, type ids are resolved by ClassNameIdResolver -> TypeFactory.findClass, and the only block on dangerous target classes is the hard-coded denylist in SubTypeValidator, invoked from BeanDeserializerFactory._validateSubType before buildBeanDeserializer. That denylist covers the well-known 2017/early-2018 gadgets (TemplatesImpl, JdbcRowSetImpl, Spring ApplicationContext/PointcutAdvisor subclasses, c3p0, tomcat-dbcp2 BasicDataSource, BCEL ClassLoader) but omits entire classes of the same family that are JNDI-capable bean classes, most notably the DBCP2 datasource classes (org.apache.commons.dbcp2.datasources.PerUserPoolDataSource / SharedPoolDataSource / TransactionAwareDataSourceProxy and their org.apache.tomcat.dbcp.dbcp2.datasources.* counterparts). Because validation consists only of \"name in set\" plus a narrow org.springframework.* superclass-name check, an attacker-supplied type id naming one of these classes passes validation and is built into a bean deserializer, allowing bean creation and setter invocation from untrusted JSON. In applications that (against Jackson guidance) enable default typing or class-based type ids on untrusted input, this is the classic jackson-databind RCE primitive; I report it as the strongest single candidate, with medium confidence because the gadget semantics of the specific classes come from background knowledge rather than from this repository."
+}

@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any remote client that can reach the ZooKeeper client port fully controls the request type and the target path. A normal session handshake (no authentication required) followed by a GetACLRequest (OpCode 6) for an arbitrary path triggers the vulnerable case. The client API ZooKeeper.getACL(path, stat) exposes the same request.",
+      "confidence": "high",
+      "counterevidence_checked": "Verified the full getACL path for any hidden enforcement: FinalRequestProcessor (case itself has no node lookup or checkACL), DataTree.getACL (no check), ZKDatabase.getACL (pure delegation), and PrepRequestProcessor (read-only opcodes only get a session check, lines 851-865). Confirmed sibling read operations do enforce READ via checkACL, so the omission is inconsistent with the surrounding authorization model rather than enforced elsewhere. Verified checkACL itself is an effective gate when called (skipACL=false default, super/world handling). No test sources are present in the snapshot to corroborate expected behavior. Could not verify the upstream commit history; version markers (pom.xml 3.6.0-SNAPSHOT, Jetty 9.4.14/Netty 4.1.29 dependencies) are consistent with a snapshot predating the public getACL fix but this was not runtime-confirmed.",
+      "id": "zk-getacl-missing-read-check",
+      "impact": "Confidentiality breach of access-control metadata for every znode on the server. An unauthenticated client can map the ACL protection of the whole namespace and obtain digest-scheme ACL entries (user:base64(SHA1(user:password))) that are designed to be brute-forced offline, enabling credential recovery and subsequent authorized access; it also leaks stat/aversion metadata. Security impact is information disclosure and authorization bypass of the READ permission model, not code execution.",
+      "locations": [
+        {
+          "end_line": 377,
+          "path": "zookeeper-server/src/main/java/org/apache/zookeeper/server/FinalRequestProcessor.java",
+          "start_line": 366
+        },
+        {
+          "end_line": 732,
+          "path": "zookeeper-server/src/main/java/org/apache/zookeeper/server/DataTree.java",
+          "start_line": 722
+        },
+        {
+          "end_line": 504,
+          "path": "zookeeper-server/src/main/java/org/apache/zookeeper/server/ZKDatabase.java",
+          "start_line": 502
+        },
+        {
+          "end_line": 333,
+          "path": "zookeeper-server/src/main/java/org/apache/zookeeper/server/PrepRequestProcessor.java",
+          "start_line": 294
+        },
+        {
+          "end_line": 865,
+          "path": "zookeeper-server/src/main/java/org/apache/zookeeper/server/PrepRequestProcessor.java",
+          "start_line": 851
+        }
+      ],
+      "prerequisites": "Server/client port reachable by the attacker; session established (default server configuration requires no auth); ACLs in use on the target znodes (non-world ACLs, e.g. digest/sasl/ip/x509 protected nodes); zookeeper.skipACL not set (if it were set, ACL checks are globally disabled anyway, so the exposure remains). No elevated privileges required.",
+      "root_cause": "The getACL request case in FinalRequestProcessor (lines 366-377) deserializes GetACLRequest and returns zks.getZKDatabase().getACL(path, stat) directly. It neither loads the DataNode nor calls PrepRequestProcessor.checkACL(..., ZooDefs.Perms.READ, ...), which is the enforcement used by other read operations. DataTree.getACL (lines 722-732) and ZKDatabase.getACL (lines 502-504) perform no permission checks either, and the PrepRequestProcessor read-request path (lines 851-865) only validates the session for getACL. There is therefore no enforcement point anywhere on this path.",
+      "title": "getACL returns znode ACLs without READ permission check",
+      "trace": "Client sends GetACLRequest -> ZooKeeperServer submits the read request -> PrepRequestProcessor.pRequest only performs sessionTracker.checkSession for OpCode.getACL (lines 851-865) -> FinalRequestProcessor switch OpCode.getACL (lines 366-377) reads path and calls zks.getZKDatabase().getACL(path, stat) with no checkACL call -> ZKDatabase.getACL (lines 502-504) delegates to DataTree.getACL (lines 722-732), which returns the ACL list for any existing node -> GetACLResponse serializes the ACLs (including digest scheme IDs) back to the client. Contrast: getData (lines 344-346), getChildren (lines 388-390) and getChildren2 (lines 408-410) all invoke PrepRequestProcessor.checkACL with ZooDefs.Perms.READ before returning data, demonstrating the intended enforcement pattern is absent only for getACL.",
+      "unverified": "No code was executed and no tests exist in the snapshot, so runtime exploitation was not confirmed. The comparison against upstream fix history could not be performed (no VCS metadata, no network). Behavior on a read-only server (ReadOnlyRequestProcessor) was not separately traced for getACL, though it only forwards read requests and contains no ACL check.",
+      "weakness_type": "CWE-862 Missing Authorization (information disclosure of ACLs)"
+    }
+  ],
+  "coverage_summary": "Source scope: 642 model-visible files, 642 indexed (index_status complete, 0 missing, 0 hash mismatches); no test directories are present and 0 files were excluded for size/sensitivity. Relation index (7,229 symbols, 19,425 calls, 13,576 edges, 670 facts) was used for navigation only and is explicitly not a vulnerability oracle. I read the core authorization path (FinalRequestProcessor, PrepRequestProcessor, DataTree, ZKDatabase), the AdminServer package, server auth providers (digest/ip/sasl/x509/key), quorum connection authentication (QuorumCnxManager auth present), TLS hostname verification, persistence/serialization utilities, and sampled the C client and contrib modules. Not every one of the 642 files was read line-by-line; unchanged/ubiquitous files (Jute codecs, CLI, metrics, recipes, docs, build scripts) were not exhaustively audited.",
+  "limitations": [
+    "No code execution, tests, scanners, or build steps were run; all conclusions are static source readings.",
+    "Test sources and VCS metadata are absent from the snapshot, so upstream intent and fix history could not be compared directly.",
+    "The relation index provides syntactic navigation candidates only; no complete data-flow, reachability, or exploitability proof was available.",
+    "Coverage is sampling-based across 642 files; areas such as the full C client, jute compiler, recipes, and contrib tools were only spot-checked.",
+    "Whether this snapshot predates or has reverted the upstream getACL fix is inferred from version/dependency markers, not verified against repository history."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "JettyAdminServer exposes all admin Commands (dump, cons, conf, set_trace_mask, etc.) with no authentication and DEFAULT_ADDRESS 0.0.0.0:8080 (JettyAdminServer.java lines 58-95, 149-183; AdminServerFactory.java lines 40-41).",
+      "reason": "This appears to be the upstream design of the 3.6.0 AdminServer (network access control is expected to restrict it); no contradictory fix artifact is present in the snapshot, so it is a hardening gap rather than a source-verified regression. Not selected."
+    },
+    {
+      "lead": "PrepRequestProcessor deleteContainer case (lines 375-391) deletes container nodes without the parent DELETE checkACL that the delete case performs (line 402).",
+      "reason": "Plausible authorization gap, but container nodes are primarily server-generated cleanup targets and reachability of a hand-crafted OpCode.deleteContainer from an untrusted client, plus upstream intent, could not be established from the snapshot. Weaker evidence than the getACL path; left unconfirmed."
+    },
+    {
+      "lead": "SerializeUtils.deserializeSnapshot reads an unbounded session count (lines 127-142), potentially causing memory pressure on malformed snapshot data.",
+      "reason": "Snapshots are local files or quorum-peer-transferred state; trust boundary is substantially higher than the unauthenticated client port, so impact and attacker control are weaker."
+    },
+    {
+      "lead": "C client format_endpoint_info uses sprintf into a fixed 128-byte static buffer (zookeeper-client-c/src/zookeeper.c lines 4364-4399).",
+      "reason": "Format inputs are bounded address strings and a port; no attacker-controlled unbounded width was identified. Rejected as speculative."
+    },
+    {
+      "lead": "loggraph FileLoader passes a request-supplied path to MergedLogSource.addSource (zookeeper-contrib-loggraph/.../servlets/FileLoader.java lines 43-58) and StaticContent resolves classpath resources from the URI.",
+      "reason": "Contrib local developer tool, not part of the default server deployment path; impact/reachability not demonstrated."
+    }
+  ],
+  "summary": "Review of the Apache ZooKeeper 3.6.0-SNAPSHOT tree (642 model-visible files; tests are not present in the snapshot). The strongest, source-verifiable issue is a missing authorization check on the read-only getACL request path: unlike getData/getChildren/getChildren2, the getACL handler in FinalRequestProcessor never calls PrepRequestProcessor.checkACL, so any client with a session can retrieve the ACL list of any znode regardless of READ permission. This is a direct missing-authorization/information-disclosure defect (ACL digests, e.g. digest user:sha1 hashes, are exposed) matching the well-known getACL authorization flaw class. Other plausible leads were examined and rejected or left unconfirmed as noted below."
+}

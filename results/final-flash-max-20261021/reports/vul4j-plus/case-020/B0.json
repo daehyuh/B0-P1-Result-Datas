@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker fully controls the PDF byte stream: the /Pages root dictionary, the /Kids arrays (including repeated indirect references to the same page-tree node or to an ancestor), each kid's /Type and /Count, and the trailer/xref (a damaged startxref/xref forces COSParser into trailer rebuild, setting trailerWasRebuild=true so checkPages runs). No special privileges or user interaction beyond supplying the file to a PDFBox-based application are needed.",
+      "confidence": "medium",
+      "counterevidence_checked": "I verified that COSParser does guard other traversal loops (xref /Prev set at COSParser.java:314, read-loop check at 471-476, BaseParser.java:957-963) and that some other cyclic structures are protected (COSDictionary.toString objs set at line 1526, PageDrawer.hasBlendMode groupsDone at 1538), so the missing page-tree guard is an exception rather than the project-wide style. I also verified that page-tree access is only triggered by page enumeration/lookup, not by every load (except the trailer-rebuild recovery path), and that PDPageTree.getCount() simply trusts /Count (lines 369-372), so some naive applications may hang on a huge declared /Count even without a malformed tree - this weakens attribution but does not remove the recursion issue. Valid, well-formed page trees are unaffected. I could not execute code or inspect any fix/patch history, so the exact upstream fix site is inferred, not confirmed.",
+      "id": "page-tree-recursion-dos",
+      "impact": "Denial of service against any application that processes untrusted PDFs with PDFBox: the worker thread hangs in a near-infinite computation (CPU exhaustion; later stages can also exhaust memory queueing page dictionaries) or dies with an uncaught StackOverflowError (an Error that typical catch(IOException) handlers do not handle). Because PDF parsing is commonly exposed in server-side pipelines (Tika, document ingestion), a single small crafted PDF can block request threads. No confidentiality or integrity impact was identified; no code execution or memory corruption is claimed.",
+      "locations": [
+        {
+          "end_line": 2328,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdfparser/COSParser.java",
+          "start_line": 2289
+        },
+        {
+          "end_line": 176,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdmodel/PDPageTree.java",
+          "start_line": 162
+        },
+        {
+          "end_line": 298,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdmodel/PDPageTree.java",
+          "start_line": 239
+        },
+        {
+          "end_line": 345,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdmodel/PDPageTree.java",
+          "start_line": 327
+        }
+      ],
+      "prerequisites": "Victim loads an untrusted PDF with PDFBox (PDDocument.load / PDFParser.initialParse). Parse-time recursion requires the document to enter the trailer-rebuild recovery path (crafted broken xref/trailer). Use-time recursion requires the application to enumerate or look up pages, which is the normal path for text extraction, rendering, merging, splitting, or getNumberofPages-driven loops. Cyclic trees violate the PDF spec but are accepted by the parser.",
+      "root_cause": "The page-tree walkers recurse into attacker-controlled /Kids entries without tracking already-visited dictionaries and without any depth or node-count limit. COSParser.checkPagesDictionary (pdfbox/src/main/java/org/apache/pdfbox/pdfparser/COSParser.java:2289-2328) recurses on every kid whose /Type is /Pages (line 2315) and PDPageTree recurses in PageIterator.enqueueKids (pdfbox/src/main/java/org/apache/pdfbox/pdmodel/PDPageTree.java:162-176, recursion line 169), in get(int,COSDictionary,int) (lines 239-298), in findPage (lines 327-345) and in getInheritableAttribute (lines 100-115). A kid array that contains an ancestor (cycle) yields infinite recursion/StackOverflowError, and a kid array that references the same subtree several times yields exponential work (2^depth leaf visits). No visited-set, depth counter, or /Count consistency check exists anywhere in these loops, unlike other hardening elsewhere in the codebase (e.g., the /Prev xref loop set in COSParser.java:314-409, the unknown-direct-object loop guard in BaseParser.java:957-963, or the transparency-group guard in PageDrawer.java:1537-1543).",
+      "title": "Crafted PDF page tree causes unbounded recursion / exponential traversal in page-tree walks (DoS)",
+      "trace": "Parse-time: PDDocument.load(byte[]) -> PDFParser.initialParse() (PDFParser.java:169-196) -> checkPages(root) at PDFParser.java:193 -> COSParser.checkPages (COSParser.java:2276-2287, only when trailerWasRebuild) -> COSParser.checkPagesDictionary (2289-2328); for each /Kids entry of /Type /Pages it calls itself recursively at line 2315 with no visited set -> cyclic page tree = infinite recursion (StackOverflowError during load); repeated/shared subtrees = exponentially many recursive calls (extreme CPU time, i.e. a hang). Use-time: PDDocument.getPages() -> PDPageTree.iterator() -> PageIterator.enqueueKids (PDPageTree.java:169) recursively descends /Kids before queueing leaves, so the same duplication/cycle produces the same unbounded recursion or explosive traversal when the application walks pages; get/findPage/getInheritableAttribute provide equivalent unguarded recursions for page lookup and inherited-attribute resolution.",
+      "unverified": "Not runtime-confirmed. Without executing PDFBox I cannot confirm how quickly a concrete crafted page tree produces a hang/StackOverflowError, whether COSObject.getObject() returns an already-shared COSDictionary for repeated references, or whether the upstream security fix for this issue added the visited set to COSParser.checkPagesDictionary, PDPageTree.PageIterator, or both. Line numbers refer to this snapshot only.",
+      "weakness_type": "CWE-674 Uncontrolled Recursion / CWE-400 Uncontrolled Resource Consumption (denial of service)"
+    }
+  ],
+  "coverage_summary": "Source scope reported 1200 model-visible files with no sensitive-path, binary, or symlink exclusions; no test sources are present in the snapshot. I reviewed the core parse/load path (BaseParser, COSParser, PDFParser, PDFStreamParser, XrefTrailerResolver, PDFXRef/object-stream parsers), the page-tree implementation and its callers (PDDocumentCatalog.getPages, PDFParser.initialParse, PDFTextStripper-style enumeration), key COS primitives, filter decoders (LZW, ASCII85, Flate, CCITT read paths), fontbox entry points (CFFParser/DataInput, CmapSubtable, TTF tables), the encryption handler, and all XML parsing entry points for external-entity handling. Debugger, examples, tools, preflight and xmpbox were sampled rather than exhaustively audited; test sources are absent, so no tests or runtime evidence were available.",
+  "limitations": [
+    "No code execution, tests, fuzzing, or runtime confirmation was performed; all conclusions are static source analysis.",
+    "No patch history, CVE/CWE labels, or fix commits were available or inspected, so linkage of this weakness to a specific upstream advisory is inferential.",
+    "I could not exhaustively audit all 1200 files (debugger, examples, tools, preflight, xmpbox were only sampled), so additional issues may exist in unaudited code.",
+    "The page-tree recursion is a resource-exhaustion class of issue; depending on the caller, it may surface as a hang or as StackOverflowError, and exact weaponization cost was not measured.",
+    "Line ranges are valid only for this snapshot's revision."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "COSParser.bfSearchForObjStreams: 'while (numbersBytes[start] == 32)' (COSParser.java:1997-2002) indexes a byte array whose length is the attacker-controlled /First value; /First == 0 or an all-space prefix can walk off the array (ArrayIndexOutOfBoundsException), and the adjacent Long.parseLong/Long.parseLong loop (2014-2023) is outside the surrounding try/catch.",
+      "reason": "Plausible crafted-PDF DoS during xref recovery, but narrower than the page-tree recursion, only reachable with a damaged xref, and the same loop appears in long-lived upstream code, so I could not establish it as the intended distinct issue."
+    },
+    {
+      "lead": "PDFObjectStreamParser.parse allocates new ArrayList<>(numberOfObjects) directly from the attacker-controlled /N of an object stream (PDFObjectStreamParser.java:71-73), allowing an immediate OutOfMemoryError/IllegalArgumentException from a tiny file.",
+      "reason": "Concrete resource-exhaustion pattern, but impact is bounded to an allocation failure during parsing, requires an ObjStm with a huge /N, and I found no additional validation gap needed to exploit it; kept as an unconfirmed weaker lead."
+    },
+    {
+      "lead": "CmapSubtable.processSubtype8 writes glyphIdToCharacterCode[(int)glyphIndex] after checking only 'glyphIndex > numGlyphs' (fontbox/.../CmapSubtable.java:186-192) while the array is created with size numGlyphs (lines 143, 553-557), leaving an index==numGlyphs off-by-one that an embedded TrueType cmap format 8 can hit.",
+      "reason": "The inconsistency with format 12's '>=' check (line 256) is suspicious, but I could not confirm whether this off-by-one is upstream behavior or exploitable through a PDF, and it only yields an unchecked runtime exception/AIOOBE."
+    },
+    {
+      "lead": "CFFParser.readIndexData computes offsets[i+1]-offsets[i] and passes it to DataInput.readBytes without the negative-length check that readStringIndexData has (CFFParser.java:202-217 vs 231-236), so decreasing offsets can trigger NegativeArraySizeException.",
+      "reason": "Real asymmetry, but it is a narrow crafted-CFF crash path and the surrounding code already contains other CFF hardening; unconfirmed as the target issue."
+    },
+    {
+      "lead": "XXE / external entity handling in FDF, XFA and XMP parsers.",
+      "reason": "Check each entry point (XMLUtil.java:60-66, PDXFAResource.java:141-147, DomXmpParser.java:80-86) shows DOCTYPE disallowed, external general/parameter entities and external DTD loading disabled, XInclude disabled, so no candidate."
+    }
+  ],
+  "summary": "Reviewed the assigned Apache PDFBox 3.0.0-SNAPSHOT source tree (1200 model-visible files; no test sources included, so behavior could not be exercised). I traced attacker-controlled PDF structures into the page-tree handling code and found one distinct, source-evidenced weakness: page-tree dictionaries (/Pages, /Kids, /Type) are walked recursively with no loop/duplicate detection, so a crafted PDF with a cyclic or shared (/Kids DAG) page tree can force unbounded recursion or exponentially repeated subtree processing. The parse-time path (COSParser.checkPagesDictionary, reached from PDFParser.initialParse when the trailer had to be rebuilt) and the use-time path (PDPageTree iterator/get/findPage) share this root cause. This is reported as one candidate (DoS / uncontrolled resource consumption); no code-execution, injection, or memory-safety issue was substantiated."
+}

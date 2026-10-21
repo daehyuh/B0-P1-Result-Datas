@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The destination name is taken from the incoming message: GenericFileProducer.createFileName reads Exchange.OVERRULE_FILE_NAME, else Exchange.FILE_NAME (GenericFileProducer.java:316-327) and converts it to String (line 350); when no header is present it may still be an endpoint fileName expression evaluated over the message (lines 346-351). Message headers are set by upstream consumers/processors from external data. I verified in-repo that JMS maps publisher-controlled properties to Camel headers without blocking Camel* names: JmsBinding.extractHeadersFromJms iterates jmsMessage.getPropertyNames() and puts decoded keys into the header map (JmsBinding.java:197-209), JmsHeaderFilterStrategy only adds JMSX* to the outgoing filter and sets no Camel in-filter (JmsHeaderFilterStrategy.java:36-47), and DefaultJmsKeyFormatStrategy.decodeKey leaves `CamelFileName` unchanged (DefaultJmsKeyFormatStrategy.java:41-45). Similar header-driven consumers (AMQP, MQTT, SEDA/VM bridges, other components) and routes that explicitly map an untrusted header/body into CamelFileName or a fileName expression are equally exposed.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether any guard exists: FileUtil.normalizePath only replaces separators (FileUtil.java:67-79); GenericFileProducer.createTempFileName explicitly compacts `..` (lines 420-421) but createFileName does not; FileOperations.storeFile has no containment/canonical-path check (lines 215-218) and GenericFileEndpoint.java:568-580 documents header-driven file names without a traversal warning. Also checked the HTTP consumer: HttpHeaderFilterStrategy sets an in-filter pattern that drops incoming Camel*/org.apache.camel* headers (HttpHeaderFilterStrategy.java:45-48), so the ordinary HTTP-header route is not directly injectable; the JMS path is (verified above). Flatten=true (GenericFileProducer.java:354-360) strips directories and mitigates routes that enable it. The finding is therefore a route/consumer-dependent (not universal) exposure, and I did not run or exploit anything.",
+      "id": "case-120-fileproducer-path-traversal",
+      "impact": "Attacker-influenced arbitrary file write outside the directory configured on the endpoint. Depending on the process privileges this allows overwriting application/configuration files, planting files in web roots, cron/authorized_keys or other execution paths, leading to integrity loss and likely remote code execution, plus disk-filling/DoS. It also breaks the endpoint's implicit directory-confinement guarantee (data intended for one directory lands anywhere writable).",
+      "locations": [
+        {
+          "end_line": 387,
+          "path": "camel-core/src/main/java/org/apache/camel/component/file/GenericFileProducer.java",
+          "start_line": 312
+        },
+        {
+          "end_line": 310,
+          "path": "camel-core/src/main/java/org/apache/camel/component/file/GenericFileProducer.java",
+          "start_line": 283
+        },
+        {
+          "end_line": 218,
+          "path": "camel-core/src/main/java/org/apache/camel/component/file/FileOperations.java",
+          "start_line": 215
+        },
+        {
+          "end_line": 79,
+          "path": "camel-core/src/main/java/org/apache/camel/util/FileUtil.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 423,
+          "path": "camel-core/src/main/java/org/apache/camel/component/file/GenericFileProducer.java",
+          "start_line": 415
+        }
+      ],
+      "prerequisites": "A Camel route delivers messages that are not fully trusted to a GenericFile producer (file/file-language endpoint, and the same header-driven logic is reused by remote file producers) while the destination name is allowed to come from the CamelFileName/CamelOverruleFileName header (the default when no fileName expression is set) or from an expression whose inputs the attacker controls. The Camel process must have write permission to the escaped location. Direct injection of Camel* HTTP headers is mitigated for HTTP-based consumers by the Camel-prefix in-filter of HttpHeaderFilterStrategy, so HTTP is a weaker path than JMS/AMQP/MQTT/bridge consumers; the vulnerability is consequently route/consumer dependent (medium confidence, not runtime-confirmed).",
+      "root_cause": "GenericFileProducer.createFileName builds the target path as `baseDir + name`, where `name` comes directly from the message header Exchange.FILE_NAME/OVERRULE_FILE_NAME or the endpoint fileName expression, with no rejection or canonicalization of `..` segments; FileUtil.normalizePath only swaps separators, and FileOperations.storeFile then does `new File(fileName)` and writes to it. The sibling temp-file path (createTempFileName) does call FileUtil.compactPath for `..`, so the target-name path is missing the same reduction; the FTP/SFTP writers also rely only on separator normalization.",
+      "title": "Arbitrary file write outside the configured directory via CamelFileName/CamelOverruleFileName headers in the core file producer",
+      "trace": "Untrusted message property/header -> GenericFileProducer.process (line 65) -> createFileName (line 312): value = header OVERRULE_FILE_NAME/FILE_NAME (lines 318-333); name = convertTo(String.class, value) (line 350); answer = baseDir + name (lines 362-379); only separator normalization applied (lines 381-384) -> processExchange (line 110) -> writeFile (line 169 -> 283) -> operations.storeFile(fileName, exchange) (line 305) -> FileOperations.storeFile: `File file = new File(fileName)` (line 218) -> writeFileByStream / writeFileByFile / writeFileByReaderWithCharset writes the body to that path. A name such as `../../../../etc/cron.d/job` (or `..\\..\\...` on Windows) escapes the baseDir because normalizePath only converts `/` and `\\` (FileUtil.java:67-79) and compactPath is used only for temp names (GenericFileProducer.java:420-421).",
+      "unverified": "No runtime validation, build, or exploit was executed; exploitability depends on a deployment route that lets untrusted input populate CamelFileName/CamelOverruleFileName or the fileName expression, and on filesystem permissions. I could not diff against upstream 2.20.3 (no VCS history) or compare against the later upstream fix, so line-level attribution of the missing check is based on reading this snapshot only.",
+      "weakness_type": "CWE-22 Path Traversal (uncontrolled destination path, arbitrary file write)"
+    }
+  ],
+  "coverage_summary": "Reviewed the repository-relative snapshot (Apache Camel 2.20.3, 10,166 visible files; 5 files excluded as sensitive-name/path; binary-like files skipped by the tools). I inspected in depth: core file component (GenericFileEndpoint/GenericFileProducer/FileOperations/FileUtil), JMS binding and header/key-format strategies, HTTP/HTTP4/Jetty/Netty/Netty4 HTTP bindings and their allowJavaSerializedObject/transferException gating, XML handling (XmlConverter, StaxConverter, XStream, SnakeYAML, Castor/Hessian whitelists, Jackson/JacksonXML data formats, XmlJsonDataFormat, XML security/validator), netty and netty4 default codec configuration, RabbitMQ converter, and smaller sanitization/config helpers. I did not exhaustively read all ~5,000 component source files, examples, tests, generated spring-boot starters, or third-party client bindings; no tests, builds, or scanners were run.",
+  "limitations": [
+    "No execution, build, dependency resolution, or exploit was performed; all conclusions are static source reading only and are not runtime-confirmed.",
+    "The snapshot has no VCS history, so I could not diff against upstream 2.20.3 or later fixes to confirm which check is missing at which release; version/CVE-range mapping for this defect could not be verified offline.",
+    "Exploitability of the selected candidate depends on application routes/consumers that let untrusted data set CamelFileName/CamelOverruleFileName or fileName expressions; HTTP consumers filter Camel* headers, so HTTP-only deployments may be unaffected.",
+    "External library behavior relevant to rejected leads (Netty ObjectDecoder, json-lib/XOM parsing, Xerces parameter-entity defaults, gadget availability) could not be inspected in this run.",
+    "Coverage was prioritized (core + security-relevant components); large parts of the repo (examples, platform starters, many client components) were sampled rather than exhaustively reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "camel-netty/camel-netty4 install Java ObjectEncoder/ObjectDecoder as the default codec (NettyConfiguration.java lines 208-241; ChannelHandlerFactories.newObjectDecoder/newObjectEncoder) so a default TCP consumer deserializes client-supplied Java streams (io.netty ObjectDecoder/readObject).",
+      "reason": "Very strong RCE-impact lead (remote, default config) but the actual readObject sink lives in the external Netty library, exploitability needs a gadget on the classpath, it is documented as an explicit default codec, and I could not tie it to a version/advisory for this snapshot; kept as an alternate lead rather than the single candidate."
+    },
+    {
+      "lead": "camel-core XmlConverter DOM/SAX parsing only disables external-general-entities (XmlConverter.java lines 1122-1148, 1243-1258); external-parameter-entities and external DTD loading remain enabled, so parameter-entity XXE (SSRF/file exfiltration) may still be reachable through XPath/Document conversions of untrusted XML.",
+      "reason": "Exploitability depends on external parser (Xerces/JDK) defaults and on parameter-entity behavior that cannot be verified inside this repo; impact is primarily confidentiality/SSRF, weaker than the chosen candidate, so treated as an unconfirmed lead."
+    },
+    {
+      "lead": "camel-rabbitmq deserializes the AMQP message body with a plain ObjectInputStream whenever the AMQP header CamelSerialize is truthy (RabbitMQMessageConverter.java lines 267-303), a header any publisher to the queue can set.",
+      "reason": "Requires the attacker to be able to publish to the consumed queue/exchange and a gadget class to be present; appears to be an intentional Camel-to-Camel serialize feature without a known in-repo guard; plausible but less clearly a vulnerability than the selected candidate."
+    },
+    {
+      "lead": "camel-consul ConsulRegistry deserializes KV values with a plain ObjectInputStream (ConsulRegistry.java lines 285-290), and camel-sql/cassandraql aggregation repositories deserialize stored blobs.",
+      "reason": "Attacker must control the external registry/DB content (often ACL-protected/local trust boundary), so it is a weaker trust-boundary violation than the header-driven file write."
+    },
+    {
+      "lead": "GenericFileProducer/FtpOperations/FtpUtils contain further path-compaction inconsistencies (FtpUtils.compactPath, SftpOperations.rename compaction) and endpoint move/preMove paths.",
+      "reason": "Same root cause as the selected candidate; not split into a separate candidate per instructions."
+    }
+  ],
+  "summary": "The strongest source-supported issue I found in the assigned Apache Camel 2.20.3 snapshot is a path-traversal / arbitrary-file-write flaw in the core file producer: the destination file name taken from the CamelFileName (Exchange.FILE_NAME) or CamelOverruleFileName message header (or a fileName expression built from untrusted data) is concatenated onto the endpoint's configured directory and passed to FileOperations.storeFile, which does `new File(fileName)` and writes it. Nothing in the chain rejects or canonicalizes `..` segments; FileUtil.normalizePath only converts path separators, and the temp-name path in the same class does call FileUtil.compactPath, showing the missing reduction for the real target name. Trusted-message assumptions do not hold for many consumer components (I verified JMS maps arbitrary message properties, including CamelFileName, into Camel headers without filtering), so a remote/untrusted message producer can cause writes outside the intended directory (e.g. cron/SSH keys/webroot → RCE; overwrite of application files). I chose this single candidate because the whole sink chain is verifiable inside the repo (no external gadget/parser behavior needed), and I list the other credible but weaker/unverified leads separately."
+}

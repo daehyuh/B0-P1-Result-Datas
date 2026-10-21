@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `rememberMe` HTTP cookie value on any unauthenticated request. CookieRememberMeManager.getRememberedSerializedIdentity() takes the raw cookie string, pads/decodes it with Base64.decode() and returns the attacker-chosen ciphertext bytes to the decryption/deserialization path (lines 205-219). No session or login is required for this path; DefaultSecurityManager.resolvePrincipals() invokes it during subject construction (core/src/main/java/org/apache/shiro/mgt/DefaultSecurityManager.java:485-498).",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that the historical hard-coded default cipher key (CVE-2016-4437) is removed: the constructor generates a random key (AbstractRememberMeManager.java:95-100) and the `Base64` import is now unused, evidence the constant was deleted. Verified errors are wrapped (SerializationException / CryptoException) and that DefaultSecurityManager.getRememberedIdentity (600-614) catches failures and logs rather than propagating, which limits response-based oracle signalling but does not authenticate the ciphertext or filter classes. Verified no class allowlist exists in ClassResolvingObjectInputStream. Checked whether the crypto layer adds integrity: AesCipherService inherits CBC + PKCS5 with a random IV but no MAC/AEAD (AesCipherService.java:86-88, DefaultBlockCipherService defaults), so ciphertext malleability/padding-oracle weakness remains. Checked whether the sample key is real and reachable in-tree: samples/guice/WEB-INF/shiro.ini:29 and SampleShiroServletModule.java:74-78.",
+      "id": "case-022-cand-1",
+      "impact": "Remote code execution through deserialization gadgets on the application classpath (pre-authentication, per-request), and/or authentication/authorization bypass by forging a remembered identity (cookie forgery / padding-oracle-assisted). Because the cookie is processed during Subject construction, the sink is reached before any login or role/permission check.",
+      "locations": [
+        {
+          "end_line": 224,
+          "path": "web/src/main/java/org/apache/shiro/web/mgt/CookieRememberMeManager.java",
+          "start_line": 185
+        },
+        {
+          "end_line": 393,
+          "path": "core/src/main/java/org/apache/shiro/mgt/AbstractRememberMeManager.java",
+          "start_line": 380
+        },
+        {
+          "end_line": 422,
+          "path": "core/src/main/java/org/apache/shiro/mgt/AbstractRememberMeManager.java",
+          "start_line": 417
+        },
+        {
+          "end_line": 508,
+          "path": "core/src/main/java/org/apache/shiro/mgt/AbstractRememberMeManager.java",
+          "start_line": 478
+        },
+        {
+          "end_line": 84,
+          "path": "core/src/main/java/org/apache/shiro/io/DefaultSerializer.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 57,
+          "path": "core/src/main/java/org/apache/shiro/io/ClassResolvingObjectInputStream.java",
+          "start_line": 50
+        },
+        {
+          "end_line": 88,
+          "path": "core/src/main/java/org/apache/shiro/crypto/AesCipherService.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 463,
+          "path": "core/src/main/java/org/apache/shiro/crypto/JcaCipherService.java",
+          "start_line": 457
+        }
+      ],
+      "prerequisites": "(1) The attacker must be able to produce a valid ciphertext: either the application explicitly configures the rememberMe cipher key (common for multi-node/restart-stable cookies - the repository's own samples/guice/WEB-INF/shiro.ini sets the publicly known key kPH+bIxk5D2deZiIxcaaaA==, consumed by samples/guice/.../SampleShiroServletModule.java:74-78), or the key is recovered/forged using the CBC/PKCS5 padding-oracle weakness (no MAC, distinguishable padding failures). (2) A gadget chain must be present on the web application classpath for RCE; without one, forged principals still permit authentication/authorization bypass. The default constructor now generates a random per-instance key (AbstractRememberMeManager.java:95-100), which blocks the trivial no-key attack.",
+      "root_cause": "The rememberMe identity is treated as trusted data: CookieRememberMeManager reads the request cookie and Base64-decodes it (no signature/MAC), AbstractRememberMeManager.decrypt() decrypts it with the configured AES key and then passes the plaintext straight to DefaultSerializer.deserialize(), whose ClassResolvingObjectInputStream.readObject() resolves and instantiates any class name present in the stream (ClassUtils.forName, no allowlist/filter). The default cipher service is AES-CBC with PKCS5 padding and no integrity check; JcaCipherService.crypt() wraps decryption/padding failures in CryptoException, so decryption errors are distinguishable from parsing errors (padding-oracle precondition). Consequently, anyone who knows or can recover the cipher key can supply an arbitrary serialized object graph that is deserialized before authentication completes, and can also forge a remembered PrincipalCollection.",
+      "title": "Attacker-controlled rememberMe cookie reaches native Java deserialization without integrity protection or class allowlisting",
+      "trace": "HTTP request cookie `rememberMe` -> CookieRememberMeManager.getRememberedSerializedIdentity (185-224, Base64.decode at 215) -> AbstractRememberMeManager.getRememberedPrincipals (380-392) -> convertBytesToPrincipals (417-421) -> decrypt (478-486) -> cipherService.decrypt (JcaCipherService.decrypt, 347-392) -> deserialize (499-508) -> DefaultSerializer.deserialize (67-84, ois.readObject() at 77) -> ClassResolvingObjectInputStream.resolveClass (50-57, ClassUtils.forName on attacker-supplied class names) -> deserialized PrincipalCollection installed as the Subject's remembered identity (DefaultSecurityManager.resolvePrincipals 485-498).",
+      "unverified": "No runtime exploitation was performed. Whether a real deployment uses a known/predictable key or is practically vulnerable to the padding oracle through this code path is environment-dependent, as is the presence of a usable gadget chain. The snapshot is an old 1.3.x development tree; later Shiro releases changed the default cipher mode and added hardening, so this is a source-level lead for this snapshot, not a claim about current Shiro.",
+      "weakness_type": "Deserialization of Untrusted Data (CWE-502), enabled by unauthenticated/integrity-less encrypted cookie (CWE-353) and malleable AES-CBC/PKCS5 (CWE-327)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 582 model-visible files, 0 excluded for size/sensitive names/symlinks; binary-like files are refused by read_file/search_code (none encountered in the queried set). The snapshot contains no src/test directories. I inspected the security-critical core packages (authc and credential matchers, authz and permission resolvers, realms including JDBC/LDAP/ActiveDirectory, mgt/DefaultSecurityManager and rememberMe, session management and DAOs, subject/principal handling, crypto/hash/codecs, io serializers, config/Ini builders, util incl. AntPathMatcher) and the web module (filter chain resolution, all authentication/authorization filters, servlet request/response wrappers, cookies, web session management, WebUtils/RedirectView), plus the pom files and support/spring, support/cas, support/guice, support/ehcache, support/quartz and tools/hasher at a lower depth. samples/* were skimmed and only sampled for configuration context.",
+  "limitations": [
+    "No runtime execution, build, tests, or exploit PoCs were performed; findings are source-level only.",
+    "The snapshot has no test sources, so upstream test-derived intent could not be checked.",
+    "The snapshot is an Apache Shiro 1.3.2-SNAPSHOT development tree; the hard-coded rememberMe default key fix (random per-instance key) is already present, so the straightforward known-default-key exploit does not apply and the candidate depends on a configured or recoverable key.",
+    "Java deserialization exploitability depends on external factors not present in the repository (gadget classes on the deployed classpath), and the padding-oracle routability through the application was not verified.",
+    "Not every one of the 582 files was read line-by-line; support/samples modules were reviewed selectively, so an injected or unusual defect in an unread sample/support file cannot be fully excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path/URI normalization authentication bypass: WebUtils.getRequestUri/decodeAndCleanUriString/normalize (web/src/main/java/org/apache/shiro/web/util/WebUtils.java:110-141, 231-235) strips everything after the first ';' after URL-decoding and can leave '..' segments unresolved, while PathMatchingFilterChainResolver.getChain (web/src/main/java/org/apache/shiro/web/filter/mgt/PathMatchingFilterChainResolver.java:93-115) selects the filter chain from that computed path. This is the CVE-2020-1957/2020-13933/2021-41303 class of auth bypass and is present in this version.",
+      "reason": "Plausible and high impact, but exploitation depends on the servlet container/Spring resolving the real resource differently from Shiro's computed path (external behavior not visible in this snapshot), so I judged it slightly weaker evidence than the rememberMe deserialization sink. Mentioned here rather than as a second candidate per the one-candidate limit."
+    },
+    {
+      "lead": "Bundled guice sample configures the publicly known rememberMe cipher key kPH+bIxk5D2deZiIxcaaaA== (samples/guice/src/main/webapp/WEB-INF/shiro.ini:29, used by SampleShiroServletModule.java:74-78).",
+      "reason": "Sample/demo configuration, not production code; it is folded into the candidate as a concrete enabling condition rather than reported as an independent finding."
+    },
+    {
+      "lead": "Padding-oracle-prone default AES-CBC/PKCS5 rememberMe encryption (AesCipherService.java:86-88; JcaCipherService.crypt:457-463; AbstractRememberMeManager.onRememberedPrincipalFailure:441-454).",
+      "reason": "Same root area as the selected candidate; treated as the enabling weakness for cookie forgery/deserialization rather than split into a separate candidate."
+    },
+    {
+      "lead": "AuthorizingRealm.isPermittedAll(PrincipalCollection, String...) returns false for an empty permission array (core/src/main/java/org/apache/shiro/realm/AuthorizingRealm.java:507-516).",
+      "reason": "Matches upstream semantics and fails closed; no security impact identified."
+    },
+    {
+      "lead": "SecureRemoteInvocationExecutor trusts a client-supplied session id to rebuild the Subject (support/spring/src/main/java/org/apache/shiro/spring/remoting/SecureRemoteInvocationExecutor.java:92-103).",
+      "reason": "Documented design of the remoting integration and only reachable if the application exports remote services; not as well evidenced as the selected candidate in this snapshot."
+    }
+  ],
+  "summary": "Reviewed the 582-file Apache Shiro snapshot (pom version 1.3.2-SNAPSHOT; core/web/support/samples/tools modules; no test directories present). I traced the rememberMe identity pipeline end-to-end and audited the main authentication/authorization, session, crypto, codec, config and web filter-chain code. The strongest single candidate is the rememberMe cookie processing chain: an unauthenticated cookie value is Base64-decoded, decrypted (default AES-CBC/PKCS5, no MAC), and then handed to native Java deserialization with no class allowlist. The default random per-instance key mitigates trivial cookie forgery (the historical hard-coded-key issue is fixed here), but any deployment that configures a key (e.g., the shipped guice sample configures the publicly known \"kPH+bIxk5D2deZiIxcaaaA==\" key) or where the key can be recovered via the CBC/PKCS5 padding-oracle weakness exposes a remote deserialization sink; forged principals also yield authentication/authorization bypass. I considered the path-normalization authentication-bypass class (WebUtils/PathMatchingFilterChainResolver) as an alternative but selected the rememberMe chain as the single strongest candidate; it is listed with the other leads below."
+}

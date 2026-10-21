@@ -1,0 +1,64 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The header is cleartext, prepended to ciphertext, and fully attacker-controlled. Callers documented to process untrusted ciphertext include CipherUtil.decrypt(BlockCipher/AEADBlockCipher, SecretKey, byte[]/InputStream/OutputStream) and AbstractCipherBean.decrypt(...) (bean/AbstractCipherBean.java:149-168), which call CiphertextHeader.decode(input) before any key lookup, decryption, padding or MAC check. A crafted byte array/stream of ~8-12 bytes controls nonceLen/keyLen arbitrarily.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the header-length field is validated (line 145: length < 0) but NonceLen and KeyNameLen are not. Confirmed the catch clauses (lines 155, 168, 200, 214) do not cover NegativeArraySizeException or OutOfMemoryError. Confirmed allocation happens before BufferUnderflowException can fire on bb.get(nonce)/bb.get(b), i.e. bounds checks are too late. Checked that the newer CiphertextHeaderV2 format deliberately stores NonceLen as a 1-byte unsigned value and caps the key name (CiphertextHeaderV2 lines 202-215), indicating these V1 4-byte length fields are the weak point; no caller-side length validation was found in CipherUtil or the bean classes. Not runtime-confirmed; no tests exist in the snapshot and no code was executed.",
+      "id": "cryptacular-header-alloc-dos",
+      "impact": "Denial of service against any service that decrypts untrusted headers: large nonceLen/keyLen values force excessive heap allocation (OutOfMemoryError, potentially affecting all requests in the JVM), and negative values raise an uncaught NegativeArraySizeException instead of the declared EncodingException, potentially aborting request/thread handling. Both occur before any authentication, so no key or valid ciphertext is required.",
+      "locations": [
+        {
+          "end_line": 174,
+          "path": "src/main/java/org/cryptacular/CiphertextHeader.java",
+          "start_line": 139
+        },
+        {
+          "end_line": 223,
+          "path": "src/main/java/org/cryptacular/CiphertextHeader.java",
+          "start_line": 187
+        }
+      ],
+      "prerequisites": "An application uses CiphertextHeader-based decryption on data it does not fully trust (the class is explicitly designed for key rotation over outstanding ciphertexts). Default heap sizing applies; each malformed header can request a very large allocation. Byte[] path: lines 152-154 (nonce) and 164-166 (key name); stream path: lines 197-199 and 211-213.",
+      "root_cause": "CiphertextHeader.decode() parses the cleartext header with only one validation: the total header length must be non-negative. The NonceLen and KeyNameLen fields are read as raw big-endian 4-byte ints (ByteBuffer.getInt / ByteUtil.readInt) and used directly as array sizes (new byte[nonceLen], new byte[keyLen]) before any comparison against remaining/available data. Negative values cause NegativeArraySizeException, which is not covered by the catch clauses (only IndexOutOfBoundsException | BufferUnderflowException, and IOException in the stream variant), and very large values request up to ~2 GB per request before any cipher/authentication step can reject the input.",
+      "title": "Unbounded/negative array allocation from unvalidated CiphertextHeader length fields (decryption DoS)",
+      "trace": "decrypt(byte[] data) -> CiphertextHeader.decode(data) -> bb.getInt() length (line 144, only checked for <0) -> bb.getInt() nonceLen (line 152) -> new byte[nonceLen] (line 153) -> bb.get(nonce) (line 154). If length > nonce.length + 8 (line 160): bb.getInt() keyLen (line 164) -> new byte[keyLen] (line 165) -> bb.get(b) (line 166). InputStream variant mirrors this at lines 197-199 (new byte[nonceLen], input.read(nonce)) and 211-213 (new byte[keyLen], input.read(b)). No upper bound and no cross-check against data length/stream length is performed at any point.",
+      "unverified": "Actual allocator/heap behavior (OutOfMemoryError vs. VM survival), and whether deployed callers impose their own size caps, were not verified. The snapshot also contains undefined symbols in CiphertextHeaderV2 (MAX_KEYNAME_LEN, ByteUtil.toUnsignedByte/toString(byte[],int,int)/toInt(byte)), so the newer V2 path could not be fully assessed; this candidate is based solely on V1 code that is self-consistent.",
+      "weakness_type": "CWE-789 Memory Allocation with Excessive Size Value / CWE-770 Allocation of Resources Without Limits or Throttling (improper input validation, CWE-20)"
+    }
+  ],
+  "coverage_summary": "Scope per get_source_scope: 131 model-visible files under the assigned root (src/main Java sources, pom/checkstyle/assembly config, README, two OpenSSL test artifacts); binaries are refused and no files were excluded by sensitive-name/path filters. Per get_relation_scope the P1 index covers all 131 files (no missing files, no hash mismatches; 985 symbols/1702 edges) but is explicitly syntactic navigation only, not data-flow, reachability, or a SAST result. I read all security-relevant areas in full: CiphertextHeader/CiphertextHeaderV2, CipherUtil, HashUtil, KeyPairUtil, PemUtil, NonceUtil, SaltedHash, BCryptHashBean, EncodingHashBean/SimpleHashBean, the ASN.1 key decoders, pbe schemes/algorithms, cipher/digest/codec specs, nonce generators, the codec package, x509/DN readers, and io stream wrappers; remaining adapter/wrapper and small support classes were skimmed (they contain no parsing or trust-boundary logic). Index facts (security_call/deserialization hints) were checked against source and are name-based navigation hints only. No build, tests, or scanners were run, and there are no test sources in the snapshot.",
+  "limitations": [
+    "No code was executed and the project was not built; findings are source-level only and not runtime-confirmed.",
+    "The snapshot contains unresolved references inside CiphertextHeaderV2 (MAX_KEYNAME_LEN and three ByteUtil helpers) and private-field access from the subclass, so that file cannot compile and its effective runtime behavior (including any key-name length cap) could not be assessed.",
+    "No test sources or version history are present, so upstream intent (design weakness vs. regression) could not be confirmed.",
+    "Reachability of the vulnerable decode path depends on how consuming applications expose decryption; only in-repo callers were traced.",
+    "BouncyCastle provider internals (bcrypt cost validation, engine behavior) were not inspected, as the dependency is not in the source tree."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CiphertextHeaderV2.arraysEqual (lines 297-308) compares the recomputed HMAC with the attacker-supplied tag byte-by-byte with early return, a non-constant-time comparison (CWE-208) of an authentication value on untrusted headers.",
+      "reason": "Real code-quality/security smell, but practical exploitability of a 32-byte HMAC timing oracle through this API is uncertain, and the class is not used anywhere else in the snapshot (dead code in-tree). Lower impact than the header-allocation DoS."
+    },
+    {
+      "lead": "CiphertextHeaderV2.decodeInternal references undefined symbols (MAX_KEYNAME_LEN at line 204; ByteUtil.toUnsignedByte at line 113; ByteUtil.toString(byte[],int,int) at line 209; ByteUtil.toInt(byte) at line 214), and writes to private parent fields (nonce/keyName/length are private in CiphertextHeader).",
+      "reason": "Source cannot compile as present, so effective bounds/behavior cannot be established; the intended key-name limit likely exists upstream. This is a snapshot-integrity limitation, not a demonstrable vulnerability."
+    },
+    {
+      "lead": "BCryptHashBean.BCryptParameters (lines 263-276) parses cost with Integer.parseInt and no [4,31] range check (setCost enforces the range, compare does not); HashUtil.compareHash and BCryptHashBean.compare use early-exit byte comparisons.",
+      "reason": "Verification cost comes from the stored hash, normally trusted; BouncyCastle's BCrypt.generate may itself range-check cost. Timing differences are dominated by the expensive bcrypt/hash computation. Left unconfirmed."
+    },
+    {
+      "lead": "StreamCipherSpec.newInstance maps algorithm name \"Grainv1\"/\"Grain-v1\" to ISAACEngine (line 48) rather than a Grain engine; no Grainv1Engine import exists.",
+      "reason": "Silently substitutes a different cipher (correctness/interoperability problem with possible crypto-misuse implications), but source alone cannot establish a concrete attacker-driven security impact; may be a long-standing upstream mapping choice."
+    },
+    {
+      "lead": "Short/empty input index errors: PemUtil.isPem reads data[0..63] and new String(data,0,10) without length checks (PemUtil.java:54-69); HexDecoder.decode calls input.get(0)/input.get(1) unconditionally (HexDecoder.java:40-41); CiphertextHeader negative lengths can throw NegativeArraySizeException.",
+      "reason": "These produce uncaught RuntimeExceptions (robustness/DoS edge cases) rather than memory exhaustion or data compromise; folded into the main candidate only where they share the unvalidated-length root cause."
+    },
+    {
+      "lead": "NonceUtil.timestampNonce/nist80063a and RandomIdGenerator randomness characteristics (modulo bias, timestamp material).",
+      "reason": "Timestamp bytes are only DRBG personalization/nonce inputs combined with SecureRandom entropy, and the modulo bias is negligible; no security-relevant predictability was demonstrated."
+    }
+  ],
+  "summary": "Reviewed the cryptacular 1.2.4-SNAPSHOT Java crypto library (131 model-visible source files) with P1 navigation only as a hint source. The strongest source-evidenced issue is in the cleartext ciphertext-header parser: CiphertextHeader.decode trusts attacker-controlled 4-byte NonceLen/KeyNameLen fields and allocates arrays of those sizes before any bounds check or authentication, giving a remote denial-of-service primitive on the decryption path (CWE-789/CWE-770). Several other leads (non-constant-time HMAC/mac comparison, unvalidated bcrypt cost, Grainv1 mapped to ISAAC, short-input index errors, and a snapshot-level inconsistency around CiphertextHeaderV2's undefined MAX_KEYNAME_LEN/ByteUtil helpers) were considered but are weaker or unverifiable; they are listed as rejected leads rather than additional candidates."
+}

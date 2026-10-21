@@ -1,0 +1,100 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any client that can authenticate to S3Proxy (with s3proxy.authorization=none, any client) controls the request-target path, the x-amz-copy-source header, multipart uploadId/partNumber and the object names/prefixes they submit; all of these flow into the NIO.2 path construction. The x-amz-copy-source value in particular can contain literal '../' sequences with no URI-level constraint, and its decode uses URLDecoder (so encoded forms such as '%2e%2e%2f' also decode to '../').",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that (a) isValidContainer is applied only to path[1] in the authenticated flow and only rejects names starting/ending with '.' and non-bucket characters, so it does not protect blob keys (S3ProxyHandler 277-287, 648-656); (b) no normalize()/getCanonicalPath()/startsWith(root) containment check exists anywhere in the repository (searches for normalize/getCanonicalPath/'\\.\\.' found none); (c) the only startsWith(root...) check is inside listHelper (AbstractNio2BlobStore 233) and affects listing output, not path resolution for get/put/delete; (d) getBlob's containerExists check (343-345, 298-299) constrains only the container segment, not the key; (e) a plain '../' key cannot simply be rejected as illegal because '/' is legitimate in S3 keys, but the code performs no segment-level rejection of '.'/'..'; (f) read-only/sharding/alias wrappers add no key validation; (g) the copy-source route is entirely inside S3Proxy and does not rely on Jetty normalization, so it survives even if Jetty canonicalizes URL dot-segments.",
+      "id": "nio2-path-traversal",
+      "impact": "Arbitrary file read (and via PUT/DELETE/multipart, likely file create/overwrite/delete) on the host running S3Proxy, outside the intended base directory and outside the per-bucket sandbox, with the privileges of the s3proxy process. The copy-source chain exfiltrates file contents through ordinary S3 GETs, so secrets such as provider credentials, TLS keystores or mounted configuration can be read. Because the shipped Docker image runs as root by default, writes could corrupt files used by the proxy or by co-located services, enabling further compromise depending on the deployment.",
+      "locations": [
+        {
+          "end_line": 1822,
+          "path": "src/main/java/org/gaul/s3proxy/S3ProxyHandler.java",
+          "start_line": 1806
+        },
+        {
+          "end_line": 1896,
+          "path": "src/main/java/org/gaul/s3proxy/S3ProxyHandler.java",
+          "start_line": 1889
+        },
+        {
+          "end_line": 474,
+          "path": "src/main/java/org/gaul/s3proxy/S3ProxyHandler.java",
+          "start_line": 471
+        },
+        {
+          "end_line": 656,
+          "path": "src/main/java/org/gaul/s3proxy/S3ProxyHandler.java",
+          "start_line": 648
+        },
+        {
+          "end_line": 347,
+          "path": "src/main/java/org/gaul/s3proxy/nio2blob/AbstractNio2BlobStore.java",
+          "start_line": 341
+        },
+        {
+          "end_line": 533,
+          "path": "src/main/java/org/gaul/s3proxy/nio2blob/AbstractNio2BlobStore.java",
+          "start_line": 525
+        },
+        {
+          "end_line": 619,
+          "path": "src/main/java/org/gaul/s3proxy/nio2blob/AbstractNio2BlobStore.java",
+          "start_line": 613
+        },
+        {
+          "end_line": 698,
+          "path": "src/main/java/org/gaul/s3proxy/nio2blob/AbstractNio2BlobStore.java",
+          "start_line": 692
+        },
+        {
+          "end_line": 94,
+          "path": "src/main/java/org/gaul/s3proxy/S3Proxy.java",
+          "start_line": 92
+        }
+      ],
+      "prerequisites": "Deployment configured with the filesystem-nio2 provider (listed in README and exercised in CI) or another store that maps keys directly to host paths; at least one existing or attacker-creatable container directory under the base directory (a normal PUT bucket operation suffices); the target file/directory readable/writable by the s3proxy OS user. The direct-URL variant additionally depends on Jetty 11.0.24 UriCompliance.LEGACY (configured in S3Proxy.java 93-94) accepting ambiguous/encoded path characters; the copy-source variant does not depend on Jetty path handling at all.",
+      "root_cause": "S3Proxy turns untrusted request data into local filesystem paths without constraining them to the configured base directory. S3ProxyHandler URL-decodes raw URI path segments into container/blob names (S3ProxyHandler.java 471-474) and URL-decodes the x-amz-copy-source header (1806-1822, 2555-2572); only the first path segment (container) is validated (648-656) and only for the non-anonymous flow, while the blob key is never checked. AbstractNio2BlobStore then builds paths as root.resolve(container).resolve(key) for read (342-347), write (526-533), delete (692-698) and copy (613-619, 686) with no normalize()/startsWith(root) containment check, so a key containing '..' segments (or an absolute path such as '/etc/passwd', which Path.resolve treats as replacing the base) escapes the base directory.",
+      "title": "Path traversal outside the filesystem-nio2 base directory via unsanitized S3 keys and x-amz-copy-source",
+      "trace": "Authenticated copy-source route (robust, no Jetty URI dependence): (1) PUT /srcbucket creates a valid container; (2) PUT /dstbucket/dstkey with header x-amz-copy-source: /srcbucket/../../../../etc/passwd reaches handleCopyBlob (1806), which URL-decodes the header (1811), strips the leading '/', and splits it into sourceContainerName=\"srcbucket\", sourceBlobName=\"../../../../etc/passwd\" (1817-1822) with no validation; (3) blobStore.copyBlob(...) (1891-1893) calls AbstractNio2BlobStore.copyBlob -> getBlob(fromContainer, fromName) (616) -> root.resolve(\"srcbucket\").resolve(\"../../../../etc/passwd\") (347), which resolves to /etc/passwd and is opened with Files.newInputStream (351-413); (4) putBlob writes the file's bytes as dstkey (526-533, 686); (5) GET /dstbucket/dstkey returns the file content. Direct-URL route (same root cause): GET/DELETE /bucket/..%2f..%2f..%2fetc%2fpasswd is split on '/' (471), URLDecoder turns '%2f' into '/' and the segments into '../../..' (473), container 'bucket' passes isValidContainer (648-656), and handleGetBlob/handleBlobRemove pass the traversing key to the NIO.2 store. Multipart parts embed the untrusted blob name in part keys (AbstractNio2BlobStore 897-905), so uploadMultipartPart/completeMultipartUpload write through the same unresolved paths.",
+      "unverified": "No code was executed. Jetty 11.0.24's exact handling of literal '..' and '%2F' under UriCompliance.LEGACY is inferred from the configuration constant (S3Proxy.java 93-94) and was not empirically confirmed; the copy-source variant avoids this dependency but itself was not run. The filesystem-nio2 provider must be selected by configuration (the Docker default is jclouds 'filesystem', whose separate source is not in this snapshot). Whether deployments treat authenticated S3 clients as trusted for host filesystem access is an environment assumption. The traversal was not confirmed at runtime, and no CVE/advisory mapping was consulted.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Read or searched all 64 repository files at least by path and inspected in depth: S3ProxyHandler (auth flow, URI/query/header decode, copy/multipart/list/ACL handlers, error paths), AwsSignature, S3AuthorizationHeader, S3Proxy/S3ProxyHandlerJetty, Main/GlobBlobStoreLocator, CrossOriginResourceSharing, Quirks, the nio2blob package (AbstractNio2BlobStore read/write/copy/delete/list/multipart paths, provider metadata), DTOs (AccessControlPolicy, CompleteMultipartUploadRequest, DeleteMultipleObjectsRequest), ChunkedInputStream, CaseInsensitiveImmutableMultimap, ReadOnly/Alias wrappers, crypto package (Encryption, EncryptionInputStream, Decryption, Constants), Dockerfile, run-docker-container.sh, pom.xml, README and CI workflow. P1 index coverage: 63/64 files indexed, 52/52 Java files parsed, 1764 index edges (syntax call/containment/inheritance candidates only; no data-flow/reachability). The one file not present in the index and the jclouds/Jackson/Jetty dependency internals were not inspectable from this snapshot. No code, tests, scanners or exploit payloads were executed; all conclusions are source-text based.",
+  "limitations": [
+    "No runtime validation: reachability of the filesystem-nio2 provider, Jetty URI handling, and the actual resolution of traversing paths were not executed or tested.",
+    "The P1 relation index is syntax/navigation-only (no control-flow, data-flow, semantic resolution or security oracle); every index hint was re-checked against source text.",
+    "Dependencies (jclouds 2.6.0, Jetty 11.0.24, Jackson 2.18.1, StAX/Woodstox, Azure SDK) are not in the snapshot, so their internal validation/XML defaults could not be verified.",
+    "No test sources are present, so behavior implied by tests could not be checked.",
+    "AzureBlobStore, EncryptedBlobStore, ShardedBlobStore, EventualBlobStore, NullBlobStore, RegexBlobStore, StorageClassBlobStore, UserMetadataReplacerBlobStore, DecryptionInputStream and the junit helpers were only partially reviewed; a second vulnerability could exist there.",
+    "Whether operators consider authenticated S3 clients trusted with host filesystem access is an environment assumption."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE / external entity processing in Jackson XmlMapper used for request bodies (AccessControlPolicy 951/1052, DeleteMultipleObjectsRequest 1587, CompleteMultipartUploadRequest 2322).",
+      "reason": "The mapper is created with defaults (S3ProxyHandler 206) and no explicit XMLInputFactory hardening is visible, but Jackson-dataformat-xml 2.18.1 and the runtime StAX provider (Woodstox vs. JDK) cannot be resolved from this snapshot, and no malicious XML flow could be proven; unverifiable without runtime/dependency inspection."
+    },
+    {
+      "lead": "handlePostBlob verifies only the signature over the client-supplied POST policy and never parses/enforces the policy's conditions or expiration (S3ProxyHandler 2033-2198).",
+      "reason": "Real gap, but exploitation requires an external signer that issues policies to less-privileged users; the server's own credential holder can already write arbitrary keys, and no such signing component is present in the snapshot."
+    },
+    {
+      "lead": "ChunkedInputStream allocates new byte[currentLength] from attacker-controlled hex and never validates per-chunk signatures or parts[1] (ChunkedInputStream 51-57).",
+      "reason": "Memory-exhaustion/500 DoS at most, mostly authenticated, and per-chunk signatures are only meaningful against in-transit tampering; not the strongest distinct issue."
+    },
+    {
+      "lead": "servicePath is stripped by length without verifying the URI prefix (S3ProxyHandler 296-300) and virtual-host handling prepends an attacker-controlled Host header as a bucket (303-317).",
+      "reason": "Configuration-dependent path confusion; signatures are still computed over the original URI, so no authentication bypass was shown."
+    },
+    {
+      "lead": "OPTIONS requests skip signature verification (S3ProxyHandler 614) and default CORS allows any origin (CrossOriginResourceSharing 57-62).",
+      "reason": "The OPTIONS handler only emits CORS headers/CORS policy responses and exposes no object data; CORS does not itself bypass S3 authentication."
+    },
+    {
+      "lead": "NPE/500 handling in AwsSignature/ChunkedInputStream (null hashAlgorithm, missing ';' in chunk header, missing Authorization sub-fields).",
+      "reason": "Availability/error-handling noise without demonstrated security impact beyond DoS."
+    }
+  ],
+  "summary": "Reviewed the s3proxy snapshot (64 files, ~553 KB; 52 Java files parsed by the P1 index, 63 files indexed, 1 file not indexed, no test sources present). The strongest source-evidenced issue is a path-traversal weakness in the optional filesystem-nio2 blob store: attacker-controlled S3 keys (URL path segments and the x-amz-copy-source header) are percent-decoded and then used to build local filesystem paths with root.resolve(container).resolve(key) without any normalization or containment check, so keys such as \"../../etc/passwd\" (or copy-source values containing them) resolve outside the configured base directory. This crosses the storage-client-to-host-filesystem trust boundary and enables file read (and, on the write paths, file create/overwrite/delete) as the s3proxy process. I am submitting it as a single lead; other leads (XML parser hardening, POST-policy condition validation, chunked-upload handling, servicePath/Host handling) are listed as unconfirmed/rejected because their prerequisites could not be established from the snapshot alone."
+}

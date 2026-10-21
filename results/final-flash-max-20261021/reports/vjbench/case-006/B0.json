@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the template source (the documented threat model for the sandbox: JinjavaBeanELResolver exists specifically to deny expressions such as the `class` property). The loop-variable names and the iterated expression are template text; the target value need not be an application bean — ObjectIterator wraps any non-collection/non-map value (including a plain string or number) as a one-element iteration (ObjectIterator.java:56-58), and every Java object exposes the `class` property. The loop body then has the leaked value bound as a normal context variable.",
+      "confidence": "medium",
+      "counterevidence_checked": "The Map.Entry branch (ForTag.java:138-148) is safe and the leak is confined to the loop scope. The downstream step (invoking methods on the leaked Class/ClassLoader) relies on JUEL 2.2.7, whose BeanELResolver source is not part of this snapshot; if JUEL filtered Object-declared methods, that would affect `getClass()`-style EL calls only, not Class/ClassLoader's own public methods, but I could not read JUEL to verify method/static filtering. The in-repo resolver blocks only `class` and clone/hashCode/notify/notifyAll/wait (JinjavaBeanELResolver.java:16-26), and PrettyPrintFilter's explicit Class-class/Object-declared skip (PrettyPrintFilter.java:65-70) shows the `class` exposure is unintended rather than documented behavior. `getReadMethod()` can be null for unusual descriptors, which yields a caught NPE/InterpretException, not a mitigation.",
+      "id": "for-tag-class-property-bypass",
+      "impact": "Sandbox escape and information disclosure: an untrusted template can obtain java.lang.Class objects (and other restricted getter results) for runtime objects, defeating the `class` restriction. This re-exposes reflection/class-loading primitives (class names, class loaders, forName/loadClass, resource lookup, newInstance) that the sandbox intended to deny, which is a code-execution primitive when suitable classes/script engines are on the classpath. Concrete end-to-end RCE is not claimed here; at minimum it is a security-relevant restriction bypass in a component whose purpose is to safely render untrusted templates.",
+      "locations": [
+        {
+          "end_line": 163,
+          "path": "src/main/java/com/hubspot/jinjava/lib/tag/ForTag.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 157,
+          "path": "src/main/java/com/hubspot/jinjava/lib/tag/ForTag.java",
+          "start_line": 149
+        },
+        {
+          "end_line": 26,
+          "path": "src/main/java/com/hubspot/jinjava/el/ext/JinjavaBeanELResolver.java",
+          "start_line": 16
+        },
+        {
+          "end_line": 76,
+          "path": "src/main/java/com/hubspot/jinjava/el/ext/JinjavaBeanELResolver.java",
+          "start_line": 68
+        },
+        {
+          "end_line": 72,
+          "path": "src/main/java/com/hubspot/jinjava/lib/filter/PrettyPrintFilter.java",
+          "start_line": 63
+        },
+        {
+          "end_line": 58,
+          "path": "src/main/java/com/hubspot/jinjava/util/ObjectIterator.java",
+          "start_line": 30
+        }
+      ],
+      "prerequisites": "1) The application renders templates that may be attacker-influenced and relies on Jinjava's `class`/method restrictions for sandboxing. 2) The template uses the `for` tag with two or more loop variables (e.g., loop variable named `class`) so that ForTag takes the non-Map.Entry bean branch (ForTag.java:134-162). 3) The target expression resolves to a non-null value. No special application getter is required, only that a value exists in the render context/iteration.",
+      "root_cause": "ForTag performs bean introspection itself instead of going through the restricted EL resolver. For multi-variable loops over non-Map.Entry values it enumerates `Introspector.getBeanInfo(val.getClass()).getPropertyDescriptors()` and, when a loop-variable name matches a property name, invokes the getter reflectively (`valProp.getReadMethod().invoke(val)`) and stores the raw result in the interpreter Context (ForTag.java:149-157). Java's Introspector always reports the `class` property (Object.getClass) for every class, so a loop variable named `class` receives a `java.lang.Class` instance. This path never passes through JinjavaBeanELResolver.validatePropertyName, whose RESTRICTED_PROPERTIES list blocks the `class` property (JinjavaBeanELResolver.java:16-18, 68-76); other in-repo bean-introspection code explicitly skips Class-typed/Object-declared read methods (PrettyPrintFilter.java:63-72), showing the restriction is intended.",
+      "title": "`for` tag exposes java.lang.Class (and arbitrary bean getters) by name, bypassing the `class` property restriction",
+      "trace": "1. `{% for class, x in <expr> %}` parses the loop variables as plain strings with no validation (ForTag.java:103-122), enters a new scope and iterates with ObjectIterator (ForTag.java:124-130). 2. Because a `class` descriptor is present in `Introspector.getBeanInfo(val.getClass()).getPropertyDescriptors()`, `loopVar.equals(valProp.getName())` matches and `valProp.getReadMethod().invoke(val)` returns `val.getClass()` directly in Java (ForTag.java:151-154). 3. The resulting `java.lang.Class` is put into the template Context under the name `class` (ForTag.java:154) and is rendered inside the loop body; the same mechanism can pull any getter result by naming the loop variable after it (e.g., classLoader on a Class value). 4. JinjavaBeanELResolver, the control that was supposed to deny the `class` property, is never consulted on this path (it is only invoked via ExpressionResolver/JinjavaInterpreterResolver for EL property/method access). 5. The leaked value is a normal EL bean: Jinjava enables JUEL method invocations for templates (JinjavaInterpreterResolver.invoke at lines 82-97; ExtendedParser uses Feature.METHOD_INVOCATIONS; filters/macros depend on it), so public methods of Class/ClassLoader such as getName/forName/loadClass/getClassLoader/newInstance/getResource become reachable in untrusted templates.",
+      "unverified": "No template was rendered and no exploit was executed. Reachability of the final reflection/RCE chain through JUEL 2.2.7 method resolution, and the set of usable gadgets on a given application classpath, were not verified; the candidate is a source-evidence lead, not a confirmed vulnerability.",
+      "weakness_type": "CWE-693 Protection Mechanism Failure (sandbox restriction bypass; potential CWE-94/CWE-470)"
+    }
+  ],
+  "coverage_summary": "Snapshot: jinjava 2.4.6-SNAPSHOT, 223 files (including the benchmark module and build/docs files); get_source_scope reported 0 files excluded by size/sensitive-path/symlink filters, and the tree contains no test sources or dependency jars. I read the EL layer (ExpressionResolver, JinjavaInterpreterResolver, JinjavaBeanELResolver, JinjavaListELResolver, ExtendedParser/Scanner, Ast* operators, AbstractCallableMethod, MacroFunctionMapper, JinjavaELContext), interpreter/context/scoping (JinjavaInterpreter, Context, ScopeMap, CallStack, TemplateError, JinjavaConfig), all tags (For/If/Include/Import/From/Extends/Block/Call/Macro/Set/Raw/Cycle/etc.), the security-relevant filters (Attr, Map/SelectAttr/RejectAttr/GroupBy, PrettyPrint, Escape/EscapeJs/EscapeJson/EscapeJinjava, Format, Urlize, XmlAttr, TruncateHtml, FromJson/ToJson, etc.), resource loaders (Jinjava, ClasspathResourceLocator, FileLocator, CascadingResourceLocator), functions (Functions, InjectedContextFunctionProxy, ELFunctionDefinition, TypeFunction), tree/parse and util classes, plus pom.xml/README/CHANGES for context. Searches for execution/deserialization/file/network sinks (Runtime, ProcessBuilder, Class.forName, ObjectInputStream, System.getenv/getProperty, ScriptEngine, openConnection, new File, reflection invocations) found no direct dangerous sink outside the EL reflection surface described in the candidate.",
+  "limitations": [
+    "No test sources are present in the snapshot, so behavior could not be cross-checked against the project's own assertions.",
+    "JUEL 2.2.7, jsoup, Jackson, javassist and Guava sources/jars are not in the scope, so BeanELResolver method/property visibility (notably whether methods declared by java.lang.Object are exposed) could not be read; this affects only the confidence of the downstream exploitation of the Class leak, not the in-repo getter bypass itself.",
+    "Execution of code, tests, or payloads was not permitted; all conclusions are static-source based and the candidate is a lead, not a runtime-confirmed vulnerability.",
+    "Exploitability of the downstream reflection chain depends on the application's classpath and on how it exposes untrusted templates; applications that only render fully trusted templates are not affected."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Magic interpreter identifier: JinjavaInterpreterResolver.getValue returns the live JinjavaInterpreter when the property name equals ExtendedParser.INTERPRETER (`____int3rpr3t3r____`), so a template can reach interpreter methods such as getResource/getContext/parse/render (JinjavaInterpreterResolver.java:147-148; ExtendedParser.java:43).",
+      "reason": "Appears to be intentional internal plumbing (the parser injects this identifier as the interpreter argument for filters/expressions tests), and the reachable methods give resource reads/recursive rendering rather than a direct code-execution primitive; no path from the interpreter to the Jinjava application or to Class was found in-repo. Weaker than the ForTag finding."
+    },
+    {
+      "lead": "Incomplete method blacklist: JinjavaBeanELResolver.RESTRICTED_METHODS does not include `getClass`, so `{{ x.getClass() }}` might be usable if JUEL exposes Object-declared methods (JinjavaBeanELResolver.java:20-26, 60-66).",
+      "reason": "Unverifiable from this snapshot: juel-api/juel-impl 2.2.7 sources are not included, so I could not confirm whether BeanELResolver exposes methods declared by java.lang.Object; the same restriction is bypassed deterministically by the ForTag path regardless."
+    },
+    {
+      "lead": "Default nested interpretation: ExpressionNode re-renders any resolved value containing `{{` or `{%` because nestedInterpretationEnabled defaults to true (ExpressionNode.java:46-55; JinjavaConfig.java:157).",
+      "reason": "Documented configuration default since 2.2.3; it is a second-order SSTI amplifier dependent on how the application mixes user data into templates, not a self-contained library vulnerability with attacker-controlled code path in this snapshot."
+    },
+    {
+      "lead": "FormatFilter passes an attacker-influenced format string to String.format (FormatFilter.java:29-32).",
+      "reason": "Impact is limited to format exceptions/memory blowups (availability), no code execution or data disclosure beyond template-visible arguments; not strong enough for the single candidate slot."
+    },
+    {
+      "lead": "UrlizeFilter builds the appendReplacement() replacement from user-supplied args (UrlizeFilter.java:56-75), and XmlAttrFilter/EscapeJsFilter emit attribute names or `<`/`/` without escaping (XmlAttrFilter.java:46; EscapeJsFilter.java:44-95).",
+      "reason": "Replacement-string misuse yields parse exceptions (DoS); the escaping filters are context-dependent (HTML-attribute-name / script-block usage) and are application-usage issues rather than clear library-level vulnerabilities."
+    },
+    {
+      "lead": "Default ClasspathResourceLocator plus opt-in FileLocator/FileLocator path handling (Jinjava.java:89; FileLocator.java:44-62; README.md:66-94).",
+      "reason": "Classpath-only reads are the documented default and the filesystem locator's risk is explicitly documented and opt-in; no unauthorized-by-default file read demonstrated."
+    }
+  ],
+  "summary": "Reviewed the assigned jinjava 2.4.6-SNAPSHOT source tree (223 files; no files excluded by the scope filters; src/test and dependency jars are absent). I traced the template-engine trust boundary end-to-end: EL parsing/resolution (ExtendedParser/ExtendedScanner, ExpressionResolver, JinjavaInterpreterResolver, JinjavaBeanELResolver), tag/filter/function libraries, resource loaders, and output nodes. The strongest source-supported issue is an incomplete sandbox restriction: the `for` tag's bean-property iteration calls `PropertyDescriptor.getReadMethod().invoke(...)` directly, so a template that uses a loop variable named `class` receives the `java.lang.Class` object of the iterated value — bypassing the `class` property block in JinjavaBeanELResolver and the identical guard used by PrettyPrintFilter. This reopens reflection/class-loading surface inside templates that are supposed to be sandboxed. Other candidate leads were checked but are weaker or unverifiable from this snapshot (noted under rejected leads). No code was executed and nothing is claimed as runtime-confirmed."
+}

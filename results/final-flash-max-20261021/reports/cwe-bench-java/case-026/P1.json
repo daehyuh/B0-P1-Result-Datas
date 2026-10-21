@@ -1,0 +1,96 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker controls the RemotingCommand code, extFields (including AccessKey/Signature) and body, i.e. every value used by parse()/checkPerm(). The attacker only needs to hold one valid non-admin accessKey/secretKey pair from the broker's plain_acl.yml (e.g. the shipped sample account 'RocketMQ' with defaultTopicPerm=DENY and admin=false in distribution/conf/plain_acl.yml) and to be reachable from an address that is not already globally whitelisted.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the hook really runs before every processor and that codes 50/53/320 are registered/reachable; verified decodeCommandCustomHeader builds the header from attacker extFields; verified the ACL file rewrite + FileWatchService reload exists (so escalation persists); verified the broker registration of SEND_BATCH_MESSAGE and V2 header use; checked that ADMIN_CODE and the parse switch indeed lack the cited codes in this snapshot; considered that namesrv/broker admin interfaces are only protected when aclEnable=true (this issue is specific to the ACL feature failing to protect its own control plane). Did not find any later check in updateAndCreateAccessConfig/updateGlobalWhiteAddrsConfig that re-validates the caller's identity.",
+      "id": "acl-fail-open-request-codes",
+      "impact": "Complete bypass of the plain ACL: an account that is explicitly non-admin and denied topic permissions can, in a few signed requests, (a) create/overwrite an admin account or set the global whitelist to '*' (full authorization bypass, ability to create/delete topics and subscriptions, update broker config), and (b) send to any topic with SEND_BATCH_MESSAGE/SEND_REPLY_MESSAGE despite DENY/PUB restrictions, and use other unmodeled codes (e.g. INVOKE_BROKER_TO_RESET_OFFSET 222, VIEW_MESSAGE_BY_ID 33, CLONE_GROUP_OFFSET 314) without resource authorization. Applies wherever RocketMQ's documented ACL isolation is relied on.",
+      "locations": [
+        {
+          "end_line": 46,
+          "path": "acl/src/main/java/org/apache/rocketmq/acl/common/Permission.java",
+          "start_line": 33
+        },
+        {
+          "end_line": 349,
+          "path": "acl/src/main/java/org/apache/rocketmq/acl/plain/PlainPermissionManager.java",
+          "start_line": 314
+        },
+        {
+          "end_line": 134,
+          "path": "acl/src/main/java/org/apache/rocketmq/acl/plain/PlainAccessValidator.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 233,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java",
+          "start_line": 222
+        },
+        {
+          "end_line": 342,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java",
+          "start_line": 302
+        },
+        {
+          "end_line": 410,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java",
+          "start_line": 379
+        },
+        {
+          "end_line": 532,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/BrokerController.java",
+          "start_line": 504
+        },
+        {
+          "end_line": 204,
+          "path": "remoting/src/main/java/org/apache/rocketmq/remoting/netty/NettyRemotingAbstract.java",
+          "start_line": 198
+        },
+        {
+          "end_line": 292,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/processor/AbstractSendMessageProcessor.java",
+          "start_line": 285
+        },
+        {
+          "end_line": 560,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/BrokerController.java",
+          "start_line": 554
+        }
+      ],
+      "prerequisites": "Broker started with aclEnable=true (non-default; BrokerController.initialAcl() returns early when aclEnable is false, BrokerController.java:504-508) and the ACL plain validator loaded via ServiceProvider. For the send-permission bypass the target topic must exist/auto-create; no admin credential is required.",
+      "root_cause": "Authorization decisions are derived only for a small hard-coded set of request codes, and the fallback is a pass, not a deny. PlainAccessValidator.parse() populates resource permissions only for 9 request codes (switch cases at acl/src/main/java/org/apache/rocketmq/acl/plain/PlainAccessValidator.java:71-118; default: break at 117-118), leaving resourcePermMap == null for every other code. PlainPermissionManager.checkPerm() (acl/src/main/java/org/apache/rocketmq/acl/plain/PlainPermissionManager.java:314-349) first requires admin only for Permission.ADMIN_CODE and then returns immediately when needCheckedPermMap == null (lines 321-324), so any request whose code is neither in ADMIN_CODE nor in the parse switch is accepted with a valid signature alone. Permission.ADMIN_CODE (acl/src/main/java/org/apache/rocketmq/acl/common/Permission.java:33-46) contains only UPDATE_AND_CREATE_TOPIC, UPDATE_BROKER_CONFIG, DELETE_TOPIC_IN_BROKER, UPDATE_AND_CREATE_SUBSCRIPTIONGROUP and DELETE_SUBSCRIPTIONGROUP; it omits the ACL-management codes UPDATE_AND_CREATE_ACL_CONFIG (50), DELETE_ACL_CONFIG (51) and UPDATE_GLOBAL_WHITE_ADDRS_CONFIG (53), and the parse switch also omits SEND_BATCH_MESSAGE (320), SEND_REPLY_MESSAGE (324) and SEND_REPLY_MESSAGE_V2 (325).",
+      "title": "Plain ACL engine fails open for unmodeled request codes: authenticated non-admin accounts can rewrite ACL configuration (privilege escalation) and bypass topic permissions",
+      "trace": "1) BrokerController.initialAcl() registers a server RPCHook that executes validator.validate(validator.parse(request, remoteAddr)) for every request (BrokerController.java:516-531). 2) NettyRemotingAbstract.processRequestCommand calls doBeforeRpcHooks(...) before pair.getObject1().processRequest(...) (NettyRemotingAbstract.java:202-203), so the ACL hook runs for all requests, including codes 50/51/53/320/324/325. 3) For code 50, PlainAccessValidator.parse takes the switch default (PlainAccessValidator.java:117-118) and never calls addResourceAndPerm, so resourcePermMap stays null; the signature is still computed over extFields/body and checked in PlainPermissionManager.validate (lines 407-411), which the attacker can satisfy with their own secretKey. 4) checkPerm() sees needAdminPerm(50)==false (ADMIN_CODE lacks 50) and needCheckedPermMap==null, so it returns without any authorization decision (PlainPermissionManager.java:315-324). 5) AdminBrokerProcessor dispatches code 50 to updateAndCreateAccessConfig() (AdminBrokerProcessor.java:222-223), which copies the attacker-supplied isAdmin/accessKey/secretKey into PlainAccessConfig and calls accessValidator.updateAccessConfig() (lines 306-321), rewriting plain_acl.yml; PlainPermissionManager.watch()/FileWatchService then hot-reloads it (PlainPermissionManager.java:296-312), activating the new admin account. The same path for code 53 replaces globalWhiteRemoteAddresses with attacker-supplied values (AdminBrokerProcessor.java:379-410), and '*' maps to the always-matching NullRemoteAddressStrategy (RemoteAddressStrategyFactory.java:41-47, 73-79). 6) For sending: BrokerController registers SEND_BATCH_MESSAGE (320) to the send processor (BrokerController.java:556/560); AbstractSendMessageProcessor.parseRequestHeader decodes 320 with SendMessageRequestHeaderV2 (AbstractSendMessageProcessor.java:287-293, topic in field 'b'), while PlainAccessValidator.parse has no case for 320/324/325, so checkPerm() again returns without a PUB check and the broker stores the message under the attacker-chosen topic.",
+      "unverified": "No runtime execution or packet crafting was performed; the exact grader-intended vulnerability for this snapshot cannot be confirmed from source alone. Also not verified: whether the project intended ACL-management codes to be admin-only (docs state only admin accounts may perform special requests, which supports this), and whether a later version fixed exactly these code lists. PlainPermissionManager.updateAccessConfig also contains a ConcurrentModificationException bug when updating an existing account (may make updates of existing entries fail); creating a new admin account takes the non-iterating branch and is unaffected.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-269 Improper Privilege Management"
+    }
+  ],
+  "coverage_summary": "Reviewed the full 798-file source listing at a structural level and read in depth: the entire acl/ module (PlainAccessValidator, PlainPermissionManager, Permission, AclUtils, AclSigner, RemoteAddressStrategyFactory), broker request processors (AdminBrokerProcessor dispatch and ACL/config handlers, SendMessageProcessor, AbstractSendMessageProcessor, ReplyMessageProcessor, QueryMessageProcessor, PullMessageProcessor sampling), BrokerController ACL/processor registration, namesrv DefaultRequestProcessor and NamesrvController, remoting protocol decode (RemotingCommand, RocketMQSerializable, NettyDecoder) and RPC hook dispatch (NettyRemotingAbstract), store CommitLog message lookup, MixAll/Configuration file helpers, FilterServerManager/FilterServerUtil, and TlsHelper. The P1 relation index covers 771 files (682 Java parsed, 27 files absent from the index, unresolved calls 14682, no data-flow/control-flow or semantic resolution), so index facts were used only for navigation and every cited edge was re-verified in source text. Tests were not present in the snapshot, and no code, build, or exploit was executed.",
+  "limitations": [
+    "No runtime confirmation: all conclusions are static source reading; ACL hook invocation, file hot-reload, and request dispatch were traced textually only.",
+    "No access to upstream git history, patches, or CVE data in this run, so I could not confirm which later commit/version fixed any of the identified gaps; the choice among plausible ACL, namesrv-config, and broker-config issues is uncertainty-weighted, not evidence of absence.",
+    "P1 index omits 27 source files and has no data-flow/control-flow or semantic resolution; call edges used for navigation may be incomplete, though ACL/broker/namesrv edges cited here were verified directly in source.",
+    "Only main sources are present (src/test stripped), so behavior tests that might document intended ACL semantics were unavailable.",
+    "Large client/ and store/ areas (e.g. MQClientAPIImpl, DefaultMessageStore, HA, DLedger, tools module) were only spot-checked, not exhaustively audited."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "NoneServer/NameServer: DefaultRequestProcessor.updateConfig (RequestCode.UPDATE_NAMESRV_CONFIG 318) accepts an unauthenticated remote properties body and calls NamesrvController.getConfiguration().update(properties); NamesrvConfig.configStorePath is settable and Configuration.persist() writes all config to that path via MixAll.string2File (namesrv/src/main/java/org/apache/rocketmq/namesrv/processor/DefaultRequestProcessor.java:503-541, NamesrvController.java:69-73, common/src/main/java/org/apache/rocketmq/common/Configuration.java:174-216, common/src/main/java/org/apache/rocketmq/common/MixAll.java:151-167).",
+      "reason": "Plausible arbitrary file write / RCE on the NameServer, but the NameServer exposes all administrative operations without any authentication in this version, so the missing authorization is a platform-wide design property rather than a localized defect; kept as an unconfirmed lead because the snapshot version (4.6.0) does not match the known later fix for this class of issue."
+    },
+    {
+      "lead": "Broker: AdminBrokerProcessor.updateBrokerConfig (RequestCode 25) accepts arbitrary properties and Configuration.update applies them (including BrokerConfig.rocketmqHome / filterServerNums), after which FilterServerManager.createFilterServer() shells out via FilterServerUtil.callShell -> Runtime.exec(['sh', '<rocketmqHome>/bin/startfsrv.sh', ...]) (AdminBrokerProcessor.java:486-520, FilterServerManager.java:53-95, FilterServerUtil.java:24-41).",
+      "reason": "Command-execution path depends on an attacker-controlled script already existing at <rocketmqHome>/bin/startfsrv.sh; Runtime.exec uses an argv array (no shell metacharacter expansion), and I could not establish a source-only file-write primitive that places that script, so the RCE chain is not demonstrated. Also only reachable when ACL is disabled (default) or by an admin."
+    },
+    {
+      "lead": "ACL signature is computed over values concatenated without field names or separators (AclUtils.combineRequestContent, acl/src/main/java/org/apache/rocketmq/acl/common/AclUtils.java:43-56).",
+      "reason": "Theoretical signature ambiguity, but a client must already know a valid secretKey to produce a matching signature, and no concrete field re-interpretation leading to a bypass was established; rejected as a candidate."
+    },
+    {
+      "lead": "PlainPermissionManager.updateAccessConfig removes entries from a List inside a for-each loop (acl/src/main/java/org/apache/rocketmq/acl/plain/PlainPermissionManager.java:139-153), so updating an existing account can throw ConcurrentModificationException.",
+      "reason": "Availability/robustness bug in an admin operation, not an authorization or code-execution weakness; not submitted."
+    }
+  ],
+  "summary": "RocketMQ 4.6.0 snapshot. Review focused on the broker/namesrv request-processing paths, the plain ACL engine, remoting decode, and message-store entry points. Strongest source-supported issue: the plain ACL engine fails open for request codes it does not explicitly model, so any client that can produce a valid signature with a non-admin accessKey can (a) invoke the ACL-management requests (UPDATE_AND_CREATE_ACL_CONFIG / DELETE_ACL_CONFIG / UPDATE_GLOBAL_WHITE_ADDRS_CONFIG) and grant itself admin or set the global IP whitelist to \"*\", i.e. take over the ACL, and (b) use unmodeled message-sending codes (SEND_BATCH_MESSAGE, SEND_REPLY_MESSAGE[_V2]) to skip topic-level PUB permission checks. One candidate is submitted; other plausible but less certain issues (namesrv UPDATE_NAMESRV_CONFIG file write via configStorePath; broker UPDATE_BROKER_CONFIG -> rocketmqHome/filterServerNums -> Runtime.exec path) are recorded as rejected leads. No code was executed and no finding is runtime-confirmed."
+}

@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The caller controls moveType (MoveType.valueOf), itemId (numeric queue id or job/display name matched by findIemByName), and viewName, with no crumb, token, or HTTP-method requirement. The MANAGE check runs identically for GET and POST.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified permission checks exist (Jenkins.MANAGE), so this is not a missing-authorization issue. Verified no @RequirePOST, @POST, or getMethod check exists anywhere in the repository (search returned zero matches), so GET is accepted. Verified the handlers genuinely change state (QueueSorter/comparator desires and sortBuildableItems). Considered that the default Jenkins crumb filter may block forged POSTs; irrelevant because the endpoint is reachable via GET, which crumb protection does not cover. Considered that curl usage in docs is intended admin usage; it still demonstrates the endpoint accepts GET, and browser links are GETs. The shipped Jelly markup is absent from this snapshot and was not used as evidence.",
+      "id": "simple-queue-csrf-get-move",
+      "impact": "A third-party web page can silently change the global Jenkins build-queue ordering (promote or demote arbitrary queued builds, or reset all manual ordering) with the victim's authority. This is unauthorized modification of a shared scheduling resource (priority manipulation / queue-ordering denial of service against other users' builds). Scope is limited because a MANAGE victim is required and only queue order changes, not builds or secrets.",
+      "locations": [
+        {
+          "end_line": 93,
+          "path": "src/main/java/cz/mendelu/xotradov/MoveAction.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 29,
+          "path": "src/main/java/cz/mendelu/xotradov/ResetAction.java",
+          "start_line": 18
+        },
+        {
+          "end_line": 11,
+          "path": "src/main/java/cz/mendelu/xotradov/PermissionHandler.java",
+          "start_line": 10
+        },
+        {
+          "end_line": 64,
+          "path": "docs_src/docs/CLI.md",
+          "start_line": 1
+        }
+      ],
+      "prerequisites": "The attacker must induce an authenticated Jenkins user holding MANAGE (Jenkins.MANAGE or Overall/Administer; checked at MoveAction.java:63 and ResetAction.java:19) to issue a cross-site request to /simpleMove/move or /simpleQueueReset/reset, for example by a link or top-level GET navigation so the session cookie is sent (SameSite=Lax still allows cookie-bearing top-level GET navigations). The queue must contain buildable items. The attacker needs no Jenkins privileges themselves.",
+      "root_cause": "MoveAction.doMove (bound at /simpleMove/move, MoveAction.java lines 59-93) and ResetAction.doReset (bound at /simpleQueueReset/reset, ResetAction.java lines 18-29) mutate global Jenkins queue state (global comparator desires via SimpleQueueComparator.addDesire and resort; SimpleQueueSorter.reset) but are plain public do* methods with no @RequirePOST or @POST annotation and no request-method check. Jenkins crumb protection covers POST-style requests, so a GET reaches the handler unchanged.",
+      "title": "State-changing queue reorder/reset endpoints lack POST enforcement, enabling CSRF",
+      "trace": "Cross-site GET to /simpleMove/move?moveType=UP_FAST&itemId=<id-or-name>&viewName=<view> -> Stapler dispatches doMove with no POST enforcement -> permission check passes for the victim -> queue.getItem / findIemByName resolves the item -> MoveType parsed -> move() -> moveUnfiltered/moveFiltered -> setSorter installs SimpleQueueSorter and addDesire stores global order desires -> queue.getSorter().sortBuildableItems(...). Analogous GET to /simpleQueueReset/reset clears all desires. The repository docs (docs_src/docs/CLI.md lines 29-63) document these exact GET endpoints with curl.",
+      "unverified": "No runtime test or build was performed; it was not verified whether a given deployment or reverse proxy adds method restrictions, and the exact UI link markup (docs indicate GET) could not be inspected because no Jelly/resources exist in the snapshot. Severity depends on how commonly non-admin accounts hold Jenkins.MANAGE.",
+      "weakness_type": "CWE-352 Cross-Site Request Forgery (missing POST enforcement on state-changing RootAction endpoint)"
+    }
+  ],
+  "coverage_summary": "All 63 files in the assigned snapshot were enumerated via get_source_scope (no excluded, sensitive-named, oversized, or symlinked files; same filters for B0 and P1). Every Java source under src/main/java (11 files: MoveAction, ResetAction, SimpleQueueComparator, SimpleQueueSorter, SimpleQueueListener, SimpleQueueUpdateAction, SimpleQueueWidget, PermissionHandler, MoveType, DefaultSorter, TVAF) was read in full, as were pom.xml, README.md, and docs_src markdown. Generated mkdocs HTML/CSS and minified JS/lunr assets under docs/ were only listed, not treated as source. The snapshot contains no src/test, no Jelly/resource files, and no web.xml, so view rendering and any form/crumb markup behind the endpoints could not be inspected.",
+  "limitations": [
+    "No execution, build, or runtime probing was performed; findings are source-level leads, not runtime-confirmed vulnerabilities.",
+    "Jelly views and other src/main/resources files are absent, limiting confidence on both the CSRF lead and the view-permission lead.",
+    "Jenkins core behavior (crumb filter method coverage, Stapler do* dispatch, QueueSorter exception handling) was reasoned from knowledge, not verified against core sources in this run.",
+    "Only one candidate is permitted; the view-level permission-check gap in SimpleQueueUpdateAction is retained as an unconfirmed lead rather than a second candidate."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SimpleQueueUpdateAction.getItems(), isFilterQueue(), and getViewName() check only global Jenkins Permission.READ and then resolve an arbitrary view from the request parameter name (SimpleQueueUpdateAction.java lines 32-63) without calling view.hasPermission(READ) or job-level read filtering.",
+      "reason": "Plausible authorization gap, but exploit impact is not established: the Jelly resources that would render Queue.Item[] are absent from the snapshot, so whether the getters return readable data to a user lacking view access (rather than a Stapler rendering failure) could not be verified. Kept as an unconfirmed secondary lead."
+    },
+    {
+      "lead": "SimpleQueueComparator is a static global singleton whose desire graph can form cycles (addDesire only removes the exact reverse pair), possibly making compare() violate the Comparator contract so Collections.sort in SimpleQueueSorter.sortBuildableItems throws IllegalArgumentException inside Jenkins queue maintenance.",
+      "reason": "Requires repeated privileged (MANAGE) moves to build a cycle; the move-path exception is caught by doMove's generic catch, and queue-thread behavior on a throwing sorter is not verifiable from this snapshot. Robustness concern rather than a clear attacker-controlled boundary violation."
+    },
+    {
+      "lead": "moveDesires lists and removeDesireOfKey clean only the departing item key (SimpleQueueComparator.java lines 80-82, SimpleQueueListener.java lines 11-13), so stale item IDs accumulate.",
+      "reason": "Low-impact memory hygiene issue; no meaningful attacker amplification beyond repeated privileged moves."
+    },
+    {
+      "lead": "findIemByName matches queue items by task.getDisplayName() (MoveAction.java lines 95-104), letting itemId select an item by user-visible name.",
+      "reason": "Display-name spoofing only lets a caller who already holds MANAGE pick an item they are already allowed to move; no privilege gain."
+    }
+  ],
+  "summary": "Reviewed the 63-file simple-queue Jenkins plugin snapshot (11 Java classes, pom, README/LICENSE, generated docs; no Jelly/resources/tests present). All Java sources were read end-to-end. Permission checks are present: MoveAction.doMove and ResetAction.doReset require Jenkins.MANAGE, SimpleQueueUpdateAction accessors require global Permission.READ. The strongest source-supported issue is that the state-changing queue-manipulation endpoints are not restricted to POST (no @RequirePOST/@POST anywhere in the tree), and the project docs explicitly document invoking them with plain GET curl URLs, making them CSRF-reachable. Submitted as one CWE-352 candidate; weaker leads are recorded as rejected."
+}

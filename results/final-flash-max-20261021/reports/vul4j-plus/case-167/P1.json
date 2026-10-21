@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A party able to publish a message to the RabbitMQ exchange/queue consumed by a Camel `rabbitmq:` route controls (a) the AMQP basic-properties header map and (b) the binary body. Setting the header key `CamelSerialize` (RabbitMQEndpoint.SERIALIZE_HEADER, RabbitMQEndpoint.java:58) to a Boolean true value routes the body into deserializeBody(); the body bytes are then read directly into ObjectInputStream.readObject(). No signature, sender identity check, or per-message opt-out is applied (the header is only removed from headers later by mergeAmqpProperties/header population, not from the properties used for the decision).",
+      "confidence": "medium",
+      "counterevidence_checked": "The deserialization is gated by `CamelSerialize` and is used deliberately for Camel-to-Camel object transfer (RabbitMQMessagePublisher.java:87-93 sets it when the body is Serializable), so in a fully closed system the path is intentional; however the gate value is entirely sender-controlled, so any producer can opt the consumer into Java deserialization — it is not a security control. `transferException`/`allowNullHeaders` on the endpoint do not affect this path (grep-verified). By contrast, other Camel components in the same snapshot gate Java deserialization behind explicit options that default to false (camel-http-common/DefaultHttpBinding.java:199-206, camel-ahc/DefaultAhcBinding.java:284-288, camel-jms `allowSerializedHeaders`), showing the missing opt-out here is an inconsistency rather than an inherent requirement. I found no allow-list, class-resolver restriction, or configuration flag anywhere in camel-rabbitmq (repository-wide searches for allowJavaSerializedMessage/trustedPackages/serialization restrictions returned nothing).",
+      "id": "cand-1",
+      "impact": "Remote code execution in the Camel consumer JVM via deserialization of a malicious Java object stream (gadget-chain dependent), or at minimum arbitrary class loading/instantiation and denial of service. The trust boundary is the AMQP broker/exchange: a producer that would normally only be able to deliver data obtains code-execution influence over the consumer process.",
+      "locations": [
+        {
+          "end_line": 323,
+          "path": "components/camel-rabbitmq/src/main/java/org/apache/camel/component/rabbitmq/RabbitMQMessageConverter.java",
+          "start_line": 287
+        },
+        {
+          "end_line": 58,
+          "path": "components/camel-rabbitmq/src/main/java/org/apache/camel/component/rabbitmq/RabbitMQEndpoint.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 195,
+          "path": "components/camel-rabbitmq/src/main/java/org/apache/camel/component/rabbitmq/RabbitMQEndpoint.java",
+          "start_line": 192
+        },
+        {
+          "end_line": 95,
+          "path": "components/camel-rabbitmq/src/main/java/org/apache/camel/component/rabbitmq/RabbitConsumer.java",
+          "start_line": 93
+        }
+      ],
+      "prerequisites": "A Camel route consuming from the rabbitmq component (or the reply-manager path) is deployed, and the attacker can publish/route a message to that exchange/queue (broker credentials, an unauthenticated broker/vhost, a shared exchange, or a compromised producer). The `CamelSerialize` header must be sent as an AMQP boolean true. Exploitation to code execution additionally requires a usable gadget chain on the consumer JVM classpath; absent that, arbitrary object instantiation/exception paths still give a denial-of-service/instability primitive.",
+      "root_cause": "RabbitMQMessageConverter.populateMessageBody() unconditionally calls deserializeBody() when the incoming AMQP message carries the header CamelSerialize=true, and deserializeBody() performs `new ObjectInputStream(byteArrayInputStream).readObject()` on the raw broker delivery body. The trigger flag is part of the message properties supplied by whichever client published the message, and this snapshot exposes no endpoint/component option to disable Java deserialization or restrict the classes that may be instantiated (no allowJavaSerializedMessage / trustedPackages-style guard; verified absent by repository-wide search). The consumer therefore treats an untrusted broker publisher as authoritative for a Java-deserialization decision.",
+      "title": "camel-rabbitmq consumer deserializes sender-controlled Java object bodies without any allow-list/opt-out (CWE-502)",
+      "trace": "RabbitConsumer.doHandleDelivery(consumerTag, envelope, properties, body) (RabbitConsumer.java:93) -> RabbitMQEndpoint.createRabbitExchange(envelope, properties, body) (RabbitMQEndpoint.java:192-195) -> RabbitMQMessageConverter.populateRabbitExchange(...) (RabbitMQMessageConverter.java:236-240) -> populateMessageBody(message, camelExchange, properties, body) (287-294) -> hasSerializeHeader(properties) (313-315) -> isSerializeHeaderEnabled(properties) reads properties.getHeaders().get(\"CamelSerialize\") (321-323) -> deserializeBody(...) (296-311) -> `new ObjectInputStream(new ByteArrayInputStream(body)).readObject()` (300).",
+      "unverified": "Not runtime-confirmed and no exploit executed. Broker authorisation model is deployment-specific (the prerequisite is publish access or an unauthenticated broker). Gadget availability on the consumer classpath is unproven. I could not diff against upstream to confirm this is the specific change the snapshot was built around; the finding is based on the source-visible missing guard, and the relation index (which flags this exact readObject location as a deserialization hint) is navigation-only evidence.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data"
+    }
+  ],
+  "coverage_summary": "Source scope per get_source_scope: 8,585 model-visible files (8,588 source-root files; 0 binaries counted, 3 files excluded by sensitive-name/path filter) with the same filters applied to B0/P1. Relation scope per get_relation_scope: index complete over 8,588 files, 0 files missing/hash-mismatched, but it is syntactic navigation only (218,954 call edges, 2,153 heuristic facts; no data-flow, reachability, or exploitability proof; build/tests not run). I inspected the repository layout and modules, enumerated Java-deserialization sinks by text search and by the index's `deserialization` security-call facts, traced the RabbitMQ consumer path end-to-end in source, examined the other gated Java-serialization paths (camel-http-common, camel-http, camel-ahc, camel-jetty, camel-jms, camel-netty/netty-http), checked path-traversal/jail handling in camel-file, camel-tarfile and camel-zipfile, checked camel-shiro token handling, camel-elytron authorization, camel-ldif URL fetch, JMX connector creation, and sampled SQL/weka/undertow handling. Not inspected in any depth: the majority of the ~300 components, most of `tooling/`, `catalog/`, `platforms/`, generated endpoint-DSL factories (spot-checked only), and any build/test execution.",
+  "limitations": [
+    "Static review only: no code was executed, no tests or scanners were run, and no runtime behavior or exploitability was confirmed.",
+    "No upstream/GitHub comparison is available in this run, so I could not diff the snapshot against the upstream 3.1.0 tree to confirm which specific security fix this snapshot precedes.",
+    "The source snapshot contains almost no test or documentation files, so regression tests and advisory text that might identify the intended fix are unavailable.",
+    "The P1 relation index has no record of implicit deserialization sinks (e.g. the Netty ObjectDecoder installed by NettyConfiguration), so absence of an index hint is not evidence of absence.",
+    "The RabbitMQ finding requires broker publish access and a classpath gadget chain; neither could be verified here, and the endpoint/component option set was checked only for this snapshot.",
+    "Broker/elicitation semantics of the `CamelSerialize` header (typed Boolean true versus string \"true\") were derived from source (`Boolean.TRUE.equals(...)`) plus the publisher code; not runtime-verified."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "camel-netty default codec: NettyConfiguration.setup() installs Netty ObjectEncoder/ObjectDecoder by default when textline=false and no codec is configured (components/camel-netty/src/main/java/org/apache/camel/component/netty/NettyConfiguration.java:206-233, ChannelHandlerFactories.java:67-81), i.e. Java deserialization from any unauthenticated network peer on a `netty:tcp://` consumer.",
+      "reason": "Strong impact, but the object codec is long-standing documented behavior with explicit mitigations (`allowDefaultCodec=false`, `textline=true`), the sink lives inside Netty's ObjectDecoder rather than Camel code (no readObject call to evidence), the relation index contains no hint for it, and I could not confirm from source that this snapshot's intended vulnerable change is here. Kept out of the candidate slot as the weaker/more uncertain of the two deserialization leads."
+    },
+    {
+      "lead": "camel-elytron role-check bypass: ElytronConsumer.handleRequest()/isAllowed() (components/camel-elytron/.../ElytronConsumer.java:48-83) forwards the request to the Camel route without any allowedRoles check when SecurityDomain.getCurrentSecurityIdentity() is null, and ElytronEndpoint.allowedRolesList defaults to an empty list.",
+      "reason": "Potentially an authorization bypass, but reachability of the null-identity branch depends on the configured Elytron HTTP mechanism/security-domain (some mechanisms challenge and reject anonymous requests before this handler), and the component is brand new in 3.1.0 with no proof the branch is attacker-reachable."
+    },
+    {
+      "lead": "camel-ldif producer fetches a URL taken from the message body: LdifProducer.process() (components/camel-ldif/.../LdifProducer.java:66-91) does `new URL(body).openStream()` for non-LDIF string bodies (SSRF / local file read via file:, jar:, etc.).",
+      "reason": "Real sink, but it is the component's documented purpose (body may be LDIF text or a URL) and requires an attacker-influenced exchange reaching an ldif producer route; comparatively weak trust-boundary story."
+    },
+    {
+      "lead": "Aggregation repositories deserialize Java state: camel-sql JdbcCamelCodec (components/camel-sql/.../JdbcCamelCodec.java:94-98), camel-cassandraql CassandraCamelCodec:82-86, camel-hbase HBaseHelper:104-108, camel-consul ConsulRegistry:273-279.",
+      "reason": "All read back state written by the same application/repository; an attacker would need write access to the backing SQL/Cassandra/HBase/Consul store first, a materially weaker precondition than the broker/network-facing paths."
+    },
+    {
+      "lead": "camel-shiro token deserialization (components/camel-shiro/.../ShiroSecurityProcessor.java:117-126).",
+      "reason": "Rejected: the serialized token is decrypted with the configured Shiro passphrase/cipher before readObject(), so an attacker without the passphrase cannot inject a crafted stream."
+    }
+  ],
+  "summary": "Reviewed the Apache Camel 3.1.0-SNAPSHOT source snapshot (8,585 visible source files; build/test/doc artifacts largely absent) as a static, defensive assessment. After tracing deserialization sinks (via grep and the P1 relation index), path-handling checks, serialization gates, and HTTP/auth components, the strongest source-evidenced issue is that the camel-rabbitmq consumer deserializes attacker-crafted AMQP message bodies with plain Java `ObjectInputStream.readObject()` whenever the *sender-controlled* AMQP header `CamelSerialize=true` is present, with no allow-list or opt-out in this snapshot. Other plausible-but-weaker leads (netty's implicit default object codec, an elytron null-identity role-check bypass, LDIF body-controlled URL fetch, datastore-driven aggregation-repository deserialization) are listed as rejected/unconfirmed leads rather than additional candidates."
+}

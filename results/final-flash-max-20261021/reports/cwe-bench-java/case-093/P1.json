@@ -1,0 +1,123 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The JSON request body of `POST /actuator/gateway/routes/{id}` is deserialized directly into `RouteDefinition` (`@RequestBody`); each `FilterDefinition`/`PredicateDefinition` carries an attacker-chosen `name` (must match a registered factory) and an attacker-chosen `Map<String,String> args`, including values such as `#{...}`. `POST /actuator/gateway/refresh` is available on the same endpoint to force route conversion and thus evaluation.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked that (a) `validateRouteDefinition` really only compares filter/predicate names against the registered factories and never inspects `getArgs()` (lines 147-175); (b) the `#{` branch in `getValue` is trivially satisfiable and is the only place route args are interpreted; (c) `ConfigurationService` has no guard/flag excluding actuator-supplied definitions; (d) `GatewayAutoConfiguration` registers the endpoints unconditionally when actuator is present and the endpoint is enabled (lines 819-843), with the in-memory repository as the default `RouteDefinitionRepository` (203-206); (e) SpEL in shortcut args is a legitimate feature for trusted file/YAML configuration, which is why the flaw is specifically the untrusted actuator write path combined with the privileged evaluation context; (f) the same codebase uses the restricted `SimpleEvaluationContext` in `DiscoveryClientRouteDefinitionLocator` (line 75), showing a safer pattern exists; (g) accessibility depends on actuator exposure, which limits real-world reachability but does not change the code-level defect.",
+      "id": "SCG-ACTUATOR-SPEL-01",
+      "impact": "When the endpoint is exposed and unauthenticated, an attacker obtains SpEL evaluation with bean resolution and default type resolution: `@bean.method(...)` calls on arbitrary Spring beans and `T(...)`-style class access (e.g. Runtime/ProcessBuilder) can lead to execution of arbitrary code with the gateway process privileges, plus full route manipulation (traffic hijack, SSRF to internal services, credential-bearing request redirection). The same endpoint combination (write route + refresh) also enables persistence of malicious routes for the lifetime of the process.",
+      "locations": [
+        {
+          "end_line": 98,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/actuate/AbstractGatewayControllerEndpoint.java",
+          "start_line": 94
+        },
+        {
+          "end_line": 159,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/actuate/AbstractGatewayControllerEndpoint.java",
+          "start_line": 134
+        },
+        {
+          "end_line": 46,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/actuate/GatewayControllerEndpoint.java",
+          "start_line": 45
+        },
+        {
+          "end_line": 45,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/actuate/GatewayLegacyControllerEndpoint.java",
+          "start_line": 44
+        },
+        {
+          "end_line": 46,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/route/InMemoryRouteDefinitionRepository.java",
+          "start_line": 38
+        },
+        {
+          "end_line": 90,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/route/CachingRouteLocator.java",
+          "start_line": 79
+        },
+        {
+          "end_line": 164,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/route/RouteDefinitionRouteLocator.java",
+          "start_line": 123
+        },
+        {
+          "end_line": 220,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/route/RouteDefinitionRouteLocator.java",
+          "start_line": 199
+        },
+        {
+          "end_line": 144,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/support/ConfigurationService.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 66,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/support/ShortcutConfigurable.java",
+          "start_line": 49
+        },
+        {
+          "end_line": 143,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/support/ShortcutConfigurable.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 39,
+          "path": "spring-cloud-gateway-server/src/main/java/org/springframework/cloud/gateway/filter/FilterDefinition.java",
+          "start_line": 33
+        }
+      ],
+      "prerequisites": "1) Spring Boot Actuator on the classpath (endpoint class is only registered `@ConditionalOnClass(Health.class)`); 2) the gateway actuator endpoint enabled and exposed over HTTP, e.g. `management.endpoints.web.exposure.include` contains `gateway` or `*` (the sample app `spring-cloud-gateway-sample/src/main/resources/application.yml` uses `*`); 3) the actuator web endpoints are reachable without effective authentication/authorization (or the attacker holds access to them). Default Boot exposure is health-only, so stock deployments without explicit exposure are not reachable.",
+      "root_cause": "`ShortcutConfigurable.getValue` treats any filter/predicate argument beginning with `#{` and ending with `}` as a SpEL expression and evaluates it in a `StandardEvaluationContext` that has a `BeanFactoryResolver` set, giving access to `@bean` references, `T(...)` type references and arbitrary method invocation. The Gateway actuator endpoint accepts a full `RouteDefinition` from an HTTP client and its only validation (`AbstractGatewayControllerEndpoint.validateRouteDefinition`) restricts the filter/predicate *names* to registered factories; arguments are passed through untouched and later evaluated when routes are loaded. There is no allow-listing/sanitization of args, and no restricted evaluation context (contrast: `DiscoveryClientRouteDefinitionLocator` uses `SimpleEvaluationContext.forReadOnlyDataBinding().withInstanceMethods()` for the same kind of property expressions).",
+      "title": "SpEL injection in route definitions written via the Gateway Actuator endpoint (args evaluated with StandardEvaluationContext + BeanFactoryResolver)",
+      "trace": "POST /actuator/gateway/routes/{id} -> AbstractGatewayControllerEndpoint.save (lines 134-145) -> validateRouteDefinition (147-159, name-only check) -> RouteDefinitionWriter/InMemoryRouteDefinitionRepository.save (38-46) -> attacker triggers POST /actuator/gateway/refresh (94-98) -> RefreshRoutesEvent -> CachingRouteLocator.onApplicationEvent (79-90) -> RouteDefinitionRouteLocator.getRoutes/convertToRoute (94-120) -> loadGatewayFilters (123-164) / lookup (199-220) -> ConfigurationService.with(factory).properties(definition.getArgs()).bind() -> ConfigurableBuilder.normalizeProperties (ConfigurationService 137-144) -> ShortcutConfigurable.ShortcutType.normalize (86-143) -> ShortcutConfigurable.getValue (49-66): since the value starts with `#{` and ends with `}`, `parser.parseExpression(entryValue, new TemplateParserContext()).getValue(StandardEvaluationContext with BeanFactoryResolver)` evaluates it in the gateway JVM.",
+      "unverified": "No code was executed, no scanner/SAST oracle was used, and no deployment was tested, so runtime exploitability and the actual actuator exposure/auth posture of any real application are unverified. Index relations are syntactic navigation candidates only (no data/control-flow proof). Also unverified: whether a later 3.0.x/3.1.x fix (if applied to a downstream build) would remove this path; the reviewed source itself contains no mitigation.",
+      "weakness_type": "Expression Language Injection (SpEL) leading to remote code execution (CWE-917 / CWE-94)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 219-file snapshot (Spring Cloud Gateway 3.0.6, no test sources present). Deep-read the Gateway server actuator endpoints, route layer (RouteDefinition, InMemoryRouteDefinitionRepository, CachingRouteLocator, RouteDefinitionRouteLocator, Composite locators), support layer (ConfigurationService, ShortcutConfigurable, AbstractConfigurable, Configurable), filter/predicate factory base types and a sample of concrete factories and filters (AddResponseHeader, RewritePath, RequestHeaderToRequestUri, RedisRateLimiter, NettyRoutingFilter, rate limiter), plus the discovery locator and X-Forwarded resolver; skimmed the mvc/webflux ProxyExchange configuration classes pending full review. P1 relation index covered 217/219 files and 189 Java files with syntax-level symbols/edges; its own qualification states no data-flow, no control-flow, no semantic resolution, and no sast/oracle findings, and 2 source files are missing from the index. No runtime execution, tests, or scanners were run.",
+  "limitations": [
+    "No runtime or test execution; all conclusions are static and source-text based, and no exploit payload was executed (per review constraints).",
+    "Reachability of the actuator endpoint depends on deployment configuration (exposure and authentication) that is not present in this repository; only the bundled sample shows `management.endpoints.web.exposure.include: '*'`.",
+    "The P1 index is syntactic only (no control/data-flow, no semantic resolution) and omits 2 source files from indexing; navigation edges were treated as leads and verified against source text but cannot prove runtime behavior.",
+    "The snapshot contains no test sources, so no repository tests could be checked for expected/patched behavior; whether a downstream build applies a later security patch cannot be determined from this tree.",
+    "The spring-cloud-gateway-mvc and webflux ProxyExchange classes (largest remaining unreviewed files) were only partially inspected; no conclusion is drawn about them.",
+    "Kotlin DSL sources (RouteDsl.kt) and documentation asciidoc files are largely absent from the snapshot scope and were not reviewed for security-relevant defaults."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "RequestHeaderToRequestUriGatewayFilterFactory lets a request header (e.g. Host-like header) override the outbound request URI, enabling SSRF.",
+      "reason": "The header-driven URI override is the documented purpose of the filter and only takes effect when an operator explicitly adds it to a route; no default route uses it, and there is no trust-boundary crossing in this source snapshot by itself."
+    },
+    {
+      "lead": "XForwardedRemoteAddressResolver.trustAll() / RemoteAddrRoutePredicateFactory trust spoofable X-Forwarded-For values, allowing client-IP spoofing.",
+      "reason": "Opt-in configuration; the source's own Javadoc explicitly documents the spoofing risk and directs users to maxTrustedIndex() instead. Not reachable with default configuration."
+    },
+    {
+      "lead": "Actuator route-write endpoint allows arbitrary route URIs, enabling SSRF/traffic hijack by design.",
+      "reason": "Same root area and prerequisites as the submitted SpEL issue (exposed actuator endpoint); it is a consequence of the same trust-boundary problem rather than a distinct stronger root cause, so it was folded into the single candidate instead of being listed separately."
+    },
+    {
+      "lead": "Missing @Valid on the actuator `@RequestBody RouteDefinition`, so bean-validation constraints (@NotEmpty predicates, @NotNull uri) are not enforced.",
+      "reason": "Robustness/input-validation gap only; no direct security impact demonstrated without an additional sink, and the SpEL path already covers the dangerous consequence."
+    },
+    {
+      "lead": "RewritePathGatewayFilterFactory uses String.replaceAll with an operator-configured regex and $-substitution handling.",
+      "reason": "Regex and replacement come from trusted route configuration, not from request data; no attacker-controlled regex/replacement, so no demonstrated injection or ReDoS."
+    },
+    {
+      "lead": "RedisRateLimiter builds Redis keys from a possibly request-derived keyResolver value.",
+      "reason": "Values are passed as Redis key/script arguments, not concatenated into Lua source; no script injection, and per-request key growth is expected behavior."
+    },
+    {
+      "lead": "spring-cloud-gateway-mvc / webflux ProxyExchange forwards request headers when building proxy calls.",
+      "reason": "Only partially inspected; it exposes `sensitive`/`autoForward` header configuration and is a developer-facing helper, with no concrete attacker-controlled path verified in this review."
+    },
+    {
+      "lead": "GatewayControllerEndpoint/GatewayLegacyControllerEndpoint expose route/definition listings without authentication.",
+      "reason": "Information exposure depends on actuator exposure and authentication configuration (same precondition as the primary finding) and is lower impact; not selected."
+    }
+  ],
+  "summary": "Spring Cloud Gateway 3.0.6 snapshot. The strongest source-evidenced issue is a SpEL-injection/RCE path reachable through the Gateway Actuator endpoint: `POST /actuator/gateway/routes/{id}` stores an attacker-supplied `RouteDefinition`, and when routes are converted (`POST /actuator/gateway/refresh`), filter/predicate `args` are bound through `ConfigurationService` -> `ShortcutConfigurable.getValue`, which evaluates any `#{...}` value with a `StandardEvaluationContext` carrying a `BeanFactoryResolver` (bean lookup) and the default type locator (`T(...)`). The endpoint's `validateRouteDefinition` only checks filter/predicate *names*, so SpEL embedded in the args of a legitimate filter (e.g. `AddResponseHeader`) is accepted. Exploitation requires the actuator gateway endpoint to be exposed and reachable (e.g. `management.endpoints.web.exposure.include=gateway`/`*` and no effective auth on the actuator), which is a deployment precondition rather than the default; the bundled sample app exposes `*`. No runtime verification was performed; the finding is based on fully traced source."
+}

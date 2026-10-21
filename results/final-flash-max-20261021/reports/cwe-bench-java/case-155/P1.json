@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The URL string is fully attacker-controlled when an application parses user-supplied URLs with the opt-in WHATWG parser: `UriComponentsBuilder.fromUriString(userInput, ParserType.WHAT_WG)` (lines 206-223) or `DefaultUriBuilderFactory.setParserType(WHAT_WG)` (used by RestClient/RestTemplate/WebClient URI building). Typical sources: redirect/return-URL parameters, user-submitted links, URLs passed to outbound HTTP calls. The host substring (including any `xn--` label) is the attacker-controlled input to `domainToAscii`.",
+      "confidence": "medium",
+      "counterevidence_checked": "(a) `containsOnlyAscii(domain)` gates the fast path (:288, helper :432-440), so non-ASCII hostnames still run through `IDN.toASCII`; the deviation is limited to ASCII hosts with xn-- labels. (b) ParserType.WHAT_WG is opt-in; the default (`fromUriString(String)`, :181-187) uses RfcUriParser, so reachability depends on application configuration. (c) The fast path lowercases, which coincides with ToASCII output for valid punycode, so only invalid/malformed punycode behavior deviates; no host substitution was demonstrated in common HTTP clients. (d) Rest of host handling checked and matches expected behavior: forbidden host/domain code points (:459-467, :2117-2124), percent-decode via UriUtils (:112-113, :533-540), IPv4 with unsigned serialization (:2360-2457), port range check (:1246-1259). (e) Sibling RFC parser and the URI component verification paths do not show the same defect.",
+      "id": "case-155-cand-1",
+      "impact": "Validation-bypass/laxity in a parser documented as implementing the WHATWG URL Living Standard used by browsers: host names whose punycode (`xn--`) labels are malformed and that `IDN.toASCII`/WHATWG parsing would reject (spec failure) are accepted and normalized only by lowercasing. Applications using ParserType.WHAT_WG for URL acceptance or host allow/deny decisions can therefore base a security decision on a host the spec says is invalid, and the parser's output no longer matches browser/WHATWG canonicalization, enabling divergent interpretation between the validating parser and other components (a known precondition for SSRF/open-redirect/allowlist bypasses). I did not establish a concrete attacker-controlled mapping from an accepted malformed host to a different hostname, so this is reported as a source-evidenced validation weakness, not a confirmed exploit.",
+      "locations": [
+        {
+          "end_line": 310,
+          "path": "spring-web/src/main/java/org/springframework/web/util/WhatWgUrlParser.java",
+          "start_line": 284
+        },
+        {
+          "end_line": 2133,
+          "path": "spring-web/src/main/java/org/springframework/web/util/WhatWgUrlParser.java",
+          "start_line": 2112
+        },
+        {
+          "end_line": 223,
+          "path": "spring-web/src/main/java/org/springframework/web/util/UriComponentsBuilder.java",
+          "start_line": 206
+        },
+        {
+          "end_line": 803,
+          "path": "spring-web/src/main/java/org/springframework/web/util/UriComponentsBuilder.java",
+          "start_line": 787
+        }
+      ],
+      "prerequisites": "(1) Application opts in to ParserType.WHAT_WG (default is RFC parsing, so this is not exploitable by default); (2) the application relies on the parser's documented WHATWG/browser-aligned validation or canonicalization for a security decision (host allow/deny list, SSRF/redirect validation, URL acceptance) or feeds the parsed value into another component that applies its own IDNA/DNS handling. No authentication required beyond reaching the URL-parsing code path.",
+      "root_cause": "`WhatWgUrlParser.domainToAscii` implements the WHATWG \"domain to ASCII\" optimization incorrectly. Per spec (and the method's own comment at lines 285-287), the shortcut of simply lowercasing the domain is only valid when strictly splitting the domain on '.' does not produce ANY label starting with a case-insensitive \"xn--\". The implementation (lines 288-310) instead: (a) starts scanning at the first '.' (domain.indexOf('.') at line 289), so the first label is never examined at all, and (b) compares the fourth character against '_' (underscore, 0x5F) instead of '-' (hyphen, 0x2D) at line 300, i.e. it tests for \"xn-_\" rather than \"xn--\". As a result the condition is effectively never true for real punycode labels and ASCII hostnames containing xn-- labels are returned lower-cased without ever running `IDN.toASCII` (lines 311-328), so malformed/invalid punycode or otherwise IDN-invalid host names that WHATWG/browsers and `IDN.toASCII` reject are accepted by this parser.",
+      "title": "WHATWG URL parser skips IDN/punycode validation for ASCII hosts due to broken \"xn--\" fast-path check",
+      "trace": "`UriComponentsBuilder.fromUriString(uri, ParserType.WHAT_WG)` (UriComponentsBuilder.java:217-220) -> `WhatWgUrlParser.parse` (:131-139) -> `basicUrlParser` -> HOST state -> `Host.parse` (:2092) -> percent-decoded host -> `domainToAscii(domain, false)` (:2115) -> fast-path block (:288-310) evaluates the broken `xn--` test; because `ch3` is compared to '_' and the loop starts at the first dot, `onlyLowerCase` stays true -> `domain.toLowerCase(Locale.ENGLISH)` returned (:308) -> host accepted as `Domain` (:2131-2132). The IDNA path that would call `IDN.toASCII` and throw `InvalidUrlException` on malformed punycode (:311-328) is never reached for ASCII input.",
+      "unverified": "Whether this specific deviation is the benchmark's intended target and whether upstream later fixed it (no network/diff access); whether the implementation actually fails any WHATWG/WPT conformance case used by the project's own tests (tests are not in scope); a complete end-to-end exploit in a concrete application (requires app-specific validation logic and opt-in); and whether any internal Spring component uses ParserType.WHAT_WG in a security decision (searched usages show opt-in only).",
+      "weakness_type": "Improper input validation of internationalized host names in URL parsing (CWE-20; host/URL validation bypass)"
+    }
+  ],
+  "coverage_summary": "Scope filters reported by get_source_scope: 5,156 source files visible (4,838 Java), test sources excluded from the visible tree, binary-like files skipped. Relation scope: 5,154 files indexed, 3,622 parsed, 62,097 symbols, 119,533 call edges, 1,110 facts; index is syntax-only (no control/data flow, no semantic resolution, 67,808 unresolved calls; 2 source files missing from the index). I reviewed ~40 files in full or in security-relevant part, concentrated in spring-web (UriComponentsBuilder, RfcUriParser, WhatWgUrlParser, ForwardedHeaderUtils/Filter, CorsConfiguration/DefaultCorsProcessor, ContentDisposition, HttpHeaders/ETag/HttpRange, HtmlUtils/HtmlCharacterEntityReferences, StringUtils.uriDecode/cleanPath, DefaultPathContainer, UriUtils users, XML converters incl. JAXB/XXE setup, reactive multipart parser entry points, spring-web 'service'/'http' surfaces), spring-webmvc (resource handling, function package PathResourceLookupFunction, HandlerMappingIntrospector, PathPatternMatchableHandlerMapping, ServletRequestPathUtils, UrlPathHelper), spring-webflux (resource handling twins), spring-core (SerializationUtils, DigestUtils, ClassUtils-adjacent utilities), spring-context/-support (JNDI, scripting, FreeMarker), spring-jdbc (JdbcTemplate/DriverManagerDataSource spot checks), spring-websocket/spring-messaging (STOMP size limits). Remaining thousands of files were not read line-by-line; the candidate area (WHATWG parser) was read around its host-parsing and encoding logic but not all 3,140 lines.",
+  "limitations": [
+    "No build, tests, scanners, or runtime execution were performed; the finding is a source-reading lead only and no runtime confirmation exists.",
+    "Test sources are excluded from the visible snapshot, so I could not check whether the project's own WHATWG/WPT-derived tests exercise (or would catch) malformed punycode host names.",
+    "No git history or upstream diff is available, so I cannot confirm which upstream commit this snapshot corresponds to, whether the deviation was introduced deliberately for this case, or whether/when it was fixed upstream.",
+    "The P1 relation index provides syntax-level call/containment hints only; it cannot prove reachability or data flow, and 67,808 calls are unresolved.",
+    "Reachability of the candidate requires an application to opt in to ParserType.WHAT_WG; no Spring-internal security decision using WHAT_WG was found, so the practical impact depends on the consuming application's validation logic.",
+    "I did not exhaustively audit all 3,140 lines of WhatWgUrlParser or all 4,838 Java files; other deviations may exist that I did not inspect."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HandlerMappingIntrospector / PathPatternMatchableHandlerMapping pattern-cache behavior (spring-webmvc, 'security patterns' @since 6.2.8)",
+      "reason": "The snapshot already contains the bounded-cache hardening (DEFAULT_CACHE_LIMIT=2048, Assert.state check at PathPatternMatchableHandlerMapping.java:63-66). Cache keys come from configured security patterns, and overflow fails closed (exception -> 500), so I could not substantiate an attacker-controlled bypass or unbounded growth; only a config-timing nuance (setPatternCacheLimit after afterPropertiesSet has no effect on already-created wrappers) was found, which is not attacker-controlled."
+    },
+    {
+      "lead": "Jaxb2RootElementHttpMessageConverter.processSource fallback when SAXParserFactory features cannot be set (XXE protection silently skipped, warning logged)",
+      "reason": "The catch-and-return-raw-source fallback with the 'Processing of external entities could not be disabled' warning is long-standing upstream behavior; it requires a SAX implementation that rejects the JDK-supported disallow-doctype-decl/external-general-entities features, which is not attacker-controlled, and the default JAXB converters disable DTD processing (supportDtd=false, processExternalEntities=false)."
+    },
+    {
+      "lead": "ForwardedHeaderUtils / ForwardedHeaderFilter trusting X-Forwarded-* headers",
+      "reason": "Documented trust-boundary requirement (must sit behind a trusted proxy or use removeOnly=true); host/scheme values are still run through UriComponentsBuilder verification and resetPortIfDefaultForScheme. No new deviation from the known/documented behavior."
+    },
+    {
+      "lead": "Static resource path traversal (ResourceHandlerUtils/PathResourceResolver/ResourceHttpRequestHandler/ResourceWebHandler/PathResourceLookupFunction)",
+      "reason": "The full modern chain is present in both webmvc and webflux: normalizeInputPath + shouldIgnoreInputPath (double-decode check), plus isResourceUnderLocation containment and encoded-'..' re-check. I traced multiple encoding variants (single/double/triple-encoded '../', backslash forms) and found containment checks catch escapes; no missing check identified."
+    },
+    {
+      "lead": "Multipart/STOMP/message-size and ETag/Range parsing DoS",
+      "reason": "HttpRange enforces MAX_RANGES=100; ETag.parse is a linear hand-written parser (the historical ReDoS fix) and headers are container-size-limited; STOMP uses BufferingStompDecoder with a 64K default message size limit and minimum WebSocket buffer sizes. No unbounded-accumulation path found in the code inspected."
+    }
+  ],
+  "summary": "Snapshot reviewed: Spring Framework 6.2.8-SNAPSHOT (Java, 5,156 visible files, main sources; tests filtered out, jmh examples visible). I reviewed the highest-risk attacker-facing code: static-resource path handling (spring-webmvc/spring-webflux ResourceHandlerUtils, PathResourceResolver, ResourceHttpRequestHandler/ResourceWebHandler, PathResourceLookupFunction), URL parsing (UriComponentsBuilder, RfcUriParser, WhatWgUrlParser), CORS (CorsConfiguration/DefaultCorsProcessor both variants), path decoding (StringUtils.uriDecode, UrlPathHelper, DefaultPathContainer, ServletRequestPathUtils), conditional headers (HttpRange, ETag), XML converters (JAXB XXE setup), forwarded headers, HandlerMappingIntrospector/PathPatternMatchableHandlerMapping, and STOMP/multipart parsing. Most of these contain the expected hardening (bounded caches/ranges, decode-and-recheck path validation, containment checks, DTD/entity restrictions, CORS validation). One concrete, reproducible-by-reading deviation stands out in the new 6.2 WHATWG URL parser: the \"xn--\" detection in `domainToAscii` is wrong (scans only labels after a dot and compares the 4th character to '_' instead of '-'), so ASCII hostnames containing punycode labels bypass IDN/Unicode ToASCII validation entirely. I submit that as the single candidate; all other observations are listed as rejected/unconfirmed leads."
+}

@@ -1,0 +1,95 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The 'log.type' request value (CONTAINER_LOG_TYPE) is fully attacker-controlled. It is normally bound from the third path segment of /containerlogs/:containerid/:appowner/:log.type, but YARN's View.$(key) falls back to ServletRequest.getParameter(key) whenever the path segment is absent (e.g., a trailing/omitted third segment), so the value can also be supplied as an ordinary query/form parameter, which allows literal '/' and encoded separators. The container id path segment is strictly parsed and the referenced application must currently be known to the NM (application != null check), which an attacker can satisfy with their own submitted application or any running application visible on the unauthenticated RM/AM web UIs.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that (1) container id/application id inputs are strictly parsed (ConverterUtils.toContainerId) and only numeric ids reach the path, so the free-form input is the log type; (2) an application/container-state check exists but does not constrain the log type or the resolved file; (3) an ACL check exists, but it is skipped when getRemoteUser() is null and is a no-op because yarn.acl.enable defaults to false (YarnAdminACLsManager line 75-76, YarnConfiguration line 153); (4) LocalDirAllocator only performs an exists() check and Path uses URI normalize(), so '..' is not rejected; (5) the route/parameter binding does provide a path value normally, which is why the query-parameter fallback (View.$(key) -> request.getParameter) is the clean vector when the third segment is absent; (6) no other validation/sanitization of CONTAINER_LOG_TYPE exists in the NM web path (only legacy TODO comments about symlinks/secure IO at lines 234-235).",
+      "id": "case-171-cand-1",
+      "impact": "Remote arbitrary local file disclosure with the NodeManager process's read privileges. On typical deployments this can expose other users'/applications' container logs and state, NM private/token and configuration files, and system files readable by the NM account (e.g., /etc/passwd-like files); on Windows the backslash normalization in Path.normalizePath provides an additional traversal form. No code execution or write primitive is claimed.",
+      "locations": [
+        {
+          "end_line": 236,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/webapp/ContainerLogsPage.java",
+          "start_line": 199
+        },
+        {
+          "end_line": 197,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/webapp/ContainerLogsPage.java",
+          "start_line": 179
+        },
+        {
+          "end_line": 121,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/webapp/WebServer.java",
+          "start_line": 110
+        },
+        {
+          "end_line": 105,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/webapp/NMController.java",
+          "start_line": 78
+        },
+        {
+          "end_line": 296,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LocalDirsHandlerService.java",
+          "start_line": 294
+        },
+        {
+          "end_line": 447,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/LocalDirAllocator.java",
+          "start_line": 426
+        },
+        {
+          "end_line": 175,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Path.java",
+          "start_line": 151
+        },
+        {
+          "end_line": 157,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/webapp/view/View.java",
+          "start_line": 151
+        },
+        {
+          "end_line": 29,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/webapp/YarnWebParams.java",
+          "start_line": 21
+        }
+      ],
+      "prerequisites": "Network reachability to the NodeManager web UI (default bind 0.0.0.0:8042, no HTTP authentication in default simple-auth deployments). A container id whose application is currently tracked by that NM. Target file must exist and be readable by the NodeManager OS account. The ACL gate is ineffective by default: it is skipped entirely when request.getRemoteUser() is null, and ApplicationACLsManager.checkAccess() returns true whenever yarn.acl.enable is false (DEFAULT_YARN_ACL_ENABLE=false).",
+      "root_cause": "In ContainerLogsPage.ContainersLogsBlock.printLogs() the request-supplied log type value (YarnWebParams.CONTAINER_LOG_TYPE = \"log.type\") is appended directly to the container log directory path and handed to LocalDirsHandlerService.getLogPathToRead(); LocalDirAllocator.getLocalPathToRead() joins it with each configured log directory via new Path(dir, pathStr) and only checks existence. Hadoop's Path constructor runs the URI through normalize(), which resolves '.'/'..' segments (and converts backslashes on Windows), so a value containing traversal sequences escapes the log root. The resulting File is opened with new FileInputStream(logFile) and its bytes are echoed to the HTTP response. There is no containment check and no validation of the parameter (no rejection of '/', '\\', '..', or of values that resolve outside the log dirs).",
+      "title": "YARN NodeManager ContainerLogsPage path traversal: unvalidated 'log.type' parameter allows arbitrary local file read",
+      "trace": "GET /containerlogs/<cid>/<owner>/ with log.type supplied as a request parameter -> dispatcher resolves the NM route (/containerlogs/:container.id/:app.owner/:log.type, WebServer.java 118-120, Router prefix matching) -> NMController.logs() -> ContainerLogsPage render() -> printLogs(): container id is parsed, the application must be present in nmContext (lines 123-135), the ineffective ACL check runs (179-197), then $(CONTAINER_LOG_TYPE) is concatenated after ContainerLaunch.getRelativeContainerLogDir(appId, cid) (199-207). LocalDirsHandlerService.getLogPathToRead -> LocalDirAllocator.getLocalPathToRead -> new Path(logDir, pathStr) -> URI normalize resolves '..' -> localFS.exists() is the only check and returns the escaped path (426-447). new File(...) -> FileInputStream (236) -> bytes are written into the HTTP response (247-255).",
+      "unverified": "Not runtime-confirmed; no build, deployment or request was executed. Exact servlet-container behavior for URL-encoded separators inside a path segment was not verified, so the query-parameter fallback (enabled by View.$(key)) is the reasoning basis for supplying raw '/' characters. Whether a given deployment populates getRemoteUser() and whether yarn.acl.enable is left at its false default affect only the strength of the authorization gate, not the path construction itself. The identity of the matching upstream fix/CVE and the precise fix location could not be verified from the snapshot.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / arbitrary file read; CWE-73 external control of file name or path"
+    }
+  ],
+  "coverage_summary": "B0 source-only review of 3,006 visible files under the assigned root (hadoop-common-project, hadoop-hdfs-project incl. hadoop-hdfs-httpfs, hadoop-mapreduce-project, hadoop-yarn-project, hadoop-tools, hadoop-client/assemblies, dev-support). Prioritized network-facing and privilege-boundary code: YARN NodeManager/ResourceManager webapps and web params/router, log serving and log aggregation, MapReduce JobHistory/AM webapps, HDFS WebHDFS/StreamFile/DataNode web, hadoop-auth and security utilities (KerberosName, SecureIOUtils, ApplicationACLsManager, AdminACLsManager), YARN container-executor native code, LocalDirAllocator/Path/FileUtil, and shell/config handling. Binary files, generated jdiff/release-note XML, and docs were treated as low-value and only spot-checked. The single candidate is based on a complete read of the ContainerLogsPage, NM route, View.$(key), LocalDirsHandlerService and LocalDirAllocator code paths.",
+  "limitations": [
+    "No execution, build, deployment or exploit testing was performed; all conclusions are static source analysis and were not runtime-confirmed.",
+    "The 3,006-file snapshot is large; coverage was risk-prioritized, so less exposed modules (hadoop-tools, streaming, rumen, fuse-dfs, libhdfs, metrics, jdiff-generated artifacts) were not exhaustively reviewed.",
+    "No git history, patches, CVE database or sibling-case data was available, so the mapping of this snapshot to a specific upstream CVE/fix commit and its exact fix location remains unverified.",
+    "Deployment-specific factors (HTTP authentication settings, yarn.acl.enable, NodeManager OS account, bind address, servlet container decoding of encoded slashes) could not be validated from source alone.",
+    "Line numbers refer to the assigned snapshot and may differ from upstream revisions."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AggregatedLogsBlock / LogAggregationUtils build the remote aggregated-log path from unvalidated app.owner and node-id request values (AggregatedLogsBlock.java 62-94 and 258-281, LogAggregationUtils.java 38-42/103-105); a related secondary path-construction sink in the same log-serving feature.",
+      "reason": "Same weakness class but weaker exploitability: LogReader opens the resolved path as a TFile-based AggregatedLogFormat file, and the ACL check is performed against the owner recorded in that file, so arbitrary plain-file disclosure is not demonstrated and the output is constrained to aggregated logs. Not selected as the single candidate."
+    },
+    {
+      "lead": "container-executor native code (write_pid_to_file_as_nm temp-file/rename and delete_as_user path handling; container-executor.c 157-205, 1083-1100).",
+      "reason": "Local setuid C component, outside the Java-focused toolchain, and the binary is not writable/executable by ordinary users (check_executor_permissions); the pid path is under an NM-private directory. No concrete privilege-crossing path was established from source in the time available."
+    },
+    {
+      "lead": "FileUtil.symLink uses Runtime.getRuntime().exec(\"ln -s \" + target + \" \" + linkname) and is reached from LocalDistributedCacheManager.createSymlinks with job-controlled cache URIs (FileUtil.java 677-679, LocalDistributedCacheManager.java ~203).",
+      "reason": "Runtime.exec(String) tokenizes arguments rather than invoking a shell, so classic shell metacharacter injection does not apply; the call also runs client-side as the job owner. No concrete security impact established."
+    },
+    {
+      "lead": "Configuration XML parsing enables XInclude and leaves external entity expansion largely unrestricted (Configuration.java 1832-1837).",
+      "reason": "Configuration resources are normally administrator/local or framework-provided; no strong untrusted remote source feeding this parser was traced, so the trust boundary and impact are unproven."
+    },
+    {
+      "lead": "Existing XSS-hardening gaps in MR/YARN web UIs (maps/reduce job name rendering etc.).",
+      "reason": "Several known XSS fixes (e.g., YARN-1932, MAPREDUCE-5778) are already present in this snapshot; remaining outputs are mostly escaped by the Hamlet/JSP layers, and no untrusted-to-raw-HTML sink was confirmed with comparable impact to the file-read traversal."
+    }
+  ],
+  "summary": "Reviewed the Hadoop 0.23.11-SNAPSHOT (branch-0.23, ~May 2014) snapshot exposed by the B0 tools (3,006 visible files; Java, native C, scripts, XML/JSP and generated jdiff/release-note artefacts across hadoop-common, hadoop-hdfs, hadoop-mapreduce, hadoop-yarn and hadoop-tools). The strongest source-evidenced issue is an unvalidated request parameter in the YARN NodeManager's log-viewing web endpoint: the container log type is concatenated into a filesystem path and then opened with a plain FileInputStream, giving a remote path-traversal / arbitrary-local-file-read primitive. Authorization around the read is ineffective in default deployments. I selected this one candidate; other leads (log-aggregation path construction, container-executor native code, FileUtil.symLink, Configuration XML parsing) are listed as unconfirmed/rejected."
+}

@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the bytes of the HAProxy v2 PROXY header. After the fixed 16-byte header and address block, each TLV is attacker-defined: type byte 0x20 (PP2_TYPE_SSL), 2-byte length, then a 1-byte client bit field, 4-byte verify value, and additional nested TLVs. Repeating this structure creates unbounded recursion depth while keeping total size within the decoder's normal maximum header size.",
+      "confidence": "medium",
+      "counterevidence_checked": "The decoder bounds the total v2 header size (V1_MAX_LENGTH/V2_MAX_LENGTH and configurable maxTlvSize), so the finding is not an unbounded-size allocation from a single length field. However, the size bound does not bound recursion depth. The decoder does catch HAProxyProtocolException around decodeHeader, but StackOverflowError and IndexOutOfBoundsException are not caught by that block. I did not execute or fuzz the parser, so the exact stack depth reached in a given deployment remains unverified.",
+      "id": "netty-haproxy-tlv-unbounded-recursion",
+      "impact": "Remote denial of service: deep recursion exhausts the thread stack and raises StackOverflowError rather than a caught protocol exception, potentially disrupting the event-loop connection handling. In addition, malformed SSL TLV lengths can trigger unchecked IndexOutOfBoundsException paths in the same parsing code, so the decoder is not robust against hostile proxy headers.",
+      "locations": [
+        {
+          "end_line": 291,
+          "path": "codec-haproxy/src/main/java/io/netty/handler/codec/haproxy/HAProxyMessage.java",
+          "start_line": 243
+        },
+        {
+          "end_line": 262,
+          "path": "codec-haproxy/src/main/java/io/netty/handler/codec/haproxy/HAProxyMessageDecoder.java",
+          "start_line": 226
+        },
+        {
+          "end_line": 462,
+          "path": "codec-haproxy/src/main/java/io/netty/handler/codec/haproxy/HAProxyMessageDecoder.java",
+          "start_line": 447
+        }
+      ],
+      "prerequisites": "The application pipeline must install HAProxyMessageDecoder and be reachable by the attacker (typical when Netty is deployed behind an HAProxy-compatible load balancer). No authentication is required. The crafted v2 header must be accepted by findVersion/findEndOfHeader and its total length must stay within v2MaxHeaderSize (roughly 16 + 65535 bytes); a nested SSL TLV frame can be as small as roughly 9 bytes, so roughly thousands of recursive frames fit.",
+      "root_cause": "HAProxyMessage.readNextTLV handles a PP2_TYPE_SSL TLV by decoding its encapsulated TLVs in a loop that calls readNextTLV again. Because nested SSL TLVs are accepted recursively and no nesting-depth or recursion limit is enforced, an attacker can build a deeply nested TLV chain. The enclosing v2 header is bounded by v2MaxHeaderSize (about 65 KB) but that still permits thousands of recursive frames.",
+      "title": "Unbounded recursion in HAProxyMessage.readNextTLV allows remote StackOverflowError",
+      "trace": "HAProxyMessageDecoder.decode() -> HAProxyMessage.decodeHeader(ByteBuf) -> readTlvs(header) (line 243) -> readNextTLV(header) (line 260). When type is PP2_TYPE_SSL, readNextTLV reads the SSL payload and, if at least 4 bytes remain, loops calling readNextTLV on the inner ByteBuf (line 282). If that inner TLV is again PP2_TYPE_SSL, the same branch recurses. The call stack depth is therefore controlled by the attacker's nesting, and no depth counter is present in this path.",
+      "unverified": "No runtime execution, compiler run, or fuzzing was performed. The exact stack size/depth needed to trigger StackOverflowError and the behavior of the surrounding Netty pipeline on Error propagation were not runtime-verified. The nested-TLV wire format was reconstructed from the source and HAProxy v2 TLV structure.",
+      "weakness_type": "CWE-674 Uncontrolled Recursion / CWE-400 Uncontrolled Resource Consumption"
+    }
+  ],
+  "coverage_summary": "Examined the assigned 2,115-file source scope. Reviewed codec/handler paths for HTTP/1.x and HTTP/2, HAProxy, DNS, MQTT, Redis, SPDY, SOCKS, compression/codec parsing, TLS/SslHandler/SNI, multipart HTTP decoding, buffer and common utilities. No test sources were present in the snapshot, and no code execution, build, scanner, or exploit run was performed.",
+  "limitations": [
+    "No runtime confirmation: all findings are source-review leads, not reproduced vulnerabilities.",
+    "The snapshot contains no src/test tree, so upstream regression/security tests could not be inspected.",
+    "Exploitability depends on the application pipeline and on how untrusted inputs reach each decoder; those integration details are outside this source snapshot.",
+    "Large native modules and some codec/handler files were reviewed selectively rather than line-by-line, so other vulnerabilities may remain uninspected.",
+    "The exact upstream revision and CVE association are inferred from source/version content, not from git metadata or external advisories."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SslClientHelloHandler allocates ctx.alloc().buffer(handshakeLength) from a 24-bit ClientHello length before the full handshake is received (handler/src/main/java/io/netty/handler/ssl/SslClientHelloHandler.java:117-142).",
+      "reason": "This is a credible remote OOM/amplification issue, but it depends on SniHandler/SslClientHelloHandler being deployed and on the attacker being able to make the handler allocate the declared length; I could not tie it to a specific fix in this snapshot and it is less directly evidenced than the HAProxy recursion path."
+    },
+    {
+      "lead": "HttpPostRequestDecoder / HttpPostMultipartRequestDecoder accumulate undecodedChunk and multipart fields without an enforced total-size or field-count limit (codec-http/.../multipart/HttpPost*.java).",
+      "reason": "Potentially serious DoS, but default factory MAXSIZE is unlimited by design and exploitability depends on application integration and configuration; the code paths are diffuse and not as self-contained as the recursion candidate."
+    },
+    {
+      "lead": "DefaultHttpHeaders header-name/value validation permits invalid token characters such as control bytes and several separators (codec-http/src/main/java/io/netty/handler/codec/http/DefaultHttpHeaders.java:368-415,444-513), and HttpObjectDecoder normalizes some trailing whitespace.",
+      "reason": "This could enable smuggling against normalization-mismatched intermediaries, but it requires an assumption about intermediary behavior and is better classified as a hardening/validation gap than a source-confirmed vulnerability in this snapshot."
+    },
+    {
+      "lead": "HTTP/1.0 multiple Content-Length handling and TE+CL parsing are lenient in HttpObjectDecoder/HttpUtil.",
+      "reason": "The code deliberately handles duplicates differently for HTTP/1.0 and TE+CL only removes Content-Length for HTTP/1.1; exploitation depends on an intermediary with conflicting framing behavior, so it remained an unconfirmed smuggling lead."
+    },
+    {
+      "lead": "NativeLibraryLoader writes and loads a native library from a temporary path (common/src/main/java/io/netty/util/internal/NativeLibraryLoader.java:170-196).",
+      "reason": "Local-only, largely requires a hostile local user or predictable temp-path condition, and is a weaker remote-security candidate than the decoder issues."
+    }
+  ],
+  "summary": "Reviewed the Netty 4.1.71.Final-SNAPSHOT source snapshot with emphasis on remotely reachable decoders (HTTP/1.x, HTTP/2, HAProxy, DNS, MQTT, SPDY, TLS, multipart) and the native loader. The strongest source-backed issue is an uncontrolled-recursion path in HAProxy proxy-protocol v2 TLV parsing: an unauthenticated remote peer can cause a StackOverflowError by nesting PP2_TYPE_SSL TLVs inside a single bounded proxy-protocol header. Other plausible issues were identified as rejected/secondary leads because they are either conditional on deployment/configuration or are hardening gaps rather than clearly exploitable defects in this snapshot."
+}

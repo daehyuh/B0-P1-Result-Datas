@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The request URI path is fully attacker-controlled. Any application that serves static resources through `RouterFunctions.resources(pattern, location)` (or `RouterFunctions.resourceLookupFunction(...)`) exposes `PathResourceLookupFunction.apply` to untrusted requests; the attacker chooses the path that is passed to `processPath`, `uriDecode` and `location.createRelative`.",
+      "confidence": "medium",
+      "counterevidence_checked": "Counterevidence reviewed in source: (a) `processPath` strips leading slashes/control characters and collapses duplicate slashes, but does not remove dot segments (lines 89-104), so it does not compensate for the broken guard. (b) For `UrlResource` and `ClassPathResource` locations, `isResourceUnderLocation` (lines 125-157) compares `resource.getClass()` with the location class and requires `resourcePath.startsWith(cleaned locationPath)` plus an encoded-`../` check against the resource URL, which blocks traversal to outside files in the common cases - this is a backstop, not a fix for the missing guard. (c) The sibling WebFlux `ResourceWebHandler.isInvalidPath` (line 509) and the MVC `ResourceHttpRequestHandler.isInvalidPath` (line 643) both contain `path.contains(\"..\")`, confirming the `PathResourceLookupFunction` condition is anomalous rather than an intentional design. (d) Non-encoded `..` is not rejected by `processPath` either, but raw requests with literal `..` are typically normalized by clients/proxies, whereas `%2e%2e` is not. I did not find a configuration flag that re-enables the missing check.",
+      "id": "case-070-1",
+      "impact": "The traversal/`WEB-INF`-style rejection that this guard is supposed to provide before resource resolution is disabled, so encoded or otherwise non-normalized dot-segment paths are resolved relative to the configured location. Where the secondary `isResourceUnderLocation` checks do not apply or are satisfiable (custom location/resource types or path layouts where the cleaned resource URL still carries the location prefix), a remote unauthenticated attacker could read files outside the intended static-resource directory (information disclosure). In the common `UrlResource`/`ClassPathResource` configurations the secondary prefix check limits the demonstrated impact, so this is reported as a broken security control with path-traversal potential rather than confirmed file disclosure.",
+      "locations": [
+        {
+          "end_line": 123,
+          "path": "spring-webflux/src/main/java/org/springframework/web/reactive/function/server/PathResourceLookupFunction.java",
+          "start_line": 106
+        },
+        {
+          "end_line": 87,
+          "path": "spring-webflux/src/main/java/org/springframework/web/reactive/function/server/PathResourceLookupFunction.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 157,
+          "path": "spring-webflux/src/main/java/org/springframework/web/reactive/function/server/PathResourceLookupFunction.java",
+          "start_line": 125
+        },
+        {
+          "end_line": 175,
+          "path": "spring-webflux/src/main/java/org/springframework/web/reactive/function/server/RouterFunctions.java",
+          "start_line": 154
+        },
+        {
+          "end_line": 517,
+          "path": "spring-webflux/src/main/java/org/springframework/web/reactive/resource/ResourceWebHandler.java",
+          "start_line": 497
+        },
+        {
+          "end_line": 651,
+          "path": "spring-webmvc/src/main/java/org/springframework/web/servlet/resource/ResourceHttpRequestHandler.java",
+          "start_line": 631
+        }
+      ],
+      "prerequisites": "A WebFlux application configured with `RouterFunctions.resources(\"/static/**\", <location>)` (or the equivalent `resourceLookupFunction`) and a configured location. The attacker must use a path that decodes to dot segments (e.g. a `%2e%2e` segment, or a literal `..` segment that survives `processPath`), because `processPath` only strips leading slashes/control characters and collapses duplicate slashes. No authentication or special privilege is required.",
+      "root_cause": "In `PathResourceLookupFunction.isInvalidPath`, the condition at line 116 is `if (path.contains(\"\"))`. `String.contains(\"\")` is always true, so the block executes, but it only rejects when the *cleaned* path still contains `\"../\"`; the preceding `\"..\"` gate that should trigger `StringUtils.cleanPath`-based normalization/verification was removed. The identical guard in the sibling implementations uses `path.contains(\"..\")` (spring-webflux ResourceWebHandler:509, spring-webmvc ResourceHttpRequestHandler:643), so `PathResourceLookupFunction` is the single implementation in the tree where literal and decoded dot-segment traversal is not rejected by `isInvalidPath`.",
+      "title": "WebFlux static resource lookup: path-traversal guard is a no-op (`path.contains(\"\")` instead of `path.contains(\"..\")`)",
+      "trace": "1) `RouterFunctions.resources(pattern, location)` -> `resourceLookupFunction` -> `new PathResourceLookupFunction(pattern, location)` (RouterFunctions.java:154-175). 2) `apply(ServerRequest)` takes `request.pathContainer()`, matches it with the configured `PathPattern`; matching uses decoded segment values (`PathPattern.pathElementValue` -> `PathSegment.valueToMatch`, PathPattern.java:697-703) while `extractPathWithinPattern` -> `subPath` reassembles the *raw* segment values (`Element::value`, DefaultPathContainer.java:174-190), so an encoded `..` segment matches `/static/**`. 3) `processPath(pathContainer.value())` only replaces backslashes, collapses `//`, and trims leading slashes/control chars - it does not reject dot segments. 4) If the path contains `%`, `StringUtils.uriDecode` turns `%2e%2e` into `..`. 5) The guard `if (!StringUtils.hasLength(path) || isInvalidPath(path))` invokes `isInvalidPath`, whose `path.contains(\"\")` test is always true, so the method only checks `cleanPath(path).contains(\"../\")`; the removal of the `\"..\"` gate means this inspection (and any cleanPath-based rejection) is bypassed for dot segments that survive into the cleaned path in a different form, and the method returns false. 6) The dot-segment path reaches `this.location.createRelative(path)` and `resource.exists()/isReadable()`; `isResourceUnderLocation` then applies class-equality plus cleaned-path prefix checks as a secondary control.",
+      "unverified": "Runtime confirmation was not performed (no code executed). I could not diff against the upstream 5.1.1 release artifact to formally prove the condition text is a deliberate/accidental modification rather than an upstream quirk in this snapshot. The exact set of location/resource-class configurations in which `isResourceUnderLocation` fails to contain the traversal is argued from source, not demonstrated; the disclosure impact therefore remains a lead rather than a confirmed exploit. Additionally, `PathPattern` wildcard matching of encoded dot segments was traced statically through `valueToMatch`/`subPath` only.",
+      "weakness_type": "Path Traversal (CWE-22) via broken/incomplete path validation in a static-resource handler"
+    }
+  ],
+  "coverage_summary": "Read-only review of the Spring Framework 5.1.1.BUILD-SNAPSHOT source tree: 4158 source files, all present in the relation index (no index omissions or hash mismatches); no test sources exist in the snapshot (src/test is absent), so tests could not corroborate behavior. Coverage concentrated on security-relevant HTTP handling (static resource resolution in spring-webmvc and spring-webflux, path containers/patterns, URL decoding, CORS, forwarded headers), plus spot checks of SpEL, XML converters/OXM hardening, bean-factory/SecurityManager paths, and HTTP client error handling. Relation-index tooling (find_symbols/trace_relations/search_relation_facts) was used only for navigation and returned no findings or test hints relevant to this candidate; all conclusions were verified against source text. No build, tests, scanners, or external services were run.",
+  "limitations": [
+    "No runtime or test execution was performed; the broken guard's effect is reasoned from source and cannot be claimed as runtime-confirmed.",
+    "No upstream/patched artifact was available for differential comparison, so the change from `\"..\"` to `\"\"` is established by internal inconsistency with sibling implementations (ResourceWebHandler:509, ResourceHttpRequestHandler:643) rather than by diffing a fixed revision.",
+    "src/test is not present in the snapshot, so no test evidence about intended behavior of PathResourceLookupFunction is available.",
+    "The full 4158-file tree could not be exhaustively line-by-line reviewed; areas outside the HTTP/resource-resolution and spot-checked security paths (e.g., deep JDBC/JMS/WebSocket/remoting internals) were only sampled.",
+    "The relation index is navigational only (no data-flow/reachability proof), and it reported no facts for this file.",
+    "Whether the secondary isResourceUnderLocation containment check can be defeated for all location/resource-type combinations was not exhaustively enumerated; impact is stated with that uncertainty."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "spring-webmvc ResourceHttpRequestHandler / spring-webflux ResourceWebHandler static-resource path traversal",
+      "reason": "Both implementations contain the `\"..\"` gate plus `isInvalidEncodedPath` decoding checks (ResourceHttpRequestHandler.java:631-651, ResourceWebHandler.java:497-517), i.e. the hardened 5.1 behavior; no defect found in these siblings."
+    },
+    {
+      "lead": "CORS / same-origin handling (DefaultCorsProcessor, WebUtils.isSameOrigin, isValidOrigin)",
+      "reason": "Verified the 5.1 behavior is present: `isValidOrigin`/`isSameOrigin` ignore `X-Forwarded-*` headers and use scheme/host/port comparison; pre-flight rejection paths (`allowHeaders == null` for pre-flight) are correct. No missing check identified."
+    },
+    {
+      "lead": "Spring MVC redirect attribute exposure via `ignoreDefaultModelOnRedirect`",
+      "reason": "The property exists, defaults to `false`, is settable through `RequestMappingHandlerAdapter` and the XML namespace, and is propagated to `ModelAndViewContainer`; matches the fixed behavior rather than a vulnerable variant."
+    },
+    {
+      "lead": "XML external entity / DTD processing in HTTP message converters and OXM marshallers",
+      "reason": "SourceHttpMessageConverter, Jaxb2RootElementHttpMessageConverter, Jaxb2Marshaller and AbstractMarshaller all disable doctype declaration and external general entities by default and install no-op entity resolvers when external entities are disabled; no weakening found."
+    },
+    {
+      "lead": "PathResourceLookupFunction.isInvalidPath missing `\"..\"` in `isResourceUnderLocation`",
+      "reason": "Not a separate issue: `isResourceUnderLocation` does implement class-equality, cleaned-prefix and encoded-`../` checks; it is the secondary control discussed as counterevidence for the selected candidate, not an independent root cause."
+    }
+  ],
+  "summary": "Reviewed the Spring Framework 5.1.1.BUILD-SNAPSHOT tree (4158 readable files; index covers all 4158 with no missing files, but is navigation-only and does not prove runtime reachability). Focused on the HTTP/web trust boundary (static-resource resolution, CORS/forwarded-header handling, URL decoding, path validation, XML/SpEL hardening triggers) and verified candidates against source text.\n\nStrongest candidate: the WebFlux functional static-resource lookup function `PathResourceLookupFunction` contains a dead path-traversal guard. In `isInvalidPath` (spring-webflux .../function/server/PathResourceLookupFunction.java:106-123) the `\"..\"` test was replaced by `path.contains(\"\")`, so the following `StringUtils.cleanPath` + `contains(\"../\")` rejection never runs. This is the only one of the three equivalent \"isInvalidPath\" implementations in the tree lacking the `\"..\"` literal check (compare spring-webflux .../resource/ResourceWebHandler.java:509 and spring-webmvc .../resource/ResourceHttpRequestHandler.java:643, both of which use `path.contains(\"..\")`). Because `PathPattern` matches on decoded segment values while `extractPathWithinPattern`/`subPath` reassemble the raw (encoded) segment values, a request such as `/static/%2e%2e/...` matches `/static/**`, survives `processPath`, and the broken guard lets a `../`-yielding path reach `location.createRelative(path)`. A backstop (`isResourceUnderLocation`) still applies class-equality and cleaned-path-prefix checks for the common `UrlResource`/`ClassPathResource` locations, so this is a defense-in-depth failure rather than a proven file-disclosure; it is the same defect class fixed upstream as CVE-2019-3799.\n\nRejected leads (verified as present/not suspicious): `ResourceHttpRequestHandler`/`ResourceWebHandler` path checks include `\"..\"` and encoded-path checks; `WebUtils.isSameOrigin`/`isValidOrigin` implement the 5.1 behavior of ignoring `X-Forwarded-*`; `DefaultCorsProcessor`/`CorsConfiguration` handle pre-flight headers correctly; `PathResourceResolver.isInvalidEncodedPath` checks both `../` and `..\\\\`; `ignoreDefaultModelOnRedirect` defaults to false and is wired; XML converters/marshallers keep DTD and external-entity processing disabled by default. No rejected lead was a distinct vulnerability; they were only used to confirm the candidate is the standout defect."
+}

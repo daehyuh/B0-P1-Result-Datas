@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The complete CSW POST request body (e.g. a `csw:GetRecords` document). The attacker adds a DOCTYPE/entity declaration and references the entity inside the document, and sets `resultType=\"validate\"` (or KVP `RESULTTYPE=validate`) so that a `csw:Acknowledgement` is produced. CSW service access is unsecured by default in the shipped `services.properties`, so the request can be sent anonymously when the CSW extension is installed.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that the primary CSW parse is guarded: CSWXmlReader.read calls `parser.setEntityResolver(resolverProvider.getEntityResolver())` (line 46); EntityResolverProvider defaults to AllowListEntityResolver (default list non-null), and AllowListEntityResolver.resolveEntity throws `SAXException(\"Entity resolution disallowed for ...\")` for anything not matching allowed XSD locations/proxy base (lines 118-189). Verified sibling WMS (GetMapXmlReader/GetLegendGraphic/SLD), WFS FilterKvpParser/StoredQuery and WPS WPSExecuteTransformer paths do set resolvers, so the CSW echo re-parse is the exceptional, unguarded sink. Also checked whether the parsed output could already leak via the primary parse (it is schema-bound/discarded), and whether an allowed-domain entity could yield secrets (it cannot).",
+      "id": "csw-acknowledgement-xxe",
+      "impact": "XXE-style data disclosure and SSRF from the GeoServer host whenever the entity is expanded by the unguarded parse: local file contents (file: entities) or responses from internal HTTP endpoints can be written into the Acknowledgement response; crafted entity expansion can also cause resource-consumption DoS. Because the parsed content is echoed, the impact is exfiltration rather than blind.",
+      "locations": [
+        {
+          "end_line": 134,
+          "path": "src/extension/csw/core/src/main/java/org/geoserver/csw/response/AcknowledgementTransformer.java",
+          "start_line": 101
+        },
+        {
+          "end_line": 39,
+          "path": "src/extension/csw/core/src/main/java/org/geoserver/csw/xml/v2_0_2/CSWRecordingXmlReader.java",
+          "start_line": 27
+        },
+        {
+          "end_line": 116,
+          "path": "src/extension/csw/core/src/main/java/org/geoserver/csw/response/AbstractRecordsResponse.java",
+          "start_line": 91
+        }
+      ],
+      "prerequisites": "1) CSW extension installed/enabled. 2) The attacker's document must pass the primary parse (`CSWXmlReader.read` → GeoTools `Parser` with `resolverProvider.getEntityResolver()`), which is why default-config exploitation is not established: with the default `ENTITY_RESOLUTION_ALLOWLIST` the `AllowListEntityResolver` throws `SAXException` for non-allow-listed `file:`/`http(s):` entities and the request fails before the acknowledgement. 3) If entity resolution is loosened (`ENTITY_RESOLUTION_ALLOWLIST=*`, allowing arbitrary http(s) entity resolution; or `xmlExternalEntitiesEnabled=true`, documented as a security risk), or for any entity the primary resolver tolerates, the unguarded second parse expands it and echoes the content.",
+      "root_cause": "`AcknowledgementTransformer.parseAsXML(String)` creates a default `DocumentBuilderFactory`/`DocumentBuilder` without setting an `EntityResolver` and without disabling DOCTYPE/external entities or enabling secure processing. The string it parses is the verbatim request body recorded by `CSWRecordingXmlReader.RECORDED_REQUEST` (`IOUtils.toString(reader)`), i.e. fully attacker-controlled. `encodePostEcho()` parses that text and `dumpAsXML()` re-serializes the resulting DOM into the `csw:Acknowledgement/csw:EchoedRequest` response, so entity expansion results are returned to the caller. The same pattern is hardened in sibling code (`WPSExecuteTransformer.parseAsXML` calls `builder.setEntityResolver(entityResolver)`), and the primary CSW parse (`CSWXmlReader.read`) uses `EntityResolverProvider`, making this re-parse the one unguarded XML sink on the path.",
+      "title": "CSW Acknowledgement re-parses the untrusted POST body with an unhardened DocumentBuilderFactory (XXE/SSRF with echoed response)",
+      "trace": "POST /geoserver/csw (GetRecords, resultType=validate, body contains DOCTYPE + external entity) -> CSWRecordingXmlReader.read records raw body in ThreadLocal RECORDED_REQUEST (lines 35-38) -> CSWXmlReader.read performs the primary, resolver-guarded parse -> operation executes and returns a CSWRecordsResult -> AbstractRecordsResponse.write sees ResultType.VALIDATE and calls transformAcknowledgement (lines 91-93, 107-116) -> AcknowledgementTranslator.encodePostEcho reads RECORDED_REQUEST (lines 101-104) -> parseAsXML builds a default DocumentBuilder with no entity resolver (lines 119-129) -> dumpAsXML serializes the expanded DOM into the response (lines 109-117).",
+      "unverified": "Runtime behavior was not executed. In particular I could not verify GeoTools' `PreventLocalEntityResolver` behavior in this snapshot (its source is not in the repository), nor whether any default configuration actually lets the attacker's entity survive the primary parse. If the primary parse always rejects the malicious entity under default settings, this is a defense-in-depth gap on a configuration-dependent path rather than a default-config exploitable XXE. No regression tests exist in the snapshot to confirm intent.",
+      "weakness_type": "CWE-611: Improper Restriction of XML External Entity Reference ('XXE')"
+    }
+  ],
+  "coverage_summary": "File inventory and scope filters were obtained first (8,758 model-visible files; binary-like files skipped). I searched broadly for dangerous sinks (command execution, deserialization, JNDI, SQL string building, SSRF/URL opening, XML parsers, zip extraction, template engines, path handling, redirects, reflection, XStream/Jackson typing) and read the reachable request-handling paths in src/ows, src/wms, src/wfs, src/wcs, src/kml, src/main, src/rest, src/restconfig, src/security, src/web, src/extension (csw, wps, importer, security, mapml, metadata, geofence), and src/community (features-templating, features-autopopulate, jwt-headers, taskmanager, oseo, backup-restore, security/oauth2, smart-data-loader). Deep review was concentrated on anonymous/attacker-reachable XML parsing and file/URL handling; many modules were only spot-checked. Note the snapshot contains no src/test sources, so no regression/security tests were available as evidence.",
+  "limitations": [
+    "No code was executed and no exploit payloads were run; findings are source-level only and not runtime-confirmed.",
+    "GeoTools sources (including `PreventLocalEntityResolver`) are outside the snapshot, so the exact runtime behavior of GeoServer's default entity-resolution configuration could only be inferred from in-repo callers (`EntityResolverProvider`, `AllowListEntityResolver`).",
+    "The snapshot has no test directories, so fix-intent/regression tests could not be consulted.",
+    "Only repository-relative, non-binary files were readable; generated artifacts and dependencies (jars) were not inspected.",
+    "Given the repository size, many files (in particular community modules, GWC integration and the Wicket UI) were only shallowly reviewed; other vulnerabilities may exist that were not identified.",
+    "I could not map this case to a specific CVE/advisory from source alone, so the single candidate is a lead whose exact match to the benchmark's ground-truth location is uncertain."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "features-templating REST `PatchMergeHandler.toXMLDocument` parses PATCH request XML with a default, unguarded DocumentBuilderFactory (same missing-resolver pattern)",
+      "reason": "Real unguarded XML sink, but the endpoint lives under /rest/**, which the shipped rest.properties locks to the full ADMIN role, so it does not cross a meaningful privilege boundary in the default configuration. Weaker impact than the CSW anonymous surface; also a distinct root cause, kept as an unconfirmed lead rather than a second candidate."
+    },
+    {
+      "lead": "File-system sandbox (`FileSandboxEnforcer`/`DefaultFileAccessManager`) bypass via lexical `normalize()` (symlinks) or non-File/URL-typed store parameters",
+      "reason": "The code uses `toAbsolutePath().normalize()` rather than `toRealPath()`, but no remote path for creating symlinks inside the sandbox was found, and I did not identify a concrete store factory whose String-typed parameter reaches a file path unchecked. No specific bypass demonstrated, so it does not meet the evidence threshold."
+    },
+    {
+      "lead": "`GeoServerHttpFirewall` runs `StrictHttpFirewall` on a normalized copy but enforces `DefaultHttpFirewall` on the original request",
+      "reason": "Looks like an intentional compatibility trade-off (documented in the class comment). I could not construct a source-level bypass that is not already handled by the servlet container/DefaultHttpFirewall normalization; rejected as speculative."
+    },
+    {
+      "lead": "taskmanager community module builds shell commands with `Runtime.getRuntime().exec(...)` using configured scripts/table names",
+      "reason": "Community module, admin-configured inputs; no direct unauthenticated attacker control found in source."
+    },
+    {
+      "lead": "jwt-headers community filter performs token/expiry/signature/audience validation only when the administrator enables the corresponding boolean flags",
+      "reason": "Validation is opt-in by design (config booleans + config validator), not a code-level bypass; no evidence of a missing check relative to configuration."
+    },
+    {
+      "lead": "MapML HTML output writes `sourceUrL` into an HTML attribute without HTML escaping",
+      "reason": "The URL is built through `ResponseUtils.buildURL`, which percent-encodes each KVP value (`urlEncode`), so I could not demonstrate an attribute breakout; rejected as unconfirmed."
+    }
+  ],
+  "summary": "Reviewed the GeoServer 2.26.2-era source snapshot (8,758 readable files; test sources are absent from the snapshot). I inventoried the whole tree, then concentrated on attacker-reachable request handling: OGC service parsers (WMS/WFS/WCS/OWS), CSW, WPS, REST/restconfig, the new file-sandbox/security code, and XML parsing sinks. Core WMS/WFS/WPS parsers consistently attach GeoServer's hardened `EntityResolverProvider` entity resolver (and some disable DTDs outright). The single strongest distinct lead is in the CSW extension: the Acknowledgement response re-parses the raw, attacker-supplied POST request body with a plain `DocumentBuilderFactory` (no entity resolver, no secure-processing/DTD limits) and then serializes the resulting DOM straight back to the requester, unlike the sibling WPS `WPSExecuteTransformer.parseAsXML`, which sets an entity resolver. I am submitting that as the one candidate, with the important caveat that the initial request parse does use the hardened resolver, which limits default-config exploitation."
+}

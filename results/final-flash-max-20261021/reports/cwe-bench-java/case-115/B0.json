@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the XML message body delivered to a route that parses it. For camel-stax this is any route using the stax() expression with isNamespaceAware=false (e.g. split().stax(Pojo.class, false)); for camel-core it is any conversion of the body to DOM/SAX (toDOMDocument, XPath evaluation, DOM-based XSLT, JAXB/Soap paths that obtain an XMLStreamReader). No headers or credentials are needed, only the ability to get one XML message into the route.",
+      "confidence": "medium",
+      "counterevidence_checked": "camel-core's StaxConverter.createXMLInputFactory already implements the correct hardening (SUPPORT_DTD=false, IS_SUPPORTING_EXTERNAL_ENTITIES=false, IS_REPLACING_ENTITY_REFERENCES=false, blocking XMLResolver) and is public/static, so the camel-stax code bypasses a control the project already built. On the DOM/SAX paths external-general-entities is disabled and FEATURE_SECURE_PROCESSING is set, so the simplest &xxe; general-entity expansion is blocked there and only parameter-entity/DTD based attacks remain (reduced direct impact). The camel-stax branch requires the non-default namespaceAware=false setting. No test files are present (stripped by the scope) to show intended behavior, and no runtime exploitation was performed.",
+      "id": "camel-xxe-parser-hardening",
+      "impact": "Confidentiality: local file disclosure via external entities (direct on the StAX path; parameter-entity/OOB or blind on the DOM/SAX path) and SSRF through attacker-chosen external DTD/entity URLs. Availability: entity-expansion/DTD denial of service. StAX parsing happens before any application validation, and successful entity expansion can also feed attacker-chosen content into downstream JAXB unmarshalling.",
+      "locations": [
+        {
+          "end_line": 125,
+          "path": "components/camel-stax/src/main/java/org/apache/camel/component/stax/StAXJAXBIteratorExpression.java",
+          "start_line": 117
+        },
+        {
+          "end_line": 1163,
+          "path": "camel-core/src/main/java/org/apache/camel/converter/jaxp/XmlConverter.java",
+          "start_line": 1136
+        },
+        {
+          "end_line": 1278,
+          "path": "camel-core/src/main/java/org/apache/camel/converter/jaxp/XmlConverter.java",
+          "start_line": 1262
+        }
+      ],
+      "prerequisites": "A route must consume untrusted XML and pass it to one of these parser paths; for the camel-stax path the expression must be created with isNamespaceAware=false (default constructors use the hardened XMLEventReader converter path). No allow-list, validation, or entity-resolution restriction is applied before parsing.",
+      "root_cause": "Camel creates XML parser factories for attacker-controlled message bodies without fully disabling DTD/external-entity resolution. StAXJAXBIteratorExpression uses XMLInputFactory.newInstance() (JDK defaults: SUPPORT_DTD=true, IS_SUPPORTING_EXTERNAL_ENTITIES=true, IS_REPLACING_ENTITY_REFERENCES=true) instead of the already-hardened StaxConverter.createXMLInputFactory(...) available in camel-core, so an XML body with a DOCTYPE/ENTITY is expanded. In camel-core, XmlConverter.createDocumentBuilderFactory() and createSAXParserFactory() disable only \"external-general-entities\" while leaving external-parameter-entities and DOCTYPE processing enabled, so parameter-entity based XXE/DTD attacks remain possible on the default DOM/SAX conversion paths.",
+      "title": "XXE: message-body XML parsed with external entities/DTD enabled (camel-stax StAX iterator; camel-core XmlConverter)",
+      "trace": "StAX: StAXJAXBIteratorExpression.evaluate (lines 113-125) -> exchange.getIn().getMandatoryBody(InputStream.class) -> XMLInputFactory.newInstance() -> setProperty(IS_NAMESPACE_AWARE,false) -> createXMLEventReader(inputStream); the content is then handed to StAXJAXBIterator.getNextElement -> unmarshaller.unmarshal(reader, clazz) (line 217). A body such as <!DOCTYPE x [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><x>&xxe;</x> is resolved by the default factory (direct file read / outbound entity fetch / expansion DoS). DOM/SAX: XmlConverter.toDOMDocument(...) (e.g. lines 846-850, 871-874, 927-930) -> createDocumentBuilder(getDocumentBuilderFactory(exchange)) -> createDocumentBuilderFactory (1136-1163) sets only external-general-entities=false, so external-parameter-entities and DOCTYPE remain enabled; the SAX factory (1262-1278) has the same gap.",
+      "unverified": "No runtime confirmation was possible. The practical exfiltration capability of the XmlConverter parameter-entity path depends on the deployed JAXP/Xerces implementation and was not verified. It is also unconfirmed whether either site is the dataset's specific ground-truth patch; the RabbitMQ CamelSerialize deserialization is retained as the strongest alternative but was not selected as the candidate.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Scope reported 10,572 readable files, with 5 binary/sensitive path exclusions and tests/docs largely absent (docs contains 4 files). I covered the core layout: camel-core (~1,842 files), components (~5,280), connectors, platforms, tooling and examples. I searched broadly for command execution (Runtime.exec/ProcessBuilder absent), Java deserialization (ObjectInputStream/readObject), XML parser construction (DocumentBuilderFactory/SAXParserFactory/XMLInputFactory), SQL statement construction, URL/URI/SSRF sinks, file/path handling, script engines, and reviewed security-relevant paths in camel-core, camel-http(-common/http4), camel-netty(-http), camel-rabbitmq, camel-stax, camel-shiro, camel-xstream/hessian/castor, camel-sql/jdbc, camel-swagger-java and camel-undertow. Component-wide review was heuristic, not a line-by-line audit of all ~5,000 component files; Scala/Groovy sources (camel-swagger, camel-grape) and examples/tooling received only spot checks.",
+  "limitations": [
+    "No test sources are present in the snapshot, so intended behavior/regression coverage could not be cross-checked.",
+    "No code execution, scanners, or exploit payloads were run; all conclusions are source-level and unconfirmed at runtime.",
+    "No VCS metadata, changelogs, or external data were available, so mapping the finding to a specific CVE/fix commit is uncertain.",
+    "The snapshot is a 2.21.4 release tree; if the dataset's ground truth is a different component or a different weakness class (e.g. the RabbitMQ deserialization), this candidate would not match it.",
+    "The practical exploitability of the DOM/SAX parameter-entity path varies by JAXP/Xerces version and was not verified."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "camel-rabbitmq: RabbitMQMessageConverter.populateMessageBody/deserializeBody (lines 274-298) deserializes the AMQP body with a plain ObjectInputStream whenever the publisher-set header CamelSerialize=true is present (RabbitMQEndpoint.SERIALIZE_HEADER, line 54); any publisher to a consumed queue can trigger gadget-chain RCE.",
+      "reason": "Real untrusted-header-triggered deserialization (CWE-502), but the header behavior is an intentional Camel-to-Camel reply-serialization feature, the trigger requires broker publish access, and no opt-in/allow-list exists in this code either way. Kept as an unselected alternative lead rather than the candidate."
+    },
+    {
+      "lead": "camel-http/camel-http4 SSRF via the Exchange.HTTP_URI / HTTP_PATH headers (HttpHelper.createURL, camel-http-common lines 255-303).",
+      "reason": "Documented Camel header override feature for producers; not an input-validation defect by itself and requires attacker control of Camel message headers in a forwarding route."
+    },
+    {
+      "lead": "camel-xmljson XmlJsonDataFormat.marshal delegates to json-lib's XMLSerializer.readFromStream (lines 161-163), whose internal SAX parser is unhardened.",
+      "reason": "The insecure parser lives in the third-party json-lib dependency, not in Camel-controlled factory construction; no Camel-side hardening hook is evident, so this is an unconfirmed dependency-level issue."
+    },
+    {
+      "lead": "camel-consul ConsulRegistry.deserialize (line 289), camel-sql ClassLoadingAwareObjectInputStream/JdbcCamelCodec, camel-cassandraql CassandraCamelCodec, camel-hbase HBaseHelper: ObjectInputStream.readObject on stored data.",
+      "reason": "Data originates from the backing store/database (KV/DB/aggregation repository), i.e. a storage trust boundary rather than direct remote message input; not the strongest local source-evidence issue."
+    },
+    {
+      "lead": "camel-core RouteCoverageXmlParser (lines 62-66) creates DocumentBuilderFactory/SAXParserFactory without XXE hardening.",
+      "reason": "Reachable through management/route-coverage operations rather than normal message processing; low reachability and impact compared with the selected finding."
+    },
+    {
+      "lead": "HTTP header filtering (HttpHeaderFilterStrategy) and camel-shiro token handling.",
+      "reason": "Reviewed and found intact (Camel/org.apache.camel patterns filtered; content-length/host filtered; Shiro token handling is AES-gated by a configured passphrase). No concrete bypass identified."
+    }
+  ],
+  "summary": "Reviewed the Apache Camel 2.21.4 main-source snapshot (10,572 readable files; the scope strips tests and most docs). I traced untrusted-input handling through message-driven components and the highest-risk sinks (XML parsers, Java deserialization, SQL statement construction, file/path and URL handling). Strongest candidate: XXE caused by XML parser factories created without complete external-entity/DTD restrictions on attacker-controlled XML — the camel-stax message-body iterator path is fully unprotected, and camel-core's XmlConverter/SAX factory retains parameter-entity/DTD processing. Other notable leads (RabbitMQ header-triggered Java deserialization, Exchange.HTTP_URI override, json-lib XMLSerializer, storage-layer deserialization, route-coverage parser) were assessed but not selected."
+}

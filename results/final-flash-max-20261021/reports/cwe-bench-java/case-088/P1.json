@@ -1,0 +1,110 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Console path: POST parameters name/pType/pValue (create/edit property) and strategy/strategyInit (create/edit feature) on the ff4j-web controllers; ConsoleOperations forwards them verbatim to PropertyFactory/MappingUtil. API path: PUT /ff4j/propertyStore/properties/{name} with JSON 'type'/'name'/'value' binds to PropertyApiBean.asProperty() -> PropertyFactory; PUT /ff4j/store/features/{uid} with JSON flippingStrategy.type binds to MappingUtil.instanceFlippingStrategy. ApiConfig defaults authenticate=false and autorize=false, and FF4jApiApplicationJersey2x.init() registers no filters in that state, so in a default ApiConfig deployment these PUT routes are reachable without credentials; when auth is enabled the caller only needs ROLE_WRITE. Console reachability depends on how the embedder protects the console URL, but no ADMIN_GROUPS/admin check exists in the handlers.",
+      "confidence": "medium",
+      "counterevidence_checked": "- The 'type'/'class' fields are documented as implementation class names, so reflection is partly by design; however, the value is used verbatim with no allow-list restricting it to org.ff4j.property.* or FlippingStrategy implementations, and it is reachable from request bodies/parameters rather than only from trusted configuration. - The post-instantiation cast to Property/FlippingStrategy limits the resulting object type only after the constructor has already run; therefore the limitation does not neutralize constructor side effects. - I did not identify a guaranteed universal RCE gadget from the source snapshot alone; the demonstrable impact is constructor side effects (e.g. arbitrary file creation/truncation through JDK classes) plus class-loading side effects. - Web console handlers assume the console URL is protected by the embedding application and the ApiConfig API assumes the embedder enables authentication; exploitation therefore depends on deployment configuration (default = no API auth). - Other candidate sinks were checked and do not counteract this one: XmlParser disables doctypes/external entities (XXE mitigated), YamlParser uses SafeConstructor, JDBC value binding uses PreparedStatement, Neo4j/Cassandra queries are parameterized, and Jackson is not configured with default typing.",
+      "id": "ff4j-unsafe-reflection-class-instantiation",
+      "impact": "Attacker-selected classes are loaded and public constructors are invoked with attacker-controlled string arguments. With the JDK always available, java.io.PrintWriter/Formatter (String fileName, String csn) let an unauthorized caller create or truncate arbitrary files writable by the server process (configuration/log/asset destruction, plantable empty files, DoS) and, more generally, exercise any side-effecting (String,String) or no-arg constructor present on the classpath - the standard gadget surface for RCE. The same request path also lets the caller define/rename/toggle features and properties (feature-flag manipulation, potentially disabling security-related toggles) in default API deployments where no authentication filter is registered.",
+      "locations": [
+        {
+          "end_line": 165,
+          "path": "ff4j-core/src/main/java/org/ff4j/property/util/PropertyFactory.java",
+          "start_line": 158
+        },
+        {
+          "end_line": 190,
+          "path": "ff4j-core/src/main/java/org/ff4j/utils/MappingUtil.java",
+          "start_line": 180
+        },
+        {
+          "end_line": 241,
+          "path": "ff4j-web/src/main/java/org/ff4j/web/embedded/ConsoleOperations.java",
+          "start_line": 226
+        },
+        {
+          "end_line": 131,
+          "path": "ff4j-web/src/main/java/org/ff4j/web/embedded/ConsoleOperations.java",
+          "start_line": 104
+        },
+        {
+          "end_line": 106,
+          "path": "ff4j-web/src/main/java/org/ff4j/web/controller/PropertiesController.java",
+          "start_line": 79
+        },
+        {
+          "end_line": 268,
+          "path": "ff4j-web/src/main/java/org/ff4j/web/controller/FeaturesController.java",
+          "start_line": 248
+        },
+        {
+          "end_line": 123,
+          "path": "ff4j-webapi/src/main/java/org/ff4j/web/api/resources/PropertyResource.java",
+          "start_line": 103
+        },
+        {
+          "end_line": 99,
+          "path": "ff4j-webapi/src/main/java/org/ff4j/web/api/resources/domain/PropertyApiBean.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 129,
+          "path": "ff4j-webapi/src/main/java/org/ff4j/web/api/resources/FeatureResource.java",
+          "start_line": 120
+        },
+        {
+          "end_line": 48,
+          "path": "ff4j-core/src/main/java/org/ff4j/web/ApiConfig.java",
+          "start_line": 44
+        },
+        {
+          "end_line": 100,
+          "path": "ff4j-webapi-jersey2x/src/main/java/org/ff4j/web/api/FF4jApiApplicationJersey2x.java",
+          "start_line": 92
+        }
+      ],
+      "prerequisites": "Network access to the ff4j console or the Jersey Web API. For the unauthenticated API path, the embedder must expose an ApiConfig in its default state (or null-configured app), which the code explicitly logs as 'No authentication nor authorization'. For file-side-effect impact, any class with a public (String,String) constructor on the classpath is sufficient - the JDK itself supplies java.io.PrintWriter(String fileName, String csn) and java.util.Formatter(String fileName, String csn), whose constructors create/truncate the named file. Stronger gadget availability depends on third-party dependencies.",
+      "root_cause": "Externally supplied strings are used directly as class names and constructor arguments with no validation against the expected ff4j implementation classes. PropertyFactory.createProperty(name, type, value) does Class.forName(pType).getConstructor(String.class, String.class).newInstance(pName, pValue) (ff4j-core PropertyFactory.java:158-165), so the attacker chooses the class and both string parameters. MappingUtil.instanceFlippingStrategy(uid, className, params) does Class.forName(className).newInstance() then init() (MappingUtil.java:180-190). In both cases the constructor executes before the result is cast to Property/FlippingStrategy, so constructor side effects and class initialization occur regardless of the later ClassCastException.",
+      "title": "HTTP-controlled class name instantiated via Class.forName/newInstance for properties and flipping strategies (unsafe reflection) in ff4j console and Web API",
+      "trace": "1) POST to the ff4j-web console with op=createProperty/op=editProperty -> PropertiesController.post (ff4j-web/.../PropertiesController.java:79-106) -> ConsoleOperations.createProperty/updateProperty (ff4j-web/.../ConsoleOperations.java:226-241 and 159-216) -> PropertyFactory.createProperty(name, pType, pValue, ...) -> Class.forName(pType).getConstructor(String.class, String.class).newInstance(name, value) (ff4j-core/.../PropertyFactory.java:163-164). 2) PUT /ff4j/propertyStore/properties/{name} -> PropertyResource.upsertProperty (ff4j-webapi/.../PropertyResource.java:103-123) -> PropertyApiBean.asProperty() (ff4j-webapi/.../PropertyApiBean.java:97-99) -> same PropertyFactory sink. 3) Feature creation/edit: PropertiesController/FeaturesController/ConsoleOperations pass the 'strategy' request parameter to MappingUtil.instanceFlippingStrategy -> Class.forName(className).newInstance() (ff4j-core/.../MappingUtil.java:183-185); the same primitive is used by FeatureResource.upsertFeature via FlippingStrategyApiBean.getType() (ff4j-webapi/.../FeatureResource.java:124) and by XmlParser/PropertiesParser/YamlParser when configuration files are imported (XmlParser.java:385-388 and 441-443, PropertiesParser.java:233-234 and 311, YamlParser.java:175-176 and 254). Because instantiation precedes the cast to Property/FlippingStrategy, the constructor body runs with attacker-chosen arguments even when the cast subsequently fails.",
+      "unverified": "Runtime reachability was not tested; the concrete deployed ApiConfig values, console URL protection, and the set of (String,String)/no-arg constructors available on a given classpath were not verified. The file-creation behavior of java.io.PrintWriter/Formatter is asserted from their documented JDK semantics, not executed. No exploit payload was built or run, and no external service, target, or credential was contacted.",
+      "weakness_type": "CWE-470 Use of Externally-Controlled Input to Select Classes or Code ('Unsafe Reflection'); arbitrary object instantiation (CWE-502-adjacent)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 580 model-visible source files (no binary/symlink/sensitive-name exclusions; 0 files over the size limit) with the same filters as B0. get_relation_scope reports the P1 index covered 578 of 580 files (2 source files absent from the index), 426 parsed Java files, 5,226 symbols / 10,822 syntax-level edges, and explicitly no control-flow, data-flow, semantic resolution, or Spring runtime enforcement; index labels were used only for navigation and every cited edge was verified in source text. I reviewed the Java sources and configuration of ff4j-core (FF4j, XmlParser, JSON/Property/Feature utilities, JDBC/InMemory/KeyValue stores, audit repository, flipping strategies, security), ff4j-web (servlet, dispatcher, all controllers, ConsoleOperations/ConsoleRenderer/ConsoleServlet, FileUtils, ImageProvider), ff4j-webapi and ff4j-webapi-jersey2x (resources, filters, security context, HTTP stores), ff4j-aop (advisor, placeholders, namespace parsers), ff4j-cli, ff4j-jmx, ff4j-config-xml/properties/yaml, and the store modules for JDBC/Spring-JDBC, Mongo, Neo4j, Cassandra, Elastic, Redis, HBase, Couchbase/CouchDB, ArangoDB, DynamoDB, GCP Datastore, Consul, CommonsConfig, and the security integrations. Templates/static JS/CSS and test resources were inspected only selectively (specific sinks around console rendering and import paths). No code, tests, scanners, or payloads were executed.",
+  "limitations": [
+    "Static review only: no build, no tests, no runtime validation; every finding is a source-evidence lead, not a confirmed exploit.",
+    "The P1 index omits 2 of 580 files and supports no control-flow/data-flow or semantic resolution, so completeness of cross-file tracing is bounded by manual reading; unresolved calls in the index (9,991) were not exhaustively followed.",
+    "Deployment-dependent assumptions remain unresolved: whether the Web API is exposed with the default ApiConfig (no auth filters), whether/how the console URL is protected, and which gadget classes exist on a given classpath.",
+    "Concrete JDK gadget behavior (java.io.PrintWriter/java.util.Formatter (String,String) constructors creating/truncating files) is based on documented JDK semantics and was not executed.",
+    "Third-party dependency vulnerabilities were not verified (no advisory lookups allowed in this run); only in-repo source logic was assessed.",
+    "Minified JavaScript, CSS, message bundles, site/documentation XML and most test resources were not audited line-by-line."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unparameterized SQL IN-clause in JdbcQueryBuilder.buildClauseIn (ff4j-core/src/main/java/org/ff4j/store/JdbcQueryBuilder.java:668-724) concatenates action/host/name/source filter values directly into SELECT/DELETE statements, which would be SQL injection if filters were attacker-controlled.",
+      "reason": "I could not trace attacker input to EventQueryDefinition filter sets from any in-snapshot entry point: the web controllers only set from/to dates (AbstractController.buildQuery:295-305), and the Web API MonitoringResource only accepts start/end. Reachability of a tainted filter remains unconfirmed, so it does not meet the evidence threshold."
+    },
+    {
+      "lead": "ff4j-web state-changing handlers (FeaturesController.post, PropertiesController.post, SettingsController.get, legacy ConsoleServlet POST, OperationsController) never enforce the ADMIN_GROUPS rule that AbstractController.makeWebContext (lines 216-228) uses only to set the 'enableEdit' UI variable.",
+      "reason": "Plausible broken access control (UI-only enforcement of an admin restriction), but it depends on a deployment that both exposes the console to non-admin authenticated users and relies on adminGroups as a real control; the framework documents the console as something the embedder must protect, and enableEdit may be intended as presentation-only. Weaker and more assumption-dependent than the selected candidate."
+    },
+    {
+      "lead": "Stored/DOM XSS in the console UI: ff4j-web/src/main/resources/static/js/ff4j.js (e.g. lines 158-170, 223-236) concatenates feature names, permissions and property names/values into HTML passed to jQuery .html(), and the legacy ConsoleRenderer builds HTML by string concatenation (ConsoleRenderer.renderMessageBox:288-300).",
+      "reason": "Real unescaped-output pattern, but exploitation requires write access to the feature/property store plus an administrator viewing the console page; impact is secondary to the class-instantiation issue and it overlaps the same trust assumptions."
+    },
+    {
+      "lead": "Third-party dependency versions (e.g. commons-configuration 1.10 in ff4j-store-commonsconfig, SnakeYAML, Jersey/Jackson stack) may carry known public vulnerabilities, notably Commons Configuration interpolation (script:/url: lookups) combined with PropertyStoreCommonsConfig.readProperty -> conf().getString(name) (PropertyStoreCommonsConfig.java:116-125).",
+      "reason": "This is a dependency-version risk rather than source logic in the snapshot, and I found no traced path where an unauthorized actor can plant an interpolated value that is later resolved; it was not verified against advisory data (external lookups were out of scope)."
+    },
+    {
+      "lead": "XML/config import paths instantiate classes named inside uploaded configuration files (XmlParser.parseFlipStrategy/parsePropertiesTag, ConsoleServlet.importFile, PropertiesParser, YamlParser).",
+      "reason": "Same root-cause family as the selected candidate (externally controlled class selection), but the upload endpoints are legacy/console-only and require file-upload access; they are noted inside the candidate trace instead of being split into a second candidate."
+    },
+    {
+      "lead": "Path traversal in StaticResourceController/FileUtils (ff4j-web) via request pathInfo passed to ClassLoader.getResourceAsStream.",
+      "reason": "Class-loader resource lookups do not traverse the filesystem ('..' entries are resolved inside the classpath) and servlet containers normalize pathInfo, so no concrete file-disclosure primitive was identified."
+    }
+  ],
+  "summary": "Defensive review of the FF4J 1.8.13 snapshot (580 source files across ff4j-core, ff4j-web, ff4j-webapi(-jersey2x), ff4j-aop, ff4j-cli, config parsers and ~30 store/strategy modules). I traced HTTP entry points into sensitive operations. XML parsing is already hardened against XXE (disallow-doctype, external entities disabled, XInclude/entity expansion off in XmlParser), YAML uses SafeConstructor, JDBC stores use PreparedStatements for values, Neo4j/Cassandra use parameterized queries, and Jackson is not configured with default typing. The strongest source-evidenced issue is unsafe reflection: request/JSON-controlled class names are passed to Class.forName(...).newInstance() / getConstructor(String,String).newInstance() when creating properties and flipping strategies, with no allow-list; because some API deployments use the default ApiConfig (authentication and authorization both disabled), the Web API route can be reachable without credentials. Concrete always-available impact is constructor-side-effect abuse (e.g., JDK java.io.PrintWriter(String,String)/java.util.Formatter(String,String) create/truncate arbitrary files); with richer classpaths this is a classic gadget surface that can escalate to code execution. This is a lead, not a runtime-confirmed vulnerability; no code was executed."
+}

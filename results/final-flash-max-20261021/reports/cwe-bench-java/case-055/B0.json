@@ -1,0 +1,73 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker controls the scanned HTML string passed to AntiSamySAXScanner.scan(...) (also reachable via AntiSamy.scan(html, policy, AntiSamy.SAX) and the Reader/Writer scan API). Element names and their text content are fully attacker-controlled.",
+      "confidence": "low",
+      "counterevidence_checked": "The DOM scanner (the default scan path) uses the correct `\"style\".equals(tagNameLowerCase)` test, so only SAX-mode scans are affected. Among the shipped policies, only antisamy-tinymce.xml contains a suffix tag (`s`); antisamy.xml and the other policies have no validate-action tag whose name is a suffix of \"style\", so they are unaffected. The CSS scanner still validates every CSS property/value, so the diverted content is not passed through unchecked; the primary observable effect may be content loss rather than injection. I could not reproduce the behavior at runtime, and I did not find a payload that provably yields script execution.",
+      "id": "case-055-cand-1",
+      "impact": "Sanitization divergence in the SAX path: content inside affected elements is re-interpreted as CSS rather than validated as HTML, nested elements/attributes are silently dropped, and the element's surviving attributes are limited to those captured for the CSS element. Depending on the policy and on how the cleaned CSS is re-serialized/re-parsed by consumers, this is a precondition for filter bypass/content smuggling and for content-loss denial of service (a malformed CSS element is removed from output). I did not establish a concrete script-execution chain from source alone, so the impact should be treated as a sanitizer-correctness/robustness defect with plausible (not confirmed) XSS relevance.",
+      "locations": [
+        {
+          "end_line": 364,
+          "path": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+          "start_line": 278
+        },
+        {
+          "end_line": 106,
+          "path": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+          "start_line": 103
+        },
+        {
+          "end_line": 203,
+          "path": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+          "start_line": 162
+        },
+        {
+          "end_line": 149,
+          "path": "src/main/resources/antisamy-tinymce.xml",
+          "start_line": 149
+        }
+      ],
+      "prerequisites": "The SAX scan path must be used (AntiSamy.SAX or AntiSamySAXScanner / stream scan API), and the active policy must map a tag whose name is a suffix of \"style\" (e.g. `s`, `l`, `e`, `t`, `t`-like names) to action=\"validate\". The shipped antisamy-tinymce.xml defines `<tag name=\"s\" action=\"validate\" />`; custom policies could add others.",
+      "root_cause": "In MagicSAXFilter.startElement, the CSS-containment decision uses `\"style\".endsWith(element.localpart)` (line 280) instead of testing that the element name equals \"style\". `endsWith` is true not only for `style` but for every element name that is a suffix of the literal \"style\" (s, t, y, l, e, st, ty, yl, le, ...). Any validate-action element with such a name is therefore treated as a stylesheet container: its children are removed (startElement pushes Ops.REMOVE while top op is CSS, lines 261-264), its raw character data is accumulated as CSS (characters(), lines 103-106), and its content is replaced by the CssScanner output (endElement Ops.CSS branch, lines 162-203) instead of going through normal tag/attribute/child HTML validation. The equivalent DOM-scanner check is a correct equality test (`\"style\".equals(tagNameLowerCase)` in AntiSamyDOMScanner.actionValidate), confirming the intended semantics.",
+      "title": "MagicSAXFilter misclassifies elements as <style> via reversed endsWith, diverting their contents into the CSS sanitizer",
+      "trace": "MagicSAXFilter.startElement → tag found with action validate → line 280 sets isStyle=true for element.localpart \"s\" → attributes are validated and `operations.push(Ops.CSS)`, cssContent allocated and cssAttributes captured (lines 360-363) → MagicSAXFilter.characters (lines 103-106) appends the element's raw text to cssContent instead of emitting it → nested elements inside it are force-removed (lines 261-264) → endElement sees Ops.CSS and runs CssScanner.scanStyleSheet(cssContent) (lines 162-191); the cleaned CSS result is emitted as the element's only content and the original markup neither reaches HTML validation nor (if the CSS does not parse) the output at all.",
+      "unverified": "No test suite or runnable build is present in the snapshot, so the runtime behavior of the SAX pipeline (NekoHTML/Xerces/Batik jars are external) is not verified. Whether the diversion can be escalated to actual XSS, versus only content rewriting/loss, remains unproven. It is also possible this line is a pre-existing upstream defect unrelated to the snapshot's intended issue.",
+      "weakness_type": "Incorrect condition / improper neutralization (CWE-697, CWE-79 class)"
+    }
+  ],
+  "coverage_summary": "Source scope reported 54 files (27 Java main sources, 6 XML policies, 11 localization bundles, pom/CI/docs); no test sources are included in the snapshot. I read all of the sanitizer/scan classes (AntiSamy, AntiSamyDOMScanner, AntiSamySAXScanner, MagicSAXFilter, AbstractAntiSamyScanner, serializers, Constants), the CSS stack (CssScanner, CssHandler, CssValidator, CssParser), the policy/model classes (Policy, InternalPolicy, Attribute, Tag, AntiSamyPattern, TagMatcher, Constants), utilities (URIUtils, XMLUtil, HTMLEntityEncoder, ErrorMessageUtil), and sampled the shipped policy XML for tags, global/dynamic attributes, URL/event-handler regexes, and CSS property rules (antisamy.xml, antisamy-tinymce.xml and targeted searches across the other policies). Dependencies (NekoHTML, Xerces, Batik, HttpClient) are not part of the snapshot, so their runtime behavior could not be inspected.",
+  "limitations": [
+    "No build, tests, scanners, or execution were permitted; all conclusions are static source reasoning and no finding is runtime-confirmed.",
+    "Key parsing/serialization behavior lives in external jars (NekoHTML 1.9.22, Xerces serializer, Batik CSS, HttpClient) and could not be inspected, which limits certainty about mXSS/attribute-smuggling and CSS re-serialization behavior.",
+    "The snapshot carries pom version 1.6.5 and no changelog/test suite, so I could not verify which upstream security fix this snapshot predates or whether any defect is intentionally introduced.",
+    "Only repository-relative readable text files were available; localization bundles and large policy files were reviewed only by targeted searches for security-relevant entries."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AntiSamyDOMScanner.processStyleTag only CSS-sanitizes the first child of a <style> element (lines 403-447) while additional children (e.g. CDATA nodes converted to Text by stripCData, lines 637-642) are serialized inside the raw-text style context; an attacker-supplied </style> in such a child could break out on browser re-parse.",
+      "reason": "Exploitability depends on external NekoHTML CDATA-node behavior inside <style> and on whether the external Xerces serializer escapes text inside <style>; neither dependency is present in the snapshot, so this rests on unverifiable assumptions. Also, with the shipped policies the style tag has action \"validate\" (antisamy.xml) and CssScanner rejects content containing unescaped markup, so no payload could be confirmed from source alone."
+    },
+    {
+      "lead": "The DOM scanner silently swallows failure to enable the security feature \"http://cyberneko.org/html/features/enforce-strict-attribute-names\" (AntiSamyDOMScanner lines 217-222) while pom.xml still depends on unpatched net.sourceforge.nekohtml:nekohtml:1.9.22 (pom.xml lines 64-75); the SAX parser never enables it (AntiSamySAXScanner.getParser, lines 204-218), leaving malformed-attribute-name parsing differences between the sanitizer and browsers as a possible XSS vector.",
+      "reason": "This is a missing dependency/hardening condition rather than a defect visible in the reviewed source: the vulnerable parsing behavior lives in the external NekoHTML library, which is not in the snapshot. No concrete malformed-attribute payload could be validated from source, so it did not meet the evidence threshold for a candidate."
+    },
+    {
+      "lead": "MagicSAXFilter accepts and CSS-scans a `style` attribute for any validated tag without first requiring the attribute to exist in the policy (line 300 checks only the name, unlike the DOM path which also checks attr != null), so style may be retained on tags whose policy forbids it.",
+      "reason": "CSS property/value validation is still applied to the value, so the divergence only widens CSS allowance rather than enabling arbitrary markup; no direct XSS impact demonstrated."
+    },
+    {
+      "lead": "Param-as-embed conversion in AntiSamyDOMScanner/MagicSAXFilter can emit `<param name=\"X\" value=\"\">` with an attacker-chosen attribute name X after invalid attributes are stripped, and setAttribute(nameValue, ...) can throw on invalid DOM names (potential uncaught DOMException).",
+      "reason": "The emitted name/value pair remains inside a <param> element and the serializer escapes attribute values; no attribute-name injection or script execution could be derived. The DOMException case is at most an availability/robustness issue."
+    },
+    {
+      "lead": "URIUtils.resolveAsString performs File/URL operations on caller-supplied href strings and Policy's include handling uses it for policy loading.",
+      "reason": "Policy includes are restricted to local file:/jar: URLs via verifyLocalUrl and the method operates on policy files, not on the untrusted HTML being sanitized; no attacker-controlled path reaching it was found in the scan flow."
+    },
+    {
+      "lead": "XMLUtil.decode uses Matcher.matches() before replaceAll, so only fully-matching entity strings are decoded.",
+      "reason": "Affects policy-file value decoding only (trusted configuration); no security impact on untrusted HTML sanitization."
+    }
+  ],
+  "summary": "Reviewed the AntiSamy 1.6.5 source snapshot (54 files: 27 main Java classes, 11 policy/property resources, CI/pom/docs). The DOM and SAX sanitizer paths, the CSS scanner/validator, policy loading, attribute matching, serializers, and shipped policy files were inspected. The single strongest source-backed lead is an incorrect element-classification check in the SAX filter: `boolean isStyle = \"style\".endsWith(element.localpart)` is true for any element whose name is a suffix of \\\"style\\\" (e.g. `s`, `l`, `e`, `t`), so such validate-action elements are diverted into the CSS pipeline instead of being validated as HTML. I could not establish a complete XSS chain from source alone, so this is submitted as a low-confidence lead, with the more speculative CDATA/multi-child `<style>` and unpatched-NekoHTML attribute-name leads listed as rejected/unconfirmed."
+}

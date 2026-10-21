@@ -1,0 +1,100 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The request parameter `fullName` on `GET /dolphinscheduler/resources/download` is a plain `@RequestParam String` supplied entirely by the client (no transformation, escaping, normalization, or whitelist). The service uses it verbatim as the source storage path. The only checks are (a) the login interceptor requires a valid session/token (`AppConfiguration` lines 104-109, `LoginHandlerInterceptor`), and (b) the path must not end with '/'. No tenant, resource-id, or permission check exists. For LOCAL storage, an absolute or `file:/`-relative OS path (e.g. `/etc/passwd`, `<install>/conf/application.yaml`) can be selected; for HDFS/S3/OSS any cluster path/bucket key can be selected.",
+      "confidence": "high",
+      "counterevidence_checked": "Verified that the login interceptor covers `/**/*` and only excludes login/register/swagger/oauth2/cookies paths, so `/resources/download` is not anonymous but is not permission-gated beyond authentication. Verified no global method-security annotations (`@PreAuthorize`/custom permission annotations) exist in the snapshot. Verified the sibling method `queryResourceListPaging` does enforce `StringUtils.startsWith(fullName, baseDir)` and that other methods call `isUserTenantValid`, showing the intended confinement that `downloadResource` omits. Verified `HdfsStorageOperator.download` and `S3StorageOperator.download` do not prepend or validate the tenant root, and that the `tenantCode` argument is unused for confinement. Verified the shipped default storage type is LOCAL. Checked that `readResource` is partially mitigated by a view-suffix allowlist but `downloadResource` has no equivalent restriction, so the download endpoint is the broader vector.",
+      "id": "case-112-cand-1",
+      "impact": "Confidentiality breach: any authenticated user can read files readable by the API-server process (e.g. `/etc/passwd`, `conf/application.yaml` containing datasource/registry credentials, `dolphinscheduler_env.sh`, SSH material), enabling credential theft and lateral movement/full environment compromise; on shared HDFS/S3/OSS storage it is a cross-tenant data disclosure of arbitrary stored resources. Integrity/availability are not directly modified by this endpoint.",
+      "locations": [
+        {
+          "end_line": 464,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/controller/ResourcesController.java",
+          "start_line": 446
+        },
+        {
+          "end_line": 1400,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 1370
+        },
+        {
+          "end_line": 549,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 541
+        },
+        {
+          "end_line": 335,
+          "path": "dolphinscheduler-storage-plugin/dolphinscheduler-storage-hdfs/src/main/java/org/apache/dolphinscheduler/plugin/storage/hdfs/HdfsStorageOperator.java",
+          "start_line": 295
+        },
+        {
+          "end_line": 378,
+          "path": "dolphinscheduler-storage-plugin/dolphinscheduler-storage-hdfs/src/main/java/org/apache/dolphinscheduler/plugin/storage/hdfs/HdfsStorageOperator.java",
+          "start_line": 358
+        },
+        {
+          "end_line": 35,
+          "path": "dolphinscheduler-storage-plugin/dolphinscheduler-storage-hdfs/src/main/java/org/apache/dolphinscheduler/plugin/storage/hdfs/LocalStorageOperatorFactory.java",
+          "start_line": 29
+        },
+        {
+          "end_line": 227,
+          "path": "dolphinscheduler-storage-plugin/dolphinscheduler-storage-s3/src/main/java/org/apache/dolphinscheduler/plugin/storage/s3/S3StorageOperator.java",
+          "start_line": 203
+        },
+        {
+          "end_line": 27,
+          "path": "dolphinscheduler-common/src/main/resources/common.properties",
+          "start_line": 24
+        },
+        {
+          "end_line": 109,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/configuration/AppConfiguration.java",
+          "start_line": 104
+        }
+      ],
+      "prerequisites": "Authenticated DolphinScheduler account (any ordinary user with a tenant; only the login interceptor is enforced on this endpoint). Resource/storage feature active (storageOperate autowired; LOCAL is the shipped default per common.properties line 27, and other types are configured storage backends). No admin permission and no access to the target file's owner is required.",
+      "root_cause": "`ResourcesServiceImpl.downloadResource(User, String fullName)` (lines 1370-1400) only verifies that the login user exists and then calls `storageOperate.download(tenantCode, fullName, localFileName, true)` with the raw, caller-supplied `fullName`. Unlike every sibling resource operation in the same class, it performs no `isUserTenantValid(...)` check and no `StringUtils.startsWith(fullName, baseDir)` confinement check (compare `queryResourceListPaging` lines 541-549 and the `isUserTenantValid` helper lines 1760-1772). The storage layer then uses the caller's string directly as the source path: `HdfsStorageOperator.download` -> `copyHdfsToLocal(srcHdfsFilePath, ...)` -> `FileUtil.copy(fs, new Path(srcHdfsFilePath), ...)` (lines 295-299, 327-335, 378), and `S3StorageOperator.download` -> `s3Client.getObject(bucketName, srcFilePath)` (lines 203-227).",
+      "title": "Arbitrary file read / cross-tenant resource read via unvalidated `fullName` in `GET /resources/download`",
+      "trace": "1) Caller with a valid session/token calls `GET /dolphinscheduler/resources/download?fullName=<path>` (ResourcesController.downloadResource, lines 446-464). 2) `ResourcesServiceImpl.downloadResource` (lines 1371-1395) looks up only `userMapper.selectById(loginUser.getId())`, then `getTenantCode(user)`. 3) `fullName` is not checked against the user's tenant root and is passed directly to `storageOperate.download(tenantCode, fullName, localFileName, true)` (line 1393). 4) LOCAL: `LocalStorageOperatorFactory` builds an `HdfsStorageOperator` with `defaultFS=file:/`; `download` -> `copyHdfsToLocal` -> `FileUtil.copy(fs, new Path(fullName), dstFile, ...)` resolves the caller path against the local filesystem, so e.g. `/etc/passwd` is copied to `FileUtils.getDownloadFilename(alias)` under `/tmp/dolphinscheduler/download/...`. 5) The bytes are returned to the caller as an HTTP attachment via `file2Resource`/`ResponseEntity` (lines 1395, 460-463). With HDFS/S3 the same missing check lets a user read other tenants' objects (S3 uses `srcFilePath` directly as the object key).",
+      "unverified": "Not executed at runtime. The LOCAL-storage arbitrary OS file read is inferred from Hadoop `Path`/`FileUtil.copy` semantics with `file:/` default FS (absolute paths and `..` are resolved by the local filesystem); I did not run the server or Hadoop. Cross-tenant read on HDFS/S3 assumes the attacker can learn/guess object paths (listing APIs and the UI expose full names). Exact deployment storage type is environment-dependent, but LOCAL is the repository default.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-862 Missing Authorization (improper path confinement on a user-controlled storage path)"
+    }
+  ],
+  "coverage_summary": "Source scope: 3,332 model-visible files (no binary exclusions; no test sources present in the snapshot). P1 relation scope: index status partial — 3,291 files indexed, 41 source files missing from the index, 16,276 symbols, 40,312 call sites, 27,469 edges, 30,831 unresolved calls; no control-flow, data-flow, semantic resolution, or exploitability analysis; Spring/security facts are annotation-name candidates only. Primary review: dolphinscheduler-api (controllers, service impls, interceptors, security/authenticators, permission classes, aspects, Python gateway, config), dolphin scheduler-dao mappers/entities, storage plugins (hdfs/local, s3), datasource plugin API/MySQL/PostgreSQL, alert plugins, task-plugin API spots, common utils, and bootstrap YAML/properties. I traced the resource-center endpoints end-to-end and cross-checked sibling methods for the intended authorization model. Unreviewed/lightly reviewed: worker/master/remote runtime modules, most task plugins, UI sources, deploy charts, and database upgrade scripts. The relation index was used only for navigation; all reported locations were verified against source text.",
+  "limitations": [
+    "No build, tests, scanners, or runtime execution were performed; all statements are source-level and no finding is runtime-confirmed.",
+    "The LOCAL-storage arbitrary file read depends on Hadoop `file:/` path resolution semantics (absolute/`..` paths), which were inferred from source, not executed.",
+    "Storage backends differ: only HDFS/local (LocalStorageOperatorFactory) and S3 download implementations were inspected closely; OSS/OBS/GCS/ABS were not traced line-by-line.",
+    "Whether the tenant/root confinement omission is reachable in every deployment depends on configuration (`resource.storage.type`, `resource.view.suffixs`) and on the attacker holding an account.",
+    "41 files are absent from the P1 relation index and the index has no data-flow/control-flow semantics, so call-path coverage outside the traced files is not guaranteed; the repository was reviewed broadly but not exhaustively (3,332 files).",
+    "Historical intent (e.g. whether self-service tenant change or the download API without a root check was previously considered acceptable) could not be verified from the snapshot because no commit history, tests, or patch data are available in this run."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unvalidated `currentDir` in `ResourcesServiceImpl.createResource`/`onlineCreateResource`/`createDirectory` (lines 139-186, 203-268, 1137-1196): when `currentDir.contains(userResRootPath)` the code uses `currentDir + name` verbatim, so `../` segments in `currentDir` can escape the tenant root and (with LOCAL storage) `copyLocalToHdfs` can write attacker-controlled content outside the resource root, potentially achieving RCE (e.g. cron/authorized_keys).",
+      "reason": "Plausible and related, but not selected as the single candidate: exploitation requires the crafted `currentDir` to contain the tenant root substring, `name` is suffix/`directoryTraversal`-checked, the target must not already exist (`verifyResourceName`/`checkResourceExists`), and HDFS (non-local) treats `..` literally so the escape is mainly a LOCAL-storage issue. Kept as an unconfirmed lead rather than a second candidate."
+    },
+    {
+      "lead": "`UsersServiceImpl.updateUser` (lines 377-479) allows any user to update their own record via `POST /users/update` (self allowed by `canOperator`) and persists an arbitrary request-supplied `tenantId`, which is the resource-isolation and task-execution (Linux user) boundary.",
+      "reason": "Could be a horizontal privilege escalation, but the security docs (docs/docs/en/guide/security/security.md line 28) describe users switching tenants as supported behavior (with resource copying), so intent is ambiguous; `copyResourceFiles` appears to be dead code in this snapshot, which weakens but does not settle the question. Not elevated to a candidate because it may be documented intended behavior."
+    },
+    {
+      "lead": "Python gateway hard-coded default auto-token `jwUDzpLsNKEFER4*a8gruBH_GsAurNxU7A@Xc` bound to 0.0.0.0:25333 (dolphinscheduler-api application.yaml lines 132-143; PythonGateway.start lines 697-713), with admin-privileged methods (ADMIN_USER_ID=1) reachable by any client that can reach the port.",
+      "reason": "Deployment/default-credential hardening issue: the gateway only sets `authToken` if configured and the repo documents that the default should be changed, so exploitability depends on deployment exposure and unchanged defaults; no code-level authorization flaw beyond the shipped default."
+    },
+    {
+      "lead": "SnakeYAML typed `Constructor` in `HttpTaskDefinitionParser.parseYamlConfigFile` (lines 62-67) parsing a task-definition YAML file, and `K8sClientService.upsertNamespacedResourceToK8s` using `yaml.loadAs` (line 80).",
+      "reason": "Unsafe-deserialization patterns, but in this snapshot `BaseHttpTemplateLoopTaskExecutor` (the only caller of `HttpTaskDefinitionParser`) has no reachable in-repo caller, the YAML path must reference a resource file, and the K8s path is admin-only with numeric limit fields; no complete attacker-controlled path to the parser was established."
+    },
+    {
+      "lead": "`POST /datasources/connect` performs a JDBC connection from the API server using caller-supplied host/port/other without any permission check (DataSourceController lines 213-224).",
+      "reason": "Residual SSRF-type exposure, but `AbstractDataSourceProcessor.checkHost/checkOther` constrain host characters and the MySQL processor filters/overrides `autoDeserialize`/`allowLoadLocalInfile` (APPEND_PARAMS + checkKeyIsLegitimate), and pgjdbc 42.4.1 contains the known socketFactory/loggerFile protections; the practical impact could not be established from source alone."
+    },
+    {
+      "lead": "MyBatis `${}` usage in DAO mapper XMLs (e.g. `${alias}` fragments), command execution sinks in alert/task plugins, and `ProcessDefinitionServiceImpl` zip import.",
+      "reason": "Mapper `${}` occurrences are internal constant SQL fragments, not request data; task/alert command execution is the documented purpose of task/alert plugins behind project permissions; the zip import reads entries into memory rather than extracting paths. No user-controlled injection or file-write path was demonstrated."
+    }
+  ],
+  "summary": "Reviewed the DolphinScheduler 3.2.0 snapshot (3,332 model-visible files; 1,723 Java files) with emphasis on the API trust boundary, resource-center/storage path handling, authentication/permission checks, datasource/JDBC inputs, YAML/JSON parsing, alert and task plugins, and the Python gateway/config defaults. The strongest source-evidenced issue is a missing authorization/path-confinement check in the resource-center download path: any authenticated user can supply an arbitrary `fullName` to `GET /dolphinscheduler/resources/download`, which is handed straight to the storage operator with no tenant-root check. With the default LOCAL storage (`resource.storage.type=LOCAL` -> `file:/` via `LocalStorageOperatorFactory`), this yields arbitrary local file read on the API server; with HDFS/S3/OSS it yields cross-tenant object read (paths/keys are not bound to the caller's tenant). No other candidate met the same combined level of attacker control, missing validation, and impact, so the output is a single candidate with the remaining leads noted as unconfirmed/rejected."
+}

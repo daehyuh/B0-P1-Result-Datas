@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The peer's DH public value y (the BigInteger transmitted during a DH exchange / supplied as a DHPublicKey to KeyAgreement.doPhase), and in DHAgreement the raw `message` BigInteger passed into calculateAgreement. These are network/protocol inputs chosen by the remote party. The victim only chooses its own exponent x; parameters p,g are checked for equality but the value y is trusted.",
+      "confidence": "medium",
+      "counterevidence_checked": "DHPublicKeyParameters (core/.../crypto/params/DHPublicKeyParameters.java) does perform a q-based subgroup check when q != null, but y=1 passes it and q is frequently absent; DHBasicAgreement/DHAgreement accept already-constructed DHPublicKeyParameters so that partial check does not cover the y=1 / missing-q cases, and the JCE SPI bypasses it completely by using javax.crypto DHPublicKey directly. The EC KeyAgreementSpi (prov/.../ec/KeyAgreementSpi.java) delegates to an agreement object, showing the DH SPI's direct modPow is an inconsistency rather than an intended design. I found no compensating check in BaseAgreementSpi or engineGenerateSecret ('Shared key' string search returns nothing in the snapshot). The exact upstream fix version/commit and the benchmark ground-truth CVE could not be verified from the snapshot alone.",
+      "id": "case-029-dh-weak-public-value",
+      "impact": "A malicious key-agreement peer can force the negotiated secret to a known value (at minimum 1) or to a small set of values, defeating the confidentiality of the derived session key and enabling authentication/session-key bypass in protocols that use the raw DH secret or KDF output. With non-safe primes/small subgroups it can also enable classic Lim-Lee style private-exponent leakage. Affects both the lightweight API and the JCE 'DH' KeyAgreement used by higher-level protocols.",
+      "locations": [
+        {
+          "end_line": 70,
+          "path": "core/src/main/java/org/bouncycastle/crypto/agreement/DHBasicAgreement.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 93,
+          "path": "core/src/main/java/org/bouncycastle/crypto/agreement/DHAgreement.java",
+          "start_line": 81
+        },
+        {
+          "end_line": 112,
+          "path": "prov/src/main/java/org/bouncycastle/jcajce/provider/asymmetric/dh/KeyAgreementSpi.java",
+          "start_line": 104
+        }
+      ],
+      "prerequisites": "Application performs Diffie-Hellman key agreement with a remote/attacker-supplied public value: either the lightweight DHBasicAgreement/DHAgreement classes or the JCE 'DH'/'DHwithRFC2631KDF' KeyAgreement with a peer-controlled DHPublicKey. For the guaranteed case the peer sends y = 1 (or a small-order value when p-1 has small factors / q is absent, as is typical for JCE DHParameterSpec). No victim-side application check is required for the flaw to be reachable in the JCE path.",
+      "root_cause": "The DH agreement code never validates the peer's public value beyond checking domain parameters, and never rejects a degenerate shared secret. In core/src/main/java/org/bouncycastle/crypto/agreement/DHBasicAgreement.java, calculateAgreement does `return pub.getY().modPow(key.getX(), dhParams.getP());` with no check that y is in [2, p-2] and no check that the result is not 1. core/src/main/java/org/bouncycastle/crypto/agreement/DHAgreement.java performs `message.modPow(key.getX(), p).multiply(pub.getY().modPow(privateValue, p)).mod(p)` on the raw attacker-supplied `message`/`pub.getY()` with no range or result checks. The JCE path is worse: prov/src/main/java/org/bouncycastle/jcajce/provider/asymmetric/dh/KeyAgreementSpi.java lines 106/111 compute `((DHPublicKey)key).getY().modPow(x, p)` directly, so DHPublicKeyParameters is never constructed and its q-based validation is entirely bypassed (JCE DHParameterSpec carries no q anyway). The check in DHPublicKeyParameters.validate only enforces y^q = 1 when q is present, which y = 1 satisfies, and does not enforce y != 1 or result != 1.",
+      "title": "DH key agreement accepts weak peer public values and can derive a predictable shared secret (small-subgroup / weak-key flaw)",
+      "trace": "Remote peer -> DHPublicKey/y (or DHAgreement `message`) -> DHBasicAgreement.calculateAgreement / DHAgreement.calculateAgreement / dh.KeyAgreementSpi.engineDoPhase -> only parameter-equality is checked -> exponentiation proceeds -> result is 1 (y=1) or confined to a small predictable subgroup -> shared secret is attacker-known/predictable and is returned as the JCE secret / used as key material. Modern Bouncy Castle code for these classes adds exactly peerY in [2, p-2] and a rejection when the computed secret equals 1 ('Diffie-Hellman public key is weak' / 'Shared key can't be 1'), which is absent here (observed from source knowledge, not verified at runtime in this run).",
+      "unverified": "Not runtime-confirmed; no test suite or build executed. The claim that upstream Bouncy Castle later added the peerY range check and the 'Shared key can't be 1' check is from source familiarity with later bc-java code, not from a diff checked in this environment. The precise CVE/benchmark ground-truth for case-029 was not identified, and I could not establish whether the intended fix commit was the DH agreement fix or another same-era fix (see rejected leads).",
+      "weakness_type": "Improper input validation in cryptographic key agreement (CWE-20/CWE-325-like; small-subgroup / weak public key attack)"
+    }
+  ],
+  "coverage_summary": "Applied the source-scope filters reported by get_source_scope (3199 model-visible text files; binary-like files skipped; no over-5MiB/sensitive/symlink exclusions). There are no test trees in the snapshot. I read or searched representative security-relevant areas: crypto agreement (DH/ECDH/ECDHC/ECMQV/SRP6/JPAKE), signers (DSA/ECDSA/GOST/ECGOST/DSTU4145), encodings (PKCS1/OAEP), RSA engines/blinding, key parameter classes, ASN.1 input/stream/length parsing, X.509/TSP/CMS paths, PGP key classes, and JCA/JCE provider key agreement and key classes; I also compared several duplicate classes across main/j2me/jdk1.1/jdk1.3/jdk1.4 source trees as a mutation oracle. I did not read every one of the 3199 files, so unread areas (e.g. much of pqc, symmetric engines, PGP/CMS internals, LDAP store helpers) remain coverage gaps.",
+  "limitations": [
+    "No tests, build execution, or runtime confirmation; findings are static source observations only.",
+    "No git metadata/history and no network access, so the exact upstream fix commit and CVE mapping for this snapshot could not be verified; candidate selection cannot be confirmed against benchmark ground truth.",
+    "Multiple plausible same-era validation gaps exist (DH peer value, ElGamal public key, ECDH cofactor handling); only the strongest was submitted and the others are listed as rejected leads.",
+    "Sibling source trees (j2me/jdk1.1/jdk1.3/jdk1.4) are legitimate older variants, so text differences there are not automatically evidence of tampering.",
+    "Submissions are leads, not confirmed vulnerabilities; line ranges refer to the snapshot as read."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ElGamalPublicKeyParameters (core/src/main/java/org/bouncycastle/crypto/params/ElGamalPublicKeyParameters.java lines 10-17) accepts any y without range/subgroup validation, unlike the analogous DSAPublicKeyParameters/DHPublicKeyParameters classes; ElGamalEngine then exponentiates it. This is a plausible same-era validation gap and may correspond to one of the 2016 Bouncy Castle CVE fixes, but ElGamal is much less commonly used than DH key agreement and I could not confirm that the corresponding upstream fix or benchmark ground truth targets this file, so it was not selected.",
+      "reason": "Plausible but lower impact and uncertain fix/ground-truth attribution; no decisive source evidence that this is the injected/benchmarked issue."
+    },
+    {
+      "lead": "ECDHBasicAgreement/ECDHCBasicAgreement (core/src/main/java/org/bouncycastle/crypto/agreement/) multiply the peer point without re-checking it via ECPoint.isValid()/ECAlgorithms.cleanPoint, and do not reject a small-order input point for cofactor > 1 curves. ECPublicKeyParameters.validate only checks on-curve/non-infinity, not subgroup membership.",
+      "reason": "The cleanPoint/cofactor handling was added much later in bc-java history (post-1.56), so a 1.55/1.56-dev snapshot is unlikely to be its parent; also partly mitigated by on-curve validation at construction."
+    },
+    {
+      "lead": "PKCS1Encoding.decodeBlock/decodeBlockOrRandom (core/src/main/java/org/bouncycastle/crypto/encodings/PKCS1Encoding.java) lack explicit block-length checks before accessing data[0] / padding indexes, and the shared blockBuffer can retain previous plaintext between calls.",
+      "reason": "Behavior largely matches upstream of that era; no concrete attacker-controlled acceptance/leak path was established beyond DoS on misconfigured pLen, and it is not tied to the validation gaps seen elsewhere in this snapshot."
+    },
+    {
+      "lead": "Treating a synthetic LLM-injected bug as the target and hunting style/permission anomalies across all 3199 files (randomness use, MAC comparisons, empty catches, file/path sinks).",
+      "reason": "No injected-bug artifact (unused fix imports, inconsistent sibling copy, hardcoded secret, disabled check) was found in the paths inspected; the snapshot's structure and the version/release-notes state are consistent with a real pre-1.56 development commit rather than a synthetic edit, but full-file review of all 3199 files was not possible."
+    }
+  ],
+  "summary": "Snapshot is a Bouncy Castle bc-java tree (core/prov/pkix/pg/mail/jce, ~1.55/1.56-dev per bc-build.properties and docs/releasenotes.html). I reviewed the crypto core, JCA/JCE provider key-agreement paths, ASN.1 parsing, CMS/TSP and PGP code. The strongest source-grounded issue is missing validation of the peer's Diffie-Hellman public value in DH key agreement: the lightweight DHBasicAgreement/DHAgreement only check domain parameters and then exponentiate an attacker-supplied value, and the JCE DH KeyAgreementSpi computes y.modPow(x,p) directly without ever building a validated DHPublicKeyParameters. A malicious peer can therefore supply a weak value (e.g. y = 1, or a small-subgroup element when q is absent) and force the shared secret to 1 / a small predictable set. The q-based check in DHPublicKeyParameters is insufficient (1 passes it) and JCE DHParameterSpec has no q at all. This is a real, well-known class of key-agreement flaw (small-subgroup / weak public key), not a pure hardening suggestion: attacker-controlled peer key material directly determines the derived secret. I found no hard-coded secrets, command/path injection, or MAC-comparison weakness in the reviewed paths. One candidate submitted; other leads listed as unconfirmed."
+}

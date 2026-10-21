@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The grammar URI comes from the XML document itself: xsi:schemaLocation / xsi:noNamespaceSchemaLocation attribute values, DOCTYPE SYSTEM/PUBLIC ids, or xml-model href PIs (ContentModelProvider implementations; SchemaLocation / NoNamespaceSchemaLocation DOM classes). A malicious XML file opened in an editor (e.g. a file from a cloned repository or downloaded document) therefore controls the scheme/host/path components used to build the cache path; the paths can contain \"../\" or \"%2e%2e/\" segments. The remote host also controls redirect Location headers for downloaded resources. No local privileges or settings changes are required: cache use is on by default (ContentModelManager.java:69-72).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that a containment guard exists (FilesUtils.isIncludedInDeployedPath, FilesUtils.java:204-206) — it is real but is placed after the existence early-return in getResource, and it is not applied at all in getResourceCachePath, which is the function that builds the path used for reads-by-cache, for cfg/codelens display and for deletion. Checked that downloads are separately gated by isDownloadExternalResources (CacheResourcesManager.java:145-148) — that gate does not protect the read of an already-existing out-of-cache file, which is the primary sink here. Checked the resolver chain: catalog/file-association resolvers return null for a generic http URI and XMLCacheResolverExtension.resolve returns null by design, so the default expandSystemId path is what produces the traversable URI. Verified that Paths.get(Path, String...) joins elements without collapsing \"..\" and that the outer Files.exists/delete resolve them against the filesystem, and that java.net.URI#getPath() decodes percent escapes.",
+      "id": "cache-path-traversal-grammar-read-delete",
+      "impact": "Confidentiality: an attacker-supplied XML document can make the language server read and parse an arbitrary existing local file located by traversing out of ~/.lemminx/cache (the containment property that the project’s own CVE-2019-18212 fix, CHANGELOG.md:356, was intended to guarantee). Parsed file content is fed into diagnostics and documentation/hover flows, so parts of the file can be surfaced in the client UI. Integrity (same root cause, second sink): the unvalidated cached path is later handed to Files.deleteIfExists by the revalidate command handler, which can delete an arbitrary existing file reachable through the traversal (e.g. a user configuration or key file) rather than a cached grammar.",
+      "locations": [
+        {
+          "end_line": 153,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/uriresolver/CacheResourcesManager.java",
+          "start_line": 139
+        },
+        {
+          "end_line": 249,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/uriresolver/CacheResourcesManager.java",
+          "start_line": 239
+        },
+        {
+          "end_line": 206,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/utils/FilesUtils.java",
+          "start_line": 204
+        },
+        {
+          "end_line": 272,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/extensions/contentmodel/model/ContentModelManager.java",
+          "start_line": 233
+        },
+        {
+          "end_line": 451,
+          "path": "org.eclipse.lemminx/src/main/java/org/eclipse/lemminx/extensions/contentmodel/model/ContentModelManager.java",
+          "start_line": 424
+        }
+      ],
+      "prerequisites": "Use of the default settings (useCache = true) and a document that references a grammar whose computed cache path resolves to an existing file outside the deployed base, e.g. xsi:schemaLocation=\"http://example.org/ns http://attacker/../../../../.ssh/id_rsa\" (four \"..\" from <base>/cache/http/host reach the parent of the ~/.lemminx base). The read path triggers on normal validation/completion/hover of the document; the destructive path additionally requires the LSP client to execute command \"xml.validation.current.file\" for that document (XMLValidationFileCommand.java:39,58 -> ContentModelManager.evictCacheFor).",
+      "root_cause": "CacheResourcesManager computes the cache location as Paths.get(\"cache\", uri.getScheme(), uri.getHost(), uri.getPath()) resolved against the deployed base (~/.lemminx) without ever validating that the result stays inside the deployed base (CacheResourcesManager.java:239-249 and 104-109). The containment guard FilesUtils.isIncludedInDeployedPath (FilesUtils.java:204-206) exists but is only consulted *after* the `Files.exists(resourceCachePath)` early-return in getResource (CacheResourcesManager.java:139-153), so any URI whose decoded path escapes the cache directory and happens to exist is treated as an already-cached grammar and returned. java.net.URI#getPath() decodes percent escapes, so \"%2e%2e\" becomes \"..\" at path-construction time, and plain \"../\" in an absolute system id also survives because absolute system ids are returned verbatim by the resolver (DefaultURIResolverExtension.resolve -> XMLEntityManager.expandSystemId, URIResolverExtensionManager.java:50-56). The same unvalidated cached path is recomputed for display/caching (ContentModelManager.java:257-266) and then used to delete files (ContentModelManager.java:434-441).",
+      "title": "Grammar cache path derived from untrusted URI path is not contained to the cache directory (out-of-cache file read; same path used for deletion)",
+      "trace": "1) XML document attribute/DOCTYPE/PI value is parsed into an Identifier (systemId) by the content-model providers. 2) ContentModelManager.findCMDocument / getReferencedGrammarInfos call resolverManager.resolve/resolveInfo (ContentModelManager.java:186,235); for http(s)/ftp system ids the default resolver returns the system id expanded by XMLEntityManager.expandSystemId, which returns already-absolute system ids unchanged (URIResolverExtensionManager.java:50-56). 3) cacheResolverExtension.canUseCache(resolvedUri) is true for http/https/ftp with cache enabled, so cacheResolverExtension.getCachedResource(resolvedUri) is called (ContentModelManager.java:247,313; XMLCacheResolverExtension.java:94-103). 4) CacheResourcesManager.getResource first computes getResourceCachePath(resourceURI) — Paths.get(\"cache\", scheme, host, uri.getPath()) resolved against the deployed base, with the URI path decoded by java.net.URI#getPath() (so %2e%2e becomes ..) and no containment validation (CacheResourcesManager.java:239-249). 5) The `Files.exists(resourceCachePath)` early-return fires before the isIncludedInDeployedPath guard, so an existing file reached through \"..\" is silently accepted as the cached grammar (CacheResourcesManager.java:140-153). 6) The returned path is read as an XSD/DTD (CMDocument creation at ContentModelManager.java:315/322, or XMLFileInputSource at XMLCacheResolverExtension.java:36-57/73-83), so a local file outside the cache directory is loaded and parsed as the grammar (its content then drives diagnostics/completion/hover). 7) Separately, ContentModelManager.fillReferencedGrammarInfo stores the same unvalidated path as GrammarCacheInfo.cachedResolvedUri (ContentModelManager.java:244-267), and ContentModelManager.evictCacheFor passes it to Files.deleteIfExists(FilesUtils.getPath(resolvedURI)) (ContentModelManager.java:435-438), which deletes the resolved out-of-cache file.",
+      "unverified": "Not runtime-confirmed. I could not execute the parser: whether an absolute system id containing \"../\" or \"%2e%2e/\" survives Xerces' URI handling unchanged (reasoned from XMLEntityManager.expandSystemId/URI semantics, which return absolute system ids verbatim), whether Path.toUri() preserves \"..\" segments (needed for the deletion sink to reach the out-of-cache file, since cachedResolvedUri is round-tripped through Path#toUri then FilesUtils.getPath), and whether any client (e.g. vscode-xml) invokes \"xml.validation.current.file\" automatically rather than only on explicit user action. Also unverified whether the traversed file’s content is echoed in specific diagnostic messages for a given target file.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-552 Files or Directories Accessible to External Parties (confidentiality, plus integrity via deletion)"
+    }
+  ],
+  "coverage_summary": "Source scope: 444 model-visible files (406 Java) under the assigned root; no binary/symlink/sensitive-path exclusions were reported. P1 relation index reports complete coverage of the same 444 files (406 Java parsed, 0 parse errors, 11132 call rows / 10123 edges / 4564 symbols) but is syntax/name-based only — no control flow, no data flow, no semantic resolution, and 6026 unresolved calls — so all index edges used for navigation were re-verified in source text. I read the grammar resolution, cache/download, diagnostics (XML/XSD/DTD validators and parser configuration), URI-resolver extensions (catalog, file association, cache, XSD, XSL), entity handling, commands, telemetry, file utilities, markup/hover and settings paths, and representative service/extension code. Not exhaustively reviewed: large service classes (XMLCompletions, XMLFormatter, XMLPositionUtility, XMLSymbolsProvider, DOM/parser internals), the xpath matcher package, formatter/folding/selection-range code, and the generators package.",
+  "limitations": [
+    "No tests are present in the snapshot (src/test was not included), so vulnerability-relevant regressions/expectations could not be inferred from test code.",
+    "All .xsd/.dtd resource files are absent from the snapshot (e.g. schemas/xsd/XMLSchema.xsd, XMLSchema.dtd, xml.xsd, schemas/xslt/*, schemas/catalog/catalog-1.1.xsd referenced by XSDURIResolverExtension, XSLURIResolverExtension and XMLCatalogURIResolverExtension); file-filtering artefact noted, but those assets and any vulnerability inside them were not inspectable.",
+    "No code execution, build, test run or scanner was performed (prohibited); every finding is static source evidence only, and no candidate is runtime-confirmed.",
+    "Path-traversal feasibility depends on JDK/Xerces normalisation semantics (URI#getPath decoding, Paths.get joining, Path#toUri round-trip) that were reasoned about but not executed; both read and delete sinks are therefore medium confidence.",
+    "The relation index cannot prove reachability of the \"xml.validation.current.file\" command from a given LSP client, and client behaviour (automatic vs. user-triggered) is out of scope of this snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE in XSD validation: XSDValidator sets EXTERNAL_GENERAL_ENTITIES_FEATURE and EXTERNAL_PARAMETER_ENTITIES_FEATURE to true unconditionally (XSDValidator.java:81-84) and passes the LSP entity resolver, which can read file:// and (with downloads enabled) http(s)/ftp resources, while the XML validation path honours xml.validation.resolveExternalEntities (default false, LSPXMLParserConfiguration.java:65-71, XMLValidationSettings.java:47).",
+      "reason": "Plausible hardening gap, but there is meaningful counterevidence that it is intentional: LemMinX ships XMLSchema.dtd and resolves http://www.w3.org/2001/XMLSchema.dtd through XSDURIResolverExtension (XSDURIResolverExtension.java:38-41), because real-world XSDs carry DOCTYPE declarations with internal subsets that reference that DTD; disabling external entities on this path would break validation of such schemas. Kept as an unconfirmed lead rather than the single candidate."
+    },
+    {
+      "lead": "CacheResourcesManager.downloadResource follows Location redirects to any scheme without re-validating it (CacheResourcesManager.java:187-214), so an attacker-controlled HTTP server could redirect the download to a file:// URL and have local content copied into the cache and parsed.",
+      "reason": "Real-looking weakness, but the copied file lands inside the cache directory (the containment check ran before download) and the same root cause family as the submitted traversal candidate; no separate candidate allowed and impact is a local copy rather than exfiltration."
+    },
+    {
+      "lead": "XMLValidator.isValidLocation opens the document-provided schema location with new URL(...).openStream() (XMLValidator.java:262-272), which bypasses the downloadExternalResources setting and produces SSRF/file-access side effects when schema validation is configured to 'onValidSchema'.",
+      "reason": "Reachable only with a non-default validation setting and the request targets the document's declared schema, which the default validation path already resolves; weaker and largely by-design for the validate-on-valid-schema mode."
+    },
+    {
+      "lead": "AssociateGrammarCommand.getTargetNamespace parses a client-supplied grammar URI with new URL(xsdURI).openStream() (AssociateGrammarCommand.java:148-158).",
+      "reason": "The URI is a command argument supplied by the LSP client, not by the untrusted XML document; the SAX factory used there already disables DOCTYPE (DOMUtils.newSAXParserFactory, DOMUtils.java:153-159). Not attacker-controlled in the document-trust model."
+    },
+    {
+      "lead": "Telemetry transmits grammar identifiers taken from the document (DocumentTelemetryInfo.java:73-80).",
+      "reason": "Documented, opt-in behaviour (USAGE_DATA.md) and limited to non-local identifiers truncated to 200 chars; not a source-code vulnerability."
+    }
+  ],
+  "summary": "Reviewed the LemMinX XML language server snapshot (0.18.5-SNAPSHOT, ~406 Java files) with the P1 relation index plus source reading, tracing untrusted XML document content (xsi:schemaLocation, xsi:noNamespaceSchemaLocation, DOCTYPE SYSTEM, xml-model href) into grammar resolution, download caching and local file access. The strongest evidence-backed candidate is a path-traversal / missing-containment defect in the grammar-download cache: the cache filesystem path is built directly from the URI path supplied by the XML document (no validation), and the guard that was added for CVE-2019-18212 (`FilesUtils.isIncludedInDeployedPath`) is evaluated only after the \"already cached\" existence early-return, so an out-of-cache path that exists is returned and parsed as the DTD/XSD. The same unvalidated cached path is later handed to `Files.deleteIfExists` by `ContentModelManager.evictCacheFor`, giving a destructive sink with the same root cause. Other leads (external entities hard-coded on in XSD validation, redirects to non-HTTP schemes, raw URL existence checks) are weaker or plausibly intentional and are listed as rejected/unconfirmed."
+}

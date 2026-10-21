@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated request to /realms/{realm}/protocol/openid-connect/auth (GET) or the authorization endpoint (POST) supplying client_id of any enabled client plus an arbitrary request_uri value (e.g. http://169.254.169.254/latest/meta-data/, http://127.0.0.1:8080/admin, http://internal-host:port/). No cookies, tokens or client secrets are required; public client_ids are typically enumerable/published (login URL, account console, security-admin-console).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the authorization endpoint still runs checkSsl/checkRealm/checkClient before parsing (so an enabled client_id is needed) and that the response is parsed as a JWS and errors are generic. Checked that no scheme check, host allow-list, or use of the client's registered request_uris exists anywhere in the snapshot (only the unused OIDCClientRepresentation.getRequestUris field). Verified HttpClientProvider.get has no URL restrictions and follows default redirect behavior; verified StreamUtil.readString is unbounded. Considered that OIDC request_uri fetching is spec-permitted, but the absence of any registration/allow-list or private-address blocking is what makes it unsafe here. Version tag 4.6.0.Final-SNAPSHOT is consistent with this code base being older than later fixes for request_uri SSRF; exact CVE/commit attribution could not be verified from the snapshot (no git metadata, no tests, no release notes).",
+      "id": "kc-request-uri-ssrf",
+      "impact": "Server-side request forgery from the Keycloak server: internal network/service reachability and port probing (loopback, RFC1918, link-local/cloud metadata endpoints), ability to trigger side-effecting GET endpoints on internal systems, and potential denial of service by pointing request_uri at an endpoint/large or slowly-streaming response that is read unbounded into memory (StreamUtil.readString). It can also be combined with Keycloak's own internal/admin (localhost-bound) endpoints. No direct file read or RCE is demonstrated by this path.",
+      "locations": [
+        {
+          "end_line": 76,
+          "path": "services/src/main/java/org/keycloak/protocol/oidc/endpoints/request/AuthorizationEndpointRequestParserProcessor.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 121,
+          "path": "services/src/main/java/org/keycloak/protocol/oidc/endpoints/AuthorizationEndpoint.java",
+          "start_line": 111
+        },
+        {
+          "end_line": 107,
+          "path": "services/src/main/java/org/keycloak/connections/httpclient/DefaultHttpClientFactory.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 74,
+          "path": "common/src/main/java/org/keycloak/common/util/StreamUtil.java",
+          "start_line": 57
+        }
+      ],
+      "prerequisites": "Keycloak server reachable by the attacker; at least one enabled client in the realm (default realm installations contain several); client attribute `request.object.required` not set to a value that forbids request_uri (default is 'not required'); network path from the Keycloak server to the chosen URL (typical for internal SSRF). The attacker does not receive the response body, so the impact is blind SSRF/DoS rather than direct data disclosure.",
+      "root_cause": "In AuthorizationEndpointRequestParserProcessor.parseRequest, the attacker-supplied OIDC `request_uri` query/form parameter (OIDCLoginProtocol.REQUEST_URI_PARAM) is passed verbatim to `session.getProvider(HttpClientProvider.class).get(requestUriParam)`. There is no validation that the URL is HTTPS, that its host is registered for the client (the OIDCClientRepresentation.request_uris value is never consumed anywhere in the server), or that it does not target loopback/link-local/internal addresses. The default client setting `request.object.required` is unset (treated as 'not required'), so any enabled client (including a public client whose client_id is public) can be used. The response stream is then read with no size limit (StreamUtil.readString) before being parsed as a JWS request object, and the parse failure is reported as a generic invalid_request, leaving a blind SSRF. The outbound client itself performs a plain HttpGet with a shared connection pool and default redirect handling (DefaultHttpClientFactory.get).",
+      "title": "Unauthenticated SSRF via OIDC authorization endpoint `request_uri` parameter",
+      "trace": "1) AuthorizationEndpoint.process() (lines 111-118) resolves the realm/client and calls AuthorizationEndpointRequestParserProcessor.parseRequest() after only checkSsl/checkRealm/checkClient (no authentication).\n2) parseRequest() (lines 48-49) extracts the raw `request_uri` parameter.\n3) Lines 70-75: when `request_uri` is present (and `request` is not), the server invokes HttpClientProvider.get(requestUriParam) and drains the response into a String with no length bound; only afterwards is the content parsed as a JWS request object.\n4) DefaultHttpClientFactory.get() (lines 100-107) executes an Apache HttpClient HttpGet against the attacker-chosen URI using the server's pooled outbound client (proxy mappings only if configured).\n5) Any fetch/parse error is collapsed into Messages.INVALID_REQUEST (lines 80-84), so the exchange is blind to the attacker but the internal request has already been issued.",
+      "unverified": "Not runtime-confirmed. Whether this specific path is the planted/known issue for this case is unverified; the code, source-to-sink trace and absence of validation are confirmed by reading. Impact severity depends on deployment/network topology (proxy mappings, truststore, firewall). External request via HttpClient could not be executed in this read-only review.",
+      "weakness_type": "Server-Side Request Forgery (CWE-918), unvalidated URL fetch by server"
+    }
+  ],
+  "coverage_summary": "Coverage is partial and source-driven. I started with get_source_scope (5,108 model-visible files, no binary/symlink/sensitive-name exclusions reported) and used repository-wide literal searches for common vulnerability sinks (command execution, deserialization, SQL/JPQL concatenation, XML/StAX/DOM parser creation, trust managers/hostname verifiers, redirects, path handling, random/password hashing, authorization/role checks, XSS-prone admin JS), then read the relevant files. Files inspected in detail include services OIDC endpoints (AuthorizationEndpoint, AuthorizationEndpointRequestParserProcessor, AuthzEndpointRequestObjectParser, LogoutEndpoint, TokenEndpoint/TokenManager), ClientRegistrationAuth/policies, IdentityBrokerService, SAMLEndpoint, AuthenticationManager/ClientSessionCode/CodeGenerateUtil, Pbkdf2PasswordHashProvider, admin permission evaluators, saml-core DocumentUtil/StAX/XMLSignatureUtil/AssertionUtil, the three HttpClientBuilder copies, keycloak.js, admin themes JS, and numerous utility classes. Notably, the tool-visible tree contains no `.ftl` templates and no `src/test` sources, and there is no `.git` metadata, so template-rendered output and test-implied behavior could not be inspected and no commit history/diff against upstream was available.",
+  "limitations": [
+    "No precomputed source-relation index in this B0 run; all tracing was manual text search/reading of 5,108 files, so most files were not read line-by-line.",
+    "Read-only review only: nothing was compiled, executed, or fuzzed; findings are not runtime-confirmed and no external request was made.",
+    "The visible snapshot omits .ftl templates and test sources. Vulnerabilities that manifest only in theme templates or would be revealed by regression tests cannot be inspected or confirmed here.",
+    "No VCS metadata/diff/patches are present, so the exact upstream revision and any planted/known-issue mapping (e.g., CVE/commit attribution such as the known request_uri SSRF advisories) could not be verified; the candidate is a source-evidenced lead, not a confirmed match.",
+    "The outbound client's effective behavior depends on deployment configuration (proxy-mappings, truststore, firewall/DNS); the SSRF reachability and impact therefore vary per installation.",
+    "Only one candidate is permitted; several plausible but weaker/unconfirmed leads (sector_identifier_uri SSRF, certificate CRL-distribution-point fetch, admin-console HTML injection, StAX entity handling) are recorded as rejected leads rather than separate candidates."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SSRF via OIDC sector_identifier_uri: PairwiseSubMapperValidator.getSectorRedirects() fetches a client-supplied sector_identifier_uri through HttpClientProvider (services/src/main/java/org/keycloak/protocol/oidc/utils/PairwiseSubMapperValidator.java lines 84-109), and the HTTPS scheme check in PairwiseSubMapperUtils.resolveValidSectorIdentifier (lines 63-78) is commented out. Rejected as the single candidate because the reachable paths (client create/update through admin REST or client registration) require authenticated admin/client-registration privileges, making attacker control weaker than the unauthenticated request_uri path.",
+      "reason": "Requires privileged/registered caller; weaker attacker model than the selected candidate."
+    },
+    {
+      "lead": "SSRF/URL fetch in X.509 authenticator CRL handling: CertificateValidator loads CRL distribution-point URIs embedded in a client-presented certificate (services/src/main/java/org/keycloak/authentication/authenticators/x509/CertificateValidator.java lines 249-263, 488-497). Rejected: requires the X.509 client-certificate authenticator to be enabled with CRL checking configured, so it is not reachable in a default deployment.",
+      "reason": "Non-default configuration needed; not the strongest reachable issue."
+    },
+    {
+      "lead": "Stored/DOM XSS in the admin console authorization-services dialog: AuthzDialog.openDialog uses $sce.trustAsHtml(message) and confirmDelete interpolates an unescaped name into that message (themes/src/main/resources/theme/base/admin/resources/js/authz/authz-services.js lines 81-131) while the generic services.js dialog has an escapeHtml helper. Rejected as an unconfirmed hardening gap: it requires a user able to create authorization resources/policies (already privileged) and I could not confirm the exact escaping behavior of the upstream revision.",
+      "reason": "Privileged attacker and unverified upstream diff; not selected."
+    },
+    {
+      "lead": "SAML StAX parser entity handling: StaxParserUtil sets XMLInputFactory.IS_REPLACING_ENTITY_REFERENCES to TRUE (saml-core/.../StaxParserUtil.java lines 874-879) with SUPPORT_DTD not explicitly disabled, while IS_SUPPORTING_EXTERNAL_ENTITIES is FALSE. Rejected as a lead: external entity expansion (XXE) appears blocked, so the residual concern is entity-expansion DoS only, and no clear injection/revert evidence was found.",
+      "reason": "Not a concrete exploitable issue on the evidence available; main XXE vector appears blocked."
+    },
+    {
+      "lead": "FreeMarkerUtil disables its template cache unconditionally (services/src/main/java/org/keycloak/theme/FreeMarkerUtil.java line 54, `cache = null;`). Rejected: this is a functional/caching quirk with no demonstrated confidentiality/integrity impact.",
+      "reason": "No security impact identified."
+    },
+    {
+      "lead": "Grep-level candidates for injection sinks elsewhere (Runtime.exec/ProcessBuilder, ObjectInputStream, native SQL concatenation, XML parser factories without hardening) were checked; the only occurrences are test utilities or fixed/parameterized code, so no candidate was formed.",
+      "reason": "No attacker-controlled data flow to these sinks was found."
+    }
+  ],
+  "summary": "Reviewed the Keycloak 4.6.0.Final-SNAPSHOT source snapshot (5,108 visible files; no precomputed relation index in this B0 run). The strongest source-evidenced issue found is a server-side request forgery (blind SSRF) in the OIDC authorization endpoint: the unauthenticated `request_uri` authorization-request parameter is fetched directly through the server's outbound HTTP client without any scheme/host/allow-list validation, and the fetched body is read unbounded into memory. Other security-sensitive areas I traced (SAML DOM/Signature validation and the assertion-mixing check, redirect-URI validation, token verification/client binding, PBKDF2 password hashing, admin permission evaluators) appear to contain their expected protections; those leads are listed as rejected. One candidate is submitted; it is a lead, not a confirmed vulnerability."
+}

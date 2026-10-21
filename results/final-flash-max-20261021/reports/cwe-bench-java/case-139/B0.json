@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Code running in the test JVM (test method, code under test, or custom TempDirFactory) knows the injected temp-dir path and can delete the empty temp dir and recreate a junction/symlink at the same path pointing outside (Windows junctions via mklink /J need no admin rights; symlinks where permitted), or place a link inside the temp dir and force a delete failure so the retry path runs. The @TempDir javadoc explicitly promises that this input cannot cause link targets to be followed/deleted, which is why the link checks exist.",
+      "confidence": "medium",
+      "counterevidence_checked": "The in-tree link checks (warn + delete link + SKIP_SUBTREE) are present and correct for links inside the tree; only a replaced root and the retry path bypass them. On POSIX a symlink at the walk root is visited as a file, so the deletion variant is Windows/junction-specific. Whether Files.walkFileTree follows a junction passed as the start path is JDK-version dependent and could not be executed; the in-code comment (:453-454) asserts junctions may be followed, which is the basis of this finding. Tests and user-guide docs are absent from the snapshot so no test evidence exists, and test code is often trusted in practice (the threat model here is the same one that motivated the existing link hardening).",
+      "id": "tempdir-cleanup-root-link-following",
+      "impact": "Code under test can cause recursive deletion of files/directories outside its temp directory, or modification of owner read/write/execute bits of link targets outside it, with the test process privileges. This breaks the documented @TempDir isolation guarantee (TempDir.java:81-91) and the protection the in-tree link checks were added to provide; affected paths can be developer/CI user directories on the same filesystem.",
+      "locations": [
+        {
+          "end_line": 538,
+          "path": "junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/extension/TempDirectory.java",
+          "start_line": 395
+        },
+        {
+          "end_line": 327,
+          "path": "junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/extension/TempDirectory.java",
+          "start_line": 308
+        },
+        {
+          "end_line": 91,
+          "path": "junit-jupiter-api/src/main/java/org/junit/jupiter/api/io/TempDir.java",
+          "start_line": 81
+        }
+      ],
+      "prerequisites": "Cleanup not skipped (default ALWAYS, or ON_SUCCESS with a successful test). For the deletion variant the platform must traverse a link placed at the root (Windows junctions per the in-code comment; on POSIX walkFileTree visits a symlink root as a file and only removes the link). For the permission variant a delete/visit failure must reach the retry path. No extra privileges for JUnit itself; deletion happens with test-JVM privileges.",
+      "root_cause": "In CloseablePath.deleteAllFilesAndDirectories() the containment baseline is computed from the cleanup root itself: rootRealPath = rootDir.toRealPath() (TempDirectory.java:405). The check isLinkWithTargetOutsideTempDir() compares !path.toRealPath().startsWith(rootRealPath) (TempDirectory.java:452-463), so if the root path has been replaced by a junction/symlink, every child resolves under the outside target and is considered 'inside'; Files.walkFileTree(rootDir, ...) then descends through the link (the code itself notes at :453-454 that walkFileTree may follow junctions on Windows) and delete(...) recursively removes the target contents. Separately, the failure-retry path resetPermissionsAndTryToDeleteAgain() (:489-509) calls tryToResetPermissions() (:515-538, using link-following File.setReadable/setWritable/setExecutable) and Files.isDirectory()/Files.walkFileTree(path, ...) (:494-495) without any link containment check.",
+      "title": "@TempDir cleanup can delete or modify files outside the temp directory when the cleanup root is a link or when deletion is retried",
+      "trace": "CloseablePath.close() (:333) -> deleteAllFilesAndDirectories() (:395) -> rootRealPath = rootDir.toRealPath() (:405) resolves through a root junction to the outside target -> tryToResetPermissions(rootDir) (:407) -> Files.walkFileTree(rootDir, visitor) (:408) enters the junction (comment :453-454) -> preVisitDirectory (:411) / visitFile (:436) call isLinkWithTargetOutsideTempDir (:452) whose comparison (:456) is true for all children of that target because rootRealPath is the target -> no warning/skip -> delete(file) (:441) / delete(dir) (:448) recursively delete the target contents. Retry path: catch IOException (:483-486) or visitFileFailed (:425-433) -> resetPermissionsAndTryToDeleteAgain (:489) -> tryToResetPermissions (:515, follows links) and Files.isDirectory/walkFileTree (:494-495) without containment check.",
+      "unverified": "Not runtime-confirmed. Junction-at-root traversal depends on JDK/Windows walkFileTree behavior; the permission-modification path depends on triggering a delete failure that survives the pre-deletion permission resets. I could not verify whether upstream treats a replaced root as in scope or whether a later change adds a root-link check.",
+      "weakness_type": "CWE-59 link following / CWE-22 path traversal"
+    }
+  ],
+  "coverage_summary": "All 1050 model-visible files were listed; scope filters exclude NUL-containing binary files, >5 MiB files, sensitive-name paths, and symlinks. I searched for dangerous sinks (process execution, XML parsing, deserialization, path construction/resolution, link following, delete/copy/write, regex compilation, class loading, env/system-property use) and read the security-relevant production code across junit-platform-commons/engine/launcher/reporting/console/suite/runner/jfr/testkit, junit-jupiter-api/engine/params, and junit-vintage-engine, plus GitHub workflows/actions and Gradle build logic. The strongest candidate is the @TempDir cleanup link-following gap described above; all other leads were rejected as documented below. Not every line of every file was read.",
+  "limitations": [
+    "No code execution, tests, or scanners were run; all conclusions are from reading source.",
+    "Test sources and user-guide AsciiDoc are absent from the snapshot, so no test or documentation evidence of intended cleanup behavior beyond the @TempDir javadoc could be checked.",
+    "Windows/junction semantics of Files.walkFileTree and File.setWritable could not be verified in this environment.",
+    "Some very large classes (e.g., ReflectionUtils, DiscoverySelectors, AnnotationUtils) and several Gradle Kotlin scripts were reviewed selectively rather than line by line.",
+    "No precomputed source-relation index was available (B0 condition); findings are based on raw text search and bounded reads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "LegacyXmlReportGeneratingListener builds reportsDir.resolve(\"TEST-\" + rootName + \".xml\") from the engine-supplied root UniqueId segment (LegacyXmlReportGeneratingListener.java:107-115), unlike the sanitized output-directory provider.",
+      "reason": "Requires a third-party TestEngine already on the classpath (code execution), and EngineIdValidator only guards reserved junit- IDs; with a malicious engine arbitrary code is already available, so this is not a clear privilege boundary. Kept as a secondary lead."
+    },
+    {
+      "lead": "HierarchicalOutputDirectoryProvider sanitizes UniqueId segments with FORBIDDEN_CHARS allowing '.', so a '..' segment can escape the output root when resolved.",
+      "reason": "Same engine-controlled input requirement; Jupiter/vintage/suite segment values cannot be '..' in practice, and impact is limited to report directory placement."
+    },
+    {
+      "lead": "AbstractExtensionContext.publishFileEntry accepts the literal name '..' because path.getParent().equals(dir) is true for dir/.. , letting a supplied action write in the report output dir's parent.",
+      "reason": "Caller-controlled test-author API with bounded, one-level effect; not a meaningful trust boundary crossing."
+    },
+    {
+      "lead": "GitHub composite actions/workflows interpolate inputs/secrets into shell commands (maven-central-user-token/action.yml:15, release.yml:47-63).",
+      "reason": "Inputs come only from workflow_dispatch by maintainers and secrets are masked; no untrusted contributor-controlled interpolation found."
+    },
+    {
+      "lead": "TestIdentifier custom Java deserialization (readObject/SerializedForm, TestIdentifier.java:275-347) without serialization filters.",
+      "reason": "Long-standing upstream design; exploitable only if an application deserializes launcher objects from untrusted bytes, for which there is no source evidence here."
+    },
+    {
+      "lead": "OpenTestReportGeneratingListener executes git in the working directory and reads stdout/stderr sequentially (OpenTestReportGeneratingListener.java:175-235).",
+      "reason": "Fixed argument vectors, no shell; any repository-config side effects presuppose an already attacker-controlled working tree, and the listener is opt-in."
+    }
+  ],
+  "summary": "Reviewed the junit-framework snapshot at 5.13.2-SNAPSHOT (1050 readable files: production Java/Kotlin sources, Gradle build logic, GitHub workflows, docs; test sources and user-guide AsciiDoc are absent). The strongest source-evidenced candidate is in @TempDir cleanup (junit-jupiter-engine TempDirectory.CloseablePath): the link-containment check compares against rootRealPath derived from the cleanup root itself and the failure-retry path performs link-following operations without containment checks, so a link placed at the temp-dir root (or a link that survives a failed delete) can lead to deletion or permission modification outside the temp directory, contradicting the documented @TempDir guarantee. Submitted as one candidate with medium confidence; rejected leads and limitations are listed."
+}

@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An attacker supplies the class file that the victim application parses (and typically rewrites) with BCEL. A crafted class can fill the constant pool close to the 65535-entry limit (constant_pool_count is a 16-bit field) and control all constant contents, class/member names, descriptors, interfaces and attributes. When the application wraps/rewrites it (e.g., `new ClassGen(clazz)` then `getJavaClass()`/`dump`, which add class, superclass, interface and SourceFile constants), the pool can exceed 65535 and the emitted class file's count/indexes are truncated to attacker-influenced values.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that `ConstantPool.getConstant(int)` already bounds-checks and rejects null (holes) entries (ConstantPool.java:249-258), so the direct read path is not the issue. Checked that reads from a parsed class are bounded (constructor loop writes only indices < constant_pool_count, ConstantPool.java:80-100). Searched for `MAX_CP_ENTRIES`/`0xFFFF`/`65535` usages: the only definitions are in Const.java:646 and the deprecated Constants.java:323; there is no enforcement anywhere. Searched for other callers of `setConstant` (unchecked array write) and found only the example helloify.java, so that API is not internally reachable with attacker indexes. No runtime table generation/verification was executed; the exact upstream fix location (ConstantPoolGen guard vs ConstantPool.dump guard) is inferred, not confirmed from the snapshot.",
+      "id": "bcel-cp-size-overflow",
+      "impact": "Malformed/attacker-influenced emitted class files (constant-pool count and indexes wrap), i.e., a parser differential between the tool's view and the JVM's/downstream consumer's view. For instrumentation or verification pipelines this can bypass inserted checks or cause execution of code not present in the analyzed form (arbitrary bytecode generation), and for the JVM it can cause VerifyError/ClassFormatError/DoS. This is the class of issue fixed in BCEL 6.6.0 for the pre-6.6.0 constant-pool handling.",
+      "locations": [
+        {
+          "end_line": 118,
+          "path": "src/main/java/org/apache/bcel/generic/ConstantPoolGen.java",
+          "start_line": 109
+        },
+        {
+          "end_line": 570,
+          "path": "src/main/java/org/apache/bcel/generic/ConstantPoolGen.java",
+          "start_line": 560
+        },
+        {
+          "end_line": 594,
+          "path": "src/main/java/org/apache/bcel/generic/ConstantPoolGen.java",
+          "start_line": 590
+        },
+        {
+          "end_line": 239,
+          "path": "src/main/java/org/apache/bcel/classfile/ConstantPool.java",
+          "start_line": 232
+        },
+        {
+          "end_line": 646,
+          "path": "src/main/java/org/apache/bcel/Const.java",
+          "start_line": 640
+        }
+      ],
+      "prerequisites": "A consuming application uses BCEL's generation/rewrite path (`ClassGen`/`ConstantPoolGen`/`MethodGen`) on an untrusted class and then writes the resulting class file or loads it (bytecode instrumentation, class-rewriting, analysis/repair pipelines). The attacker's class must push the pool to near/over the 65535 limit, so the pool grows past 65535 during the rewrite.",
+      "root_cause": "`org.apache.bcel.generic.ConstantPoolGen` enforces no maximum constant-pool size: the `ConstantPool(Constant[])`-style constructor at ConstantPoolGen.java:109-118 sets `size = Math.max(256, cs.length + 64)` (already >65535 when `cs.length` is a maximal parsed pool, e.g. 65535), and `adjustSize()` (ConstantPoolGen.java:560-570) grows `size` by repeated doubling with no upper-bound check. `Const.MAX_CP_ENTRIES` (Const.java:640-646) exists but is used nowhere in the repository, indicating the limit check is absent. `getFinalConstantPool()` (ConstantPoolGen.java:590-594) copies all `index` entries into a `ConstantPool`, and `ConstantPool.dump()` (ConstantPool.java:232-239) writes the count with `file.writeShort(constantPool.length)`, which truncates any value >65535 modulo 65536; constant-pool indexes embedded in instructions/attributes are likewise written as 16-bit values. The result is a re-emitted class file whose constant-pool count and indexes do not describe the bytecode the tool saw.",
+      "title": "Constant pool can grow past the JVM's 65535-entry limit and its count/indexes are silently truncated when written",
+      "trace": "Untrusted .class -> ClassParser/JavaClass (ConstantPool reads up to 65535 entries) -> ClassGen(JavaClass) creates ConstantPoolGen with `size = max(256, cs.length+64)` (ConstantPoolGen.java:112) -> addInterface/addAttribute/addAnnotationEntry add constants; addClass_/addUtf8/addNameAndType call adjustSize() (ConstantPoolGen.java:563-570), which never checks Const.MAX_CP_ENTRIES and simply doubles the array -> index can exceed 65535 -> getFinalConstantPool() builds ConstantPool of length >65535 (ConstantPoolGen.java:590-594) -> JavaClass.dump -> ConstantPool.dump writes `writeShort(constantPool.length)` (ConstantPool.java:233), truncating the count; 16-bit constant indexes in instructions/attributes are truncated too -> JVM or downstream tool parses a different class structure/bytecode than the one analyzed.",
+      "unverified": "Not runtime-confirmed. The exploit requires an application that grows the pool past 65535 on the rewrite path; the precise upstream patch hunk and whether the released fix added the check in `adjustSize()`, `getFinalConstantPool()`, or `ConstantPool.dump()` could not be verified offline. Also not verified is whether current/historical BCEL releases place the MAX_CP_ENTRIES check elsewhere; the repository contains no test tree to confirm expected behavior.",
+      "weakness_type": "CWE-787/CWE-1284-like: missing bounds/limit enforcement on a length field leading to truncated output (malformed/arbitrary bytecode)"
+    }
+  ],
+  "coverage_summary": "Coverage focused on the class-file parsing/generation core: ConstantPool.java, ConstantPoolGen.java, ClassParser.java, Class/Constant/Attribute handling, Code/StackMap/attribute readers, Utility.java (partial), ClassGen/MethodGen/InstructionList/ConstantPoolGen, Const/Constants, util and verifier packages (sampled), plus build/site files. The snapshot contains 472 files and no test tree (src/test is absent), so expected-behavior tests could not be examined. Searches performed for constant-pool bounds, MAX_CP_ENTRIES, 0xFFFF/65535, arraycopy sites, getConstant/setConstant callers, and direct array writes. Not exhaustively reviewed: all individual ~250 generic instruction classes, the full ~78KB Pass2Verifier and ~118KB InstConstraintVisitor, Mini example parser, and generated HTML/site resources.",
+  "limitations": [
+    "No test sources are present in the snapshot, so I could not compare against regression tests or confirm intended maximum-pool behavior.",
+    "No code execution, build, or scanner was run; all findings are static and the candidate is unconfirmed at runtime.",
+    "The upstream fix for the pre-6.6.0 BCEL constant-pool issue could not be inspected offline; the exact patched method (ConstantPoolGen vs ConstantPool.dump) is inferred from the code and the unused Const.MAX_CP_ENTRIES constant.",
+    "Large verifier/instrumentation files were only sampled, so a separate issue there cannot be excluded; verifier fixes referenced in changes.xml (#117, BCEL-303..337) predate this snapshot.",
+    "Exploitability depends on the consuming application's usage pattern (parsing untrusted classes and re-emitting/growing the constant pool); no concrete in-repo consumer demonstrates that full chain."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unchecked array indexing in `Const.getMethodHandleName(int)` (Const.java:3086-3088) and `Const.getConstantName(int)` (Const.java:3047-3049) reachable from `ConstantPool.constantToString` via a crafted CONSTANT_MethodHandle reference_kind (0-255) while METHODHANDLE_NAMES has only 10 entries.",
+      "reason": "ArrayIndexOutOfBoundsException is an out-of-bounds read (DoS in stringification/class-dump tooling), not a write and not attacker-controlled code execution; weaker than the constant-pool limit issue."
+    },
+    {
+      "lead": "`ConstantPoolGen.addConstant(Constant, ConstantPoolGen)` (ConstantPoolGen.java:276-331) indexes the source pool array directly with craftable indexes (e.g. `constants[s.getStringIndex()]`), and `ConstantPoolGen.getConstant(int)` (line 576-578) has no bounds check (used by `InstructionList.replaceConstantPool`, lines 1067-1071).",
+      "reason": "Reachable from crafted class files only as AIOOBE/NullPointerException (robustness/DoS); no write or semantic difference demonstrated."
+    },
+    {
+      "lead": "`ClassPath.Dir.getClassFile/toFile` (ClassPath.java:187-246) builds file paths from class names without sanitizing `..`, potentially allowing traversal when a name comes from untrusted bytecode.",
+      "reason": "Requires the host application to resolve attacker-supplied class names through this repository; typical names come from constant pool entries but the path is a standard classpath-lookup design with no clear security boundary shown in this snapshot."
+    },
+    {
+      "lead": "Examples under src/examples (e.g. helloify.java:57 calling the unchecked `ConstantPool.setConstant`) and util tooling (Class2HTML/CodeHTML emitted HTML) could be misused.",
+      "reason": "Example/demo code is not part of the library's attack surface and the unchecked setConstant call takes an index already validated by getConstant in the example flow; HTML generation is local tooling without a demonstrated trust boundary."
+    }
+  ],
+  "summary": "Reviewed the Apache Commons BCEL 6.6.0-SNAPSHOT source (472 files: main sources, examples, site/build files; no test tree present). The strongest source-evidenced issue is the missing enforcement of the JVM's 65535-entry constant-pool limit on the generation path. `Const.MAX_CP_ENTRIES = 65535` (Const.java:640-646) is defined but referenced nowhere in the entire tree; `ConstantPoolGen` grows its backing array without any upper bound (constructor at ConstantPoolGen.java:109-118 allows `size = cs.length + 64` — already >65535 for a maximal parsed pool; `adjustSize()` at ConstantPoolGen.java:560-570 doubles `size` indefinitely), and `getFinalConstantPool()` (ConstantPoolGen.java:590-594) then hands a >65535-entry array to `ConstantPool`. When such a pool is written, `ConstantPool.dump()` emits `file.writeShort(constantPool.length)` (ConstantPool.java:232-239), silently truncating the count modulo 65536, and CP-referencing instructions likewise write truncated short indexes. For applications that parse an untrusted class and re-emit it (instrumentation, rewriting, analysis pipelines), an attacker can supply a class whose pool is filled near the limit so that BCEL's own additions (e.g., ClassGen wrapper adding class/superclass/interface/SourceFile constants) push the pool over the limit, producing a class file whose count/indexes differ from the analyzed bytecode (parser differential / attacker-influenced bytecode). This matches the known pre-6.6.0 BCEL constant-pool overflow security issue. Confidence is medium: the code-path and truncation are concrete and source-verified, but I could not confirm at runtime and the precise upstream fix site (ConstantPoolGen vs ConstantPool.dump) is inferred.\n\nNo runtime confirmation was performed; all reasoning is static source evidence."
+}

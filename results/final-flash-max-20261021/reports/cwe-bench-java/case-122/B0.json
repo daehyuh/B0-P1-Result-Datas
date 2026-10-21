@@ -1,0 +1,101 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An HTTP request header on a module that embeds this library: the configured tenant header (default `X-Okapi-Tenant`). POST/DELETE /_/tenant bind the header through `@TenantHeader` (TenantController lines 31, 42) and pass it directly to HibernateSchemaService.createTenant/deleteTenant; independently, HibernateTenantIdentifierResolver reads the same header on ordinary requests to choose the Hibernate schema. Header values may legally contain `'`, `;`, `-`, spaces and `--`, which is all the payload needs; CR/LF is not required.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) SchemaService.getSchema appends `_<artifact>` and replaces `-` with `_`; it does not remove quotes, semicolons or comment tokens, and the trailing suffix can be neutralized with `--`, so this transformation is not a mitigation. (2) The create path first calls schemaExists with the raw tenant in a quoted literal; a quote-free payload such as `x; <attacker statement>; --` compares as a non-existent schema name (returns false), so execution proceeds to the injectable CREATE SCHEMA — the delete/drop path requires a payload valid in both the literal and statement contexts and is harder, but is not needed for impact. (3) A repository-wide search for validation, regex or filters (`Pattern.compile`, `validate`, `Interceptor`, `getHeader`) found only the JSON `$ref` and RAML `!include` patterns — no tenant allow-list anywhere. (4) The PostgreSQL branch uses `connection.setSchema` (driver-quoted) and the H2 branch uses a `USE` string; the deterministic string-formatted sinks in HibernateSchemaService and the SQL templates are the primary evidence, independent of driver quoting. (5) `thread-local` tenant setting (`ThreadLocalStorage`) also feeds the resolver unvalidated, excluding the header path as the only source.",
+      "id": "tenant-header-sql-injection",
+      "impact": "Arbitrary SQL execution against the shared module database using the module's JDBC credentials: attacker-injected statements run alongside the schema DDL, allowing schema/data destruction (e.g. DROP SCHEMA ... CASCADE, DROP TABLE), manipulation or disclosure of other tenants' data (all tenants share one database with per-tenant schemas), and denial of service; the `information_schema.schemata` query additionally permits classic quoted-literal subversion for blind extraction. The same unvalidated value selects the Hibernate schema per request, so database-level tenant isolation is not enforced by the library.",
+      "locations": [
+        {
+          "end_line": 188,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateSchemaService.java",
+          "start_line": 179
+        },
+        {
+          "end_line": 141,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateSchemaService.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 177,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateSchemaService.java",
+          "start_line": 173
+        },
+        {
+          "end_line": 117,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateSchemaService.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 15,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/service/SchemaService.java",
+          "start_line": 13
+        },
+        {
+          "end_line": 33,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/resolver/TenantHeaderResolver.java",
+          "start_line": 26
+        },
+        {
+          "end_line": 47,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/controller/TenantController.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 64,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateMultiTenantConnectionProvider.java",
+          "start_line": 44
+        },
+        {
+          "end_line": 54,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateTenantIdentifierResolver.java",
+          "start_line": 35
+        },
+        {
+          "end_line": 1,
+          "path": "tenant/src/main/resources/templates/schema/select.postgres.sql",
+          "start_line": 1
+        }
+      ],
+      "prerequisites": "The module's HTTP port is reachable by the attacker (directly, module-to-module in-cluster, or via a gateway that forwards the tenant header without character validation — the gateway is outside this snapshot) and the attacker can set the tenant header. Because SchemaService appends `_<artifactId>`, the payload must terminate the SQL statement and comment out the suffix (e.g. `--`), which is derivable from the module's build info. Multi-statement execution depends on the JDBC driver (PostgreSQL simple `Statement` queries allow it; H2's behavior differs), but single-statement subversion of the generated SQL is sufficient for impact.",
+      "root_cause": "The tenant identifier is taken directly from an HTTP header with no validation (TenantProperties.headerName defaults to X-Okapi-Tenant; TenantHeaderResolver.resolveArgument line 32 and HibernateTenantIdentifierResolver lines 39-41 return the raw value). SchemaService.getSchema (lines 13-15) only decorates it with `String.format(\"%s_%s\", tenant, artifact).replace(\"-\", \"_\")`, which removes no SQL metacharacters. The resulting string is then string-formatted into SQL and executed with JDBC Statement: HibernateSchemaService.schemaExists (lines 181-182: `... schema_name = '%s'`), createSchema (line 139: `CREATE SCHEMA IF NOT EXISTS %s;`), dropSchema (line 175: `DROP SCHEMA IF EXISTS %s CASCADE;`), plus SqlTemplateService.templateSelectSchemaSql (line 157 with schema/select.h2.sql and schema/select.postgres.sql rendering `SET SCHEMA`), and HibernateMultiTenantConnectionProvider.getConnection (line 52: `statement.execute(\"USE \" + schema)`). No tenant allow-list/pattern/quoting was found in the snapshot.",
+      "title": "SQL injection via unvalidated tenant header in tenant schema lifecycle (CREATE/DROP SCHEMA, schema lookup)",
+      "trace": "Request header -> TenantHeaderResolver.resolveArgument line 32 (raw value, no validation) -> TenantController.create/delete lines 35/45 -> HibernateSchemaService.createTenant lines 100-106 / deleteTenant lines 110-116 -> initializeSchema lines 126-135 -> createSchema line 139 `String.format(\"CREATE SCHEMA IF NOT EXISTS %s;\", schema)` executed via Statement.executeUpdate, or dropSchema line 175 `DROP SCHEMA IF EXISTS %s CASCADE`, or schemaExists lines 181-182 with the schema embedded inside a single-quoted literal; also createAdditionalSchema line 157 -> SqlTemplateService.templateSelectSchemaSql -> templates/schema/select.{h2,postgres}.sql `SET SCHEMA` statements. Parallel ordinary-request path: header -> HibernateTenantIdentifierResolver lines 39-41 -> schema name -> HibernateMultiTenantConnectionProvider.getConnection lines 45-64 -> `statement.execute(\"USE \" + schema)` line 52. No other code validates or escapes the value.",
+      "unverified": "Not runtime-confirmed. Whether an upstream gateway (Okapi) forwards or constrains arbitrary X-Okapi-Tenant content, the module DB account's privileges, and multi-statement support per driver/JDBC mode are not determinable from this snapshot. The delete/drop injection context was reasoned analytically rather than executed. HibernateTenantInit (referenced at HibernateSchemaService line 80) is not present in the snapshot, so any validation it might add is unseen.",
+      "weakness_type": "SQL injection through unvalidated request-header value concatenated into raw SQL"
+    }
+  ],
+  "coverage_summary": "Reviewed all 57 model-visible files (source scope reports 57 files, no exclusions beyond the documented binary/NUL filter; parity with other conditions). Read in full or in relevant part: tenant module (HibernateSchemaService, HibernateTenantIdentifierResolver, HibernateMultiTenantConnectionProvider, HibernateMultiTenantConfig, TenantController, TenantControllerAdvice, TenantHeaderResolver, TenantResolverWebMvcConfig, TenantProperties, BuildInfoProperties, SchemaService, SqlTemplateService, ThreadLocalStorage, TenantAttributes, exceptions, annotations, SQL templates), web module (HttpService, ObjectPlainTextConverter, TokenHeaderResolver, TokenResolverWebMvcConfig, ErrorUtility, AnnotationUtility, Error/ResponseErrors/Parameter, TokenHeader), domain module (JsonSchemasController/Service, RamlsController/Service, DomainAdvice, MultipleInterfaceAdvice, EntityJsonSchemaGenerator, CustomUUIDGenerator, AbstractBaseEntity, exceptions), plus all three pom.xml files and root README/pom. Searched for header reads, SQL execution sinks, resource loading, validation/regex, interceptors and tenant configuration; none of the searched mitigations exist. Empty files (READMEs, NEWS.md, initial import SQL templates) and build/codestyle files contribute no behavior.",
+  "limitations": [
+    "No runtime verification, tests, or scanners were used; findings are source-level only.",
+    "No application configuration (application.properties/yml) or tests are present in the snapshot, so default header names, datasource platform, and deployment packaging must be inferred from annotations/defaults.",
+    "The `HibernateTenantInit` interface referenced in HibernateSchemaService (line 80) is not present in the snapshot; a consuming module could add validation or SQL execution behavior through it.",
+    "Behavior of the FOLIO gateway (Okapi) with respect to X-Okapi-Tenant validation/forwarding, as well as database account privileges and driver multi-statement semantics, cannot be confirmed from this snapshot.",
+    "Spring, Thymeleaf, H2 and PostgreSQL driver internals (classpath resource cleaning, SQL-template inlining, identifier quoting) were reasoned about from knowledge, not read from the snapshot.",
+    "The delete/drop injection context and exact payload-shaping were analyzed statically; the create-path and per-request schema-selection sinks carry the strongest direct evidence."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal / arbitrary classpath resource read in JsonSchemasService.getSchemaByPath (line 42) and RamlsService.getRamlByPath (line 38) via the request `path` parameter concatenated into `classpath:ramls/` + path.",
+      "reason": "Attacker-controlled `path` reaches the resource loader, but Spring's ClassPathResource cleans the path and in the standard Spring Boot fat-jar deployment `..` cannot escape the jar; only exploded-classpath deployments might read files outside ramls. Responses are limited to classpath content and served as application/schema+json / application/raml+yaml. Plausible but weaker and deployment-dependent than the SQL injection; left as an unconfirmed lead."
+    },
+    {
+      "lead": "Reflected `x-okapi-url` header written unescaped into `$ref`/`!include` replacement strings (JsonSchemasService line 59; RamlsService lines 54-56) returned by /_/jsonSchemas and /_/ramls.",
+      "reason": "The response body is a JSON schema or RAML document (not HTML), so the reflected value is not in an executable browser context; impact would be limited to injecting references into returned metadata. No convincing injection chain identified."
+    },
+    {
+      "lead": "No existence or authorization check when the tenant header selects the Hibernate schema (HibernateTenantIdentifierResolver lines 39-41; schemaService.getSchema), allowing a caller to point a session at any existing schema such as `public` or another tenant's schema.",
+      "reason": "Real isolation weakness, but it shares the same root cause family as the submitted candidate (unvalidated/trusted tenant header) and is a design pattern of the FOLIO gateway model; not split into a second candidate per the single-root-cause rule."
+    },
+    {
+      "lead": "/_/tenant POST and DELETE have no authentication/authorization in the module (TenantController lines 28-47).",
+      "reason": "FOLIO relies on gateway-level interception of /_/ endpoints for these calls; no in-module access-control contract is visible in the snapshot, so this is not demonstrably a vulnerability on its own (it does lower the barrier for the SQL injection and is therefore reflected in that candidate's prerequisites)."
+    },
+    {
+      "lead": "HibernateSchemaService.createAdditionalSchema executes arbitrary SQL files listed in `tenant.schemaScripts` from the classpath/filesystem (lines 155-171).",
+      "reason": "The resource path comes from deployer configuration, not attacker input; a deployment-time trust decision rather than an attacker-controlled primitive."
+    }
+  ],
+  "summary": "The snapshot is the FOLIO `spring-module-core` library (modules: domain, tenant, web; Spring Boot 2.7.5). The strongest issue is an unvalidated HTTP tenant-header value flowing into raw SQL statements built and executed with JDBC `Statement`. `X-Okapi-Tenant` (configurable `tenant.headerName`) is read verbatim by `TenantHeaderResolver` and `HibernateTenantIdentifierResolver`, only gets `_<artifactId>` appended / `-`→`_` replaced in `SchemaService.getSchema`, and is then interpolated with `String.format` into `CREATE SCHEMA`, `DROP SCHEMA` and `information_schema` queries in `HibernateSchemaService`, rendered into `SET SCHEMA` templates, and concatenated into `\"USE \" + schema` per request in `HibernateMultiTenantConnectionProvider`. No allow-list, regex, quoting or escaping exists anywhere in the repository. Other plausible-but-weaker leads (classpath path traversal on `/_/jsonSchemas` and `/_/ramls`, reflected `x-okapi-url`, missing per-request schema existence/authorization check) were checked and are recorded as rejected/unconfirmed rather than separate candidates."
+}

@@ -1,0 +1,91 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client with network access to the Jenkins HTTP port or to the TCP agent/CLI port (50000 by default) controls the entire remoting byte stream on these endpoints: HTTP `POST /cli` (with any `remoting` value other than `false`) or the TCP greeting `Protocol:CLI-connect` / `Protocol:CLI2-connect` followed by arbitrary remoting frames, including serialized Java objects (method-call requests, `Callable`/argument graphs). No Jenkins account, session, API token or crumb is required.",
+      "confidence": "medium",
+      "counterevidence_checked": "The channels are built with `withRestricted(true)` (CliProtocol) or a `restricted` flag derived from `!hasPermission(ADMINISTER)` (FullDuplexHttpChannel, line 53/CLIAction line 253). That blocks remote *class definition/loading* from the peer but does not prevent instantiation/deserialization of classes that the base uber-class loader can already load (gadget classes bundled with Jenkins or plugins), which is why this remained a pre-auth deserialization issue. The actual `ObjectInputStream`/`ClassFilter` implementation lives in the external `hudson.remoting` artifact (3.10.2 in pom.xml) and could not be inspected here, so I cannot prove the exact filter configuration from this tree. The CLI can be administratively disabled, the TCP protocol requires the agent listener to be enabled, CLI1 is opt-in based on the legacy instance id hash, and practical exploitation requires a gadget chain (not verifiable statically). I also confirmed this is a *pre-fix* shape: the code comment itself states the HTTP remoting endpoint requires no permission, and no authentication or ClassFilter whitelist is applied to the CLI channels in this repo.",
+      "id": "jenkins-cli-remoting-deserialization",
+      "impact": "Unauthenticated remote code execution on the Jenkins controller if a suitable gadget chain exists on the class path (the intent of the restricted/base-loader setup is defeated because the base loader is the plugin uber class loader, which exposes Jenkins plus every plugin class to `ObjectInputStream`), or at minimum untrusted-data deserialization by an unauthenticated client with the full master class loader. This is the same vulnerability class as the publicly fixed critical SECURITY-595 (Jenkins CLI remoting deserialization), which led to removal/disablement of these legacy CLI transports.",
+      "locations": [
+        {
+          "end_line": 119,
+          "path": "core/src/main/java/hudson/cli/CLIAction.java",
+          "start_line": 105
+        },
+        {
+          "end_line": 263,
+          "path": "core/src/main/java/hudson/cli/CLIAction.java",
+          "start_line": 242
+        },
+        {
+          "end_line": 105,
+          "path": "core/src/main/java/hudson/cli/CliProtocol.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 99,
+          "path": "core/src/main/java/hudson/cli/CliProtocol2.java",
+          "start_line": 49
+        },
+        {
+          "end_line": 79,
+          "path": "core/src/main/java/hudson/model/FullDuplexHttpChannel.java",
+          "start_line": 46
+        }
+      ],
+      "prerequisites": "1) `jenkins.CLI` remains enabled (default) so `CliProtocol`/`CliProtocol2` advertise themselves; 2) the attacker can reach the HTTP `/cli` endpoint and/or the TCP agent port (CLI2 is always enabled; CLI1 is instance-hash opt-in); 3) a deserialization gadget chain is available on the server/plugin class path (not verifiable from this repository — remoting 3.10.2 and plugin contents are external).",
+      "root_cause": "`CLIAction` is an `UnprotectedRootAction` bound to `/cli`; its `getTarget()` routes any POST to `/cli` (without `remoting=false`) into `RemotingCliEndpointResponse` whenever `jenkins.CLI` is enabled, explicitly without any permission check (code comment: \"do not require any permission to establish a CLI connection\"). That response builds a full-duplex remoting `Channel` over the HTTP streams. Independently, the TCP agent protocol handlers `CliProtocol.Handler.run()/runCli()` and `CliProtocol2.Handler2.run()` accept a connection, exchange a greeting (and, for CLI2, a DH key), and immediately build a remoting `Channel` with `.withBaseLoader(Jenkins.getActiveInstance().pluginManager.uberClassLoader)`; nothing authenticates the peer before `channel.join()` begins reading and deserializing remoting requests/arguments. `CliManagerImpl.main()` (the `CliEntryPoint` implementation installed on the channel) is only reached after that deserialization has already happened, so per-command permission checks in `CLICommand.main()` are too late to prevent gadget-chain deserialization.",
+      "title": "Unauthenticated Jenkins CLI remoting endpoints create a master-side remoting channel and deserialize attacker-supplied Java objects before authentication",
+      "trace": "HTTP: `POST /cli` with `remoting` != \"false\" (`CLIAction.getTarget`, lines 105-119) -> `RemotingCliEndpointResponse.createService` (lines 242-263) -> `FullDuplexHttpChannel.run` -> `new Channel(..., restricted)` (FullDuplexHttpChannel.java:52-54) -> the channel is joined with no authentication and incoming remoting requests are deserialized with the channel class loader before `CliManagerImpl.main` runs a command. TCP: `CliProtocol.handle` (58-61) / `CliProtocol2.handle` (49-52) -> `Handler.run`/`Handler2.run` (81-101) -> `Handler.runCli` (87-105) builds `ChannelBuilder ... .withBaseLoader(pluginManager.uberClassLoader).build(...)` and calls `channel.join()`; `CliManagerImpl.main` (CliManagerImpl.java:78-104) is only invoked for already-deserialized calls, and `CLICommand.main` (CLICommand.java:248-275) performs READ checks even later.",
+      "unverified": "Exact load-time behavior of remoting 3.10.2 (sink and class filtering) is external to this snapshot; gadget availability on a real deployment is unknown; I could not confirm that this specific dataset case corresponds to SECURITY-595 or another CLI CVE; no runtime or payload testing was performed.",
+      "weakness_type": "Deserialization of Untrusted Data / Missing Authentication for Critical Function (CWE-502, CWE-306)"
+    }
+  ],
+  "coverage_summary": "Enumerated the full snapshot (8,936 readable files: Jenkins core, cli, war, build/pom/config files). Note the snapshot excludes all test sources and all `.jelly`/`.tag` view templates, so UI-level XSS/CSRF fixes could not be reviewed; `remoting`, `stapler` and other third-party libraries are dependencies, not present as source. I inspected authentication/authorization filters, CSRF crumb handling, the CLI (HTTP/plain/remoting protocols, commands, auth), item/job/view/user/computer/queue endpoints, XStream/XStream2 and console note/annotator serialization, plugin/update-center endpoints, path handling, and secret handling. Repository-relative locations are cited with line ranges; no code was executed and no runtime verification was performed.",
+  "limitations": [
+    "View templates (.jelly/.tag) and test sources are absent from the assigned snapshot, so view-layer vulnerabilities and the regression tests that indicate the dataset's fix commit could not be inspected.",
+    "The remoting and stapler libraries are external Maven dependencies; the actual `ObjectInputStream` deserialization sink and `ClassFilter` behavior for the CLI channel could not be inspected in-tree.",
+    "The snapshot version (2.73.4-SNAPSHOT, stable-2.73 era) does not let me determine the exact upstream fix commit/CVE for this case; the submitted candidate matches the known SECURITY-595 vulnerability class but is a lead, not a confirmed case match.",
+    "Exploitability of the deserialization candidate depends on a gadget chain being present on the server/plugin class path, which cannot be verified statically from this snapshot.",
+    "No runtime testing, scanning, or payload execution was performed, consistent with the assignment constraints."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "GET-triggered builds (`/build`, `/buildWithParameters`) lack `@RequirePOST` in `ParameterizedJobMixIn.doBuild/doBuildWithParameters` (core/src/main/java/jenkins/model/ParameterizedJobMixIn.java:191,228)",
+      "reason": "Not exploitable: both methods call `BuildAuthorizationToken.checkPermission`, which rejects any non-POST request with 405 unless it carries a valid build token or the legacy API-token request attribute (core/src/main/java/hudson/model/BuildAuthorizationToken.java:71-97)."
+    },
+    {
+      "lead": "`AbstractItem.delete(StaplerRequest, StaplerResponse)` performs deletion without `@RequirePOST` (core/src/main/java/hudson/model/AbstractItem.java:565)",
+      "reason": "The method has no `do` prefix and is not the Stapler action for `/delete` (that path is a legacy view); it still calls `doDoDelete` -> `delete()`, which enforces the DELETE permission. Not a demonstrated CSRF vector."
+    },
+    {
+      "lead": "`AnnotatedLargeText` deserializes `X-ConsoleAnnotator` request headers with the plugin uber class loader (core/src/main/java/hudson/console/AnnotatedLargeText.java:115-138)",
+      "reason": "The header value is AES-encrypted under a server-side `CryptoConfidentialKey` (`PASSING_ANNOTATOR`) that is never disclosed to clients, so a client cannot forge a valid serialized payload; replayed values are limited by a timestamp check. ECB use and absence of a MAC are hardening concerns but no source-visible exploit path."
+    },
+    {
+      "lead": "CSRF crumb predictability with spoofable `X-Forwarded-For` (core/src/main/java/hudson/security/csrf/DefaultCrumbIssuer.java:111-120)",
+      "reason": "The crumb salt in this snapshot is a randomly generated `HexStringConfidentialKey` (DefaultCrumbIssuer.java:126-130), so an external attacker cannot compute a victim's crumb even knowing the username/host/IP."
+    },
+    {
+      "lead": "Unconfigured SAXParserFactory parsing attacker XML (`parseRequestedPlugins`, core/src/main/java/hudson/PluginManager.java:1773-1800)",
+      "reason": "All callers (`prevalidateConfig`, install paths) require ADMINISTER, and the install path installs a `RestrictiveEntityResolver`; no lower-privileged entry point was found."
+    },
+    {
+      "lead": "`QueryParameterMap` throws `ArrayIndexOutOfBoundsException` for a query parameter without `=` (core/src/main/java/hudson/util/QueryParameterMap.java:60-63)",
+      "reason": "Not referenced anywhere in the core/cli sources, so no reachable request path; at most a low-impact DoS if used by a plugin."
+    },
+    {
+      "lead": "`hudson.cli.Connection.verifyIdentity` ignores the boolean result of `Signature.verify` and DH uses 512-bit parameters (cli/src/main/java/hudson/cli/Connection.java:151-264)",
+      "reason": "Only used on the deprecated remoting/SSH CLI path; the CLI client also ignores the returned server identity (cli/src/main/java/hudson/cli/CLI.java:619-620 TODO: server verification). It is a client-side authentication weakness, not a compromise of the Jenkins master, and it appears to be long-standing upstream behavior rather than this case's fix target."
+    },
+    {
+      "lead": "`CrumbFilter` calls `extractCrumbFromRequest(httpRequest, \".crumb\")` without assigning the result (core/src/main/java/hudson/security/csrf/CrumbFilter.java:67-70)",
+      "reason": "Fail-closed: it makes the legacy `.crumb` fallback ineffective and cannot be used to bypass CSRF validation."
+    },
+    {
+      "lead": "`FileParameterValue` uses a `location` string in filesystem paths (core/src/main/java/hudson/model/FileParameterValue.java:203-231)",
+      "reason": "`location` is set from the parameter *definition* name (`setLocation(getName())` in FileParameterDefinition), which is job-configuration controlled, not from build-trigger request data; no attacker-controlled traversal shown."
+    }
+  ],
+  "summary": "Reviewed the assigned Jenkins (jenkinsci/jenkins) snapshot (pom version 2.73.4-SNAPSHOT, stable-2.73-era code: core + cli + war modules, 8,936 readable files). The snapshot contains only main sources — test trees and all `.jelly`/`.tag` view templates are absent — so view-level issues could not be reviewed; the `remoting` and `stapler` libraries referenced by the code are not part of the tree. I traced authentication, CSRF/POST enforcement, path handling, XStream/XStream2, console-note/console-annotator deserialization, CLI, plugin-upload/update-center endpoints, and the User/item/view model code. The single strongest, highest-impact issue is the unauthenticated Jenkins CLI remoting surface: both the HTTP `/cli` endpoint and the TCP CLI1/CLI2 agent protocols let an anonymous network client create a full remoting `Channel` into the master and have it deserialize client-supplied Java objects before any credential is checked; the channel's base class loader is the plugin uber class loader, so only \"restricted\" (remote-defined) class loading is blocked, not deserialization of server-classpath gadget classes. This corresponds to the known critical SECURITY-595 class of Jenkins vulnerability, though I could not confirm the exact upstream fix commit for this dataset. No runtime confirmation was performed."
+}

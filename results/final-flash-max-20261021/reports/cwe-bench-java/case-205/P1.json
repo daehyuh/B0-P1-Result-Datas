@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated CQL user whose role holds MODIFY on a system_auth table (granted directly, at keyspace level, or implicitly through a root-level grant such as GRANT ALL ON ALL KEYSPACES). The attacker fully controls the DML statement text: target role name and the values written to is_superuser, can_login, member_of in system_auth.roles and to salted_hash (they can compute a bcrypt hash of a known password).",
+      "confidence": "low",
+      "counterevidence_checked": "Checked whether any other layer blocks this: AlterSchemaStatement.execute() blocks DDL on local/virtual keyspaces, and preventSystemKSSchemaModification blocks CREATE/ALTER/DROP on local/replicated system keyspaces, but both are DDL-only; READABLE_SYSTEM_RESOURCES only short-circuits SELECT and does not include system_auth tables; DataResource/TABLE_LEVEL_PERMISSIONS and Resources.chain show no special-casing of system keyspaces; CassandraRoleManager/AuthKeyspace add no write guard around the roles tables; ModificationStatement.validate() only rejects TTL on virtual tables. Also verified system-keyspace writes via DDL, virtual-table writes, UDF sandbox checks (allow/deny resource lists, noPermissions ProtectionDomain, setSecurityManager denial), JMX AuthorizationProxy deny-list (compilerDirectivesAdd/jvmtiAgentLoad/MLet), and TLS endpoint verification are otherwise present. The CHANGES entry \"Tighten up permissions on system keyspaces (CASSANDRA-20090)\" is already in this snapshot, so an earlier, schema-focused hardening is present; this candidate concerns the DML half of the same trust boundary and may be a deliberately accepted model (root-level grants as fully authoritative) rather than the intended flaw — I could not confirm from source alone that upstream treats it as a vulnerability.",
+      "id": "case-205-c1",
+      "impact": "Privilege escalation to superuser (full cluster control: read/modify all keyspaces, manage roles and permissions, change schema, use JMX-equivalent administrative operations). Variants: self-escalation via is_superuser/salted_hash, credential takeover of an existing login-enabled superuser, or downgrading/removing other roles. An indirect consequence of the same missing DML guard is unauthorized writes to other replicated/system tables (e.g., system.local/system.peers-style state) for roles holding MODIFY via root-level grants.",
+      "locations": [
+        {
+          "end_line": 394,
+          "path": "src/java/org/apache/cassandra/service/ClientState.java",
+          "start_line": 376
+        },
+        {
+          "end_line": 457,
+          "path": "src/java/org/apache/cassandra/service/ClientState.java",
+          "start_line": 438
+        },
+        {
+          "end_line": 262,
+          "path": "src/java/org/apache/cassandra/cql3/statements/ModificationStatement.java",
+          "start_line": 240
+        },
+        {
+          "end_line": 103,
+          "path": "src/java/org/apache/cassandra/auth/CassandraRoleManager.java",
+          "start_line": 84
+        },
+        {
+          "end_line": 100,
+          "path": "src/java/org/apache/cassandra/auth/PasswordAuthenticator.java",
+          "start_line": 93
+        }
+      ],
+      "prerequisites": "PasswordAuthenticator + CassandraAuthorizer/CassandraRoleManager in use (authentication on); an existing MODIFY-capable grant on the system_auth keyspace/table (e.g., through a root-level permission); no additional operator action needed afterwards on the attacking session. Without any such grant the chain fails, so this is a second-order privilege-escalation path, not an unauthenticated one.",
+      "root_cause": "ClientState's system-keyspace protection is applied only to schema-changing permissions. In ensurePermission(String keyspace, Permission perm, DataResource resource) (ClientState.java:376-394) preventSystemKSSchemaModification() is called, but that method returns immediately unless perm is CREATE/ALTER/DROP (ClientState.java:438-457), and the PROTECTED_AUTH_RESOURCES check likewise only fires for CREATE/ALTER/DROP (lines 390-392). DML therefore falls through to ensurePermissionOnResourceChain(), which walks table->keyspace->root grants; a role that holds MODIFY directly on a system_auth table, or MODIFY via a root-level GRANT (ALL/MODIFY ON ALL KEYSPACES), is authorized to INSERT/UPDATE/DELETE rows of the authentication database. ModificationStatement.authorize() (ModificationStatement.java:240-262) adds no system-keyspace restriction either.",
+      "title": "System-keyspace authorization guards cover only DDL, allowing DML on system_auth roles to escalate to superuser",
+      "trace": "Client sends UPDATE system_auth.roles SET is_superuser = true, salted_hash = '<known bcrypt>' WHERE role = 'attacker' -> ModificationStatement.authorize() calls state.ensureTablePermission(metadata, Permission.MODIFY) (ModificationStatement.java:242) -> ClientState.ensurePermission(keyspace, MODIFY, DataResource.table(system_auth, roles)) -> validateKeyspace/validateLogin -> preventSystemKSSchemaModification(system_auth, resource, MODIFY) returns early because MODIFY is not ALTER/DROP/CREATE (ClientState.java:441-442) -> PROTECTED_AUTH_RESOURCES.contains(resource) is true but the CREATE/ALTER/DROP condition is false (lines 390-392) -> ensurePermissionOnResourceChain(MODIFY, table) iterates table->keyspace->root; a root/keyspace grant contains MODIFY, so authorization passes -> the mutation is applied to system_auth.roles. On the next authentication/permission evaluation CassandraRoleManager.ROW_TO_ROLE reads is_superuser from exactly this table (CassandraRoleManager.java:84-103), Roles.hasSuperuserStatus/AuthenticatedUser.isSuper become true, and PasswordAuthenticator.checkpw validates against the attacker-supplied salted_hash (PasswordAuthenticator.java:93-100), yielding a fully privileged role.",
+      "unverified": "Not runtime-tested and no exploit executed. Whether an administrator granting MODIFY on ALL KEYSPACES (or on system_auth) is considered an explicit delegation of role-table write authority in Cassandra's security model is a policy question I could not resolve from the snapshot. I also could not confirm whether a later upstream fix added a DML/system-keyspace guard, or whether the benchmark's ground-truth fix lies in a different subsystem entirely; the identifier-to-transport mapping and cache-invalidation timing (PermissionsCache/RolesCache) were not executed, so the escalation is traced statically only.",
+      "weakness_type": "CWE-863 Incorrect Authorization / privilege escalation (data-level permission missing on system keyspaces)"
+    }
+  ],
+  "coverage_summary": "Scope: get_source_scope reports 2,172 model-visible files (2,115 also present in the P1 relation index; 57 indexed-file omissions and 58 uncovered files, mostly non-Java), with no sensitive-name/symlink/binary exclusions. All files are read-only source; tests, cqlsh Python sources and scripts are largely absent from this snapshot, so no test-side evidence was available. I focused on security-relevant main Java code: auth/authorization (auth/, auth/jmx/, ClientState, RoleOptions/Roles/PermissionsCache), CQL statement authorize()/validate() implementations (DCL, DDL, DML, DESCRIBE, lists), the native transport protocol (CBUtil, Envelope decoding, Dispatcher auth backport, InitialConnectionHandler, Server/Connection), net-layer inbound/outbound authentication, UDF sandboxing, SSL/TLS configuration, virtual tables, and schema-option class loading. I used the P1 index only for navigation (security_call facts, symbol and relation lookups) and verified every candidate against source text; the index has no data-flow/control-flow or semantic resolution and its `security_call` facts are name-based hints, not findings. I did not read all 2,032 Java files line-by-line: areas only spot-checked include large data-path files (SSTable readers/writers, compaction internals, commit log, BTree/collections, GMS/gossip, repair/streaming, Hadoop integration, nodetool tools, metrics), where memory-safety-style or DoS issues could hide.",
+  "limitations": [
+    "Static review only: no code executed, no server started, no exploit payloads, no tests or scanners run; the privilege-escalation trace is a source-level argument, not a runtime-confirmed exploit.",
+    "The exact upstream commit/base was inferred (cassandra-4.0, 4.0.16-SNAPSHOT, early development) from build.xml/CHANGES.txt/NEWS.txt; no git history, tags, or fix commit were available, so I could not diff against upstream and could not confirm which security fix (if any) is the benchmark's ground truth.",
+    "The P1 relation index provides syntactic/navigation candidates only (97,427 call edges, 43,512 symbols, parse-based, no semantic resolution, no data/control flow, no Spring/DI enforcement verification); absence of an indexed edge is not evidence of absence, and its security_call facts are generic risky-API name hints.",
+    "57 source files are missing from the index and 58 index files are outside the visible scope; these were not analyzed via relations, and non-Java assets (conf/*.yaml, bin/conf shell scripts, .circleci) were reviewed only selectively.",
+    "The system_auth DML candidate depends on Cassandra's policy interpretation of root-level grants; I could not verify from source whether such grants are intended to convey write authority over the authentication database, nor whether a later upstream change added a DML guard.",
+    "DESCRIBE permission filtering, class-instantiation from schema options, and DoS/memory-safety questions in large I/O paths were not exhaustively resolved; other undiscovered issues may exist despite the single submitted candidate."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DescribeStatement performs no permission checks (authorize() is empty; describe() filters nothing), so any authenticated user can DESCRIBE any keyspace/table/function, including system keyspaces and function bodies.",
+      "reason": "Impact is limited because the same schema information (and DESCRIBE output source, system_schema) is already readable by every authenticated user via READABLE_SYSTEM_RESOURCES; I could not establish that a privilege boundary is crossed, and the ClientState parameter in describe()/metadata() is used only for the session keyspace, consistent with a public-schema feature."
+    },
+    {
+      "lead": "DescribeStatement.cluster() returns token-range ownership for any non-system keyspace set via USE without checking permissions on it (DescribeStatement.java ~677-704).",
+      "reason": "Only topology/ownership metadata is disclosed, and equivalent information is available to authenticated users from readable system tables; no write or escalation path."
+    },
+    {
+      "lead": "Class instantiation from schema options (CompactionParams.classFromName, IndexMetadata custom index class, CompressionParams.parseCompressorClass, replication strategy class) lets a user with ALTER/CREATE instantiate arbitrary classes on the classpath.",
+      "reason": "Assignability checks (AbstractCompactionStrategy/Index/AbstractReplicationStrategy) constrain the class set, requires an existing DDL permission, and I found no concrete exploitable implementation; treated as a hardening opportunity, not a vulnerability."
+    },
+    {
+      "lead": "JMX AuthorizationProxy/invoke handling (checkVulnerableMethods, MLet, local subject == null path).",
+      "reason": "The known dangerous operations (compilerDirectivesAdd, jvmtiAgentLoad, MLet addURL/getMBeansFromURL, createMBean/instantiate/registerMBean/deserialize) are already denied; the local-only subject==null path matches the documented connector-server behavior."
+    },
+    {
+      "lead": "Request parsing/UTF-8 handling in CBUtil (the most recent CHANGES entry, CASSANDRA-20234).",
+      "reason": "The fix (CBUtil.encodedUTF8Length via ByteBufUtil.utf8Bytes plus strict decoder and length checks) is present in the snapshot; readValue/readBoundValue/readString all validate lengths. No residual inconsistency found."
+    },
+    {
+      "lead": "UDF sandbox (UDFClassLoader/ScriptBasedUDFunction/ThreadAwareSecurityManager).",
+      "reason": "Resource allow/deny lists, no-permissions ProtectionDomain compilation, setSecurityManager denial and per-thread package checks appear intact, including the java.lang.System restriction for non-threaded UDFs; no deviation from the hardened design was identified."
+    },
+    {
+      "lead": "Internode authentication bypass (InboundConnectionInitiator authenticate()); process-execution sinks (FileUtils/CommitLogArchiver/ExternalArchiver); path handling for keyspace/table names.",
+      "reason": "Inbound authentication is enforced before handshake completion; process-execution sinks are operator-config driven; keyspace/table names are validated by SchemaConstants.isValidName (word chars, 48 chars), preventing directory traversal via names."
+    }
+  ],
+  "summary": "Snapshot is Apache Cassandra cassandra-4.0 branch at version 4.0.16-SNAPSHOT (build.xml base.version=4.0.16; CHANGES.txt top = 4.0.16, incl. CASSANDRA-20234/CBUtil UTF-8, CASSANDRA-20090 \"Tighten up permissions on system keyspaces\" merged from 3.0). I reviewed the authentication/authorization stack (PasswordAuthenticator, CassandraRoleManager, CassandraAuthorizer, AuthCache/RolesCache/PermissionsCache, Resources/DataResource/FunctionResource/RoleResource, JMX AuthenticationProxy/AuthorizationProxy, CassandraLoginModule), the CQL DDL/DML/DCL statement authorize() implementations, ClientState permission plumbing, the CQL native-protocol framing/CBUtil code, SSL/TLS setup, the UDF sandbox (UDFClassLoader/ScriptBasedUDFFunction/ThreadAwareSecurityManager), virtual tables, and class-instantiation paths for table options/indexes. Most of these match a hardened, self-consistent design (system keyspace DDL blocked, protected auth resources, UDF class allow/deny lists, JMX vulnerable-method deny list, TLS endpoint identification, negative-auth results not cached). The one weakness with a concrete source-level privilege-escalation chain is that system-keyspace protection in ClientState only covers schema operations (CREATE/ALTER/DROP), not DML, so a role holding MODIFY on system_auth tables (directly or via a root/keyspace-level grant) can rewrite the authentication database and escalate to superuser. I report it as a single low-confidence candidate; the strongest counter-argument is that Cassandra may intend such grants to be authoritative, and the presence of the CASSANDRA-20090 changelog entry shows related hardening already landed for schema changes."
+}

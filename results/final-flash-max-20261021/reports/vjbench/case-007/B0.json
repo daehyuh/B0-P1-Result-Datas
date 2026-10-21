@@ -1,0 +1,78 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Theme file APIs take a fully attacker-controlled path string: GET /api/admin/themes/activation/files/content?path=<P> (ThemeController:61-64) and GET /api/admin/themes/{themeId}/files/content, plus PUT variants whose JSON body ThemeContentParam.path is attacker-controlled (ThemeController:72-81); these flow to ThemeServiceImpl.getTemplateContent/saveTemplateContent. Separately, theme install/update/fetch take an attacker-supplied ZIP whose ZipEntry names are attacker-controlled (ThemeServiceImpl.upload 394-429, update(themeId,file) 518-568, fetch(uri) 467-493, downloadZipAndUnzip 636-653), and FileUtils.unzip uses the raw entry name at line 101.",
+      "confidence": "medium",
+      "counterevidence_checked": "The guard is genuinely present and does reject paths that do not begin with the theme directory, so this is an incomplete-fix/validation flaw rather than a missing control. Every reachable sink I traced is behind the admin authentication filter (HaloConfiguration lines 143-174; no unauthenticated route to these methods was found: content-side templateExists only proves existence and FreeMarker view names, and template names there come from DB fields, not request parameters). Files.copy does not use REPLACE_EXISTING, so existing files are not silently overwritten by the ZIP path. The legacy migration content handler (WordPress) is non-functional, so the admin theme APIs are the only confirmed sinks.",
+      "id": "case-007-c1",
+      "impact": "Post-authentication (admin/temp-token) containment bypass: reading files readable by the Halo process outside the theme directory (for example the work-dir application.yaml with datasource/mail/OSS secrets, the H2 database files, or OS files) and writing or overwriting files writable by that process outside the theme directory (config, templates, database files, or startup/SSH artifacts when permissions allow), i.e. confidentiality and integrity loss that can escalate to code execution or full data destruction depending on deployment permissions. For the ZIP path, classic Zip Slip arbitrary file write. All of this exceeds the intended administrator restriction to the activated theme directory.",
+      "locations": [
+        {
+          "end_line": 303,
+          "path": "src/main/java/run/halo/app/utils/FileUtils.java",
+          "start_line": 295
+        },
+        {
+          "end_line": 112,
+          "path": "src/main/java/run/halo/app/utils/FileUtils.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 269,
+          "path": "src/main/java/run/halo/app/service/impl/ThemeServiceImpl.java",
+          "start_line": 216
+        },
+        {
+          "end_line": 81,
+          "path": "src/main/java/run/halo/app/controller/admin/api/ThemeController.java",
+          "start_line": 61
+        }
+      ],
+      "prerequisites": "A running, installed blog and a valid admin credential (access token / refresh token, or a leaked one-shot temp_token) because /api/admin/themes/** is behind AdminAuthenticationFilter; network reachability of the admin API; for Zip Slip, the ability to upload/update/fetch a theme archive as admin. No victim interaction and no special server configuration were identified in source.",
+      "root_cause": "FileUtils.checkDirectoryTraversal(Path parentPath, Path pathToCheck) returns successfully when pathToCheck.startsWith(parentPath.normalize()). Path.startsWith() compares path elements only; pathToCheck is never normalized/canonicalized. A value such as <themeDir>/../../../../<file> starts with <themeDir>'s elements, so the check passes, while the subsequent Files.readAllBytes / Files.write / Files.copy resolves the '..' segments and operates outside <themeDir>. Callers rely on this helper as their only containment control (ThemeServiceImpl.checkDirectory, FileUtils.unzip).",
+      "title": "Incomplete path containment check in FileUtils.checkDirectoryTraversal enables directory traversal (arbitrary theme-external file read/write and Zip Slip)",
+      "trace": "1) GET /api/admin/themes/activation/files/content?path=P -> ThemeController.getContentBy -> ThemeServiceImpl.getTemplateContent(P) (line 216) -> checkDirectory(P) (line 729) -> FileUtils.checkDirectoryTraversal(themePath, P). If P is themePath + \"/../..\" + target file, startsWith(themePath.normalize()) is true and the guard returns; line 224 then does Files.readAllBytes(Paths.get(P)), which the OS resolves outside the theme directory, and the file content is returned in the HTTP response. 2) PUT /api/admin/themes/activation/files/content with {\"path\":P,\"content\":C} -> saveTemplateContent (243-255) -> Files.write at line 251 writes C to the resolved location outside the theme directory. 3) POST /api/admin/themes/upload with a ZIP containing an entry named e.g. \"../../<name>\": FileUtils.unzip line 101 builds entryPath = targetPath.resolve(entryName); the same flawed check at line 104 passes; line 111 Files.copy(zis, entryPath) writes the entry outside the intended extraction directory (Zip Slip); directory entries take the same path through Files.createDirectories at line 108. ThemeServiceImpl.update(themeId,file) and fetch(uri)/downloadZipAndUnzip use the identical unzip path.",
+      "unverified": "No runtime execution or test suite exists in the snapshot; exploitability was derived from Java Path.resolve/startsWith and Files semantics only. The deployment work-dir layout and process-user permissions were not verified, so concrete files reachable for read/write are inferred. Whether upstream intends this guard as a security boundary for admins is inferred from its name/comment and call sites. Adjacent, separately-rooted issues (unvalidated theme id from theme.yaml used in themeWorkDir.resolve + FileUtils.copyFolder at ThemeServiceImpl.add lines 452-455) were not folded into this candidate.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / Zip Slip (CWE-22, CWE-23)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 494-file snapshot: read the security package (filters, handlers, resolver, token utils), HaloConfiguration/WebMvcAutoConfiguration, all admin and content controllers, and the key service implementations (theme, backup, recovery/migrate, attachment, comment, post/sheet, admin/user, option, static storage), plus utility classes (FileUtils, FilenameUtils, JsonUtils, MarkdownUtils, HaloUtils, ServletUtils, CacheLock interceptor, cache stores, freemarker listener/tags/random method) and build/config files. Searched repository-wide for path/file I/O (Paths.get, Files., unzip/zip, transferTo), auth-exclusion patterns, @Query/JPQL, reflection, process execution (none found), and template rendering entry points. Generated admin JS/CSS bundles and theme static assets were only searched, not read in depth; no FTL theme templates or tests exist in the snapshot.",
+  "limitations": [
+    "No code was executed and no tests exist in the snapshot; all conclusions are static-source inferences (Java Path.startsWith/resolve semantics, Spring OncePerRequestFilter ordering, servlet URL-pattern behavior).",
+    "Theme .ftl templates, the admin SPA sources, and runtime configuration (halo.work-dir, process user, container permissions) are outside the snapshot, so downstream output-context and exact reachable files could not be verified.",
+    "Admin JS/vendor bundles (~1.5 MB of generated code) were searched for endpoints but not audited line-by-line.",
+    "Only the single strongest candidate is reported; the rejected leads above may still be real issues that were not fully confirmed or disproven.",
+    "Some findings depend on Spring/Tomcat framework behavior (shouldNotFilter ordering, URL-decoding of slashes) that was reasoned from framework semantics rather than executed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unauthenticated access to /api/admin/migrations/* (MigrateController) and /api/admin/recoveries/migrations/* — HaloConfiguration.java lines 155-164 exclude these paths from AdminAuthenticationFilter, and OncePerRequestFilter consults shouldNotFilter before the isInstalled gate in AbstractAuthenticationFilter (lines 144-171), so an installed blog can have OldVersionMigrateHandler data imported (posts/sheets/comments flagged isAdmin/categories/tags/menus) with no credential.",
+      "reason": "Genuine-looking trust-boundary gap, but impact is content/DB injection rather than file or credential compromise, and the exclusion list looks deliberate (RecoveryController has its own isInstalled guard, MigrateController does not); I could not confirm the intended policy from the snapshot, so it was not selected over the broken containment control."
+    },
+    {
+      "lead": "Password reset allows unlimited code guessing: POST /api/admin/password/code and PUT /api/admin/password/reset are excluded from authentication (HaloConfiguration lines 162-163), the reset code is a 6-digit number cached under the global key \"code\" (AdminServiceImpl lines 204-262) with no attempt counter or CacheLock, and success resets the blog owner's password.",
+      "reason": "Account takeover requires online brute force of a 6-digit code inside a 5-minute window, i.e. a feasibility question outside static source evidence; treated as an unconfirmed lead."
+    },
+    {
+      "lead": "Backup filename handling lacks containment checks: BackupServiceImpl.deleteHaloBackup (lines 214-228) does not normalize/validate the request-parameter filename before Files.delete, and loadFileAsResource (lines 231-248) normalizes but never verifies the result is inside backupDir; BackupController exposes the download path variable with {fileName:.+}.",
+      "reason": "Both endpoints are inside the authenticated /api/admin/** filter and deletion/download requires an admin token; URL path-variable slashes are normally rejected by the container, so I could not establish a strong, reachable exploit from source alone."
+    },
+    {
+      "lead": "CorsFilter reflects any Origin and sets Access-Control-Allow-Credentials: true for /api/* (CorsFilter lines 34-37).",
+      "reason": "Authentication uses explicit admin-token/api_access_key headers or query parameters, not cookies, so there is no ambient credential for a cross-origin page to leverage; not exploitable as written."
+    },
+    {
+      "lead": "Stored HTML/XSS through unauthenticated comment creation (BaseCommentServiceImpl.createBy/create lines 220-308; BaseCommentParam content up to 1023 chars with no escaping) possibly rendered unescaped by themes.",
+      "reason": "The theme FTL templates that would establish the output context are not part of the snapshot (only theme settings/assets are present), so the XSS claim cannot be evidenced locally."
+    },
+    {
+      "lead": "Theme metadata path injection: ThemeServiceImpl.add uses themeWorkDir.resolve(tmpThemeProperty.getId()) (line 454) with the theme id read from the uploaded theme.yaml and then FileUtils.copyFolder, with no traversal check on the id.",
+      "reason": "Real missing validation in the same feature area but a distinct root cause from the broken checkDirectoryTraversal helper; not selected in order to keep one root cause per candidate."
+    },
+    {
+      "lead": "Spoofable client IP for rate limiting (ServletUtils.getRequestIp -> hutool getClientIP honoring X-Forwarded-For; used by @CacheLock traceRequest and comment IP storage).",
+      "reason": "Rate-limit bypass/spam-level issue only; no high-impact path identified."
+    }
+  ],
+  "summary": "Assigned snapshot is Halo (run.halo.app, build.gradle version 1.1.3-beta.3, Spring Boot 2.2.1), 494 source files, all filtered files reviewed at listing level. The single strongest source-evidenced issue is a broken path-containment check: FileUtils.checkDirectoryTraversal() normalizes only the parent path and compares the *raw* candidate path with Path.startsWith(), which is component-wise. Any path that begins with the allowed directory and then contains \"..\" segments passes the check even though the OS resolves it outside the directory. The same helper is the only containment control for (a) theme template file read/write endpoints and (b) ZIP extraction, giving arbitrary file read/write and Zip Slip as the Halo process user (gated behind the admin token). I selected this one candidate; other plausible-but-weaker leads are listed as rejected."
+}

@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "perfectoConnectLocation, perfectoConnectFile and pcParameters are @DataBoundConstructor fields settable from the job configuration UI by a user with Item/Configure, or from a pipeline script via the build-wrapper step (the class exposes @Symbol(\"withPerfecto\"), and BuildWrapper steps can be instantiated with arbitrary parameter maps). cloudName and apiKey are read from the selected Perfecto credential (lines 218-219) and are concatenated into the same shell string unquoted, so a user able to create/edit Perfecto credentials could also embed shell metacharacters. Values cross into the shell on both branches: e.g. a trailing/embedded `; cmd`, `$(cmd)`, backticks or newline on Unix, or `& cmd`, `| cmd` on Windows, is interpreted by bash/cmd.exe rather than passed as data to the Perfecto Connect client.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the whole visible call path for quoting/escaping, whitelisting or shell-free execution: none exists (Util.fixEmptyAndTrim is used only for emptiness checks; the ENVIRONMENT_VARIABLE_PATTERN at line 71 is unused). Considered that these fields are job-configuration values, and that users with Item/Configure can often already add shell build steps to runs on an agent; however this code executes on the Jenkins controller itself and is reachable from pipeline/wrapper parameters, so it is a distinct boundary crossing. Checked the reuseTunnelId path: it is used only as an environment value (line 222, 234), never in the shell, so it is not an injection vector. Checked the log-sink angle: Jenkins console output is escaped, so the raw printing of process output (line 173) is log forging, not XSS. Verified no other process/command execution sinks exist in the visible Java sources.",
+      "id": "perfecto-command-injection",
+      "impact": "Arbitrary OS command execution with the privileges of the Jenkins controller process (the BuildWrapper setUp runs in the controller JVM, not on a build agent; the Launcher argument is unused). Impact includes theft of Jenkins credentials/secrets accessible to that account, modification of jobs/builds, persistence, and lateral movement. Because the wrapper can also be instantiated from pipeline code, including sandboxed Jenkinsfile-as-code from SCM, values supplied there trigger controller-side execution rather than the usual agent-side step execution, weakening the sandbox/agent boundary. Secondary: the plaintext Perfecto security token is passed as an argv element of the spawned process (line 160), readable by other local users via process listings, even though the plugin's own log echo masks it as <<TOKEN>> (line 161).",
+      "locations": [
+        {
+          "end_line": 168,
+          "path": "src/main/java/io/plugins/perfecto/PerfectoBuildWrapper.java",
+          "start_line": 151
+        },
+        {
+          "end_line": 149,
+          "path": "src/main/java/io/plugins/perfecto/PerfectoBuildWrapper.java",
+          "start_line": 129
+        },
+        {
+          "end_line": 222,
+          "path": "src/main/java/io/plugins/perfecto/PerfectoBuildWrapper.java",
+          "start_line": 204
+        },
+        {
+          "end_line": 395,
+          "path": "src/main/java/io/plugins/perfecto/PerfectoBuildWrapper.java",
+          "start_line": 371
+        }
+      ],
+      "prerequisites": "The wrapper must be present on a build and the tunnel-creation branch must execute: credentials resolved by PerfectoCredentials.getPerfectoCredentials(build, this) must be non-null and reuseTunnelId must not contain '-' (otherwise setUp throws or skips getTunnelId, lines 212-222). A user with Item/Configure can satisfy this (select a valid credentialId); credential-field injection requires permission to create/modify Perfecto credentials. No requirement that the configured Perfecto Connect binary actually exist: injected commands after `;` still run even if the preceding command fails. Note also that enablePerfectoConnect is never consulted in setUp (lines 80, 254-260), so once the wrapper is configured the command path runs on every matching build.",
+      "root_cause": "PerfectoBuildWrapper.getTunnelId() builds one command string by string concatenation from attacker-influenceable values and gives it to an OS shell: pcLocation = perfectoConnectLocation (+ File.separator) + perfectoConnectFile (lines 155-159); baseCommand = pcLocation.trim() + \" start -c \" + cloudName.trim() + \".perfectomobile.com -s \" + apiKey.trim() (line 160). On Windows the string is passed to {\"cmd.exe\", \"/c\", baseCommand + \" \" + pcParameters.trim()} via ProcessBuilder (lines 163-164); on Unix it is passed to {\"bash\", \"-c\", \"(cd \" + perfectoConnectLocation + \"; \" + baseCommand + \" \" + pcParameters.trim() + \")\"} via Runtime.exec (lines 166-167). No shell quoting/escaping is applied and no validator rejects metacharacters: the constructor stores the raw strings (lines 130-149), and the only server-side validation methods (doCheckPerfectoConnectLocation lines 371-382, doCheckPerfectoConnectFile lines 384-395) merely check emptiness; pcParameters has no validator at all.",
+      "title": "OS command injection in Perfecto Connect build wrapper via unquoted shell command construction",
+      "trace": "1) Constructor (lines 130-149) stores perfectoConnectLocation, perfectoConnectFile, pcParameters, tunnelIdCustomName, reuseTunnelId, credentialId verbatim from the data-bound configuration. 2) Build start: setUp (lines 204-222) resolves credentials and, on the non-reuse path, reads the plaintext API key (line 218) and calls getTunnelId(perfectoConnectLocation, credentials.getCloudName(), apiKey, listener) (line 219). 3) getTunnelId concatenates the values into pcLocation (lines 155-159) and baseCommand (line 160), then executes the whole string through a shell: cmd.exe /c (line 163-164) or bash -c \"(cd <location>; <baseCommand> <pcParameters>)\" (lines 166-167). 4) Because bash/cmd.exe parse the concatenated string, metacharacters in perfectoConnectLocation, perfectoConnectFile, pcParameters, cloudName or apiKey yield arbitrary OS commands executed by the Jenkins controller JVM user. 5) The stdout of that process is then read and printed (lines 169-193), which additionally exposes command output in the build log.",
+      "unverified": "The exact credential-resolution semantics of PerfectoCredentials.getPerfectoCredentials (including whether an arbitrary pipeline author can reference any credentialId) live in the excluded file src/main/java/io/plugins/perfecto/credentials/PerfectoCredentials.java and could not be inspected, so the lowest-privileged attacker path is not proven; no runtime/build execution was performed (per assignment rules), so this is a source-evidence lead, not a confirmed exploit. The Windows branch was assessed from the cmd.exe /c semantics rather than a run.",
+      "weakness_type": "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+    }
+  ],
+  "coverage_summary": "Source scope reported 18 root source files, 13 model-visible, 5 excluded by the sensitive-name/path filter (one confirmed: src/main/java/io/plugins/perfecto/credentials/PerfectoCredentials.java; it is imported and central to credential resolution). Both visible Java files were read in full (PerfectoBuildWrapper.java 1-462, PerfectoEnvironmentUtil.java 1-61), plus pom.xml, README.md, .gitignore and all 7 visible help HTML files. search_code was used for PerfectoCredentials, apiKey, ProcessBuilder, Runtime, bash, BuildUtils, ENVIRONMENT_VARIABLE_PATTERN, enablePerfectoConnect and perfectoSecurityToken; excluded files are not returned by search_code. No .jelly/.properties files are present in the snapshot (config.jelly and descriptor resources appear to be filtered by the snapshot's file selection), and src/main/java/io/plugins/perfecto/BuildUtils.java is generated at build time from a template that is not present in the snapshot (pom.xml lines 88-90). No code was executed and no runtime behavior was confirmed.",
+  "limitations": [
+    "Five files are excluded from the model-visible view, including the confirmed credential class src/main/java/io/plugins/perfecto/credentials/PerfectoCredentials.java; the credential-resolution and credential-selection permission logic could not be inspected, so the lowest-privileged attacker path for the command-injection candidate remains partially unverified.",
+    "The snapshot contains no config.jelly or credentials UI resources, so client-side validation and the exact set of fields exposed in the UI could not be cross-checked against the server-side code.",
+    "BuildUtils.java is generated from BuildUtils.template (pom.xml lines 88-90), and the template is not present in the snapshot; any telemetry/utility code there was not reviewed.",
+    "All statements are source-level only; no build, deployment or exploit was run, and Jenkins console-escaping and cmd.exe/bash behaviors were assessed from platform knowledge, not executed.",
+    "Version/context is taken from pom.xml (1.17) and README; no external advisory or patch data was consulted per assignment rules."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Raw process output and configuration values printed to the build log (listener.getLogger().println(s) line 173; command echo line 161) as a stored-XSS vector.",
+      "reason": "Jenkins escapes console output by default; the data lands in a text log, so at most log forging/format manipulation, not script execution. No HTML rendering of these strings in the visible code."
+    },
+    {
+      "lead": "Environment-variable injection/overwrite via tunnelIdCustomName with overwrite=true (line 234 and PerfectoEnvironmentUtil.outputEnvironmentVariable lines 38-42).",
+      "reason": "Tunnel ID name and value (including arbitrary reuseTunnelId) can replace existing env vars in the build, but this gives no direct shell/controller execution primitives (values are plain env data) and requires the same configuration-level access as the command-injection issue, so it is weaker and appears to be a design limitation rather than an independent vulnerability."
+    },
+    {
+      "lead": "Legacy perfectoSecurityToken stored in configuration and marked sensitive (lines 88, 113-116, 286-292).",
+      "reason": "The field is no longer used by setUp and a migration path for the legacy embedded credentials object exists (migrateCredentials lines 405-439). Whether old configs still persist plaintext tokens could not be verified from the visible files; no clear exploitable path in this snapshot."
+    },
+    {
+      "lead": "doCheckCredentialId returns FormValidation.ok() early whenever item != null and value is non-empty (line 361), without verifying the credential exists.",
+      "reason": "Functional validation bug; the method still enforces Jenkins.ADMINISTER first (line 360) and discloses no secret, so no concrete security impact."
+    },
+    {
+      "lead": "run_condition 'condition' field is stored but never evaluated in setUp.",
+      "reason": "The configured condition is silently ignored, which is a correctness/behavior issue, not a security vulnerability by itself."
+    },
+    {
+      "lead": "README pipeline sample builds an `sh` script by concatenating cloudName/securityToken/perfectoConnectPath (README.md lines 95-122).",
+      "reason": "Documentation example operating on values the script author already controls; not a defect in the plugin code."
+    }
+  ],
+  "summary": "Reviewed the assigned snapshot of the Jenkins Perfecto plugin (pom version 1.17). The snapshot exposes 13 of 18 source files; 5 files are excluded by the sensitive-name/path filter (at least one confirmed: src/main/java/io/plugins/perfecto/credentials/PerfectoCredentials.java, which is imported by the wrapper and resolves credentials). Both visible Java sources (PerfectoBuildWrapper.java, PerfectoEnvironmentUtil.java) were read in full, along with pom.xml, README.md, .gitignore and the visible help HTML. The strongest source-evidenced issue is a textbook OS command injection: PerfectoBuildWrapper.getTunnelId() concatenates job-configuration fields (perfectoConnectLocation, perfectoConnectFile, pcParameters) and credential fields (cloudName, apiKey) into a single string that is executed through cmd.exe /c or bash -c without quoting/escaping or any meaningful validation. The plugin performs this execution on the Jenkins controller during BuildWrapper.setUp(), before build steps run."
+}

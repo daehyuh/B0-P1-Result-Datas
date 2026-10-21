@@ -1,0 +1,67 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated client controls how many direct h2c connections are opened and when they are closed. It connects to the HTTP connector and sends the HTTP/2 connection preface (\"PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n\"); Http11InputBuffer.parseRequestLine() detects it (Http11InputBuffer.java:365-376) and Http11Processor.service() returns SocketState.UPGRADING with a null upgrade token (Http11Processor.java:260-263), reaching the vulnerable branch. Repeating connect/preface/close cycles leaks one more processor object graph per connection.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the processor is released elsewhere: the non-direct upgrade branch does call release(processor) (AbstractProtocol.java:870-874), but no equivalent exists for the token==null branch; wrapper.setCurrentProcessor() only overwrites a field (SocketWrapperBase.java:140-142); release(SocketWrapperBase) later only releases the wrapper's current (HTTP/2) processor; waitingProcessors only applies to async processors. Checked that releasing P before creating the upgrade processor would be safe: the h2c handler is created with a null coyote request (Http2Protocol.java:103-107) and leftover input is captured before the branch (line 851). Checked whether the leak is real without JMX: with a null protocol domain, register() is skipped and P would become collectible, so a non-default JMX-disabled configuration reduces the anchor; default Tomcat derives the \"Catalina\" domain and registers the MBean. Checked the in-repo changelog versus code for consistency (HttpServlet 405 and application/wasm entries match the code), which makes the h2c entry/code mismatch stand out.",
+      "id": "tomcat-h2c-processor-release-missing",
+      "impact": "Remote unauthenticated denial of service: per direct-h2c connection one Http11Processor plus its associated request/response objects, protocol buffers and socket wrapper are retained indefinitely, and a RequestProcessor MBean is registered permanently. With repeated connections the leak is unbounded, eventually exhausting heap; even short-lived scanner-style traffic causes steady memory growth and JMX registry growth until restart.",
+      "locations": [
+        {
+          "end_line": 861,
+          "path": "java/org/apache/coyote/AbstractProtocol.java",
+          "start_line": 847
+        },
+        {
+          "end_line": 874,
+          "path": "java/org/apache/coyote/AbstractProtocol.java",
+          "start_line": 870
+        },
+        {
+          "end_line": 1057,
+          "path": "java/org/apache/coyote/AbstractProtocol.java",
+          "start_line": 1032
+        },
+        {
+          "end_line": 1097,
+          "path": "java/org/apache/coyote/AbstractProtocol.java",
+          "start_line": 1072
+        },
+        {
+          "end_line": 1169,
+          "path": "java/org/apache/coyote/AbstractProtocol.java",
+          "start_line": 1144
+        },
+        {
+          "end_line": 116,
+          "path": "webapps/docs/changelog.xml",
+          "start_line": 113
+        }
+      ],
+      "prerequisites": "The connector must have the HTTP/2 upgrade protocol configured (org.apache.coyote.http2.Http2Protocol), which is what makes direct h2c connections possible; this is not in the default server.xml. The retention anchor is JMX registration of per-processor RequestProcessor MBeans, which is on by default because AbstractProtocol.init() derives a non-null domain from the connector/service and registers the protocol (AbstractProtocol.java:499-552, register() at 1072-1097). No authentication or application interaction is required beyond the HTTP/2 preface.",
+      "root_cause": "In AbstractProtocol.ConnectionHandler.process() the direct HTTP/2 (h2c) branch handles SocketState.UPGRADING with a null UpgradeToken by obtaining a new HTTP/2 processor and calling wrapper.setCurrentProcessor(processor), but it never calls release(processor) for the HTTP/1.1 processor that processed the connection so far. The parallel non-direct upgrade branch at lines 870-874 does call release(processor). Because the HTTP/1.1 processor was registered in JMX at creation (register(), lines 1072-1097), the MBean server keeps a RequestProcessor MBean -> RequestInfo -> Request -> hook -> processor reference chain alive; without release()/recycle() that whole graph (processor, request/response, buffers, socket wrapper) is never reclaimed and its MBean is never unregistered (RecycledProcessors.push() unregisters only when a released processor cannot be cached, lines 1155-1168).",
+      "title": "HTTP/1.1 processor is not released on a direct h2c upgrade, leaking processors and enabling memory-exhaustion DoS",
+      "trace": "1) Connection accepted: a new Http11Processor P is created and register(P) binds a RequestProcessor MBean pointing at P.request.getRequestProcessor() (AbstractProtocol.java:823-835, 1072-1097). 2) Client sends the h2c preface: Http11InputBuffer sets parsingRequestLinePhase=-1 (Http11InputBuffer.java:365-376); Http11Processor returns SocketState.UPGRADING with upgradeToken==null (Http11Processor.java:260-263). 3) ConnectionHandler sees UPGRADING, token==null, fetches the h2c UpgradeProtocol, captures leftOverInput, then replaces the current processor with upgradeProtocol.getProcessor(...) and wrapper.setCurrentProcessor(newProcessor) without release(P) or P.recycle() (AbstractProtocol.java:843-861; Http2Protocol.getProcessor creates the upgrade processor with a null coyote request, Http2Protocol.java:103-107). 4) P is now unreachable from the socket wrapper, but the MBean server still roots RequestInfo -> Request -> hook == P (Request.java:153,424-426; AbstractProcessor.java:86-91), so P and its buffers are never garbage-collected and the MBean is never unregistered. 5) Each additional direct-h2c connection repeats steps 1-4, so heap and MBean registrations grow without bound until OutOfMemoryError / denial of service. The same file's non-direct upgrade branch performs release(processor) immediately before creating the upgrade processor (lines 870-874), and the repo changelog (lines 113-116) states this direct-h2c recycling fix was made, so the cleanup is expected but absent in this snapshot.",
+      "unverified": "Not runtime-confirmed. The exact retained object size per connection and whether every supported Tomcat deployment leaves JMX registration enabled were not measured. The snapshot has no tests and no VCS metadata, so I could not diff against the upstream fix commit; the inference that this hunk is the intended missing fix rests on the code path plus the contradicting changelog entry.",
+      "weakness_type": "Missing resource release (CWE-404/CWE-400): processor and its JMX/request object graph are never recycled"
+    }
+  ],
+  "coverage_summary": "Scope was the 2,866-file source root (no test/ or VCS metadata present; binary-like files skipped by the harness). I inspected the Coyote core (AbstractProtocol, AbstractProcessor, Http11Processor/Http11InputBuffer, Http2Protocol, HTTP/2 and AJP processors/filters), the Catalina connector/session/authenticator/filters areas (including FileStore.java), the WebSocket implementation (WsFrameBase and subclasses, LocalStrings), and the in-repo changelog/project docs; I also sampled recently claimed fixes (HttpServlet, MIME types, cookie parsing, h2c) to compare code against documented state. Coverage is not exhaustive: Jasper/EL internals, modules/jdbc-pool, webapps applications, build/bin scripts, and many lesser-used classes were only sampled or not read line-by-line.",
+  "limitations": [
+    "No execution, build, tests, or runtime measurement was performed; the leak and its size are inferred from source references only.",
+    "The snapshot has no tests and no VCS metadata, so the fix history/ground truth cannot be inspected; the finding is a lead, not a confirmed vulnerability.",
+    "Direct h2c and JMX-based RequestProcessor registration are configuration-dependent prerequisites; non-default deployments may reduce or eliminate the retention anchor.",
+    "Not all 2,866 files were reviewed; unread areas (Jasper, EL, webapps, jdbc-pool, bin scripts) remain unreviewed and could contain other issues."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "WebSocket 64-bit payload length is not validated for the high bit: byteArrayToLong() can return a negative long for a 127-form frame (WsFrameBase.java:257-265, 667-678); UnmaskTransformation/NoopTransformation then never consume payload and keep returning OVERFLOW while input remains (WsFrameBase.java:977-1003), and processDataText()/processDataBinary() loop over transformations (WsFrameBase.java:405-449, 504-530), which looks like a remote busy-loop/CPU DoS for endpoints with text or partial-message handlers.",
+      "reason": "Plausible but not selected. No in-repo changelog entry or local artifact ties this to the snapshot's fix state (unlike the h2c case, where the repo changelog explicitly documents the missing fix), and it requires an application WebSocket endpoint with a suitable message handler. Kept as an unconfirmed secondary lead."
+    },
+    {
+      "lead": "Other recently changed security-sensitive areas checked but not selected: FileStore.load path canonicalization (CVE-2020-9484-style) is present (FileStore.java:344-360); HttpServlet method-not-allowed handling is present (HttpServlet.java:407-416); the h2c non-direct upgrade branch does release the HTTP/1.1 processor (AbstractProtocol.java:870-874); RFC 2109/6265 cookie parsing and IPv6 parsing fixes claimed in the changelog have matching code.",
+      "reason": "No missing validation or cleanup was identified in these paths during the review, so they do not compete with the selected candidate."
+    }
+  ],
+  "summary": "Snapshot is Apache Tomcat 10.0.x (10.0.0-M7 in development, per build.xml/changelog). Review focused on the Coyote protocol/HTTP upgrade path, HTTP/1.1/2 processors, sessions, WebSocket, and the in-repo changelog. The strongest issue found is in the direct-h2c upgrade path: the HTTP/1.1 processor is replaced by the HTTP/2 upgrade processor without being released/recycled, even though the repo's own changelog entry (webapps/docs/changelog.xml:113-116) records that this exact cleanup was implemented. Each direct-h2c connection therefore permanently retains the HTTP/1.1 processor (and its buffers) via the JMX RequestProcessor MBean graph, giving an unauthenticated remote memory-exhaustion DoS. A second, independently plausible denial-of-service lead in WebSocket frame length handling was considered but not selected; details are in rejected leads."
+}

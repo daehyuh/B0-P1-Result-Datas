@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated caller controls the {userId} path parameter of POST /api/users/{userId}/tokens/{name} (plus the token name and optional TTL body). Nothing restricts {userId} to the caller's own account. The JSON response includes the plaintext token value (Token.token(), UsersResource line 743).",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the method has no @RequiresPermissions and that ShiroSecurityBinding/ShiroAuthorizationFilter only enforce the annotation, so the caller-scoped in-method check is the only gate. Verified users:tokencreate:<username> is a real self-service permission granted dynamically (Permissions.userSelfEditPermissions, UserImpl.getPermissions) and consumed at runtime (MongoDbAuthorizationRealm). Checked sibling methods (listTokens 702, revokeToken 755, changeUser 423, changePassword 622) which check the target username, making the generateNewToken check the outlier rather than a deliberate 'admin-only' pattern. Checked the 6.2 token-management migrations: fresh installs default to restrictAccessTokenToAdmins=true, which blocks non-admin callers; the escalation needs the relaxed upgrade defaults (or explicit reconfiguration), so the issue is configuration-dependent but matches documented 6.2 upgrade behavior. Could not run the server or tests, so exploitability is not runtime-confirmed.",
+      "id": "graylog-token-create-target-authz-bypass",
+      "impact": "Vertical privilege escalation: a non-administrative user who is allowed to create their own API tokens can mint a token for any other account, including an administrator, and use it to gain that account's permissions (full admin). The token persists until its TTL/revocation, giving durable unauthorized access. The token creation is recorded via the USER_ACCESS_TOKEN_CREATE audit event, but that does not prevent the action.",
+      "locations": [
+        {
+          "end_line": 744,
+          "path": "graylog2-server/src/main/java/org/graylog2/rest/resources/users/UsersResource.java",
+          "start_line": 720
+        },
+        {
+          "end_line": 778,
+          "path": "graylog2-server/src/main/java/org/graylog2/rest/resources/users/UsersResource.java",
+          "start_line": 773
+        },
+        {
+          "end_line": 176,
+          "path": "graylog2-server/src/main/java/org/graylog2/security/AccessTokenServiceImpl.java",
+          "start_line": 157
+        },
+        {
+          "end_line": 81,
+          "path": "graylog2-server/src/main/java/org/graylog2/security/realm/AccessTokenAuthenticator.java",
+          "start_line": 56
+        }
+      ],
+      "prerequisites": "The caller must be authenticated and hold users:tokencreate:<own-name>. That dynamic permission is granted via Permissions.userSelfEditPermissions / UserImpl.getPermissions whenever token creation is allowed for the account, i.e. for internal (or allowed external) users when UserConfiguration.restrictAccessTokenToAdmins is false. Fresh 6.2 installs set restrictAccessTokenToAdmins=true, but installations upgraded to 6.2 keep the relaxed value (UserConfiguration.DEFAULT_VALUES_FOR_UPGRADE, used by V20250206105400_TokenManagementConfiguration), and administrators can also disable the restriction. The attacker also needs the target's user ID; a built-in 'User Inspector' role (USERS_READ+USERS_LIST) or any users:list holder can read IDs, including the admin_user id returned by /api/users/paginated.",
+      "root_cause": "UsersResource.generateNewToken() loads the target user from the {userId} path parameter (futureOwner) but evaluates the USERS_TOKENCREATE permission against the calling user (currentUser), and then creates the token for futureOwner. Because the caller's self-service permission users:tokencreate:<own-name> satisfies the check, there is no binding between the caller and the account the token is created for. Sibling endpoints (listTokens, revokeToken, changeUser, changePassword) all evaluate the permission against the target user, showing the intended pattern.",
+      "title": "POST /api/users/{userId}/tokens/{name} authorizes the caller instead of the target user, allowing access tokens to be minted for arbitrary accounts (privilege escalation)",
+      "trace": "1) Caller authenticated with its own account sends POST /api/users/{adminUserId}/tokens/{name}; class-level @RequiresAuthentication is satisfied and the method has no @RequiresPermissions, so no filter-level permission check runs (ShiroSecurityBinding only registers ShiroAuthorizationFilter when @RequiresPermissions is present). 2) loadUserById(userId) resolves the admin account into futureOwner. 3) isPermitted(USERS_TOKENCREATE, currentUser.getName()) evaluates users:tokencreate:<caller>, which the caller holds for self-service, so it passes. 4) accessTokenService.create(futureOwner.getName(), name, ttl) stores an AccessToken whose USERNAME field is the admin's username and returns the plaintext token in the HTTP response. 5) The caller authenticates with 'Authorization: Basic base64(<token>:token)'; ShiroSecurityContextFilter builds an AccessTokenAuthToken; AccessTokenAuthenticator loads the user stored on the token (the admin) and authenticates the request as that user; MongoDbAuthorizationRealm resolves the admin's '*'-equivalent role, so the caller obtains full administrative privileges.",
+      "unverified": "No runtime verification (static review only; no tests are present in the visible snapshot). Exact per-deployment values of allowAccessTokenForExternalUsers/restrictAccessTokenToAdmins are not observable from source. Ease of obtaining another user's Mongo ObjectId from a low-privilege account outside the users:list/'User Inspector' path was not fully established (the /api/authz/shares endpoints and user-by-id endpoint enforce USERS_EDIT on the target). Whether this specific flaw corresponds to a published Graylog advisory could not be checked (no web access).",
+      "weakness_type": "Incorrect Authorization (CWE-863); Authorization Bypass Through User-Controlled Key (CWE-639)"
+    }
+  ],
+  "coverage_summary": "Scope covered: 6,242 model-visible files (4,028 Java files reported by the P1 index; ~2,542 parsed, 9 files missing from the index, 4 parse errors; no control-flow or data-flow analysis available, so all edges are syntactic candidates only). I concentrated on graylog2-server REST resources and security/auth code and read the full UsersResource, SupportBundleService/Resource, SessionsResource/SessionCreator, HTTP transport/HttpHandler, LDAP auth service backend, HTTP header auth realm, token services/realms, permission model (Permissions, RestPermissions, UserImpl, MongoDbAuthorizationRealm), and cluster-config deserialization guards, plus targeted searches for SQL/process/deserialization/path/SSRF sinks across the tree. No test sources appear in the visible snapshot, so behavior is not corroborated by tests. I did not exhaustively review every module (data-node internals, storage adapters, pipeline processor functions, integrations/AWS, content packs, and the large migrations surface were only spot-checked).",
+  "limitations": [
+    "Static, read-only review: no code, tests, scanners, or exploit payloads were executed; the finding is a lead, not a runtime-confirmed vulnerability.",
+    "The P1 relation index provides syntactic navigation only (no data flow, control flow, semantic resolution, runtime reachability, or exploitability proof), and it omits 9 source files and reports 4 parse errors.",
+    "No test sources are present in the visible snapshot, limiting behavioral cross-checks.",
+    "Deployment-specific configuration (allow_access_token_for_external_user, restrict_access_token_to_admins) cannot be observed from source; the privilege-escalation path depends on non-admin token creation being permitted (documented 6.2 upgrade default).",
+    "The exact mechanism for a low-privilege user to learn another account's MongoDB ObjectId was not fully established; users:list holders (e.g. the built-in 'User Inspector' role) can, and other GRN leaks are plausible.",
+    "Large parts of the repository were not reviewed exhaustively; other unconfirmed candidates may exist."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Support bundle download/delete path traversal (filename path param)",
+      "reason": "SupportBundleService.ensureFileWithinBundleDir (lines 603-608) normalizes and checks the resolved path against bundleDir, and download/delete call it; the GHSA-2q4p-f6gf-mqr5 fix is present."
+    },
+    {
+      "lead": "HTTP input authentication bypass (GHSA-q7g5-jq6p-6wvx)",
+      "reason": "netty HttpHandler enforces the configured authorization header when set (blank/mismatched values return 401), and AbstractHttpTransport validates that header name/value are configured together; the fix is present."
+    },
+    {
+      "lead": "Session fixation in SessionsResource (GHSA-3xf8-g8gr-g7rh)",
+      "reason": "SessionsResource.newSession explicitly passes null as the previous session id with a comment referencing the advisory, so a new session is always created; fix present."
+    },
+    {
+      "lead": "Event definition remediation-steps XSS (GHSA-76vf-mpmx-777j)",
+      "reason": "EventDefinitionDto.remediationSteps carries @JsonSerialize(converter = HTMLSanitizerConverter.class); sanitization fix present."
+    },
+    {
+      "lead": "HTTPHeaderAuthenticationRealm condition weakened by '&& matchedResources.size() == 1'",
+      "reason": "The condition lets a trusted-header request through when Jersey reports more than one matched resource, which the log message says should be denied. Exploitation requires the optional trusted-header feature enabled, a trusted-proxy source address, and a request that actually matches multiple resources; no such route was identified, so this stays an unconfirmed lead."
+    },
+    {
+      "lead": "BearerTokenAuthInterceptor compares the gRPC bearer token with String.equals (not constant time)",
+      "reason": "Only a theoretical timing side channel on an optional gRPC input feature; no evidence of practical exploitability or stronger impact than the selected candidate."
+    },
+    {
+      "lead": "Cluster configuration / event-type deserialization class restrictions",
+      "reason": "RestrictedChainingClassLoader / UnsafeClassLoadingAttemptException checks are present in ClusterConfigServiceImpl, ClusterEventPeriodical and ClusterConfigResource; the GHSA-p6gg-5hf4-4rgj fix appears intact."
+    }
+  ],
+  "summary": "Graylog 6.2.4-SNAPSHOT (graylog2-server + data-node + storage modules): reviewed authentication/authorization, REST resources, support bundle, sessions, HTTP inputs, lookup adapters, and token management. The strongest candidate is a broken object-level authorization in the access-token creation endpoint: the handler checks the caller's own token-create permission but mints the token for the user identified by the attacker-controlled path parameter, so a non-admin account permitted to create its own tokens can mint an access token for any other account, including an administrator, and authenticate as that user (privilege escalation). Known Graylog fixes (support-bundle path traversal, session fixation, HTTP-input authentication, event remediation HTML) are present in this snapshot. No other candidate met the evidence threshold."
+}

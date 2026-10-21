@@ -1,0 +1,111 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Every header line of a STOMP frame received over the WebSocket is stored verbatim as a native header (StompDecoder.readHeaders -> headerAccessor.addNativeHeader(headerName, headerValue), StompDecoder.java:229-232), and STOMP allows arbitrary header names, so the value of the `selector` header (default name, DefaultSubscriptionRegistry.java:72 and 124-127) is fully attacker-controlled text. StompSubProtocolHandler.handleMessageFromClient only adds session id/user and marks the message immutable before forwarding it to the clientInboundChannel (StompSubProtocolHandler.java:273-299); no header filtering is performed.",
+      "confidence": "medium",
+      "counterevidence_checked": "Parse errors and evaluation/conversion errors are caught and logged (DefaultSubscriptionRegistry.java:153-157, 220-227), so a payload cannot crash the broker and a non-Boolean result is only logged; evaluation still happens before conversion, so side effects are not prevented (the execution is blind). The `selector` header is a documented SpEL feature (Javadoc lines 112-123), so the defect is the unhardened evaluation context, not the feature itself. Reachability is limited to the in-memory simple broker: with a STOMP broker relay, subscriptions are forwarded to the external broker (StompBrokerRelayMessageHandler) and selectors are not evaluated locally. A message routed to the subscribed destination and an enabled destination prefix (checkDestinationPrefix, line 257) are required. Alternative messaging path checked for similar injection: outbound re-encoding of client-supplied native headers cannot inject frames because StompEncoder escapes CR/LF in header keys and values for MESSAGE frames (StompEncoder.java:140-157, 170-189). No other main-source site evaluates client input as SpEL. Static-resource traversal protections (ResourceHttpRequestHandler.isInvalidPath/isInvalidEncodedPath, PathResourceResolver.isInvalidEncodedPath) and multipart filename parsing were reviewed and are not this candidate.",
+      "id": "spel-selector-stomp-broker-rce",
+      "impact": "Arbitrary code execution with the application JVM's privileges from a single STOMP connection (command execution, filesystem/secret access, lateral movement). Because the stored expression is evaluated for messages published by any session or application component to the subscribed destination, the payload can be armed once and re-triggered remotely; failures are only logged, so the attacker gets no error feedback (blind execution).",
+      "locations": [
+        {
+          "end_line": 161,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/DefaultSubscriptionRegistry.java",
+          "start_line": 139
+        },
+        {
+          "end_line": 231,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/DefaultSubscriptionRegistry.java",
+          "start_line": 188
+        },
+        {
+          "end_line": 78,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/DefaultSubscriptionRegistry.java",
+          "start_line": 72
+        },
+        {
+          "end_line": 293,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/SimpleBrokerMessageHandler.java",
+          "start_line": 249
+        },
+        {
+          "end_line": 333,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/SimpleBrokerMessageHandler.java",
+          "start_line": 332
+        },
+        {
+          "end_line": 80,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/AbstractSubscriptionRegistry.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 245,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/stomp/StompDecoder.java",
+          "start_line": 208
+        },
+        {
+          "end_line": 217,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/support/NativeMessageHeaderAccessor.java",
+          "start_line": 211
+        },
+        {
+          "end_line": 175,
+          "path": "spring-expression/src/main/java/org/springframework/expression/spel/support/StandardEvaluationContext.java",
+          "start_line": 169
+        },
+        {
+          "end_line": 102,
+          "path": "spring-expression/src/main/java/org/springframework/expression/spel/support/StandardTypeLocator.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 60,
+          "path": "spring-expression/src/main/java/org/springframework/expression/spel/support/SimpleEvaluationContext.java",
+          "start_line": 39
+        },
+        {
+          "end_line": 282,
+          "path": "spring-websocket/src/main/java/org/springframework/web/socket/messaging/StompSubProtocolHandler.java",
+          "start_line": 271
+        }
+      ],
+      "prerequisites": "An application that exposes a STOMP-over-WebSocket endpoint backed by the in-memory broker (spring-messaging SimpleBrokerMessageHandler, e.g. registry.enableSimpleBroker(\"/topic\", \"/queue\") in @EnableWebSocketMessageBroker), with destination prefixes reachable by the client (checkDestinationPrefix, SimpleBrokerMessageHandler.java:257). The attacker needs a STOMP session (anonymous if the handshake is unauthenticated, otherwise any authenticated user) and must send (a) a SUBSCRIBE frame whose `selector` header contains a syntactically valid SpEL expression for an enabled destination, and (b) a message to that same destination (or wait for any other client or the application to publish one) so the selector filter runs. The expression must parse (parse failures are swallowed at DefaultSubscriptionRegistry.java:153-157); it need not return a Boolean because SpEL evaluates the expression before the result conversion.",
+      "root_cause": "DefaultSubscriptionRegistry accepts the `selector` value from the STOMP SUBSCRIBE frame's native headers (client-controlled) and parses it as SpEL (this.expressionParser.parseExpression(selector), DefaultSubscriptionRegistry.java:144-147), storing the resulting Expression on the subscription. When a message is routed to that destination, the stored expression is evaluated with `context = new StandardEvaluationContext(message)` plus only an additional header PropertyAccessor (DefaultSubscriptionRegistry.java:211-216). StandardEvaluationContext keeps its default StandardTypeLocator (StandardEvaluationContext.java:169-175 -> StandardTypeLocator.java:97-102, ClassUtils.forName) and the reflective method/constructor resolvers, so expressions can reference arbitrary Java types (T(java.lang.Runtime)), construct objects (new java.lang.ProcessBuilder(...)) and invoke methods. No restricted context is used, even though the in-tree SimpleEvaluationContext (spring-expression/.../SimpleEvaluationContext.java:39-60 and 149-157, whose TypeLocator always raises TYPE_NOT_FOUND) exists for exactly this purpose but is unused anywhere in main sources, and no allow-list or sanitization of the selector expression is applied.",
+      "title": "Client-controlled SpEL in the STOMP subscription `selector` header is evaluated with an unrestricted StandardEvaluationContext (Expression Language injection / RCE) in the spring-messaging simple broker",
+      "trace": "1) Client sends STOMP SUBSCRIBE with `selector: <SpEL>` -> StompDecoder.readHeaders stores it as a native header (StompDecoder.java:232) -> StompSubProtocolHandler.handleMessageFromClient forwards the message unchanged to the clientInboundChannel (StompSubProtocolHandler.java:299). 2) SimpleBrokerMessageHandler.handleMessageInternal sees SimpMessageType.SUBSCRIBE and calls this.subscriptionRegistry.registerSubscription(message) (SimpleBrokerMessageHandler.java:285-288). 3) AbstractSubscriptionRegistry.registerSubscription passes the raw SUBSCRIBE message to addSubscriptionInternal(...) (AbstractSubscriptionRegistry.java:79). 4) DefaultSubscriptionRegistry.addSubscriptionInternal reads the selector via SimpMessageHeaderAccessor.getFirstNativeHeader(getSelectorHeaderName(), headers) and parses it as SpEL, storing the Expression on the Subscription (DefaultSubscriptionRegistry.java:142-159). 5) The attacker (or any other client/application) sends a MESSAGE to the same destination: sendMessageToSubscribers(destination, message) (SimpleBrokerMessageHandler.java:261-264) -> subscriptionRegistry.findSubscriptions(message) (line 333) -> DefaultSubscriptionRegistry.filterSubscriptions iterates matching subscriptions and, because selectorHeaderInUse is now true, builds new StandardEvaluationContext(message) and calls expression.getValue(context, boolean.class) (DefaultSubscriptionRegistry.java:191-216). 6) SpEL evaluates the attacker's expression with the permissive context, so T(...)/new .../reflective calls execute in the broker JVM (for example T(java.lang.Runtime).getRuntime().exec(...) or new java.lang.ProcessBuilder(...).start()); any evaluation/conversion exception is only logged (lines 220-227), making execution blind but repeatable for every message routed to that destination.",
+      "unverified": "No code was executed: the code-execution capability is inferred from the in-tree evaluation-context/type-locator implementation (StandardEvaluationContext default StandardTypeLocator plus reflective resolvers, versus SimpleEvaluationContext blocking type references) and SpEL's documented T(...)/constructor syntax, not from a runtime PoC. Whether a given deployment strips or ignores the `selector` header via a custom ChannelInterceptor, MessageHeaderInitializer, StompSubProtocolHandler, or custom SubscriptionRegistry could not be determined from this snapshot, and no application configuration or test sources exist here to corroborate exploitability. The specific upstream fix/identifier for this snapshot was not consulted (no external data used).",
+      "weakness_type": "Expression Language Injection (Spring Expression Language) leading to code execution (CWE-917 / CWE-94)"
+    }
+  ],
+  "coverage_summary": "Reviewed the Spring Framework snapshot (version=4.3.15.BUILD-SNAPSHOT, 28 Gradle modules, 3,897 model-visible files; main sources only, no test trees; no external advisory, patch, or label data used). Deep inspection of spring-messaging (simp broker: DefaultSubscriptionRegistry, SimpleBrokerMessageHandler, AbstractBrokerMessageHandler, AbstractSubscriptionRegistry, StompDecoder/StompEncoder, DefaultUserDestinationResolver, SimpMessagingTemplate), spring-websocket (StompSubProtocolHandler), spring-expression (StandardEvaluationContext, SimpleEvaluationContext, StandardTypeLocator, parser entry points), spring-web (multipart support and commons multipart, codecs/UriComponents, UrlPathHelper, WebUtils, FormHttpMessageConverter), spring-webmvc (resource handling: ResourceHttpRequestHandler, PathResourceResolver), and spring-core utilities (StringUtils.cleanPath, ClassUtils, SerializationUtils). Cross-cutting searches were run over all main sources for SpEL evaluation sites, ObjectInputStream/deserialization, process execution, XML parser factories, and path-validation helpers. Remaining modules (spring-orm/hibernate, spring-jdbc/tx, spring-oxm, spring-jms, spring-context and context-support, spring-test, spring-instrument, portlet/tiles) were keyword-searched only, not read line-by-line.",
+  "limitations": [
+    "No test sources are present in the snapshot, so intended versus unintended behavior could not be corroborated with the project's own tests.",
+    "No build or execution was permitted; all conclusions are static source readings, and the SpEL payload capability (T(...), constructors) is inferred from the evaluation-context and type-locator implementations rather than demonstrated.",
+    "No application configuration exists in this repository, so effective exposure (endpoint authentication, enabled simple-broker prefixes, custom interceptors or custom SubscriptionRegistry/selector handling) is unknown; an application-level interceptor that strips the `selector` header could reduce or remove reachability.",
+    "The snapshot contains no VCS history, issue tracker, or advisory data, so the specific upstream fix commit or identifier corresponding to this snapshot could not be identified within the allowed tooling.",
+    "Module coverage is not uniform: messaging, expression, and web/webmvc resource and multipart paths were read closely; ORM, JDBC/TX, OXM, JMS, context-support, and portlet/tiles modules were only keyword-searched.",
+    "Line numbers refer to this snapshot only and may drift in other revisions."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Multipart filename / Content-Disposition handling in spring-web (StandardMultipartHttpServletRequest.extractFilename and extractFilenameWithCharset, StandardMultipartFile.getOriginalFilename, CommonsMultipartFile path stripping, MultipartResolutionDelegate.isMultipartContent)",
+      "reason": "The code returns or derives the client-supplied filename without path sanitization, and the manual Content-Disposition parsing is fragile (for example a `name` parameter containing the literal `filename=` can be picked up as the filename), but Spring itself performs no file write: MultipartFile.transferTo/FileOutputStream targets are supplied by the application (StandardMultipartHttpServletRequest.java:301-311). Traversal/overwrite impact therefore depends on application misuse, and the javadoc (MultipartFile.java:47-56) documents that the returned name may contain path information. No framework-level sink with an attacker-controlled destination was found, so this was not selected."
+    },
+    {
+      "lead": "Static-resource path traversal (ResourceHttpRequestHandler / PathResourceResolver)",
+      "reason": "Traversal defenses appear present and consistent in this snapshot, including the decoded-path check: ResourceHttpRequestHandler.processPath/isInvalidPath/isInvalidEncodedPath (lines 505-524, 599-663) and PathResourceResolver.isInvalidEncodedPath (lines 283-304). No bypass was identified from source reading."
+    },
+    {
+      "lead": "STOMP frame/header injection into other clients' connections via copyHeadersIfAbsent(message.getHeaders()) (SimpleBrokerMessageHandler.java:344) followed by StompEncoder output",
+      "reason": "StompEncoder escapes backslash, CR/LF (and ':') in header keys and values for all non-CONNECT/CONNECTED commands (StompEncoder.java:140-157, 170-189), so values unescaped by StompDecoder.unescape cannot be re-emitted raw as new header lines or frames. No injection confirmed."
+    },
+    {
+      "lead": "Java deserialization endpoints reachable from remote input (SerializationUtils.deserialize, BlobSerializableType, HttpInvoker/RemoteInvocationSerializingExporter, AbstractHttpInvokerRequestExecutor)",
+      "reason": "These paths require the application to deliberately expose a remoting or database-backed serialization endpoint (spring-web remoting, spring-orm Blob types) and are not reachable in a default Spring MVC/WebSocket setup; the exporters are configuration-gated. Not an attacker-controlled flaw of the reviewed default stack and not tied in-source to the active 4.3.15 development window."
+    },
+    {
+      "lead": "SpEL in the spring-webmvc JSP tag EvalTag (EvalTag.java:59, 134-138)",
+      "reason": "The expression is authored in the JSP page by the developer (page configuration) rather than derived from request data; no attacker-controlled input reaches parseExpression there."
+    }
+  ],
+  "summary": "Snapshot is Spring Framework 4.3.15.BUILD-SNAPSHOT (main sources only, ~3,897 files, no test trees). The strongest defensible candidate is an Expression Language (SpEL) injection in the in-memory STOMP broker: the value of the client-supplied `selector` native header of a SUBSCRIBE frame is parsed by a SpelExpressionParser and later evaluated with a fully permissive StandardEvaluationContext rooted at the message, so type references (T(...)), constructors and reflective method calls are available to the message sender, i.e. attacker-controlled code execution in the broker JVM. Notably, the restrictive SimpleEvaluationContext (which blocks type and bean references) exists in this very snapshot (@since 4.3.15) but is not used anywhere in main sources, including this evaluation site. Other investigated areas (static-resource path traversal, multipart filename/Content-Disposition handling, STOMP header re-encoding to other clients, Java deserialization endpoints, JSP EvalTag SpEL) did not yield a comparably strong, attacker-triggered issue and are recorded as rejected leads."
+}

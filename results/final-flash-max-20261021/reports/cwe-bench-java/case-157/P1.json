@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Plain HTTP request headers sent to GeoServer: the configured username/JWT header (must carry a token that passes the configured username validation — e.g. the attacker's own legitimately issued low-privilege token) and the configured roles header (e.g. `X-Roles: ROLE_ADMINISTRATOR`, or a self-made JWT whose payload contains `roles: [ROLE_ADMINISTRATOR]`). No proxy cooperation, signing key, or administrative access is required once the filter is configured for JWT/JSON role extraction.",
+      "confidence": "medium",
+      "counterevidence_checked": "I verified the mitigating controls that do exist: (a) `HTTP_ATTRIBUTE_CONFIG_ID` is set only after the username token passes `TokenValidator.validate`, and `getRoles` returns empty roles otherwise, so a completely unrelated request cannot inject roles; (b) `TokenValidator` does check signature, expiry, endpoint, audience and subject when the corresponding flags are enabled, and the username token is the one validated; (c) header-based authentication behind a reverse proxy is an intentionally trusted-deployment pattern (also true for the core `GeoServerPreAuthenticatedUserNameFilter` with role source Header), and the module is not enabled by default; (d) `RoleConverter` can restrict to listed external roles (`onlyExternalListedRoles`) — but that flag defaults to false. The residual flaw is that the roles header is *never* bound to the validated token (no signature check, no subject binding, no requirement that it be the same header), and the missing configuration validation allows all validation flags to remain false. I found no code path that re-verifies the roles header.",
+      "id": "cand-1-jwt-headers-role-spoofing",
+      "impact": "Privilege escalation from any authenticated IdP/SSO user (or any requester when token validation is off, which is the configuration default) to GeoServer administrator: the attacker can manage users/roles (`/rest/security/...`), change security rules, read/modify the catalog, and generally gain full control of the server. Because roles are not tied to the signed token, the classic 'only trust the proxy' assumption is violated by the module's own design, which otherwise does verify the username token.",
+      "locations": [
+        {
+          "end_line": 197,
+          "path": "src/community/jwt-headers/gs-jwt-headers/src/main/java/org/geoserver/security/jwtheaders/filter/GeoServerJwtHeadersFilter.java",
+          "start_line": 152
+        },
+        {
+          "end_line": 72,
+          "path": "src/community/jwt-headers/jwt-headers-util/src/main/java/org/geoserver/security/jwtheaders/roles/JwtHeadersRolesExtractor.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 66,
+          "path": "src/community/jwt-headers/jwt-headers-util/src/main/java/org/geoserver/security/jwtheaders/token/TokenValidator.java",
+          "start_line": 32
+        },
+        {
+          "end_line": 52,
+          "path": "src/community/jwt-headers/jwt-headers-util/src/main/java/org/geoserver/security/jwtheaders/JwtConfiguration.java",
+          "start_line": 36
+        },
+        {
+          "end_line": 51,
+          "path": "src/community/jwt-headers/gs-jwt-headers/src/main/java/org/geoserver/security/jwtheaders/filter/GeoServerJwtHeadersFilterConfigValidator.java",
+          "start_line": 44
+        },
+        {
+          "end_line": 49,
+          "path": "src/community/jwt-headers/jwt-headers-util/src/main/java/org/geoserver/security/jwtheaders/roles/RoleConverter.java",
+          "start_line": 35
+        }
+      ],
+      "prerequisites": "1) The `jwt-headers` community module is installed and configured as a security authentication filter (its documented purpose is SSO behind a proxy that injects identity headers), with the role source set to `JWT` or `JSON` so `GeoServerJwtHeadersFilter.getRoles` reads the roles header. 2) The attacker can reach GeoServer with the username and roles headers — either directly (GeoServer reachable beyond the proxy) or through a proxy that forwards client-supplied headers. 3) The attacker holds any token that satisfies the configured username validation; if `validateToken` is left at its false default (no config validation enforces it), even a forged/blank-format username header can be used.",
+      "root_cause": "In the jwt-headers authentication extension the *username* token is cryptographically validated, but the *roles* are read from a different header and parsed without any signature/expiry/audience verification. `GeoServerJwtHeadersFilter.getPreAuthenticatedPrincipalName` (lines 152-173) calls `tokenValidator.validate(headerValue)` only on the username header and then marks the request; `GeoServerJwtHeadersFilter.getRoles` (lines 179-197) subsequently reads `rolesHeaderName` and hands it to `JwtHeadersRolesExtractor.getRoles` (lines 40-72), which calls `JWSObject.parse(...).getPayload().toJSONObject()` and never calls `verify()` — the only JWS verifier in the module (`TokenSignatureValidator`) is used exclusively for the username token. Extracted role names become `GeoServerRole` authorities directly (line 193) and `RoleConverter.convert` (lines 35-49) passes through any role name that is not in the mapping when `onlyExternalListedRoles` is false (the Java default). Compounding this, all validation switches in `JwtConfiguration` (lines 36-52: `validateToken`, `validateTokenSignature`, `validateTokenExpiry`, …) default to false and `GeoServerJwtHeadersFilterConfigValidator.validateGeoServerJwtHeadersFilterConfig` (lines 44-51) is an empty `// todo`, so a filter can be installed with role extraction enabled and token validation enabled for the username while the roles header is still attacker-controlled.",
+      "title": "jwt-headers authentication filter grants roles from an unvalidated HTTP header, allowing escalation to GeoServer administrator",
+      "trace": "HTTP request with username header + attacker-chosen roles header -> jwt-headers filter chain -> `getPreAuthenticatedPrincipalName` extracts the username, calls `TokenValidator.validate(usernameHeader)` (validates only that token) and on success sets `HTTP_ATTRIBUTE_CONFIG_ID` (lines 162-170) -> `getRoles` sees the marker and, for role source JWT/JSON, reads `request.getHeader(rolesHeaderName)` (lines 187-193) -> `JwtHeadersRolesExtractor.getRoles` parses the header value as JSON/JWT and returns the role claim(s) without verifying any signature (lines 40-72) -> `RoleConverter.convert` passes unmapped names through (lines 35-49) -> each name is wrapped in `new GeoServerRole(x)` and used as a granted authority, so `ROLE_ADMINISTRATOR` yields administrator rights in GeoServer's role-based checks (e.g. `GeoServerSecurityManager.checkAuthenticationForAdminRole`, `ComponentAuthorizer.ADMIN`, and the REST/UI security interceptor).",
+      "unverified": "Not executed or runtime-tested (no build/test execution permitted). Whether the flaw is exploitable in a given deployment depends on the proxy forwarding or stripping client-supplied role headers and on network reachability of GeoServer; a hardened proxy that overwrites the roles header neutralizes it. I could not confirm whether this corresponds to a published upstream advisory, and the community module is not part of the default distribution. The derived-role → administrator mapping is inferred from GeoServer's role-based authorization code (`GeoServerRole.ADMIN_ROLE`, `checkAuthenticationForAdminRole`, `ComponentAuthorizer.ADMIN`), not demonstrated at runtime.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-290 Authentication Bypass by Spoofing (roles not bound to the validated token)"
+    }
+  ],
+  "coverage_summary": "Scope: GeoServer 2.26.2 snapshot, 8,758 source files (root `src/`, `data/`, `doc/`, `SECURITY.md`, build files); binary-like files were refused/skipped by the tools and 292 files are absent from the relation index (no .ftl/static resources were visible in listings). Relation-index coverage is partial and syntactic only (no data flow, no control flow, no semantic resolution; 2 parse errors; 139k unresolved calls), so unreported areas cannot be claimed as reviewed. Files reviewed directly include: security plumbing (`GeoServerSecurityFilterChain`, `GeoServerSecurityFilterChainProxy`, `GeoServerSecurityMetadataSource`, `RESTfulDefinitionSource`, `RESTfulDefinitionSourceDelegateMap`, `IncludeQueryStringAntPathRequestMatcher`, `GeoServerRequestMatcher`, `GeoServerSecurityInterceptorFilter`, `GeoServerSecurityManager` role checks, access-rule DAOs, `PropertyFileWatcher`, `GeoServerSecurityContextPersistenceFilter`); REST framework and controllers (`RestConfiguration`, `RestBaseController`, `ResourceController`, `TemplateController`, `StyleController`/`AbstractStoreUploadController`, `RESTUtils`, security controllers `UsersRestController`, `RolesRestController`, `MasterPasswordController`, `UserPasswordController`, `RestAccessController`); OGC/request parsing (`Dispatcher` SOAP reader, `GetMapXmlReader`, `StoredQuery`, `WPSExecuteTransformer`, `JSONType`, `JSONDescribeLayerResponse`, `GeoJSONGetFeatureResponse`, `Ogr2OgrOutputFormat`/`AbstractToolWrapper`); XML hardening (`EntityResolverProvider`, `AllowListEntityResolver`, `ResourcePool.getEntityResolver`); FreeMarker safety (`TemplateUtils`, `RestBaseController`, `MapMLMapTemplate`); Wicket authorization basics (`GeoServerSecuredPage`, `GeoServerBasePage` users, login/error pages, `GeoServerApplication` CSRF setup); and security/extension modules (`jwt-headers` full filter/token/role code, `importer` transforms and `RemoteData`, `taskmanager` exec sites, `fileRootsFinder`). Not exhaustively reviewed: most of the ~8.7k files (large WMS/WFS renderers, catalog converters, GWC, most community modules, JavaScript/static assets, tests, and .ftl templates not visible to the tools). No build, tests, scanners or exploit payloads were executed.",
+  "limitations": [
+    "No runtime/build/test execution and no network access: all conclusions are source-level and unconfirmed.",
+    "The source snapshot contains no git history or upstream advisory references, so I could not verify which upstream fix/advisory the snapshot precedes or match it to a specific CVE.",
+    "The P1 relation index is partial and syntactic (292 source files missing, 2 parse errors, no data/control-flow), so code areas not returned by index queries were not claimed as reviewed.",
+    "Some resource types (notably .ftl template files) did not appear in file listings/search, so template-level XSS/escaping behavior could not be fully verified.",
+    "Only one candidate may be submitted; several plausible leads were rejected or left unconfirmed as noted, so the absence of additional candidates is not an assertion that the repository contains only one issue.",
+    "Exploitability of the selected candidate depends on deployment (whether the reverse proxy overwrites/strips the roles header and whether GeoServer is directly reachable) and on the community module being installed and configured; this was not verified at runtime."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected XSS via unsanitized JSONP callback (`JSONType.getCallbackFunction`, `JSONDescribeLayerResponse`, `GeoJSONGetFeatureResponse`): `format_options=callback:<script>` is echoed into a `text/javascript` response without a whitelist.",
+      "reason": "JSONP output formats are removed at startup by `JSONPExtensionFilter` unless the non-default `ENABLE_JSONP` property is enabled, and echoing the callback is the defined behavior of JSONP; not exploitable in a default configuration, so weaker than the selected candidate."
+    },
+    {
+      "lead": "XXE in XML parsers that do not install an entity resolver (e.g. `features-templating` REST `PatchMergeHandler.toXMLDocument`, community oSEO `AbstractOpenSearchController.checkWellFormedXML`, `metadata` `RemoteDocumentReaderImpl`).",
+      "reason": "Reachable only by administrators (REST API is admin-gated by rest.properties) and/or from administrator-configured URLs; the default `xmlExternalEntitiesEnabled=false` posture plus `AllowListEntityResolver`/`PreventLocalEntityResolver` protects the core pre-authentication parsers I checked (OWS SOAP, WMS GetMap XML, WFS StoredQuery, REST MapXMLConverter). Impact and attacker reach are therefore limited."
+    },
+    {
+      "lead": "Core `GeoServerPreAuthenticatedUserNameFilter` accepts roles from a request header (`roleSource=Header`), which could be spoofed.",
+      "reason": "This is the documented header-based authentication design (trusted reverse proxy); the filter is not present in the shipped default security chains, and the module/JWT case is the one where a token is actually validated, making the inconsistency concrete."
+    },
+    {
+      "lead": "Wicket pages extending `GeoServerBasePage` (e.g. `WPSRequestBuilder`, `DemoRequestsPage`, `MapPreviewPage`) bypass the authentication check performed by `GeoServerSecuredPage`.",
+      "reason": "Guest access to home/demo/error/login pages appears intentional, and the builder pages only assemble requests that are then executed through the normal OWS dispatcher (so service/role security still applies). No direct sensitive server-side action or data exposure was traced from these pages."
+    },
+    {
+      "lead": "REST store uploads support `method=external` (arbitrary local file path) and `method=url` (arbitrary URL fetch) without URLChecks (`RESTUtils.handleEXTERNALUpload`/`handleURLUpload`), and importer `RemoteData.resolve` resolves attacker-chosen VFS locations including `file://`.",
+      "reason": "All of these endpoints/`imports` REST resources are administrator-only by default and are documented administrative features; no privilege boundary crossing was established (an attacker would already need admin)."
+    },
+    {
+      "lead": "Command execution paths (`taskmanager` `Runtime.getRuntime().exec(\"pg_dump --dbname=\" + url …)`, importer `AbstractCommandLineTransform`, OGR WPS `ProcessBuilder`).",
+      "reason": "Commands/options originate from administrator configuration (DB URL, prepare script, format definitions) rather than request input; ProcessBuilder/CommandLine usage avoids a shell, and `typeName`/output names are constrained by `Paths.valid` or catalog-validated names."
+    },
+    {
+      "lead": "REST security rule ordering / path matching (`RESTfulDefinitionSource` + `IncludeQueryStringAntPathRequestMatcher`) as a possible authorization bypass (semicolons, sub-path shadowing).",
+      "reason": "I checked `SubpathMatcher` (requires `path.charAt(prefix.length())=='/'`), the lowercase conversion, catch-all `/**` fallback and default `allowIfAllAbstainDecisions=false`; the default `rest.properties` locks REST to the admin role and I could not construct a source-verified bypass (container-level routing of `;`-suffixed paths could not be verified from source)."
+    }
+  ],
+  "summary": "The snapshot is GeoServer 2.26.2 (root pom `src/pom.xml`, gs 2.26.2 / gt 32.2), including core modules plus extensions and community modules. I scoped the review with `get_source_scope` (8,758 visible files; no binary/symlink exclusions) and `get_relation_scope` (partial syntactic index: 8,466 files indexed, 292 source files missing from the index, 2 parse errors, 139k unresolved calls, no control-flow/data-flow or semantic resolution). I concentrated on trust boundaries reachable from HTTP: the security filter chain and path matchers, REST authorization (rest.properties/RESTfulDefinitionSource), REST controllers for resources/templates/security/uploads, OGC request parsing (OWS SOAP, WMS GetMap XML, WFS StoredQuery, WPS), entity-resolver/XXE hardening, JSONP output, FreeMarker safety, Wicket page authorization, and security-relevant extension/community modules (jwt-headers, taskmanager, importer, oSEO/features-templating). The single strongest source-evidenced candidate is in the 2024-added `jwt-headers` authentication extension: the filter validates the username token but accepts authorization roles from a separate, never-validated HTTP header, so a low-privileged authenticated token holder can self-assign `ROLE_ADMINISTRATOR`. Several other plausible leads were examined and rejected (listed below). No finding was runtime-confirmed; I could not correlate the snapshot against upstream advisories/patches (no history available in the snapshot)."
+}

@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `appId` request parameter is fully attacker-controlled (`?appId=<any app>`); the attacker is any caller that can reach the portal and satisfy whatever authentication the deployment uses (any logged-in portal account under the `auth`/`ldap` profiles; in the shipped default profile the portal applies no URL authorization at all, so any network client can reach it). The response contains the target app's plaintext token valid until `ConsumerToken.expires` (created tokens default to 2099-01-01, ConsumerController.java:26).",
+      "confidence": "high",
+      "counterevidence_checked": "Sibling endpoints in the same controller are explicitly guarded with `@permissionValidator.isSuperAdmin()`, and the same controller intentionally exposes `DEFAULT_EXPIRES` of 2099, so the endpoint is clearly meant to hand out long-lived secrets as a privileged feature; the corresponding page is gated client-side by `isRootUser`, ruling out an intended anonymous/self-service use; the service layer adds no check (verified the whole method and its repository calls); no Spring Security antMatcher or HandlerInterceptor covers /consumers/** (searched antMatchers and HandlerInterceptor across the tree); method security is active in all three portal security configurations; ConsumerAuthenticationFilter demonstrably compares the raw Authorization header against the stored plaintext token, so the leaked value is directly usable; I also considered that in the default (no auth profile) deployment Apollo deliberately ships without portal authentication, which reduces the novelty of the finding there but does not change the missing server-side check in the auth/ldap deployments.",
+      "id": "case-021-c1",
+      "impact": "Horizontal privilege escalation and credential disclosure: an ordinary authenticated portal user (or any client in a default-profile deployment) can obtain the OpenAPI bearer token of any application that uses the open API, then read and, subject to the consumer's assigned roles, create/update/delete configuration items and publish releases for that application via /openapi/v1/**. Apollo configuration typically contains credentials and feature/behavior switches for the target application, so the impact spans confidentiality and integrity of other teams' deployed configuration.",
+      "locations": [
+        {
+          "end_line": 60,
+          "path": "apollo-portal/src/main/java/com/ctrip/framework/apollo/portal/controller/ConsumerController.java",
+          "start_line": 57
+        },
+        {
+          "end_line": 108,
+          "path": "apollo-portal/src/main/java/com/ctrip/framework/apollo/openapi/service/ConsumerService.java",
+          "start_line": 101
+        },
+        {
+          "end_line": 62,
+          "path": "apollo-portal/src/main/java/com/ctrip/framework/apollo/portal/spi/configuration/AuthConfiguration.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 50,
+          "path": "apollo-portal/src/main/java/com/ctrip/framework/apollo/openapi/filter/ConsumerAuthenticationFilter.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 49,
+          "path": "apollo-portal/src/main/resources/static/open/manage.html",
+          "start_line": 24
+        }
+      ],
+      "prerequisites": "Portal reachable and authenticated (auth/ldap profile) or unprotected as shipped by default; the target app must have an OpenAPI consumer row with a non-expired token (the normal state of any app that integrated with the open API); method security is enabled in every portal security configuration (@EnableGlobalMethodSecurity(prePostEnabled = true) at AuthConfiguration.java:268, 356, 460), so the missing annotation is the only missing control.",
+      "root_cause": "ConsumerController.getConsumerTokenByAppId (apollo-portal .../portal/controller/ConsumerController.java:57-60) is a @GetMapping(\"/consumers/by-appId\") with no @PreAuthorize, unlike createConsumer (line 36, isSuperAdmin) and assignNamespaceRoleToConsumer (line 62, isSuperAdmin) in the same class. The call chain ConsumerService.getConsumerTokenByAppId (apollo-portal .../openapi/service/ConsumerService.java:101-108) has no ownership/role check either: it resolves any caller-supplied appId to the Consumer row and returns that consumer's ConsumerToken, whose `token` field is the raw secret (ConsumerToken.java:25-26, 39-41). No URL-level rule restricts /consumers/** (AuthConfiguration.java:60-62 permit-lists only prometheus/metrics/openapi/static/health, so /consumers/** is only required to be authenticated, not privileged), and no interceptor exists (WebMvcConfig has none).",
+      "title": "Missing authorization on GET /consumers/by-appId exposes any application's OpenAPI consumer token",
+      "trace": "1) Attacker calls `GET /consumers/by-appId?appId=<victimApp>` on apollo-portal. 2) ConsumerController.java:57-60 has no @PreAuthorize, so no permission evaluation occurs even though the sibling endpoints in the same class demand `@permissionValidator.isSuperAdmin()`. 3) ConsumerService.java:101-108 looks the appId up in ConsumerRepository and returns ConsumerTokenRepository.findByConsumerId(...) -> the ConsumerToken object is serialized by Jackson with its plaintext `token` (and `expires`) fields. 4) The UI for this feature (static/open/manage.html:24 `ng-show=\"isRootUser\"`, driven by has_root_permission in static/scripts/controller/open/OpenManageController.js:47-51) shows the intended privilege level is super admin; the server does not enforce it. 5) Attacker replays the stolen value as the `Authorization` header to `/openapi/v1/...`; because `/openapi/**` is in BY_PASS_URLS (AuthConfiguration.java:60-62), Spring Security URL rules do not apply and ConsumerAuthenticationFilter.java:40-47 resolves the raw token to a consumerId and admits the request. 6) The request then runs with the consumer's own rights (ConsumerPermissionValidator/ConsumerRolePermissionService map consumerId -> ConsumerRole -> RolePermission), so the attacker inherits read access to the target app's namespaces/items (open-API read endpoints such as openapi/v1/controller/NamespaceController.java:93-112 and ItemController.java:40-47 carry no per-app permission check beyond a valid token) and, where the consumer holds modify/release namespace roles or the app-master role, mutation and release of the target app's configurations.",
+      "unverified": "No code was executed and no deployment was contacted; I did not confirm at runtime that the portal is deployed with the auth/ldap profile, that any consumer token currently exists, or that the SpEL permission expressions resolve as expected (they are present and consistent with sibling methods, but the expression engine was not exercised). I did not diff against upstream, so I cannot state from this snapshot alone how the project classifies this behavior; the assessment rests solely on in-repo evidence of intent (sibling guards + UI gating) versus the actual server behavior.",
+      "weakness_type": "Missing authorization / broken access control (CWE-862) leading to disclosure of a plaintext API credential (CWE-200)"
+    }
+  ],
+  "coverage_summary": "Source scope: 819 model-visible files (543 Java, ~4.4 MB of Java source); 0 files excluded for size/sensitive path/symlink. I enumerated the whole tree and read in depth the authorization and credential-handling surface of apollo-portal (ConsumerController/ConsumerService/ConsumerAuthenticationFilter, PermissionController, ItemController, NamespaceController, NamespaceBranchController, AppController, ClusterController, ReleaseController, FavoriteController, NamespaceLockController, ConfigsImport/Export controllers and services, PermissionValidator, RoleUtils, DefaultRoleInitializationService, AuthConfiguration for ctrip/auth/ldap/default profiles), the openapi v1 controllers, the configservice client authentication path (ClientAuthenticationFilter, AccessKeyUtil, AccessKeyServiceWithCache, ConfigFileController, ConfigController), YAML/config-text parsing (YamlParser, portal ItemController text handling), InputValidator, and the JPA repositories (searched @Query/nativeQuery/createNativeQuery for injection). P1 relation index: 543 of 544 Java files parsed, 1 omitted, 5460 symbols, 10212 call sites, 9542 edges, 6079 unresolved calls; it provides syntax-level containment/call/inheritance/route/guard candidates only and explicitly no control flow, data flow, semantic resolution, runtime reachability or exploitability, so it was used for navigation and then verified against source text (e.g., the index's 'guard' facts for lines 35/62 vs. none for 57-60 of ConsumerController match the source).",
+  "limitations": [
+    "Not all 543 Java files were read line-by-line; modules skimmed rather than fully audited include apollo-client (local cache, meta-server providers), apollo-core foundation/io/tracer utilities, apollo-assembly/demo/mockserver, and most apollo-biz entity/repository/controller pairs beyond the release/namespace/gray-release services touched by the trace.",
+    "The index covers Java only and reports control/data flow and semantic resolution as not implemented, with 6079 unresolved calls; XML, YAML, properties, JS/HTML front-end files in the snapshot are outside its parsed set (I sampled the portal static JS/HTML only where it bore on intent).",
+    "No code, tests, scanners or exploit payloads were run and no live service was contacted; every statement is source-level and none is runtime-confirmed.",
+    "The ctrip-profile authentication path depends on external CAS libraries not present in the tree (AuthConfiguration loads org.jasig.cas.* and com.ctrip.framework.apollo.sso.filter.* reflectively), so I could not verify that profile's actual enforcement; the finding's primary deployment assumption is the self-contained auth/ldap Spring Security profiles.",
+    "Classification as a defect (rather than intended super-user convenience) rests on in-repo intent signals only (sibling @PreAuthorize(isSuperAdmin), client-side isRootUser gating); no upstream advisory, patch, or CVE information was consulted, per the review constraints.",
+    "I did not verify whether any Consumer/ConsumerToken rows exist in a real installation, so the data-dependent preconditions could not be confirmed empirically."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "POST /apps/envs/{env} (apollo-portal .../portal/controller/AppController.java:159-166) has no @PreAuthorize, so app creation in a remote environment is not gated by hasCreateApplicationPermission().",
+      "reason": "Real missing guard, but impact is limited and conditional: the admin service rejects the call when the app already exists in that environment (apollo-adminservice .../controller/AppController.java:36-47), and roleInitializationService.initNamespaceSpecificEnvRoles only creates Role/Permission rows for the (appId, application, env) tuple without assigning them to the caller (DefaultRoleInitializationService.java:99-111, 195-204), so no direct privilege is granted. Kept as a secondary lead rather than the submitted candidate."
+    },
+    {
+      "lead": "POST /apps/{appId}/initPermission (apollo-portal .../portal/controller/PermissionController.java:60-64) has no @PreAuthorize and takes an arbitrary appId plus an arbitrary namespaceName in the body.",
+      "reason": "Creates Role/Permission rows for arbitrary (appId, namespaceName) in every portal env, but it does not assign any role to the caller and grants nothing by itself (DefaultRoleInitializationService.java:89-111). Data-pollution/DoS at most; not strong enough to submit."
+    },
+    {
+      "lead": "Open API read endpoints lack object-level checks: openapi/v1/controller/ItemController.getItem (:40-47), NamespaceController.findNamespaces/loadNamespace (:93-112), ClusterController.loadCluster (:36-42), ReleaseController.loadLatestActiveRelease (:77-88), NamespaceBranchController.findBranch (:56-66) require only a valid consumer token, not a per-app role.",
+      "reason": "Could not establish intent from source: Apollo's portal deliberately lets any authenticated user read configuration by default (config view is public unless the 'member only' portal setting is enabled, PermissionValidator.shouldHideConfigToCurrentUser), so broad read access may be by design. Not submitted because the evidence of a boundary violation is weaker than for the token-disclosure endpoint, though it does amplify that finding's impact."
+    },
+    {
+      "lead": "apollo-adminservice (and the configservice admin paths) expose app/namespace/item/release mutation endpoints with no authentication.",
+      "reason": "Appears to be the documented deployment trust model (admin service is an internal service), not a source-level deviation; no repository guidance in the snapshot declaring it a vulnerability."
+    },
+    {
+      "lead": "ClientAuthenticationFilter enforces HMAC signatures only for apps that have enabled access keys, and compares signatures with non-constant-time Objects.equals (configservice/filter/ClientAuthenticationFilter.java:53-113).",
+      "reason": "The opt-in nature is the intended backwards-compatible design (apps with no access key remain open); the timing difference on an attacker-known HMAC output is a marginal side channel, not a demonstrable vulnerability."
+    },
+    {
+      "lead": "AccessKey entities store secrets in plaintext and are returned to the client by apollo-portal AccessKeyController (UUID secret), and the portal's /openapi consumer token is a raw SHA-1 of appId|timestamp|salt.",
+      "reason": "Secret creation/retrieval is gated by isAppAdmin(#appId) on every endpoint; predictable-token concern depends on the portal-configured salt, which is not attacker-visible in this snapshot."
+    },
+    {
+      "lead": "apollo-client LocalFileConfigRepository writes cache files derived from appId/cluster/namespace names; ResourceUtils/DefaultServerProvider read local files.",
+      "reason": "Values come from client-side configuration and the local classpath/user.dir search is the documented loading order; no server-side attacker-controlled path traversal identified."
+    }
+  ],
+  "summary": "Reviewed the Apollo (ctripcorp/apollo) 1.8.0-SNAPSHOT snapshot as a defensive source review, concentrating on the portal's authorization surface (controllers, method-security annotations, PermissionValidator/AuthConfiguration, open API consumer model) and then tracing the strongest candidate across files. One candidate is submitted: the portal endpoint that returns an app's OpenAPI consumer token (`GET /consumers/by-appId`) has no authorization guard, while its sibling endpoints in the same controller require super admin and the corresponding UI page is only rendered for root users. The returned value is a plaintext bearer token accepted by `ConsumerAuthenticationFilter` for all `/openapi/**` calls (a Spring Security bypass path), so it is a direct path from any authenticated portal user to another app's configuration API. Everything else I inspected was either correctly guarded (Item/Namespace/Cluster/Release/ConfigsImport/ConfigsExport endpoints), parameterized (repositories), using safe constructors (YAML), or an intentional trust-model property (unauthenticated admin service, opt-in access keys)."
+}

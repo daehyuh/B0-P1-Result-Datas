@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote unauthenticated client that can reach an AMQP port supporting protocol versions 0-8/0-9/0-9-1 (the standard distribution's default AMQP port advertises all installed protocols, including 0-8..0-9-1) fully controls the length-prefixed fields of the connection.start-ok frame. Two decode routes reach the unchecked allocations before SASL authentication completes: (1) EncodingUtils.readBytes is called while parsing the start-ok frame's SASL `response` field (ConnectionStartOkBody.java line 142), so a 4-byte length larger than the frame/heap triggers the allocation during parse; (2) the start-ok `client-properties` field table is decoded lazily but is forced open by AMQPConnection_0_8Impl.receiveConnectionStartOk -> setClientProperties (lines 1106 and 560-580), which calls clientProperties.get(...) before processSaslResponse; the table scan in FieldTable.findValueForKey (lines 463-488) reaches AMQTypedValue.readFromBuffer (lines 214-231) -> AMQType.LONG_STRING.readValueFromBuffer (lines 63-67) -> EncodingUtils.readLongString when an entry uses a type marker such as 'S' (LONG_STRING) or the binary type mapped to readLongstr with an over-declared 4-byte length (a value name equal to the first queried client property, e.g. the qpid.close_when_no_route key, reaches readFromBuffer directly).",
+      "confidence": "high",
+      "counterevidence_checked": "Frame-level protections exist but do not mitigate: AMQDecoder.decodable enforces the negotiated maximum frame size (AMQDecoder.java 143-167) and AMQPConnection_0_8Impl.receiveConnectionTuneOk validates the client's frameMax (1193-1224), but these bound only the outer frame size; a frame of a few dozen bytes can still declare a 2 GiB inner length. FieldTable construction validates only that the table length fits the frame (QpidByteBuffer.view, MultiQpidByteBuffer 953-957), and skipLongString throws on out-of-range positions (EncodingUtils 247-254), so an oversized value encountered while scanning for a different key aborts rather than allocates - the allocation is reached when the oversized value is the requested key or is the SASL response field, which is the path described. The guarded AMQShortString reader (86-97) shows bounds validation was the intended pattern, supporting that this is an oversight rather than a design decision. I confirmed the start-ok frame is dispatched before authentication (setClientProperties precedes processSaslResponse) and that no layer between the decoder and the thread pool catches Error. I did not verify any of this at runtime (execution is out of scope) and did not confirm the corresponding upstream fix/CVE.",
+      "id": "qpid-brokerj-amqp0x-preauth-alloc-dos",
+      "impact": "Unauthenticated remote denial of service: an attacker can force large heap allocations per connection, causing OutOfMemoryError in the broker JVM; with the default exception handler this terminates the broker process (full service outage) and, per the default launch script's -XX:+HeapDumpOnOutOfMemoryError, writes heap dumps that can also exhaust disk. Lower-volume attempts degrade service through GC thrashing; with a very large declared length the allocation itself fails immediately, so no actual memory needs to be consumed by the client.",
+      "locations": [
+        {
+          "end_line": 244,
+          "path": "broker-core/src/main/java/org/apache/qpid/server/protocol/v0_8/EncodingUtils.java",
+          "start_line": 230
+        },
+        {
+          "end_line": 270,
+          "path": "broker-core/src/main/java/org/apache/qpid/server/protocol/v0_8/EncodingUtils.java",
+          "start_line": 256
+        },
+        {
+          "end_line": 330,
+          "path": "broker-core/src/main/java/org/apache/qpid/server/protocol/v0_8/EncodingUtils.java",
+          "start_line": 316
+        },
+        {
+          "end_line": 152,
+          "path": "broker-plugins/amqp-0-8-protocol/src/main/java/org/apache/qpid/server/protocol/v0_8/transport/ConnectionStartOkBody.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 599,
+          "path": "broker-plugins/amqp-0-8-protocol/src/main/java/org/apache/qpid/server/protocol/v0_8/AMQPConnection_0_8Impl.java",
+          "start_line": 560
+        },
+        {
+          "end_line": 1109,
+          "path": "broker-plugins/amqp-0-8-protocol/src/main/java/org/apache/qpid/server/protocol/v0_8/AMQPConnection_0_8Impl.java",
+          "start_line": 1070
+        },
+        {
+          "end_line": 498,
+          "path": "broker/src/main/java/org/apache/qpid/server/Main.java",
+          "start_line": 443
+        }
+      ],
+      "prerequisites": "Network access to an enabled AMQP 0-8/0-9/0-9-1 port. No credentials are required: the vulnerable decode happens while processing connection.start-ok, before the SASL exchange is evaluated, and the default installation accepts the frame sequence (protocol header, server connection.start, client connection.start-ok). Effect is greatest with the default broker JVM heap (512 MB per broker/bin/qpid-server* and doc/java-broker Appendix-Environment-Variables); any declared length above the available free heap (e.g. 0x7FFFFFFF, or values > 2^31-1 yielding NegativeArraySizeException) triggers an OutOfMemoryError/error. Highest impact if the operator has not set -Dqpid.broker.exceptionHandler.continue=true.",
+      "root_cause": "In broker-core EncodingUtils, length-prefixed values are decoded by reading a 4-byte unsigned length and immediately allocating `new byte[(int) length]` without verifying that the declared length is actually available in the remaining buffer: readLongString (lines 230-244), readLongstr (lines 256-270) and readBytes (lines 316-330). A declared length up to 0x7FFFFFFF therefore forces an allocation of up to ~2 GiB (or a NegativeArraySizeException for lengths > 2^31-1) from a tiny frame, and the missing check is asymmetric with the guarded short-string reader AMQShortString.readAMQShortStringAsBytes (lines 86-97), which does enforce `length > buffer.remaining()`; QpidByteBuffer.view (MultiQpidByteBuffer lines 953-957) likewise validates only the outer table length, not inner value lengths.",
+      "title": "Pre-auth AMQP 0-8/0-9/0-9-1 decoding allocates byte arrays from unvalidated 4-byte length fields (remote OOM / broker termination)",
+      "trace": "1) ConnectionStartOkBody.process (lines 136-152) parses connection.start-ok in order: readFieldTable (lazy FieldTable; outer length is bounds-checked by QpidByteBuffer.view), AMQShortString mechanism, EncodingUtils.readBytes for the SASL response, locale. 2) EncodingUtils.readBytes (316-330) does `long length = buffer.getUnsignedInt(); ... new byte[(int) length]; buffer.get(dataBytes);` with no `length <= buffer.remaining()` check, so the array is allocated before the (underflowing) copy; readLongString (230-244) and readLongstr (256-270) have the identical pattern. 3) Field-table variant: `clientProperties.get(...)` in setClientProperties (560-580) -> FieldTable.getProperty/findValueForKey (101-110, 463-488) -> AMQTypedValue.readFromBuffer (214-231) -> AMQType LONG_STRING.readValueFromBuffer (AMQType.java 63-67) -> EncodingUtils.readLongString -> allocation. This path runs from receiveConnectionStartOk (1070-1109) before `processSaslResponse` authenticates the response. 4) The resulting OutOfMemoryError is not caught: AMQPConnection_0_8Impl.onReceive catches only AMQFrameDecodingException|IOException (246-259, and AbstractAMQPConnection.received only StoreException, 566-589); NonBlockingConnection.doWork catches only IOException|ConnectionScopedRuntimeException (248-318); SelectorThread.ConnectionProcessor.run (544-578) has no catch, so the Error reaches the thread-pool worker's uncaught-exception path. 5) Main.setExceptionHandler (443-498) installs a default handler that calls Runtime.getRuntime().halt(1) (line 489) unless the system property qpid.broker.exceptionHandler.continue is set; broker docs also state an OutOfMemoryError forces broker shutdown. Even under 'continue', repeated triggers/GC thrashing and the default -XX:+HeapDumpOnOutOfMemoryError heap dumps provide a sustained DoS.",
+      "unverified": "Runtime exploitability and the exact JVM outcome were not tested; the OOM-to-halt effect depends on the default UncaughtExceptionHandler being in effect (i.e., qpid.broker.exceptionHandler.continue not set), and the impact is reduced by larger heaps, connection-rate limits, or a custom exception handler. The exact intended upstream patch/CVE for this snapshot could not be confirmed offline. Whether all deployment profiles enable AMQP 0-8..0-9-1 auto-detection on the exposed port depends on the configured `protocols` attribute (the default shipped configuration does).",
+      "weakness_type": "Uncontrolled resource consumption / allocation from untrusted length (CWE-400, CWE-789); pre-authentication denial of service"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 2,493-file Apache Qpid Broker-J 8.0.0-SNAPSHOT tree (Maven multi-module; main sources only - no src/test files are present in the snapshot, and no binary files were needed). P1 relation index reports complete coverage: all 2,493 files indexed, 65,209 edges, 30,177 symbols, no missing files or hash mismatches; index edges were used only for navigation and every cited edge was re-verified in source. Surveyed: AMQP 0-8/0-9/0-9-1 decoder and encoders (AMQDecoder, ServerDecoder, ConnectionStart/Tune/Open bodies, FieldTable, AMQType/AMQTypedValue, EncodingUtils, AMQShortString), AMQP 0-10 transport decoder/assembler, AMQP 1.0 framing/type handling, message conversion and MIME converters (including JMS map/stream parsing), management HTTP authentication filters/servlets/controllers and converters, access-control rule sets and ACL file parsing, authentication managers (plain/MD5/OAuth2 identity resolvers), storage serdes (JDBC/Derby/BDB), and the broker main/exception-handling path. The submitted candidate was traced end-to-end in source from the network frame to the uncaught-exception handler.",
+  "limitations": [
+    "Static review only: no build, test, scanner execution, or runtime confirmation was performed (and none is permitted in this run).",
+    "The snapshot contains no test sources, so regression tests that might confirm or bound the behavior were unavailable.",
+    "Only a survey-level review was possible for large secondary areas (BDB/JDBC store implementations, OAuth2 providers, management console JavaScript, websocket plugin), so those areas are not fully covered.",
+    "The P1 index is navigational (syntactic candidates, no control/data-flow or reachability proof); all statements about data flow in the finding come from manual source reading, not the index.",
+    "Mapping the finding to a specific upstream fix/CVE was not possible without external data, and external/advisory lookups were out of scope.",
+    "Impact details that depend on deployment configuration (JVM heap size, qpid.broker.exceptionHandler.continue, connection limits, enabled protocol set) could not be validated against a running system."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "TypedBytesContentReader.readObject (broker-core typedmessage) allocates new byte[size] from an attacker-controlled JMS map/stream byte-array length, reachable via MessageConverter_v0_8_to_Internal/MessageConverter_v0_10_to_Internal and MessageConverter_to_1_0.getBodySection when a message with content type jms/map-message or jms/stream-message is viewed via the management API with returnJson=true or consumed by a cross-protocol consumer.",
+      "reason": "Plausible same-class DoS, but requires an authenticated publisher plus a conversion trigger (management access or an AMQP 1.0 consumer), so it is not as strong as the pre-authentication allocation path for this snapshot; not submitted because of the one-candidate cap."
+    },
+    {
+      "lead": "GZIPUtils.uncompressStreamToArray/uncompressBufferToArray decompress message content without any size limit, and the same conversion paths (management returnJson preview, AMQP 1.0 delivery) inflate it into a ByteArrayOutputStream.",
+      "reason": "Plausible gzip-bomb DoS in the same conversion channel, but it is a design-level resource limit issue in a utility used in several features and I could not confirm a remote, unauthenticated trigger; not submitted."
+    },
+    {
+      "lead": "InternalMessage / InternalMessageMetaDataType use java.io.ObjectInputStream to deserialize stored INTERNAL message metadata and bodies.",
+      "reason": "The INTERNAL metadata ordinal is chosen by the broker's own writers, not by wire input; I found no remote path that lets an attacker control stored bytes for that type, so the deserialization lead was not substantiated."
+    },
+    {
+      "lead": "PluginClassProviderAction.perform loads classes by request parameter via Class.forName(\"org.apache.qpid.server.plugin.\" + className).",
+      "reason": "Class name is constrained to a fixed package and the result is only used with QpidServiceLoader; no dangerous sink or class-initializer abuse was identified."
+    },
+    {
+      "lead": "FileServlet builds a classpath resource path from request.getServletPath()/getPathInfo() and opens it.",
+      "reason": "Potential traversal depends on container URI normalization (Jetty) and classpath layout; no source-level evidence of an accessible out-of-bounds resource, so it remains unconfirmed."
+    },
+    {
+      "lead": "AMQP frame-size handling in v0-8 (max frame size, tune-ok validation) and v0-10 (ServerInputHandler size checks) / v1.0 (FrameHandler size checks).",
+      "reason": "Reviewed as a possible DoS vector; these checks are present and bound frame sizes correctly, so no candidate there."
+    }
+  ],
+  "summary": "Snapshot is Apache Qpid Broker-J 8.0.0-SNAPSHOT (multi-module Java broker; 2,493 main-source files, no tests present). I surveyed protocol decoders (AMQP 0-8/0-10/1.0), management HTTP auth/servlets, access-control rules, message conversion/MIME converters, store serdes and OAuth2 authenticators, then traced the strongest issue in source. Single candidate submitted: unauthenticated remote denial of service via unbounded array allocation in AMQP 0-8/0-9/0-9-1 decoding (broker-core EncodingUtils). The broker reads 4-byte length prefixes and calls `new byte[length]` before checking that the declared length fits in the received frame, on the pre-authentication `connection.start-ok` path; the resulting OutOfMemoryError is not caught by the I/O stack and reaches the default uncaught-exception handler that halts the JVM. Other plausible but weaker leads (JMS map/stream conversion allocation, gzip decompression, INTERNAL metadata deserialization) are listed as unconfirmed/rejected and are not submitted as additional candidates."
+}

@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote peer fully controls the raw HTTP/1 byte stream: header names/values, duplicated or conflicting Content-Length and Transfer-Encoding headers, whitespace before the colon in a field name, leading SP/HTAB on header lines, header ordering, and pipelined/keep-alive bytes following a body.",
+      "confidence": "medium",
+      "counterevidence_checked": "Default HttpRequestDecoder/HttpServerCodec/HttpClientCodec use validateHeaders=true, and DefaultHttpHeaders.validateHeaderNameElement() rejects ' ', TAB, CR, LF, VT, FF and other prohibited characters in field names (DefaultHttpHeaders 368-415), which blocks the simplest 'Transfer-Encoding : chunked' request under defaults; the decoder's preference for Transfer-Encoding when it does recognize chunked is RFC 7230-conformant, so a bare Content-Length+Transfer-Encoding message is not automatically exploitable without a peer that resolves it differently; the comma-separated aware HttpHeaders.containsValue() (HttpHeaders 1597-1651) exists but is deliberately used only for Connection/Upgrade checks, not for Transfer-Encoding (HttpUtil 302-304), while isKeepAlive uses it; no tests, git history, or upstream diff were available to confirm which hardening is missing; no traffic was captured and nothing was executed.",
+      "id": "case-002-netty-http1-framing-smuggling",
+      "impact": "HTTP request/response desynchronization (request smuggling) between Netty and an adjacent HTTP parser: front-end authorization/routing/rate-limit bypass, cache poisoning, credential or session cross-talk, reaching endpoints not exposed to the front end, and connection-level DoS. Described as a source-level lead; no runtime exploitation was performed.",
+      "locations": [
+        {
+          "end_line": 627,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 568
+        },
+        {
+          "end_line": 765,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 720
+        },
+        {
+          "end_line": 596,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 576
+        },
+        {
+          "end_line": 188,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 146
+        },
+        {
+          "end_line": 304,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 302
+        },
+        {
+          "end_line": 415,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/DefaultHttpHeaders.java",
+          "start_line": 368
+        }
+      ],
+      "prerequisites": "Netty's HTTP codec must be one of at least two HTTP parsers over the same connection (proxy/gateway/origin chain, or Netty client parsing a proxied response), where the other parser resolves the ambiguity differently (prefers Content-Length over an obfuscated Transfer-Encoding, accepts/rejects whitespace-before-colon or obs-fold differently, etc.). For the whitespace-in-field-name variant, either the decoder is built with validateHeaders=false (public HttpRequestDecoder/HttpServerCodec/HttpClientCodec constructors allow this) or the peer normalizes the whitespace differently. Keep-alive or pipelined connections let the desynchronized residual bytes be parsed as a subsequent request.",
+      "root_cause": "HttpObjectDecoder does not fully normalize or reject ambiguous HTTP/1 framing metadata. The message framing decision (HttpObjectDecoder.readHeaders, lines 607-619) is based on HttpUtil.isTransferEncodingChunked(), which performs an exact, whole-value containment check for 'chunked' (HttpUtil lines 302-304), and HttpUtil.getContentLength(), which simply returns the first Content-Length value (lines 146-188). The decoder never errors on a duplicated/conflicting Content-Length, never rejects Content-Length combined with Transfer-Encoding (it silently prefers chunked and leaves the stale Content-Length on the outgoing message), and never normalizes or rejects Transfer-Encoding field names containing whitespace before the colon: splitHeader (lines 720-765) includes such whitespace in the field name and relies solely on optional DefaultHttpHeaders validation (DefaultHttpHeaders lines 368-415) to reject it. Header lines beginning with SP/HTAB are merged into the previous header's value as obs-fold continuations (lines 577-590). Different HTTP parsers over the same byte stream can therefore compute different message boundaries.",
+      "title": "Ambiguous HTTP/1 framing headers (Transfer-Encoding/Content-Length, whitespace and obs-fold) in HttpObjectDecoder enable request smuggling",
+      "trace": "Raw bytes -> HttpObjectDecoder.decode() (line 186) -> readHeaders() (line 568): each line is split by splitHeader() (line 720). Before splitting, lines starting with SP/HTAB and with a previous header pending are appended to that header's value (lines 577-590). splitHeader() breaks the field name only at ':' for requests, so 'Transfer-Encoding : chunked' yields the name 'Transfer-Encoding ' (with trailing space); it is rejected only if DefaultHttpHeaders validation runs (validateHeaders=true, DefaultHttpHeaders 368-415) and then goes through the invalid-message/BAD_MESSAGE path, otherwise it is stored as a distinct header. The framing decision (lines 607-619) then calls HttpUtil.isTransferEncodingChunked() (exact value match, HttpUtil 302-304) and HttpUtil.getContentLength() (first value only, HttpUtil 146-188). If 'chunked' is not recognized exactly, the body is framed by Content-Length or until EOF while a peer may frame it as chunked; if chunked is recognized, the message is emitted with both Transfer-Encoding and any stale Content-Length header, which encoders re-emit (HttpObjectEncoder). The resulting disagreement on where one message ends and the next begins is the smuggling primitive.",
+      "unverified": "The exact upstream fix/CVE this snapshot precedes could not be confirmed (no repository history or tests); exploitability depends on the adjacent parser's behavior and, for the whitespace-in-name variant, on validateHeaders=false or a peer that normalizes differently; all conclusions are from static reading and were not runtime-confirmed. CVE identities mentioned are the class of advisories in the same code path, not a confirmed match.",
+      "weakness_type": "CWE-444 Inconsistent Interpretation of HTTP Requests ('HTTP Request Smuggling')"
+    }
+  ],
+  "coverage_summary": "Scope reports 1,961 model-visible files, all production sources (binary-like files skipped by the extractor; no test sources and no .git history in the snapshot). I enumerated the module tree (buffer, codec, codec-dns, codec-haproxy, codec-http, codec-http2, codec-memcache, codec-mqtt, codec-redis, codec-smtp, codec-socks, codec-stomp, codec-xml, common, handler, handler-proxy, resolver, resolver-dns, transport, native transports, examples, microbench) and read the HTTP/1 codec path in depth (HttpObjectDecoder, HttpUtil, DefaultHttpHeaders, HttpHeaders, HttpObjectAggregator, HttpObjectEncoder, HttpServerCodec, HttpRequestDecoder, HttpResponseEncoder), the HTTP/2 HPACK/frame-listener entry points (HpackDecoder, HpackDynamicTable, Http2StreamFrameToHttpObjectCodec, Http2EmptyDataFrame*/Http2ControlFrameLimit*), compression decoders (JdkZlib/JZlib/Lzf), and the DNS, HAProxy, MQTT, memcache, STOMP and SMTP decoders, plus sampled handler/ssl and native-transport option/config files. Version fingerprinting used pom.xml (4.1.44.Final-SNAPSHOT, tcnative 2.0.28.Final, no JDK14 profile, no io_uring/SegmentedDatagramPacket) and the newest issue references in comments (#9663).",
+  "limitations": [
+    "No test sources or git history are present, so I could not diff against upstream or confirm exactly which security fix this snapshot precedes (CVE-2019-16869 / CVE-2019-20444/20445 / CVE-2020-7238 all touch this same code area).",
+    "Nothing was executed; all statements are static source-level observations and exploitability is not runtime-confirmed.",
+    "Large modules (buffer, common internals, transport/native transports, resolver-dns, handler/ssl, examples, microbench) were sampled rather than exhaustively line-reviewed; an issue elsewhere in those modules cannot be excluded.",
+    "obs-fold and whitespace-in-name impact depends on the behavior of the adjacent (non-Netty) HTTP parser in a given deployment, which is not visible in this snapshot.",
+    "The candidate intentionally covers the shared root cause (framing-header normalization/validation) rather than selecting one of the closely related CVE manifestations."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unbounded decompression in codec/compression/JdkZlibDecoder.java and JZlibDecoder.java (no maxAllocation/max capacity on inflated output; the later CVE-2020-11612 hardening is absent).",
+      "reason": "Real missing hardening, but the snapshot version 4.1.44.Final-SNAPSHOT predates that fix cycle (4.1.46), so it is unlikely to be the fix commit this snapshot precedes; also requires a decompression handler on an attacker-influenced stream and is not as strongly evidenced by the version/date fingerprint."
+    },
+    {
+      "lead": "HAProxyMessageDecoder (codec-haproxy) recursion/stack-overflow class issues (later CVE-2022-41881).",
+      "reason": "The snapshot already contains the v2 header-size/TLV caps (findEndOfHeader, v2MaxHeaderSize) and the CVE/fix is years later than this snapshot's version."
+    },
+    {
+      "lead": "Http2StreamFrameToHttpObjectCodec does not sanitize/remove Transfer-Encoding when converting HTTP/2 to HTTP/1 (later CVE-2021-21295-era fix).",
+      "reason": "Same general weakness class but the fix belongs to the 4.1.60 (2021) cycle, far outside this 4.1.44-SNAPSHOT window; primary framing bug remains the HTTP/1 decoder."
+    },
+    {
+      "lead": "HPACK / HTTP-2 header-list-size and empty-data-frame DoS protections.",
+      "reason": "Mitigations (DEFAULT_HEADER_LIST_SIZE=8192, Http2EmptyDataFrameListener/Http2ControlFrameLimitEncoder, HpackDecoder maxHeaderListSize) are already present in the snapshot; no missing protection was found there."
+    },
+    {
+      "lead": "codec-memcache, codec-dns, codec-mqtt, codec-stomp, codec-smtp decoders (length/overflow handling).",
+      "reason": "Quick review found length and state checks consistent with upstream and no attacker-controlled allocation/indexing defect strong enough to promote; reviewed much less deeply than the HTTP codec."
+    }
+  ],
+  "summary": "The snapshot is Netty 4.1.44.Final-SNAPSHOT (release-cycle state between 4.1.43 and 4.1.44), production sources only (1,961 files; no tests, no .git). Across the network-facing decoders, the strongest source-evidenced security issue is in the HTTP/1 codec: HttpObjectDecoder decides message framing from minimally-normalized Content-Length/Transfer-Encoding metadata and does not reject ambiguous combinations (duplicate/conflicting Content-Length, Content-Length together with Transfer-Encoding, Transfer-Encoding field names carrying whitespace before the colon, obs-fold continuation lines). This is the same class of defect as the HTTP request-smuggling advisories fixed in the 4.1.42–4.1.45 window (e.g., CVE-2019-16869, CVE-2019-20444/20445, CVE-2020-7238); the snapshot's exact missing fix could not be confirmed without history/tests, so the candidate is a lead, not a confirmed vulnerability."
+}

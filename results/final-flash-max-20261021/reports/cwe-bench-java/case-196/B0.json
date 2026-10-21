@@ -1,0 +1,100 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the HTTP method (PUT), the request path (and therefore the temporary file name, e.g. PUT /x.session -> work-dir file .x.session), the Content-Range header (triggering the partial-PUT branch, including the file length/offset written by RandomAccessFile) and the request body (the bytes placed in the temporary file). For the session-load side the attacker controls the JSESSIONID cookie value, which is accepted without format validation (CoyoteAdapter.parseSessionCookiesId, CoyoteAdapter.java:990-1034; Request.setRequestedSessionId).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the mitigations that limit the chain: (a) default configuration is safe - readOnly defaults to true and listings=false in conf/web.xml, so doPut returns 405 and no temporary file is created; allowPartialPut can be set to false (parseContentRange returns 400); (b) traversal/escape from the document root is blocked - StandardRoot.validate() normalizes and rejects paths that escape the root, DirResourceSet.file()/AbstractFileResourceSet.file() perform canonical+absolute containment and case-sensitivity checks; (c) direct requests to /WEB-INF and /META-INF are blocked by StandardContextValve.invoke() and WebdavServlet.isSpecialPath() is applied to service(), destination and delete paths; (d) FileStore.file() canonicalizes and checks containment, which prevents session-id traversal outside the store directory (this does not prevent using a different, attacker-influenced file name inside that directory); (e) no alternative, default-configurable remote primitive was found in the sampled code paths.",
+      "id": "tomcat-partial-put-workdir-file-session-collision",
+      "impact": "Unsafe deserialization of attacker-controlled bytes in the Tomcat JVM: remote code execution when a suitable gadget chain is on the classpath (the session class filter is disabled by default); otherwise at least attacker-controlled file creation/overwrite inside the container work directory plus deserialization errors/DoS. With writes enabled, PUT also allows writing files inside the web application document root (this part is the intended, documented behavior of readOnly=false and only becomes dangerous in combination with the above).",
+      "locations": [
+        {
+          "end_line": 640,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 581
+        },
+        {
+          "end_line": 701,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 655
+        },
+        {
+          "end_line": 184,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 184
+        },
+        {
+          "end_line": 256,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 256
+        },
+        {
+          "end_line": 213,
+          "path": "java/org/apache/catalina/session/FileStore.java",
+          "start_line": 182
+        },
+        {
+          "end_line": 308,
+          "path": "java/org/apache/catalina/session/FileStore.java",
+          "start_line": 258
+        },
+        {
+          "end_line": 387,
+          "path": "java/org/apache/catalina/session/PersistentManagerBase.java",
+          "start_line": 359
+        },
+        {
+          "end_line": 627,
+          "path": "java/org/apache/catalina/session/PersistentManagerBase.java",
+          "start_line": 544
+        },
+        {
+          "end_line": 5332,
+          "path": "java/org/apache/catalina/core/StandardContext.java",
+          "start_line": 5326
+        }
+      ],
+      "prerequisites": "Non-default configuration on the target: (1) the Default Servlet must have readOnly=false (DefaultServlet readOnly defaults to true, line 184) so doPut is not rejected; (2) allowPartialPut must remain enabled (default true, line 256; Content-Range present); (3) the application must use file-based session persistence (PersistentManager with a Store such as FileStore, whose default directory resolves to the same work directory); (4) application code (or the manager) must load the requested session so that store.load() is called with the attacker-chosen id; for remote code execution, a deserialization gadget must exist on the web application classpath and the session attribute class filter is not configured (ManagerBase.sessionAttributeValueClassNamePattern defaults to null, i.e. no filtering).",
+      "root_cause": "DefaultServlet.executePartialPut() writes a temporary file into ServletContext.TEMPDIR (the context work directory) using a name derived directly from the request path via path.replace('/', '.') (java/org/apache/catalina/servlets/DefaultServlet.java:660-667). The work directory is also the default location of the file-based session store: FileStore.directory defaults to \".\" and is resolved against ServletContext.TEMPDIR (FileStore.java:64 and 258-283), and StoreBase/FileStore deserialize any file named <sessionId>.session in that directory when a session with that id is requested (FileStore.java:182-213, PersistentManagerBase.java:359-387,544-600,619-627). Nothing prevents the temporary file name from ending in \".session\" or from being opened as a session file: a request path such as /x.session produces the work-directory file \".x.session\", which is exactly the session file for the (attacker-supplied) session id \".x\". The file is created before the resource write is attempted and is not deleted when the subsequent write fails (doPut finally block only closes the stream, DefaultServlet.java:631-639; executePartialPut only registers deleteOnExit()), so the attacker-controlled bytes persist in the work directory.",
+      "title": "Default Servlet partial PUT creates an attacker-named file in the context work directory that can collide with file-based session-store files (deserialization sink)",
+      "trace": "1) PUT /<app>/x.session with a Content-Range header reaches DefaultServlet.doPut; isReadOnly() is false, parseContentRange() accepts the header (DefaultServlet.java:582-598,1439-1467) and the partial branch calls executePartialPut(req, range, path) (line 614). 2) executePartialPut takes tempDir = ServletContext.TEMPDIR (the context work directory, set in StandardContext.postWorkDirectory, StandardContext.java:5330), converts the path with path.replace('/', '.') and creates new File(tempDir, \".x.session\") (lines 660-667); it then seeks to range.getStart() and writes the request body into that file (lines 687-696). 3) Even if the following resources.write(path,...) to the web application docBase fails, the work-directory file is left behind (lines 618-639; only deleteOnExit is registered). 4) Later, a request carrying Cookie: JSESSIONID=.x causes PersistentManagerBase.findSession(\".x\") -> swapIn -> loadSessionFromStore -> store.load(\".x\") (PersistentManagerBase.java:359-387,544-600,619-627); FileStore.file(\".x\") resolves to work-dir/.x.session (FileStore.java:291-308), opens it and wraps it in an ObjectInputStream (FileStore.java:196-204, StoreBase.java:194-210) whose resolveClass filtering is disabled by default (ManagerBase.java:294-310), so the attacker-supplied bytes are deserialized by StandardSession.readObjectData/doReadObject (StandardSession.java:831,1128).",
+      "unverified": "Not runtime-confirmed. Whether a real deployment uses PersistentManager with FileStore (and thus the work-directory collision), whether the application triggers store.load() for the attacker-chosen id, and whether a deserialization gadget is present are environment-dependent. I could not diff the snapshot against the upstream fix for this issue, so I cannot state from the source alone whether the upstream correction (if any) changed the temporary-file naming/location, the session-store loading, or the partial-PUT default.",
+      "weakness_type": "Attacker-influenced file creation in a shared directory (CWE-73/CWE-434) leading to deserialization of untrusted data (CWE-502), with RCE/information-integrity impact"
+    }
+  ],
+  "coverage_summary": "2971 model-visible files? The scope report lists 2967 source files with no sensitive-name/symlink/size exclusions and binary files skipped only when a NUL byte is present; there is no test directory in the snapshot. Reviewed by targeted search plus bounded reading: DefaultServlet (PUT/partial PUT/write path), StandardRoot/DirResourceSet/AbstractFileResourceSet/FileResourceSet write and containment logic, UDecoder/RequestUtil/CoyoteAdapter URI decode+normalize, session persistence (FileStore, PersistentManagerBase, StoreBase, CustomObjectInputStream, ManagerBase, SessionIdGeneratorBase), authentication (AuthenticatorBase, Basic/Digest/Form/SSL/NonLogin), filters (CorsFilter, CsrfPreventionFilter, RemoteIpFilter), WebDAV servlet path/special-path handling, cookie/session-cookie configuration, conf/server.xml, conf/web.xml, conf/tomcat-users.xml, security-relevant parser classes (ContentRange, Authorization, HttpParser skeleton) and selected manager/CGI code. Not exhaustive: Jasper compiler/runtime, HTTP/2 internals, WebSocket, clustering/tribes, DBCP, examples and manager JSPs were only spot-checked.",
+  "limitations": [
+    "No upstream reference copy or git history is available, so I could not diff this snapshot against a fixed version to confirm exactly which lines constitute the vulnerable state or the corresponding upstream fix.",
+    "No code was executed and no dynamic analysis was performed; all conclusions are source-level only and the exploitability of the deserialization route depends on deployment configuration and classpath contents.",
+    "The exploit requires non-default configuration (Default Server write enabled and file-based session persistence); under the shipped defaults (readOnly=true) the temporary-file primitive is not reachable over HTTP.",
+    "The snapshot has no tests, so test-based confirmation of intended behavior was impossible.",
+    "Large subsystems (Jasper/JSP, HTTP/2, WebSocket, tribes, DBCP, examples/manager/host-manager webapps) were not reviewed in depth and could contain other issues.",
+    "Because only one candidate may be submitted, the RewriteValve and session-ID-validation leads noted above were left unconfirmed rather than investigated further."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DefaultServlet PUT writing outside the web application root via crafted paths",
+      "reason": "StandardRoot.validate() normalizes the path and AbstractFileResourceSet.file() applies canonical/absolute containment and Windows-specific checks, so directory traversal does not escape the resource root; no bypass found in the inspected code."
+    },
+    {
+      "lead": "WebDAV servlet exposing /WEB-INF or /META-INF (or write/copy/delete of those paths)",
+      "reason": "isSpecialPath() is implemented and applied in service() and to destination/delete/move paths (WebdavServlet.java:568,1936,2121,2401), matching the recent changelog fix; no bypass found."
+    },
+    {
+      "lead": "FileStore session-id path traversal outside the session store directory",
+      "reason": "FileStore.file() canonicalizes the candidate file and rejects names whose canonical path is not under the storage directory (FileStore.java:291-308); no prefix/containment flaw found."
+    },
+    {
+      "lead": "Session id accepted from the JSESSIONID cookie without format validation",
+      "reason": "True (CoyoteAdapter.java:990-1034), but on its own it is only a weak input-validation issue; it becomes significant only together with the work-directory file-write primitive described in the submitted candidate."
+    },
+    {
+      "lead": "RewriteValve rewritten-URL/query-string handling allowing rule bypass",
+      "reason": "The rewrite path is complex (RewriteValve.java:280-545) with URL-encoding/normalization of the rewritten URL; I did not identify a concrete bypass with source-level confidence, so it was not selected."
+    },
+    {
+      "lead": "CORS/CSRF/RemoteIp filters or authentication valves misconfigured",
+      "reason": "Sampled CorsFilter (origin allow-list/credential checks), CsrfPreventionFilter (nonce/entry-point logic), RemoteIpFilter (internal-proxy defaults), AuthenticatorBase/BasicAuthenticator/DigestAuthenticator and conf defaults; no defect with clear attacker-controlled impact was found."
+    }
+  ],
+  "summary": "Snapshot reviewed: Apache Tomcat main branch in development for 12.0.0-M1 (changelog states it contains all 11.0.2 changes plus changes up to early January 2025; no tests directory is present). I traced the partial-PUT path in the Default Servlet, the web-resource write path, URI decoding/normalization, session persistence (FileStore/PersistentManagerBase/StandardSession/CustomObjectInputStream), authentication and several filters, cookie/session-ID generation and WebDAV path checks. One candidate is submitted: the partial-PUT temporary file is created inside the context work directory with a name derived from the request path, and that same directory is the default location for the file-based session store, so an attacker-influenced PUT can create a file that the session manager later deserializes. This requires non-default configuration (writes enabled for the Default Servlet and file-based session persistence) and is a lead, not a confirmed exploit. Everything else inspected (WEB-INF/META-INF blocking, resource-root containment checks, WebDAV special-path checks, FileStore canonical containment, CORS/CSRF/authentication code) looked consistent with the upstream hardening, so no second candidate was submitted."
+}

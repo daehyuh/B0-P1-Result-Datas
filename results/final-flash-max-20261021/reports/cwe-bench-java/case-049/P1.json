@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The remote SCP peer (the SSH server the client downloads from, or a MITM impersonating it) fully controls the '<name>' text of the 'C<octal-perms> <length> <name>' and 'D<octal-perms> <length> <name>' protocol lines read by ScpHelper.receive (ScpHelper.java lines 199-212). It can send an absolute path (e.g. /home/victim/.ssh/authorized_keys) or '..' components; ScpPathCommandDetailsSupport (line 66) preserves the value verbatim and LocalFileScpTargetStreamResolver/ScpFileOpener resolve it against the local destination. No escaping, sanitizing, basename extraction or containment check exists anywhere in the sshd-scp module (searches for sanitize/normalize/escape in that module return none). Note that mina-sshd's client default server-key verifier is AcceptAllServerKeyVerifier (ClientBuilder.java line 72), which makes MITM impersonation of the SCP server feasible unless a verifier is configured, so a non-malicious but intercepted download is also in scope.",
+      "confidence": "medium",
+      "counterevidence_checked": "(a) Server-side receive is protected when a rooted/virtual file system is used: RootedFileSystemProvider.resolveLocalPath (sshd-common .../file/root/RootedFileSystemProvider.java 468-503) performs normalize() and throws InvalidPathException if the resolved path does not start with the root — so the server-side SCP receiver is not equally exposed. (b) ScpHelper.receiveFile (line 322) normalizes the local *target* path, but not the peer-supplied name, so normalization does not mitigate the escape. (c) The download-to-stream path (receiveFileStream, lines 118-164) uses a MockPath and does not write to the file system — unaffected. (d) I searched the module for sanitize/normalize/escape/containment logic and found none; the only name handling is the Windows separator replacement at LocalFileScpTargetStreamResolver:73. (e) The Java API behavior used here (Path.resolve with an absolute argument discards the base; '..' is resolved by the OS on open) is standard and documented, so no runtime check was needed to establish the sink. (f) The repository's host-key Java-deserialization path (the CVE-2022-45047 area) is already mitigated by the ValidatingObjectInputStream allowlist and OpenSSH-format writer (no ObjectOutputStream remains anywhere in the tree), so I did not treat it as the finding.",
+      "id": "scp-receive-name-traversal",
+      "impact": "Arbitrary file creation/overwrite and directory creation on the SCP client host with the privileges of the client process, outside the user-requested destination directory (for example overwriting ~/.ssh/authorized_keys or shell startup files, or clobbering arbitrary user-writable files). This is a client-side compromise (code execution/persistence via overwritten trusted files) and integrity/availability loss, triggered by a malicious or impersonated SCP server during an otherwise normal download. It is the same trust-boundary failure as OpenSSH CVE-2019-6111, which OpenSSH fixed by validating the peer-supplied name against the requested one.",
+      "locations": [
+        {
+          "end_line": 67,
+          "path": "sshd-scp/src/main/java/org/apache/sshd/scp/common/helpers/ScpPathCommandDetailsSupport.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 397,
+          "path": "sshd-scp/src/main/java/org/apache/sshd/scp/common/ScpHelper.java",
+          "start_line": 320
+        },
+        {
+          "end_line": 115,
+          "path": "sshd-scp/src/main/java/org/apache/sshd/scp/common/helpers/LocalFileScpTargetStreamResolver.java",
+          "start_line": 63
+        },
+        {
+          "end_line": 118,
+          "path": "sshd-scp/src/main/java/org/apache/sshd/scp/common/ScpFileOpener.java",
+          "start_line": 72
+        },
+        {
+          "end_line": 120,
+          "path": "sshd-scp/src/main/java/org/apache/sshd/scp/common/helpers/DefaultScpFileOpener.java",
+          "start_line": 69
+        },
+        {
+          "end_line": 101,
+          "path": "sshd-scp/src/main/java/org/apache/sshd/scp/client/DefaultScpClient.java",
+          "start_line": 84
+        }
+      ],
+      "prerequisites": "Client-side use of SCP receive with the default components: ScpClient.download(remote, filesystem, local, options) / ScpHelper.receive(local, ...) where the local target is an existing directory (or Option.TargetIsDirectory / recursive download is used, or a 'D' directory entry is processed), with the default DefaultScpFileOpener/LocalFileScpTargetStreamResolver; the client account must have OS permission to write the attacker-chosen path. The download-to-OutputStream variant (ScpHelper.receiveFileStream) is not affected. On the SCP *server* side the same code exists but is normally bounded because a rooted/VirtualFileSystemFactory file system rejects out-of-root paths (see counterevidence).",
+      "root_cause": "The SCP protocol file name is taken verbatim from the peer's header line and is never validated as a single relative name. ScpPathCommandDetailsSupport parses the line as \"C/D<octal perms> <length> <name>\" and stores everything after the length as 'name' (line 66). This name is passed unchanged to the receive resolvers, and both default implementations simply do Path.resolve(name): LocalFileScpTargetStreamResolver.resolveTargetStream (lines 72-74: file = path.resolve(name.replace('/', File.separatorChar))) and ScpFileOpener.resolveIncomingFilePath (lines 83-85, and Files.createDirectory(file) at 109-111) perform no Path.normalize() and no target-directory containment check (e.g. target.normalize().startsWith(dir.normalize())). A name beginning with '/' is resolved as an absolute path (Path.resolve returns the absolute argument), and names containing '..' escape the directory after OS-level resolution.",
+      "title": "SCP receive path resolves peer-supplied file names without containment checks (arbitrary file write outside the target directory)",
+      "trace": "1) Peer sends header line 'C0644 <len> ../../../../home/victim/.ssh/authorized_keys'; ScpHelper.receive (ScpHelper.java 206-212) reads it and calls receiveFile (line 320) or receiveDir. 2) receiveStream (lines 341-373) does String name = details.getName() and calls resolver.resolveTargetStream(session, name, length, perms, ...). 3) LocalFileScpTargetStreamResolver.resolveTargetStream (lines 71-74) sees that the local target is a directory and does file = path.resolve(name.replace('/', File.separatorChar)) with no normalize()/startsWith() check. 4) DefaultScpFileOpener.openWrite (lines 69-79) calls Files.newOutputStream(file, CREATE, TRUNCATE_EXISTING, WRITE, SYNC), creating/overwriting the attacker-named file. For directory headers, ScpHelper.receiveDir (line 282) calls ScpFileOpener.resolveIncomingFilePath, which does the same resolve (lines 83-85) and even Files.createDirectory(file) at line 110. A name beginning with '/' short-circuits Path.resolve to that absolute location.",
+      "unverified": "No runtime PoC or test was executed (read-only review), so exploitability is argued from standard java.nio.file semantics rather than demonstrated. I could not verify whether a later upstream release added name validation to the SCP receive path (no changelog entry for it exists in this snapshot), whether custom ScpFileOpener implementations are expected to enforce containment in deployments, or whether the harness's target vulnerability is this issue. The client-side exposure also depends on the application actually downloading into a directory from a server that is not fully trusted.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory (path traversal) leading to arbitrary file write"
+    }
+  ],
+  "coverage_summary": "Source scope: 1110 repository files (1002 Java), no binary/symlink/sensitive-name exclusions and none over 5 MiB, so no files were dropped by the source filters. The P1 relation index covered 1100 files (10 source files missing from the index) with syntax-only relations (no control flow, no data flow, no semantic resolution); I used it only for navigation and verified every cited location in source text. I reviewed in depth the sshd-scp module (ScpHelper, ScpCommand, ScpShell, resolvers, openers, ScpFileOpener), key parts of sshd-core (UserAuthPublicKey/HostBased/KeyboardInteractive/GSS, AbstractSession, KexExtensionHandler/Default*KexExtensionHandler, DHG/AbstractDH, ClientBuilder, key verifiers), sshd-common (SimpleGeneratorHostKeyProvider/AbstractGeneratorHostKeyProvider, KeyEntryResolver, PublicKeyEntryDecoder, DERParser, Buffer/getBytes/getPublicKey, RootedFileSystemProvider/RootedPath/BasePath, SttySupport), sshd-sftp (SftpSubsystem/AbstractSftpSubsystemHelper doRead/doOpen/doInit, SftpModuleProperties, AbstractSftpClient data responses, SftpFileSystem), sshd-ldap (all 4 classes), sshd-spring-sftp, sshd-git pack/pgm, sshd-contrib access-control and proxy-protocol classes, and the CHANGES.md/docs for snapshot dating. I did not exhaustively read every one of the ~1000 Java files (e.g. most of sshd-cli, the SFTP client/fs internals, MINA/Netty I/O back-ends, sshd-openpgp, sshd-putty, sshd-osgi, assembly scripts, and much of sshd-common/sshd-core utility code were sampled rather than fully audited).",
+  "limitations": [
+    "Read-only review: no code, build, tests, scanners or PoC payloads were executed; all findings are static source evidence.",
+    "The P1 relation index is partial and syntax-only (no data-flow, control-flow or semantic resolution; 18486 unresolved calls; 10 files missing), so absence of an indexed relation is not evidence of absence in code.",
+    "The snapshot's version/date (2.9.2 pom, CHANGES.md through GH-266) is inferred from build files and docs; the repository-relative line numbers may differ slightly from other revisions.",
+    "I could not access ground truth, patches, CVE labels or sibling conditions, so the match between my candidate and the case's intended vulnerability is uncertain; several alternative issues (LDAP injection, missing strict-KEX/strict-key-exchange, client host-key verification default) could not be fully ruled out from within this snapshot.",
+    "The SCP traversal candidate was verified in source but not runtime-confirmed; severity depends on how the library is embedded (client-side download into a directory from an untrusted or impersonated server)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Java deserialization in SimpleGeneratorHostKeyProvider (CVE-2022-45047 area)",
+      "reason": "Already mitigated in this snapshot: reading legacy keys goes through ValidatingObjectInputStream with a class allowlist (SimpleGeneratorHostKeyProvider.java 101-156) and writing uses OpenSSHKeyPairResourceWriter; there is no ObjectOutputStream left in the repository. Only a hardening path remains, which the prompt says is not itself a vulnerability."
+    },
+    {
+      "lead": "Missing Terrapin (CVE-2023-48795) strict-KEX mitigation (no 'kex-strict-s/c-v00@openssh.com' handling in the KEX extension code)",
+      "reason": "Confirmed absent by searching for kex-strict, but this is an absent protocol feature / interoperability hardening rather than a code-level validation defect; impact cannot be established from source alone and requires an active MITM plus a peer supporting strict KEX. Not selected as the single candidate."
+    },
+    {
+      "lead": "LDAP search-filter injection in sshd-ldap (LdapNetworkConnector.resolveSearchFilter formats raw username/password into the filter with MessageFormat; no escaping exists in the module)",
+      "reason": "Real unescaped-value sink (lines 460-464; default filter in LdapPasswordAuthenticator.java 55-56), and in the default 'none' bind mode a wildcard password could make the search match and authenticate() return true. However it is module-optional, deployment-dependent (requires an LDAP server that returns userPassword to the query, plus the LDAP authenticators configured), and could not be confirmed end to end; kept as an unconfirmed lead rather than the primary candidate."
+    },
+    {
+      "lead": "RootedFileSystem symlink following / SFTP real-root escape",
+      "reason": "RootedFileSystemProvider.resolveLocalPath normalizes and rejects '..'-based escapes (startsWith(root) check), and symlink-following behavior is a documented policy (sftp-auto-follow-links, resolvePathResolutionFollowLinks). No source-level bypass of the containment check was found."
+    },
+    {
+      "lead": "Spring Integration SFTP factory creates SshClient via setUpDefaultClient() with AcceptAllServerKeyVerifier and exposes no ServerKeyVerifier setter",
+      "reason": "The accept-all default is documented mina-sshd framework behavior (docs/client-setup.md) and an integrator-visible configuration gap rather than a code defect in the snapshot; not enough evidence for a vulnerability candidate."
+    }
+  ],
+  "summary": "Repository is Apache MINA SSHD (Java SSH client/server, 15 Maven modules, ~1110 files; version 2.9.2 / late-2.9.2 development per pom.xml and CHANGES.md). I traced client-reachable input paths through the SCP, SFTP, session/KEX, auth, key-loading, LDAP and Spring-Integration modules. The snapshot already contains the 2.9.2 security fixes (restricted host-key deserialization allowlist, OpenSSH host-key writer, buffer/OOM hardening), so those are not vulnerabilities here. The strongest distinct issue I could verify in source is in the SCP receive path: the file name supplied by the peer in the SCP protocol \"C\"/\"D\" headers is used verbatim and resolved against the local target directory without normalize()/containment validation, so a malicious or spoofed SCP server can write files (and create directories) outside the requested destination — the same defect class as OpenSSH CVE-2019-6111. One candidate is submitted; several plausible alternatives are listed as rejected/unconfirmed leads."
+}

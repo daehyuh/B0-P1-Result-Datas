@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A YARN application owner controls its LocalResource list (LocalResource records submitted in the container launch context; the REST path RMWebAppUtil also maps user-supplied URIs to LocalResource). The resource's URL file component is a raw string: URL.newInstance(scheme, host, port, file) takes an arbitrary `file` string and URL.toPath() wraps it in a URI/Path with no character sanitization (URL.java lines 43-45 and 134-137), and FSDownload uses only the last path component via sCopy.getName() (FSDownload.java line 252/349/361). FSDownload.unpack() then calls FileUtil.unTar(localrsrc, dst) whenever the name ends in `.tar`/`.tar.gz`/`.tgz` (lines 280-283 and 311-316). Characters such as `;`, `$`, `(`, `)`, backtick and single quote are valid in HDFS/YARN path strings and in POSIX file names, so the attacker can embed a shell payload in the resource file name; no LocalResource-name validation was found in FSDownload or ResourceLocalizationService.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified makeShellPath(String) returns the raw string on Unix (FileUtil.java 514-516) and performs no escaping; verified the gzip branch does add single quotes (656-660) while the plain-tar branch does not (669), so the flaw is specific and not a misunderstanding of the whole method; verified Windows uses the shell-free unTarUsingJava path (641-645); verified FSDownload determines the name solely from the resource URL (252, 349, 361) and that no file-name validation exists in FSDownload or the ResourceLocalizationService cleanup paths searched; verified the destination `cd '<untarDir>'` is quoted (661-663), so the primary injectable input is the archive file name, not the destination; verified the public URL record type exposes an unvalidated raw `file` field (URL.java 43-45).",
+      "id": "case-179-cand-1",
+      "impact": "Arbitrary command execution with the privileges of the Hadoop process invoking unTar (NodeManager service account during YARN resource localization), i.e., compromise of cluster worker nodes from an ordinary, authenticated job submission; the injected commands can read/write node files, establish persistence or move laterally. The same sink can yield local privilege escalation wherever a privileged process unpacks an archive whose name an unprivileged party controls.",
+      "locations": [
+        {
+          "end_line": 679,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileUtil.java",
+          "start_line": 653
+        },
+        {
+          "end_line": 543,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileUtil.java",
+          "start_line": 508
+        },
+        {
+          "end_line": 283,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/FSDownload.java",
+          "start_line": 250
+        },
+        {
+          "end_line": 371,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/FSDownload.java",
+          "start_line": 345
+        },
+        {
+          "end_line": 45,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/api/records/URL.java",
+          "start_line": 43
+        }
+      ],
+      "prerequisites": "Unix/Linux deployment (Shell.WINDOWS false, so unTarUsingTar runs; on Windows unTarUsingJava is used and is not shell-based). The attacker must be able to submit a YARN application/container launch context containing a LocalResource of type ARCHIVE (or PATTERN) whose URL file name ends in `.tar` and contains shell metacharacters, and must be able to create the corresponding source archive at that path. The NodeManager must localize the resource (normal container startup), executing the command as the NodeManager service account (commonly `yarn`, potentially a privileged account). Any other caller of the public FileUtil.unTar API that forwards an untrusted file name is affected as well.",
+      "root_cause": "FileUtil.unTarUsingTar() builds a shell command string and executes it via `bash -c`. In the non-gzipped branch it appends `FileUtil.makeShellPath(inFile)` directly after `tar -xf ` with no quoting or escaping (FileUtil.java lines 664-670). On Unix, makeShellPath(String) is a no-op that only returns the input filename (FileUtil.java lines 514-516), so any shell metacharacter in the file name (;, $(), backticks, quotes, spaces, etc.) is interpreted by bash. The gzipped branch quotes the path with single quotes (lines 656-660), showing the omission is specific to the plain-tar path. FSDownload derives the localized file name from the application-controlled LocalResource URL and passes it to FileUtil.unTar(), turning the utility into an injection sink for a job owner.",
+      "title": "OS command injection via unquoted archive path in FileUtil.unTar() reachable from YARN resource localization",
+      "trace": "FSDownload.call(): sCopy = resource.getResource().toPath() (line 349) -> copy(): Path dCopy = new Path(dstdir, \"tmp_\"+sCopy.getName()) (line 252) -> unpack(new File(dTmp.toUri()), new File(dFinal.toUri())) (line 369) -> unpack(): lowerDst = dst.getName().toLowerCase(); if (lowerDst.endsWith(\".tar\")) FileUtil.unTar(localrsrc, dst) (lines 280-283) -> FileUtil.unTar(): non-Windows -> unTarUsingTar(inFile, untarDir, gzipped) (line 649) -> untarCommand = \"cd '\" + makeShellPath(untarDir) + \"' ; tar -xf \" + FileUtil.makeShellPath(inFile) (lines 661-670, no quotes around inFile) -> new ShellCommandExecutor(new String[]{\"bash\", \"-c\", untarCommand}).execute() (lines 671-673). The unescaped, attacker-influenced file name is parsed by bash as shell syntax.",
+      "unverified": "Not built or executed; runtime reachability depends on YARN accepting the crafted resource name and URI encoding preserving the metacharacters (URI construction keeps ; $ ( ) ' and encodes spaces, which does not neutralize shell parsing). Whether deployments configure LocalResource name validation, and the exact privilege level of the NodeManager in a given cluster, were not verified. No test sources are present to confirm a reproducer.",
+      "weakness_type": "OS command injection (CWE-78)"
+    }
+  ],
+  "coverage_summary": "Read-only review of the assigned snapshot (6,927 model-visible files, root version 3.0.1, no test directories present). Coverage was broad but targeted: repository/file layout and top-level build files; hadoop-common FileUtil/Configuration/Shell/security/alias/crypto; hadoop-auth server/client handlers (AuthenticationFilter, JWT, Kerberos, LDAP, AuthenticatedURL); hadoop-hdfs client/server web and servlet entry points (JspHelper, AuthFilter, ImageServlet, GetJournalEditServlet, ECPolicyLoader); hadoop-yarn common (FSDownload, LocalResource/URL, Localizer), ResourceManager webapp/REST and config stores, NodeManager container/localizer code plus native container-executor and Docker utilities; mapreduce core TaskLog/RunJar; selected tools (S3A, Azure, Rumen). Searches covered Runtime.exec/ProcessBuilder, bash -c, Shell.execCommand, ObjectInputStream, DocumentBuilderFactory, HttpServletRequest parameter handling, getCanonicalPath, unTar/unZip/unJar, and makeShellPath. No build, test execution, or dynamic analysis was performed.",
+  "limitations": [
+    "No compilation, test run, or runtime confirmation; all conclusions are static source-evidence leads.",
+    "Test sources are absent from the snapshot, so no reproducer/test hints could be inspected.",
+    "No git history, patch, advisory, or relation index is available in B0, so I could not diff this tree against upstream fixed versions; the identification of the pre-fix pattern relies on source shape.",
+    "Large parts of the tree (native code, JS/web assets, mapreduce/yarn/hdfs internals not on the traced path) were sampled by targeted search rather than exhaustively line-reviewed.",
+    "Runtime factors (YARN LocalResource acceptance of metacharacters after URI encoding, NodeManager privileges, HDFS name validation at the server) were not verified."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Zip-slip / path traversal in FileUtil.unZip(), FileUtil.unpackEntries() (tar entries), and RunJar.unJar() (no canonical-path containment check before writing entries)",
+      "reason": "Same localization path (FSDownload) could write outside the destination as the NodeManager user, but I found no in-tree fix/validation and less certainty that this matches the intended case; kept as an unconfirmed secondary lead rather than a second candidate."
+    },
+    {
+      "lead": "Java-native deserialization of ZooKeeper/LevelDB data in ZKConfigurationStore.deserializeObject() and LeveldbConfigurationStore (ObjectInputStream.readObject on capacity-scheduler mutations)",
+      "reason": "Requires write access to the ZooKeeper path or local store, a much stronger precondition than a job submission; exploitability is unclear and no validation bypass in code was demonstrated."
+    },
+    {
+      "lead": "XML parsers (ECPolicyLoader, QueueConfigurationParser, AllocationsFileLoaderService, ConfigurationUtils, rumen parsers) instantiate DocumentBuilderFactory without disabling external entities",
+      "reason": "Inputs are administrator-controlled configuration files, not attacker-reachable request data in the reviewed code paths."
+    },
+    {
+      "lead": "KerberosAuthenticator/AuthenticatedURL client does not disable HTTP redirects while sending the Negotiate token",
+      "reason": "Plausible credential-forwarding concern, but Java's HttpURLConnection redirect/header semantics and the intended Hadoop behavior could not be validated from source alone; no conclusive attacker-controlled path was traced."
+    },
+    {
+      "lead": "JavaKeyStoreProvider.KeyMetadata.readObject uses in.readInt() as an array length without validation",
+      "reason": "The stream originates from a local keystore file already trusted/writable by the process owner; no privilege boundary crossing was evidenced."
+    }
+  ],
+  "summary": "The snapshot is Apache Hadoop 3.0.1 (root pom version 3.0.1), roughly 6,927 readable main-source files (test trees are absent). Working only from source, the strongest evidence-backed issue is an OS command injection in hadoop-common's FileUtil.unTar(): the non-gzipped branch interpolates a file path into a `bash -c` command line without quoting, and the path is attacker-influenced when YARN localizes an application-supplied archive resource (FSDownload). I also examined, but did not select, several weaker/less certain leads (zip-slip in unZip/RunJar.unJar, Java deserialization in the capacity-scheduler ZK/LevelDB stores, XML parsers without XXE hardening, KerberosAuthenticator redirect handling, JavaKeyStoreProvider.readInt). No runtime execution or build was performed; findings are source-evidence leads only."
+}

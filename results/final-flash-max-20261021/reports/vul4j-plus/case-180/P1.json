@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A user with Job/Configure sets the file parameter's name (e.g. `../../../../plugins/x.jpi` or `../../../../init.groovy.d/x.groovy`) in the job configuration; parameter names are stored verbatim (ParameterDefinition/FileParameterDefinition constructors do not validate). The uploaded file content is supplied when the parameterized build is run (by the same user if they may build, or by any user who builds the job).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the parameter name is validated anywhere before use: `ParameterDefinition(String,String)` and `FileParameterDefinition` constructors store names verbatim, `ParametersDefinitionProperty` performs no name validation, and there is no `doCheckName` for file parameters — so a Configure user can save such a name. Confirmed `location` is re-set from the definition name in `createValue`, so it is config-controlled rather than merely request-controlled. Confirmed `FilePath.normalize` intentionally collapses `..` segments instead of rejecting them, and `new File(build.getRootDir(), \"fileParameters/\" + location)` performs no normalization/containment check. Noted the mitigating requirement that the destination's parent directory must already exist (`copyTo` does not create it), and that exploitation requires both Configure and a build file upload.",
+      "id": "file-parameter-location-path-traversal",
+      "impact": "Arbitrary file write on the Jenkins controller with attacker-supplied content (limited to already-existing target directories). This can be leveraged for code execution (e.g. dropping a crafted plugin under `$JENKINS_HOME/plugins/`, or a Groovy init script under `init.groovy.d` when that directory exists, loaded at restart) or to overwrite configuration files and corrupt/deny service. It also allows escaping the build workspace for the same write, breaking the expected containment of build inputs.",
+      "locations": [
+        {
+          "end_line": 95,
+          "path": "core/src/main/java/hudson/model/FileParameterValue.java",
+          "start_line": 85
+        },
+        {
+          "end_line": 153,
+          "path": "core/src/main/java/hudson/model/FileParameterValue.java",
+          "start_line": 138
+        },
+        {
+          "end_line": 231,
+          "path": "core/src/main/java/hudson/model/FileParameterValue.java",
+          "start_line": 223
+        },
+        {
+          "end_line": 90,
+          "path": "core/src/main/java/hudson/model/FileParameterDefinition.java",
+          "start_line": 87
+        }
+      ],
+      "prerequisites": "1) Permission to configure the job and set a file parameter name (Job/Configure); 2) a build of that job with a file uploaded for the parameter (Job/Build, or a victim who is induced to build it); 3) the resolved destination's parent directory must exist because `FilePath.copyTo(FilePath)` opens the target directly (no mkdirs for the controller target) — directories such as `$JENKINS_HOME`, `$JENKINS_HOME/jobs`, `$JENKINS_HOME/plugins` normally exist.",
+      "root_cause": "`FileParameterValue.location` is initialized from the job-configured parameter name (`FileParameterDefinition.createValue(...)` calls `setLocation(getName())`; the `FileParameterValue(String name, FileItem file)` constructor also sets `location = name`) and is never validated. `createBuildWrapper` uses it for `build.getWorkspace().child(location)` and `getLocationUnderBuild(build)` returns `new File(build.getRootDir(), \"fileParameters/\" + location)`. Because no check restricts `location` (no `..`/separator rejection, no containment check), path traversal segments survive and the uploaded file is copied to the resolved path on the Jenkins controller.",
+      "title": "File parameter name is used unvalidated as a path component for controller-side writes (arbitrary file write)",
+      "trace": "Job config XML -> `FileParameterDefinition` name -> `FileParameterDefinition.createValue(req)` / `createValue(req,jo)` calls `p.setLocation(getName())` (FileParameterDefinition.java:55/89) -> `FileParameterValue(...,name,...)` also calls `setLocation(name)` (FileParameterValue.java:89) -> on build `createBuildWrapper(...).setUp(...)` computes `FilePath locationFilePath = build.getWorkspace().child(location)` (FileParameterValue.java:145) and then `locationFilePath.copyTo(new FilePath(getLocationUnderBuild(build)))` (FileParameterValue.java:148) -> `getLocationUnderBuild` builds `.../builds/<n>/fileParameters/<location>` (FileParameterValue.java:229-231) -> with `..` segments the write resolves outside the build directory and outside the workspace on the Jenkins controller.",
+      "unverified": "No runtime reproduction or test execution was possible (snapshot contains no tests, and execution is out of scope). The exact upstream fix commit/release and whether upstream tracked this as a CVE/security advisory could not be verified from the snapshot. Exploit detail (which exact pre-existing directories are writable and whether `init.groovy.d` exists by default) is environment-dependent and was not verified.",
+      "weakness_type": "CWE-22 Path Traversal / Arbitrary File Write (CWE-73)"
+    }
+  ],
+  "coverage_summary": "Coverage: 8,936 repository-relative files, complete per the relation index (0 files missing from index, 0 hash mismatches, no SAST/findings oracle loaded; index is navigation-only). I read and traced the strongest evidence across the file-parameter subsystem (`FileParameterDefinition`, `FileParameterValue`, `FilePath` copy semantics), CLI commands and their web counterparts (`CopyJobCommand`, `CreateJobCommand`, `CreateViewCommand`, `CreateNodeCommand`, `UpdateNodeCommand`, `ItemGroupMixIn`, `Items`, `ComputerSet`, `Computer`, `Nodes`), request-handling/security code (`Jenkins` endpoints, `AbstractItem`, `View`, `User`, `Secret`, `XStream2`, CSRF filter, security realm), and archive/deserialization consumers (`FilePath` unzip/untar, `AnnotatedLargeText`, `ConsoleNote`, `ObjectInputStreamEx` usage). I did not exhaustively review all 8,936 files: large files such as AbstractProject, Job, Queue, Run, Fingerprint, PluginManager, UpdateCenter, Maven/JDK installers, and most resource/Jelly/localization files were only spot-checked, and no runtime/build analysis was performed.",
+  "limitations": [
+    "No tests are present in the snapshot (all src/test files excluded), so regression tests that might identify the intended fix could not be inspected.",
+    "No execution, build, scanner, or exploit payload was run; all conclusions are static source reasoning (candidate is a lead, not a confirmed vulnerability).",
+    "The declared pom version (2.73.4-SNAPSHOT) is internally inconsistent with some source markers (e.g. `@since 2.83` in SlaveComputer.java, absent `Util.isDescendant` referenced as '2.80+' in User.java), so the exact upstream release/commit could not be pinned down from the tree alone; this affects confidence that the snapshot is the parent of a specific security fix.",
+    "Whether the selected file-parameter behavior was fixed by a specific upstream security commit (and its CVE identifier) could not be verified without external references, which are out of scope.",
+    "The relation index does not prove data flow, reachability, or exploitability; index-provided call/containment edges were verified against source text where used, and unreported areas were not assumed reviewed.",
+    "Environment-dependent prerequisites (existence of target directories such as init.groovy.d, default permissions, whether upstream considers Configure-to-controller-write a trust boundary crossing) were not verified at runtime."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "`CopyJobCommand` (core/src/main/java/hudson/cli/CopyJobCommand.java:52-77) does not validate the destination job name, unlike `CreateJobCommand` (checkGoodName at CreateJobCommand.java:71) and the web copy path (`ItemGroupMixIn.createTopLevelItem`, checkGoodName at line 166). A dst such as `..` flows through `ModifiableTopLevelItemGroup.copy` -> `ItemGroupMixIn.copy` -> `createProject` (no name validation) and `getRootDirFor(name)` = `$JENKINS_HOME/jobs/<name>`, so `$JENKINS_HOME/config.xml` can be overwritten via the `fileParameters`-independent path `Items.getConfigFile(item)`.",
+      "reason": "Real internal inconsistency and plausible file overwrite/DoS for users with Job/Create, but impact is limited to overwriting `config.xml` with a job-format document (startup failure/config loss) and it duplicates the same 'unvalidated name used as path' theme with lower severity than the selected candidate; left unconfirmed rather than submitted as the single candidate."
+    },
+    {
+      "lead": "`CreateNodeCommand` (core/src/main/java/hudson/cli/CreateNodeCommand.java:53-78) and `update-node` -> `Computer.updateByXml` (Computer.java:1507-1511) accept a node name from the CLI argument or from the submitted XML without calling `Jenkins.checkGoodName`, while the web paths validate it (`ComputerSet.checkName` -> checkGoodName at ComputerSet.java:316, and `Computer.doConfigSubmit` at Computer.java:1455). `Nodes.persistNode` (Nodes.java:153-160) writes `new File(new File(getNodesDir(), node.getNodeName()), \"config.xml\")`, so name `..` resolves to `$JENKINS_HOME/config.xml`.",
+      "reason": "Same class of missing-name-validation issue in a different subsystem (Agent/Create or Agent/Configure actors); not selected because the primary candidate has clearer attacker-controlled content and higher impact, and I could not determine whether upstream fixed these CLI paths together with the selected issue."
+    },
+    {
+      "lead": "`cli/src/main/java/hudson/cli/Connection.java:248-264` (`verifyIdentity`) ignores the boolean result of `Signature.verify(...)` when validating the peer's proof of identity, whereas the analogous check in `CLI.java:266-272` throws on verification failure.",
+      "reason": "The code path is limited to the deprecated Remoting CLI transport (`CLI.authenticate` is documented deprecated/specific to Mode.REMOTING), so the trust-boundary impact is legacy and hard to substantiate; treated as an unconfirmed lead."
+    },
+    {
+      "lead": "`FilePath.unzip(File,File)` (FilePath.java:590-624) extracts ZIP entries via `new File(dir, e.getName())` without rejecting `..`/absolute entry names, and `FilePath.untarFrom`/`readFromTar` unpack archives without visible containment checks.",
+      "reason": "Archives are normally fetched from configured tool/update URLs rather than directly attacker-supplied input, and the reachable attack surface from an unprivileged request could not be established from source alone; not submitted."
+    },
+    {
+      "lead": "Defensive hardening opportunities observed but not vulnerabilities by themselves: `doScript`/`doScriptText` rely on an inline POST check instead of `@RequirePOST` (Jenkins.java:4337-4373), and `Jenkins.doIconSize` redirects to the request `Referer` header (Jenkins.java:4408-4418).",
+      "reason": "No concrete attacker-controlled path to a sensitive operation was established; the script endpoints already enforce `RUN_SCRIPTS` plus POST when a script parameter is present, and the `Referer` redirect matches long-standing upstream behavior."
+    }
+  ],
+  "summary": "Reviewed the assigned Jenkins-core snapshot (8,936 files, main sources only; no tests present) with focus on attacker-controlled names/paths that reach filesystem or deserialization sinks. The strongest source-supported issue is in the file-parameter subsystem: a file parameter's name (stored in job configuration and used as `FileParameterValue.location`) is interpolated, with no validation, into controller-side file paths, so the file uploaded for that parameter is written outside the build/workspace area. A user able to configure a job and start a parameterized build can therefore write attacker-chosen content to arbitrary existing directories reachable by the Jenkins process (for example `$JENKINS_HOME/plugins/`, `$JENKINS_HOME/config.xml`, or `init.groovy.d`), which can escalate to code execution at restart or to configuration/DoS damage. Several CLI name-validation gaps and a deprecated CLI signature-verification result being ignored were recorded as rejected/unconfirmed leads. No runtime confirmation was performed; this is a source-evidence-based lead only."
+}

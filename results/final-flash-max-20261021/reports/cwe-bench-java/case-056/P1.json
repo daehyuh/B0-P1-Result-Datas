@@ -1,0 +1,82 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client able to reach the executor port controls the POST /run JSON body, including the glue type and glue source (and can choose job/log identifiers to avoid collisions). When the configured access token is blank, no credential or token header is required.",
+      "confidence": "high",
+      "counterevidence_checked": "The access-token check is real and effective when a non-empty matching token is configured; the vulnerability depends on the supplied/default blank token or an externally reachable executor port. The script path requires a non-null executor parameter and a valid interpreter, but those are operational details, not mitigations. No code-level restriction limits the embedded server to admin hosts, and bootstrap.bind(port) uses a wildcard bind. No runtime test, network scan, or exploit was performed.",
+      "id": "executor-run-unauthenticated-rce",
+      "impact": "Arbitrary code/OS command execution on the executor host under the executor JVM's privileges. This can compromise job data and credentials, the executor application, and potentially enable lateral movement; it also breaks the intended trust boundary between the scheduler and executor.",
+      "locations": [
+        {
+          "end_line": 84,
+          "path": "xxl-job-core/src/main/java/com/xxl/job/core/server/EmbedServer.java",
+          "start_line": 84
+        },
+        {
+          "end_line": 201,
+          "path": "xxl-job-core/src/main/java/com/xxl/job/core/server/EmbedServer.java",
+          "start_line": 186
+        },
+        {
+          "end_line": 115,
+          "path": "xxl-job-core/src/main/java/com/xxl/job/core/biz/impl/ExecutorBizImpl.java",
+          "start_line": 100
+        },
+        {
+          "end_line": 152,
+          "path": "xxl-job-core/src/main/java/com/xxl/job/core/thread/JobThread.java",
+          "start_line": 133
+        },
+        {
+          "end_line": 82,
+          "path": "xxl-job-core/src/main/java/com/xxl/job/core/handler/impl/ScriptJobHandler.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 76,
+          "path": "xxl-job-core/src/main/java/com/xxl/job/core/util/ScriptUtil.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 152,
+          "path": "xxl-job-core/src/main/java/com/xxl/job/core/executor/XxlJobExecutor.java",
+          "start_line": 138
+        },
+        {
+          "end_line": 14,
+          "path": "xxl-job-executor-samples/xxl-job-executor-sample-springboot/src/main/resources/application.properties",
+          "start_line": 13
+        }
+      ],
+      "prerequisites": "The executor's embedded server must be running and its port reachable, and xxl.job.accessToken must be unset or blank, as in the supplied sample configuration. A shell interpreter such as bash must exist for the GLUE_SHELL path, or the bundled Groovy path can compile/instantiate supplied source. No admin login is required.",
+      "root_cause": "The embedded executor server checks XXL-JOB-ACCESS-TOKEN only when the configured token is non-empty. The supplied executor configuration defaults xxl.job.accessToken to blank, so POST /run reaches ExecutorBizImpl.run without authentication. That method trusts the request's glue type and glue source, constructs a ScriptJobHandler or Groovy handler from them, and queues the request for the job thread, whose handler writes and executes the supplied source.",
+      "title": "Unauthenticated executor /run endpoint permits arbitrary script execution when the optional access token is unset",
+      "trace": "EmbedServer binds the executor port and routes POST /run to executorBiz.run. Its token check is skipped when accessToken is blank. ExecutorBizImpl.run reads triggerParam.getGlueType() and triggerParam.getGlueSource(); for a script type it constructs ScriptJobHandler with that source, starts/queues a JobThread, and returns. JobThread calls handler.execute(), ScriptJobHandler writes the source to a script file, and ScriptUtil.execToFile invokes Runtime.getRuntime().exec with the interpreter and script. The Groovy branch similarly parses and instantiates supplied code.",
+      "unverified": "Actual deployment binding, firewall/reverse-proxy exposure, and whether operators override xxl.job.accessToken with a secret were not verified. The executor process privilege level and interpreter availability are deployment-dependent. The finding is a source-evidence lead, not a runtime-confirmed exploit.",
+      "weakness_type": "Missing Authentication for Critical Function (CWE-306) leading to Code Injection / OS Command Execution (CWE-94/CWE-78)"
+    }
+  ],
+  "coverage_summary": "Source scope exposed 232 files with no sensitive-name, size, or symlink exclusions. The relation index covers all 232 files, including 138 Java files, with no parse errors or missing indexed files, but it explicitly provides only syntactic relations and no control-flow, data-flow, semantic resolution, or exploitability proof. I inventoried the repository and verified the key admin auth/controller, MyBatis mapper, executor RPC, trigger, job-thread, script, configuration, and documentation paths in source text.",
+  "limitations": [
+    "No build, tests, runtime execution, network probing, or exploit payloads were run; the finding is not runtime-confirmed.",
+    "The relation index is syntactic only and does not prove complete data flow, reachability, or deployment topology.",
+    "The candidate is deployment-dependent: a configured non-empty access token or firewall/reverse-proxy isolation would close the unauthenticated path.",
+    "Not every line of all 232 visible files was reviewed, and vendor/static JavaScript assets were not exhaustively audited.",
+    "The rejected authorization leads were identified from targeted source inspection and were not fully chained or confirmed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Object-level authorization gaps in admin controllers, especially JobCodeController.save (lines 56-77) writing any job's glueSource without JobInfoController.validPermission, with similar gaps in JobInfoController mutating endpoints and JobLogController log/clear operations.",
+      "reason": "Plausible authenticated IDOR: a low-privilege account could modify jobs outside its group and potentially chain to executor RCE. Not selected because it requires a valid account and a subsequent trigger, while the selected executor /run path is unauthenticated."
+    },
+    {
+      "lead": "Admin JobApiController exposes /api/{uri} with login disabled and relies on the optional access token; with the blank default, registry and callback operations are unauthenticated.",
+      "reason": "Registry poisoning and callback/log manipulation are plausible and security-relevant, but lower direct impact than unauthenticated code execution and dependent on scheduler/registry behavior."
+    },
+    {
+      "lead": "Default administrator credentials admin/123456 appear in seed SQL and documentation.",
+      "reason": "This is a deployment/configuration risk rather than a direct source-code execution flaw; it was not selected as the strongest evidence-supported candidate."
+    }
+  ],
+  "summary": "Strongest source-backed lead: the executor's embedded Netty RPC exposes POST /run with authentication only when a non-empty access token is configured; the supplied executor configuration leaves xxl.job.accessToken blank. The request-controlled glue type/source reaches ScriptJobHandler and then Runtime.exec, giving an unauthenticated network attacker code execution on the executor host. Other authorization and default-credential weaknesses were noted but not selected because they either require an authenticated account or have lower direct impact."
+}

@@ -1,0 +1,94 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the value of a Camel message header named `CamelGsonUnmarshalType` (GsonConstants.UNMARSHAL_TYPE) or `CamelJohnzonUnmarshalType` (JohnzonConstants.UNMARSHAL_TYPE) on a message that is later unmarshalled with the corresponding data format. Such headers are trivially settable from transports whose inbound header filter does not strip `Camel*` names: for camel-jms, `JmsBinding.extractHeadersFromJms` copies every JMS property into a Camel header, applying only `JmsHeaderFilterStrategy`, which registers no in-filter and no Camel-prefix pattern (lines 33-44), so a publisher able to send to the consumed queue/topic can set the header; the same applies to other property/header-carrying consumers (AMQP/SJMS/Kafka/SQS-style) and to any route that copies untrusted input into a header. The header value is then used as a Java class name.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked and excluded: (a) camel-jackson, camel-jacksonxml and camel-cbor read the same kind of header only when `allowUnmarshallType` is true (default false in the generated JSON metadata components/camel-jackson/src/generated/resources/.../json-jackson.json, jacksonxml.json, cbor.json) — so the capability is intentionally opt-in elsewhere; (b) camel-fastjson (FastjsonDataFormat.unmarshal lines 98-105) never reads a header and uses only the configured type, so it is not affected; (c) on HTTP consumers the default `HttpHeaderFilterStrategy` in-filter pattern (`CAMEL_FILTER_PATTERN`, DefaultHeaderFilterStrategy line 45, lines 155-158) filters out inbound `Camel*` headers, so simple HTTP-header injection does not reach this code path with the default filter strategy — attacker control therefore depends on the transport/header-filter configuration (JMS-style property propagation is the concrete path I verified); (d) no `allowUnmarshallType`/`allowJmsType` token exists anywhere under components/camel-gson or components/camel-johnzon, so there is no hidden gate in these two components. Other candidate sinks reviewed and judged weaker/not reported are listed in rejected_leads.",
+      "id": "CAND-1",
+      "impact": "An attacker able to influence that header dictates which Java type the message is deserialized into, defeating the application's fixed `unmarshalType` and turning the data format into generic attacker-directed object creation/population. Consequences are classpath-dependent: classes with side-effecting construction/field population or a class-attached Gson `@JsonAdapter` can be driven from attacker JSON (JNDI/resource lookup, file or network access, template evaluation), i.e. a path to RCE/SSRF/file disclosure, and at minimum arbitrary type instantiation plus denial of service (e.g. choosing types that allocate heavily when triggered); for Gson, types without a no-arg constructor are instantiated via Unsafe, widening the set of reachable classes. This is precisely the risk the sibling jackson/jacksonxml/cbor data formats mitigate by leaving the header inert unless explicitly enabled.",
+      "locations": [
+        {
+          "end_line": 161,
+          "path": "components/camel-gson/src/main/java/org/apache/camel/component/gson/GsonDataFormat.java",
+          "start_line": 146
+        },
+        {
+          "end_line": 24,
+          "path": "components/camel-gson/src/main/java/org/apache/camel/component/gson/GsonConstants.java",
+          "start_line": 19
+        },
+        {
+          "end_line": 197,
+          "path": "components/camel-johnzon/src/main/java/org/apache/camel/component/johnzon/JohnzonDataFormat.java",
+          "start_line": 184
+        },
+        {
+          "end_line": 199,
+          "path": "components/camel-jackson/src/main/java/org/apache/camel/component/jackson/JacksonDataFormat.java",
+          "start_line": 186
+        },
+        {
+          "end_line": 196,
+          "path": "components/camel-jacksonxml/src/main/java/org/apache/camel/component/jacksonxml/JacksonXMLDataFormat.java",
+          "start_line": 176
+        },
+        {
+          "end_line": 104,
+          "path": "components/camel-cbor/src/main/java/org/apache/camel/component/cbor/CBORDataFormat.java",
+          "start_line": 85
+        },
+        {
+          "end_line": 225,
+          "path": "components/camel-jms/src/main/java/org/apache/camel/component/jms/JmsBinding.java",
+          "start_line": 203
+        },
+        {
+          "end_line": 44,
+          "path": "components/camel-jms/src/main/java/org/apache/camel/component/jms/JmsHeaderFilterStrategy.java",
+          "start_line": 33
+        }
+      ],
+      "prerequisites": "A route that unmarshals with the gson (or johnzon) data format (`.unmarshal().gson()`, dataFormat gson in XML/YAML, etc.); the attacker must be able to set the `CamelGsonUnmarshalType` / `CamelJohnzonUnmarshalType` header on that message (e.g., a broker/queue producer on a JMS-style consumer, or a route that maps untrusted data into that header). Note the mitigating context: on HTTP-style consumers the default `HttpHeaderFilterStrategy` (components/camel-http-common/.../HttpHeaderFilterStrategy.java lines 43-48, `setInFilterPattern(CAMEL_FILTER_PATTERN)`) drops inbound `Camel*` headers, so plain HTTP consumers are not directly exposed unless a custom/no-op header filter strategy is used.",
+      "root_cause": "GsonDataFormat.unmarshal() and JohnzonDataFormat.unmarshal() read the unmarshal-type header unconditionally and pass it to the class resolver, so any message that reaches the gson/johnzon unmarshal step can force the deserialization target class. Neither class defines an `allowUnmarshallType` (or `allowJmsType`) option at all (verified: no occurrence of either token anywhere under components/camel-gson or components/camel-johnzon), whereas the parallel implementations in the same snapshot wrap exactly this header read in `if (allowUnmarshallType)` and default it to false.",
+      "title": "camel-gson / camel-johnzon unmarshal the attacker-specified class from a message header without the opt-in gate used by the other data formats",
+      "trace": "1) Untrusted message arrives on e.g. camel-jms; `JmsBinding.extractHeadersFromJms` (lines 209-224) copies the JMS property `CamelGsonUnmarshalType` into the Camel message headers because `JmsHeaderFilterStrategy` defines no in-filter/pattern (lines 33-44) — the value is a wholly attacker-chosen FQCN. 2) The route applies the gson data format: `GsonDataFormat.unmarshal` (lines 147-161) reads `exchange.getIn().getHeader(GsonConstants.UNMARSHAL_TYPE, String.class)` at line 151 with no `allowUnmarshallType` check (contrast JacksonDataFormat lines 186-199, JacksonXMLDataFormat lines 176-196 and CBORDataFormat lines 85-104, which only read the header `if (allowUnmarshallType)`, default false per their generated JSON metadata). 3) Line 153 resolves that FQCN: `exchange.getContext().getClassResolver().resolveMandatoryClass(type)`; line 154 deserializes attacker JSON into that class (`gson.fromJson(reader, clazz)`), overriding the endpoint's configured `unmarshalType`. The identical pattern exists in JohnzonDataFormat lines 184-197 (header read at line 188, class resolution at line 190, `objectMapper.readObject(stream, clazz)` at line 195).",
+      "unverified": "No runtime execution, test run, scanner or fix/CVE metadata was used (out of scope here), so the finding is source-based only: I did not confirm on a live route that a JMS property named `CamelGsonUnmarshalType` survives the configured key-format strategy and filter strategy end-to-end, nor did I enumerate a concrete gadget class present on this project's test classpath. Whether a specific deployment is exploitable for code execution therefore depends on configuration (transport, header filter strategy, whether the gson/johnzon data format is used) and on the classes assembled in the runtime classpath; the arbitrary-class-selection and override of the configured type themselves are clear from the source. Ownership/date of a potential upstream fix was not verified (no web/history access allowed).",
+      "weakness_type": "Use of externally-controlled input to select classes during deserialization (CWE-470; unsafe deserialization CWE-502)"
+    }
+  ],
+  "coverage_summary": "Source scope: 10,047 readable files (get_source_scope; 6 sensitive-named paths excluded, no symlinks/oversize files), and the P1 relation index reports complete coverage of the same 10,047 files (sqlite index, 132,618 symbols, 291,566 calls, 247,568 edges; no SAST or findings oracle loaded). Index facts (config_file, security_call) were used only for navigation; its 1,924 facts are name-based heuristics, and its unsupported analyses (no data flow, no reachability) were not treated as evidence. I read source in: the JSON/XML data formats (gson, johnzon, jackson, jacksonxml, cbor, fastjson, snakeyaml, xstream, jaxb), the HTTP families (http, http-common, http-base, ahc, netty, netty-http), JMS/SJMS/rabbitmq/MINA providers, aggregation-repository codecs (cassandra, sql/jdbc, consul, leveldb, caffeine, ehcache, infinispan, hazelcast), XML parsing/XPath/XSLT plumbing, header-filter strategies and the consumer bindings, and various endpoint option defaults. Not inspected: the majority of the ~400 components/plugins (cloud/CRM/messaging long tail), most test sources, most build/generated descriptors, and `examples/`, `platform/`, `tooling/` beyond incidental reads.",
+  "limitations": [
+    "No code was executed and no tests, scanners or exploit payloads were run; all statements are source-level and were not runtime-confirmed.",
+    "I could not consult upstream history, patches, advisories or CVE/ground-truth data, so I cannot confirm whether the missing gate in camel-gson/camel-johnzon was later fixed or map it to a specific advisory.",
+    "Exploitability of the attacker-chosen target class depends on the runtime classpath (available gadget/adapter classes) and on route/transport configuration; I did not enumerate a concrete gadget on this snapshot's classpath.",
+    "Attacker header control was verified by code reading for the JMS path (JmsBinding property copy + JmsHeaderFilterStrategy absence of in-filter); other transports (AMQP/SJMS/Kafka/SQS/file/raw TCP) were judged analogous but not individually re-verified, and HTTP consumers are additionally protected by the default Camel-prefix in-filter.",
+    "Most components, test suites and generated descriptors were not inspected, so additional issues (including other ungated header-driven reflection sinks) may exist outside the reviewed sample; the relation index provides navigation candidates only, not a completeness guarantee."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "camel-rabbitmq RabbitMQMessageConverter.deserializeBody (components/camel-rabbitmq/.../RabbitMQMessageConverter.java lines 299-323) performs raw `new ObjectInputStream(...).readObject()` on the AMQP body when a `CamelSerialize` header is present.",
+      "reason": "Gated by the `allowMessageBodySerialization` endpoint option, annotated defaultValue=false with an explicit security warning in the option javadoc (RabbitMQEndpoint.java lines 176-177, 591-602); a message cannot reach the sink unless the application opts in."
+    },
+    {
+      "lead": "Client-side Java-object response deserialization in camel-http/camel-ahc/camel-netty-http (HttpProducer line 395, AhcHelper.deserializeJavaObjectFromStream lines 66-80, NettyHttpHelper.deserializeJavaObjectFromStream lines 164-178) — raw/Camel ObjectInputStream without an allowlist.",
+      "reason": "Every caller observed is guarded by `allowJavaSerializedObject` (component option, default off, with documented warning) and/or `transferException` (endpoint option, default false); opt-in configuration, so weaker than the ungated gson/johnzon case."
+    },
+    {
+      "lead": "Java deserialization of datastore contents without allowlist: CassandraCamelCodec.deserialize (line 83), JdbcCamelCodec/JdbcAggregationRepository via ClassLoadingAwareObjectInputStream (lines 55-101, 92-96), ConsulRegistry.deserialize (lines 272-276).",
+      "reason": "Real unsafe-deserialization sinks, but the attacker must already be able to write to the Cassandra/SQL/Consul store used by Camel's aggregation repository or registry, i.e. control of a trusted datastore rather than the message path; kept as an unconfirmed secondary lead."
+    },
+    {
+      "lead": "SSRF via `Exchange.HTTP_URI`/`REST_HTTP_URI` message headers in HttpHelper.createURL (camel-http-common .../HttpHelper.java lines 199-220) and NettyHttpHelper.createURL.",
+      "reason": "Documented URL-override behaviour of the HTTP producer (and placeholder resolution on it); it is an app-visible contract, not a defect in this code, so it was not submitted as the vulnerability."
+    },
+    {
+      "lead": "XXE / XML external-access hardening: XmlConverter/XmlSignatureHelper/XmlLineNumberParser and friends already set FEATURE_SECURE_PROCESSING, disallow-doctype-decl or disable external entities; XPathBuilder delegates parsing to the hardened XmlConverter.",
+      "reason": "No missing hardening found in the XML parsing paths inspected; the `Exchange.DOCUMENT_BUILDER_FACTORY`/`SAXPARSER_FACTORY` exchange properties are application-set, not message-derived."
+    },
+    {
+      "lead": "camel-snakeyaml SnakeYAMLDataFormat (SafeConstructor by default, typeFilters), camel-xstream AbstractXStreamWrapper.addDefaultPermissions, camel-shiro ShiroSecurityProcessor resolveClass allowlist, camel-exec command headers, camel-sql `CamelSqlQuery` header, camel-file `CamelFileName`.",
+      "reason": "Each already has an allowlist/type-filter or is an explicitly documented high-risk feature; no missing control identified, so they were not elevated to candidates."
+    }
+  ],
+  "summary": "Review of the apache/camel snapshot (version 3.2.0-SNAPSHOT, ~March 2020; 10,047 readable source files per get_source_scope). I traced attacker-controllable message input into reflective/deserialization sinks, comparing sibling implementations that perform the same operation. The strongest distinct issue is in the JSON data formats: `camel-gson` (`GsonDataFormat.unmarshal`) and `camel-johnzon` (`JohnzonDataFormat.unmarshal`) unconditionally honour a message header that names the Java class to unmarshal into (`CamelGsonUnmarshalType` / `CamelJohnzonUnmarshalType`), overriding the application-configured `unmarshalType`, while the sibling formats in the same snapshot (`camel-jackson`, `camel-jacksonxml`, `camel-cbor`) gate the identical capability behind an opt-in `allowUnmarshallType` flag that defaults to false. The gating asymmetry inside one snapshot, plus the header-propagation path from JMS properties straight into Camel headers, makes this the strongest candidate: attacker-chosen deserialization target class (CWE-470/CWE-502)."
+}

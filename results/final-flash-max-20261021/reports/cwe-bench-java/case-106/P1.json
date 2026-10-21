@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any authenticated user (default Reader-level account can call the views/search API). The attacker only needs the id of an ownerless Search, which is exposed as the searchId of a view (ViewDTO.searchId()) obtainable via GET /api/views/{id} for readable/installed views; content-pack-installed views are shared by design. No special permission beyond normal search/view access is required.",
+      "confidence": "low",
+      "counterevidence_checked": "Checked the intended fallback: hasReadPermissionFor() already authorizes searches that are referenced by a readable view, so a fail-closed owns() (orElse(false)) would still allow legitimate access to content-pack/shared searches and to their execution — the fail-open is not required for functionality. The outer orElse(true) in saveForUser is only needed when no prior search exists and is not itself the defect. Stream-level access is enforced separately (SearchExecutionGuard/PluggableSearchValidation), so this is not a message-data bypass. I found no comment, javadoc or test asserting that ownerless searches are intentionally public, but I could not diff the snapshot against upstream Graylog 5.1.2, so the possibility that orElse(true) is deliberate backward-compatibility behavior could not be excluded.",
+      "id": "cand-1",
+      "impact": "Unauthorized disclosure of stored search configuration (query strings, stream ids/filters, referenced search-filter ids) and unauthorized modification/takeover of searches referenced by other users' views — an integrity issue affecting shared dashboards/saved searches. Message contents of streams the attacker cannot read are not disclosed because execution-time stream checks remain in place, which bounds the confidentiality impact.",
+      "locations": [
+        {
+          "end_line": 119,
+          "path": "graylog2-server/src/main/java/org/graylog/plugins/views/search/permissions/SearchUser.java",
+          "start_line": 116
+        },
+        {
+          "end_line": 99,
+          "path": "graylog2-server/src/main/java/org/graylog/plugins/views/search/SearchDomain.java",
+          "start_line": 53
+        },
+        {
+          "end_line": 145,
+          "path": "graylog2-server/src/main/java/org/graylog2/contentpacks/facades/ViewFacade.java",
+          "start_line": 140
+        },
+        {
+          "end_line": 167,
+          "path": "graylog2-server/src/main/java/org/graylog/plugins/views/search/rest/SearchResource.java",
+          "start_line": 126
+        }
+      ],
+      "prerequisites": "An ownerless Search document must exist (created by content-pack import via ViewFacade, or legacy data). The attacker must be authenticated and able to reach the /api/views/search APIs; for the write path, they must know the search id.",
+      "root_cause": "SearchUser.owns(Search) evaluates search.owner().map(o -> o.equals(username())).orElse(true) (SearchUser.java lines 116-119), i.e. a missing owner is treated as 'owned by the requester'. SearchDomain.hasReadPermissionFor() short-circuits to 'allowed' when owns() returns true (lines 84-87) and therefore never falls through to the intended view-based permission fallback (lines 89-98); SearchDomain.saveForUser() likewise uses owns() to decide whether an existing search may be overwritten (lines 76-79). Because Search owners are optional and ownerless searches are really created in this codebase (ViewFacade.decode() saves the content-pack Search without withOwner, lines 141-144, while the view itself is saved with an owner), the check fails open for those documents.",
+      "title": "Fail-open search ownership check lets any authenticated user read and overwrite ownerless saved searches",
+      "trace": "Read: GET /api/views/search/{id} -> SearchResource.getSearch -> SearchDomain.getForUser (lines 53-59) -> checkPermission -> hasReadPermissionFor -> searchPermissions.owns(search) returns true because owner() is empty -> returns true before evaluating canReadView, so the raw stored Search (queries, stream filters, timers, referenced search-filter ids) is returned. Execute: POST /api/views/search/{id}/execute -> SearchExecutor.execute -> SearchDomain.getForUser passes the same check (stream-level message access remains separately guarded by PluggableSearchValidation/SearchExecutionGuard, limiting data exposure to the search definition). Write/takeover: POST /api/views/search with an existing ownerless id -> SearchDomain.saveForUser (lines 73-82): previous.map(searchUser::owns).orElse(true) yields true, the PermissionException is skipped and dbService.save(search.withOwner(searchUser.username())) overwrites the stored search and assigns it to the attacker; the view referencing that search now executes attacker-controlled query definitions for all of its users.",
+      "unverified": "Whether an ownerless Search exists in a typical deployment (content-pack-created searches are the concrete source in this snapshot, but I could not confirm installation paths at runtime); whether upstream used orElse(false) so that this is an introduced regression rather than long-standing behavior; no runtime validation was performed.",
+      "weakness_type": "Missing/incorrect authorization (CWE-862/CWE-863)"
+    }
+  ],
+  "coverage_summary": "Java sources were the focus (3,130 files, all parsed by the P1 index). I inspected authentication/session code (Shiro filters, HTTP header auth, session/token realms, CookieFactory, SessionCreator), the central permission helpers (RestResource, SearchUser, SearchDomain, ViewService/ViewUtils, PermittedStreams/UserStreams, SearchExecutionGuard, MongoDbAuthorizationRealm/DefaultPermissionAndRoleResolver), REST resources for messages, users, roles, cluster config, content packs, search/views/start page/export, sidecar, lookup adapters and URL-whitelist/SSRF paths, plus data-node management/rest code. I did not review all 3,130 Java files (most JSON DTOs, migrations, storage adapters, input transports, and enterprise stubs were only sampled or skipped), and the frontend was only spot-checked (.ts/.js present; .tsx/.jsx are absent from the snapshot).",
+  "limitations": [
+    "P1 index is syntax-only: no control-flow, data-flow, semantic resolution, or runtime reachability; index labels/edges are navigation hints, not verdicts.",
+    "Index coverage is partial: 12 source files missing from the index and 4 parse errors; those files were not verified through relations (the omitted files were not enumerated).",
+    "Java test sources are stripped from the snapshot (no src/test trees) and .tsx/.jsx React components are absent, so tests/UI security logic could not be used as corroborating evidence.",
+    "No upstream baseline/diff was available, so I could not confirm whether the reported fail-open owns() check is a regression versus long-standing behavior; no code was executed and nothing was runtime-confirmed.",
+    "Large areas remain uninspected (e.g., most content-pack/migration code, JSON DTOs, storage adapters, input transports), so additional vulnerabilities may exist."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "UsersResource.create() (lines 304-354) accepts arbitrary permissions and roles with only the users:create permission, so a delegated 'user administrator' could create an Admin-role account.",
+      "reason": "Real-looking privilege boundary, but it appears to be long-standing intended Graylog design (users:create is a powerful permission), and the analogous self-check used elsewhere (EventDefinitionsResource.checkEventDefinitionPermissions) exists only for event definitions; no source evidence that a check was removed, so I could not reach the evidence threshold."
+    },
+    {
+      "lead": "ViewsResource.update() (lines 341-358) authorizes edits via SearchUser.canUpdateView() (lines 91-96), which branches on the view type supplied in the request body and also accepts dashboards:edit for DASHBOARD-typed updates.",
+      "reason": "Plausible type/authorization confusion, but the type-based dashboard permission branch looks native to Graylog and the preconditions (dashboards:edit on the target id) are restrictive; unconfirmed."
+    },
+    {
+      "lead": "CORSFilter (lines 30-40) emits Access-Control-Allow-Origin: * together with Access-Control-Allow-Credentials: true when http_enable_cors is enabled.",
+      "reason": "Browsers reject the *+credentials combination for credentialed requests and the feature is disabled by default (HttpConfiguration.httpEnableCors = false), so no concrete exploitable impact was established."
+    },
+    {
+      "lead": "MongoDbSession.getAttributes() uses ObjectInputStream to deserialize session attributes from MongoDB (lines 65-76).",
+      "reason": "Requires an attacker to already have write access to the MongoDB session collection, which is outside the modeled trust boundary; Java deserialization gadget availability was not verified."
+    }
+  ],
+  "summary": "Reviewed the Graylog 5.1.2 snapshot (4,445 visible files; 3,130 Java files parsed by the P1 index). I traced authn/session handling (Shiro filters, realms, SessionCreator, CookieFactory), permission plumbing (RestResource, SearchUser/SearchDomain/ViewService, UsersResource/RolesResource), search/views REST endpoints, message access, content packs, lookup adapters, URL-whitelist/SSRF paths, sidecar, and data-node code. One source-verifiable fail-open authorization defect stands out: SearchUser.owns() returns true for searches with no owner, and SearchDomain uses owns() as an unconditional grant for both reading and overwriting searches. Ownerless Search documents are legitimately created by the content-pack ViewFacade (searchDbService.save without withOwner) and can exist from legacy data. I could not diff against upstream, so intent is uncertain; no finding is runtime-confirmed."
+}

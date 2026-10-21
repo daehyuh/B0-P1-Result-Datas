@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `{profiles}` (and to a lesser extent `{name}`/`{label}`) path variables of the unauthenticated-by-default Config Server endpoints, e.g. GET /{name}/{profiles} and GET /{name}/{profiles}/{label} plus their .properties/.json/.yml variants. The mapping regex `.*[^-].*` allows the variable to contain slashes, and Spring MVC's UrlPathHelper decodes the request path, so encoded/double-encoded dot-segment sequences (e.g. `..%252f`) can reach the controller as `../` without being caught for the profile component.",
+      "confidence": "medium",
+      "counterevidence_checked": "The snapshot already contains the earlier traversal hardenings: EnvironmentController.normalize() with PathUtils.isInvalidEncodedLocation() for name and label (lines 112-127), and GenericResourceRepository re-checks every resolved location and relative path (lines 60-73), which mitigates the resource endpoint even where ResourceController only applies Environment.normalize(). That asymmetry (validation exists for name/label and in the resource path, but never for profiles) is what makes the omission conspicuous; however, it also shows the maintainers were aware of the class, and the missing profile case may be intentional/covered elsewhere in ways not visible here. PathUtils.isInvalidEncodedLocation itself is correctly implemented (decodes and processes the string, checks '..' and '#'), and no bypass of it was identified. Config-driven sinks (Vault/Credhub URL paths, JDBC parameterized queries, proxy/AWS credential selection) were reviewed and rejected as weaker or by-design.",
+      "id": "cand-1",
+      "impact": "Directory traversal / unauthorized read of configuration files (e.g. *.properties, *.yml, *.yaml) located outside the configured search locations, potentially disclosing other applications' or tenants' configuration and secrets stored on the same host. The same profile string is also substituted into git repository URIs for pattern-matching repos, which can redirect which repository path is used.",
+      "locations": [
+        {
+          "end_line": 127,
+          "path": "spring-cloud-config-server/src/main/java/org/springframework/cloud/config/server/environment/EnvironmentController.java",
+          "start_line": 103
+        },
+        {
+          "end_line": 254,
+          "path": "spring-cloud-config-server/src/main/java/org/springframework/cloud/config/server/support/AbstractScmAccessor.java",
+          "start_line": 239
+        },
+        {
+          "end_line": 203,
+          "path": "spring-cloud-config-server/src/main/java/org/springframework/cloud/config/server/environment/NativeEnvironmentRepository.java",
+          "start_line": 164
+        },
+        {
+          "end_line": 215,
+          "path": "spring-cloud-config-server/src/main/java/org/springframework/cloud/config/server/environment/NativeEnvironmentRepository.java",
+          "start_line": 208
+        },
+        {
+          "end_line": 228,
+          "path": "spring-cloud-config-server/src/main/java/org/springframework/cloud/config/server/environment/MultipleJGitEnvironmentRepository.java",
+          "start_line": 203
+        },
+        {
+          "end_line": 78,
+          "path": "spring-cloud-config-server/src/main/java/org/springframework/cloud/config/server/support/PathUtils.java",
+          "start_line": 40
+        }
+      ],
+      "prerequisites": "Config Server exposed to the attacker (default endpoints have no built-in authentication). The affected backend/config must make profile participate in path construction: a `{profile}` placeholder in git `search-paths`, native `search-locations`, or a multi-repo URI template, or the native backend in which the attacker-chosen profile is used inside generated config-file names. The attacker generally needs to know/guess the server-side path layout or an existing config file name. Not verified at runtime.",
+      "root_cause": "EnvironmentController sanitizes only the `name` and `label` path variables: labelled() does `name = normalize(name); label = normalize(label);` where normalize() rejects traversal via PathUtils.isInvalidEncodedLocation(), but it forwards `profiles` unchanged to repository.findOne(). No validator (validateProfiles only rejects hyphens, and JSR-303 is not applied) inspects profiles anywhere in the server module. The environment repositories then use the raw profile string for path/location construction: AbstractScmAccessor.getSearchLocations() substitutes it for the `{profile}` placeholder in configured search paths and resolves it with `new File(dir, value).toURI()` + PathMatchingResourcePatternResolver; NativeEnvironmentRepository.getLocations() does the same for search locations and sets it as `spring.profiles.active`, so it becomes part of the config-file name looked up by the nested SpringApplication; MultipleJGitEnvironmentRepository.getRepository() also substitutes it into repository URIs.",
+      "title": "Directory-traversal validation omitted for the `profiles` request component in Config Server environment endpoints",
+      "trace": "HTTP GET /{name}/{profiles}[/{label}] -> EnvironmentController.defaultLabel()/labelled() (lines 103-120): name and label go through normalize()/PathUtils.isInvalidEncodedLocation(), profiles does not -> EnvironmentRepository.findOne(name, profiles, label) -> JGit/SVN/Native repository getLocations(): profile is substituted for `{profile}` in AbstractScmAccessor.getSearchLocations() (lines 245-247) and resolved to concrete directories with `new File(dir, value).toURI()` / matchingDirectories (lines 261-276), or set as spring.profiles.active and used in generated config names in NativeEnvironmentRepository.getEnvironment()/getArgs() (lines 208-215, 272-284) -> Spring config loading resolves property files from attacker-influenced directories outside the configured search locations -> PropertySource values are returned in the HTTP response.",
+      "unverified": "Exploitability was not executed or runtime-confirmed. Spring MVC/Tomcat decoding and dot-segment normalization behavior, the exact Spring Boot 2.1 config-file-name resolution semantics for profiles containing slashes, and whether the affected deployment uses {profile} placeholders are all inferred from source and public framework behavior only. No tests, git history, fix diff or CVE metadata are present in the snapshot to confirm the intended validation point.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / CWE-23 Relative Path Traversal"
+    }
+  ],
+  "coverage_summary": "Reviewed the full 162-file source snapshot exposed by get_source_scope (spring-cloud-config 2.1.8.RELEASE: server, client, monitor, sample and starter modules; no test sources are present). I read the HTTP controllers (EnvironmentController, ResourceController, EncryptionController, PropertyPathEndpoint), all environment repositories and factories (Native, JGit, MultipleJGit, SVN, Vault, Credhub, JDBC, Passthru, Composite), the path-handling helpers (PathUtils, GenericResourceRepository, AbstractScmAccessor, EnvironmentCleaner), client-side locator/properties, and the credential/SSH/TLS/proxy support classes. Main focus was attacker-controlled request data reaching filesystem/URL/path sinks.",
+  "limitations": [
+    "No code execution, build, tests or runtime probing was performed; findings are source-evidence only and no issue is claimed as runtime-confirmed.",
+    "Test sources are absent from the snapshot, so intended validation behavior cannot be cross-checked against tests.",
+    "No git history, changelog or fix diff is available, so the snapshot cannot be diffed against the patched version of the same files.",
+    "Spring MVC/Tomcat URL decoding, encoded-slash handling and Spring Boot 2.1 config-file-name resolution semantics were not verified, which affects exploitability of the reported candidate.",
+    "Dependency behavior (Spring Boot 2.1, JGit, SVNKit, CredHub, Vault client, Apache HttpClient) was assessed only from usage sites, not from library sources.",
+    "Only the filtered source tree reported by get_source_scope (162 files) was inspected; excluded/binary files were not reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ResourceController accepts name/label/profile without PathUtils.isInvalidEncodedLocation (only Environment.normalize) and uses request path substringing in getFilePath().",
+      "reason": "Traversal for the resource endpoint is neutralized downstream in GenericResourceRepository, which skips locations failing isInvalidEncodedLocation and rejects local paths failing isInvalidPath/isInvalidEncodedPath; no concrete bypass of those checks was established from source."
+    },
+    {
+      "lead": "Vault/Credhub key and path construction from attacker-controlled application/profile (VaultKvAccessStrategySupport.getData builds %s/v1/%s/%s; CredhubEnvironmentRepository builds /application/profile/label).",
+      "reason": "Attacker influence over remote secret paths is inherent to the repository key model, requires those optional backends, and does not itself yield local file traversal; impact depends on the Vault/CredHub policy and was not established as a distinct vulnerability."
+    },
+    {
+      "lead": "JdbcEnvironmentRepository SQL handling.",
+      "reason": "The configured SQL is executed with bound parameters (new Object[] { app, env, label }); no injection identified."
+    },
+    {
+      "lead": "EncryptionController decrypts with request-controlled key aliases/prefixes and logs ciphertext on failure (lines 124-141).",
+      "reason": "Alias/secret selection is bounded by the server keystore and default secret; public-key endpoint only exposes public keys; no confidentiality/integrity break with concrete prereqs found."
+    },
+    {
+      "lead": "Git/AWS credentials handling (GitCredentialsProviderFactory, AwsCodeCommitCredentialProvider.canHandle, GitSkipSslValidationCredentialsProvider).",
+      "reason": "Credentials are only sent to the configured git URI; the AWS provider requires an https git-codecommit.*.amazonaws.com host; no attacker-controlled redirection of credentials identified."
+    },
+    {
+      "lead": "Proxy/TLS support classes (HttpClientSupport, SchemeBasedRoutePlanner, HttpClientConfigurableHttpConnectionFactory).",
+      "reason": "Routes and trust settings derive from server configuration, not request input."
+    }
+  ],
+  "summary": "The snapshot is the main sources (no tests) of spring-cloud-config 2.1.8.RELEASE, including the server, client and monitor modules. I traced request-controlled data from the HTTP controllers through the environment/resource repositories and the path-handling helpers. The codebase contains an explicit traversal-defense family (PathUtils.isInvalidEncodedLocation / isInvalidPath, normalize() in EnvironmentController, location re-checks in GenericResourceRepository), but the defense is applied asymmetrically: the `name` and `label` path variables are sanitized while the equally attacker-controlled `profiles` component is passed to EnvironmentRepository.findOne untouched and is subsequently used to build search locations and config-file names. That omission is the strongest candidate identified. No runtime verification was performed; this is a source-evidenced lead."
+}

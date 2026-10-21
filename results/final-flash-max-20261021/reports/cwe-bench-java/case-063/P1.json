@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker fully controls the request: PUT /nacos/v1/auth/users?username=<victim>&newPassword=<new value> (e.g. username=nacos), with their own valid credential (Authorization: Bearer <token>, accessToken parameter, or username/password parameters), i.e. attacker chooses both the target account and the new password. No old password is requested by this code path.",
+      "confidence": "high",
+      "counterevidence_checked": "Verified that response.sendError() does not abort handler execution (no exception is thrown; the subsequent DB update is executed before the return value is serialized), so the missing return is decisive. Verified that the annotation-level check is not a backstop: NacosRoleServiceImpl.hasPermission() returns true for UPDATE_PASSWORD_ENTRY_POINT before any role lookup. Verified that the request attribute used by hasPermission() is really populated for this endpoint (AuthFilter calls authManager.login(req) for methods annotated with @Secured) and that the console controllers are registered in ControllerMethodsCache (ConsoleConfig.init). Verified the password update is parameterized SQL (no injection), so the defect is exactly the authorization control flow. Considered that with nacos.core.auth.enabled=false the endpoint is open by design, which does not remove the flaw when auth is enabled. Considered that the stale javadoc (\"@throws IllegalArgumentException if ... oldPassword is incorrect\") indicates this method was refactored, consistent with a regression around this check.",
+      "id": "case-063-1",
+      "impact": "Privilege escalation / account takeover: any authenticated but unprivileged user can set a new password for any other account, including the built-in global administrator 'nacos' (ROLE_ADMIN per schema.sql), then authenticate as that account and obtain full control over configuration and naming data (publish/delete configs, namespaces, users, roles, permissions). Also enables account lockout / denial of service for arbitrary users. Because the HTTP response may still be 403, the action can go unnoticed.",
+      "locations": [
+        {
+          "end_line": 160,
+          "path": "console/src/main/java/com/alibaba/nacos/console/controller/UserController.java",
+          "start_line": 143
+        },
+        {
+          "end_line": 177,
+          "path": "console/src/main/java/com/alibaba/nacos/console/controller/UserController.java",
+          "start_line": 162
+        },
+        {
+          "end_line": 122,
+          "path": "console/src/main/java/com/alibaba/nacos/console/security/nacos/roles/NacosRoleServiceImpl.java",
+          "start_line": 118
+        },
+        {
+          "end_line": 101,
+          "path": "console/src/main/java/com/alibaba/nacos/console/security/nacos/NacosAuthManager.java",
+          "start_line": 67
+        }
+      ],
+      "prerequisites": "nacos.core.auth.enabled=true and the console module deployed; attacker holds at least one valid account/token (a role-less user is sufficient); target account exists. Normal client requests reach the @Secured logic in AuthFilter: when the configured server identity key/value are non-blank, a non-matching identity header only logs a warning and execution continues to the annotation check (core/src/main/java/com/alibaba/nacos/core/auth/AuthFilter.java lines 82-96), and ConsoleConfig registers com.alibaba.nacos.console.controller in ControllerMethodsCache so login(req) is invoked and NACOS_USER_KEY is populated.",
+      "root_cause": "In UserController.updateUser() the permission check is evaluated but its failure path only calls response.sendError(HttpServletResponse.SC_FORBIDDEN, ...) without returning, so execution continues: the target user is loaded and userDetailsService.updateUserPassword(username, encode(newPassword)) overwrites the password. The @Secured framework check cannot compensate because the method declares resource NacosAuthConfig.UPDATE_PASSWORD_ENTRY_POINT (\"console/user/password\") and NacosRoleServiceImpl.hasPermission() returns true unconditionally for that exact resource, so AuthFilter -> NacosAuthManager.auth() always passes for it. The controller's private hasPermission() (auth disabled OR request attribute NACOS_USER_KEY is global admin OR same username) is therefore the only real gate, and it is bypassable by not stopping execution.",
+      "title": "Broken authorization on PUT /v1/auth/users (console password update): any authenticated user can reset any account's password, including the global admin",
+      "trace": "1) PUT /nacos/v1/auth/users?username=<victim>&newPassword=<new> hits AuthFilter (registered for /* in core/src/main/java/com/alibaba/nacos/core/auth/AuthConfig.java). 2) ControllerMethodsCache resolves UserController.updateUser, which carries @Secured(resource = UPDATE_PASSWORD_ENTRY_POINT, action = WRITE). 3) authManager.login(req) validates the JWT and sets request attribute NACOS_USER_KEY (NacosAuthManager lines 68-101). 4) auth() -> roleService.hasPermission(user, permission) returns true immediately for resource \"console/user/password\" (NacosRoleServiceImpl lines 119-122). 5) The controller evaluates private hasPermission(username, request): false when the caller is not that user and not global admin. 6) Line 149 sends 403 but there is no return, so lines 152-157 still run: getUserFromDatabase(username) then updateUserPassword(username, encode(newPassword)). 7) The response body may still indicate failure/403 while the password has already been changed in the users table.",
+      "unverified": "No code was executed and no runtime/HTTP test was performed; exploitability was established only by reading the code paths above (sendError semantics, attribute population, annotation matching). It is not verified whether this exact behavior is an upstream regression or an intentional property of this snapshot, nor whether the shipped default server-identity values would additionally change the required attacker position. The repository snapshot contains no tests, so no oracle (for example, an expected 403-and-no-change assertion) could be consulted.",
+      "weakness_type": "Improper Authorization / Missing authorization enforcement on a sensitive operation (CWE-863 / CWE-284)"
+    }
+  ],
+  "coverage_summary": "Source scope: 1390 model-visible files (1138 Java, 1386 files indexed; 4 files missing from the index; control-flow and data-flow analyses are not implemented by the index and its edges are syntax/navigation candidates only). I read the top-level layout and pom, then the HTTP entry points and authorization path in core (AuthFilter, AuthConfig, ControllerMethodsCache, RequestMappingInfo, NacosClusterController, CoreOpsController, ServerLoaderController), the console security stack (NacosAuthConfig, JwtAuthenticationTokenFilter, JwtTokenManager, NacosAuthManager, NacosRoleServiceImpl, User/Role/Permission/Namespace controllers, LdapAuthenticationProvider), config controllers and filters (ConfigController, ConfigOpsController, ConfigServletInner, HistoryController, CapacityController, ClientMetricsController, CommunicationController, ListenerController), config auth persistence (External/Embedded user-role-permission services) and ParamUtils, plus naming controllers and RPC handlers (Instance/Service/Health/Cluster/Catalog/Operator/Distro/Raft/UpgradeOps and the v2 request handlers). I also ran targeted literal searches for command execution, process building, script engines, XML parsers, unsafe deserialization, string-built SQL, zip/entry handling, trust-all TLS, and hardcoded secrets/credentials. Much of the client module, istio generated code, and large service/repository internals were searched or sampled rather than read line by line.",
+  "limitations": [
+    "No code was built or executed; nothing is runtime-confirmed, and no external advisory/CVE data or patches were consulted (per instructions).",
+    "The repository contains no test sources at all, so no test oracle could corroborate expected authorization behavior.",
+    "The P1 relation index is syntax/navigation-only (no control flow, no data flow, no semantic resolution; 21527 unresolved calls), so index edges were only used for navigation and every cited path was verified in source text.",
+    "Four of the 1390 files are absent from the index and five are omitted; I did not enumerate what those specific omissions are, so my coverage statement does not extend to them.",
+    "Only one candidate may be submitted; several other genuine-looking weaknesses in this snapshot (listed as rejected leads) were not fully explored, so the possibility remains that a different item matches any external ground truth.",
+    "Line references are from the snapshot as read here; offsets may differ if the tree is re-generated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Default server identity shipped in configuration: nacos.core.auth.server.identity.key=serverIdentity / value=security (console/src/main/resources/application.properties lines 141-142 and distribution/conf/application.properties lines 167-168) combined with AuthFilter granting a full bypass when the header matches (core/src/main/java/com/alibaba/nacos/core/auth/AuthFilter.java lines 76-90).",
+      "reason": "Real weakness when auth is enabled and the defaults are unchanged (a client can send serverIdentity: security to skip all @Secured checks), but it is a shipped configuration default / hardening item rather than a code-level logic error, and the surrounding comment documents that operators must set custom values; not selected because the evidence is configuration-centric and less specific than the code-level authorization flaw."
+    },
+    {
+      "lead": "Default JWT signing key nacos.core.auth.default.token.secret.key=SecretKey012345678901234567890123456789012345678901234567890123456789 in console/src/main/resources/application.properties line 131 and distribution/conf/application.properties line 157, consumed by AuthConfigs.getSecretKeyBytes() (auth/src/main/java/com/alibaba/nacos/auth/common/AuthConfigs.java lines 58/91-96) and JwtTokenManager.",
+      "reason": "If the default key is left unchanged while auth is enabled, tokens are forgeable; however this is an insecure default in configuration (later versions made the key mandatory), not a source-level control-flow defect, and it requires a non-default operational setting (auth enabled) without a modified secret."
+    },
+    {
+      "lead": "Several admin/ops endpoints carry no @Secured annotation (CapacityController GET/POST, ClientMetricsController /cluster and /current, ListenerController, ConfigOpsController /localCache and /log), while AuthFilter enforces nothing for un-annotated methods (core/src/main/java/com/alibaba/nacos/core/auth/AuthFilter.java lines 100-105).",
+      "reason": "Potentially unauthenticated access to quota/metrics/ops functions when auth is enabled, but these may be intended internal endpoints, the pattern spans several files rather than one root cause, and no concrete attacker-controlled state change with clear impact was confirmed by reading only source."
+    },
+    {
+      "lead": "Zip Slip in DiskUtils.decompress (sys/src/main/java/com/alibaba/nacos/sys/utils/DiskUtils.java lines 421-444): entry names are used directly (new File(Paths.get(outputDir, fileName))) with no canonical-path containment check; reachable through raft snapshot loading (config DerbySnapshotOperation.onSnapshotLoad, naming NamingSnapshotOperation.readSnapshot).",
+      "reason": "Requires a malicious/compromised cluster peer able to supply a crafted snapshot zip (or an already-privileged admin for the import endpoint), so the trust boundary and attacker position are much weaker than the selected finding; left unconfirmed."
+    },
+    {
+      "lead": "ConfigOpsController.derbyOps executes a caller-supplied SQL string restricted only by a startsWithIgnoreCase(\"SELECT\") prefix check (config/src/main/java/com/alibaba/nacos/config/server/controller/ConfigOpsController.java lines 99-123).",
+      "reason": "Endpoint is annotated @Secured(resource = \"nacos/admin\") (admin only), embedded-storage only, and Java/Derby does not support stacked statements in a single query; no read/write escalation beyond the intended query capability was demonstrated, so it does not meet the evidence threshold."
+    }
+  ],
+  "summary": "Snapshot is Alibaba Nacos (pom revision 2.0.3, develop branch with 2.0.4-era code, e.g. ConfigServletInner's \"Before 2.0.4 version\" long-polling compatibility and Protocol.getVersionNumber 2.0.4 note). I reviewed the HTTP/gRPC entry points, the annotation-driven authorization path (AuthFilter, ControllerMethodsCache, RemoteRequestAuthFilter), the console security stack (NacosAuthConfig, JwtTokenManager, NacosAuthManager, NacosRoleServiceImpl, User/Role/Permission/Namespace controllers), config/naming controllers and their @Secured coverage, config persistence/auth services (parameterized SQL), input validation (ParamUtils), and searched for common sink classes (command execution, XML parsing, deserialization, zip handling, string-built SQL). The single strongest, code-level finding is an ineffective authorization check on the console password-update endpoint: UserController.updateUser() writes HTTP 403 when the \"admin or same user\" check fails but does not return, so it proceeds to overwrite the requested account's password; the framework-level check cannot compensate because NacosRoleServiceImpl.hasPermission() unconditionally returns true for the UPDATE_PASSWORD_ENTRY_POINT resource declared by the @Secured annotation. This yields attacker-chosen password reset of arbitrary accounts (including the built-in global admin) by any authenticated user."
+}

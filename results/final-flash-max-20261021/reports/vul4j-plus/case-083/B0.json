@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker supplies the raw HTTP/1.1 request headers, including an arbitrary all-digit Content-Length value. Nothing in the parser, HttpReadListener, or areRequestHeadersValid bounds or range-checks that number before it reaches parsePositiveLong.",
+      "confidence": "medium",
+      "counterevidence_checked": "FixedLengthStreamSourceConduit's constructor rejects negative values and values above 2^61-1, so wrapped results outside [0, 2^61-1] surface as an IllegalArgumentException -> 400 Bad Request rather than a bad conduit; only wrapped values inside that range (achievable, since the wraparound is modulo 2^64) reach the framing logic. HttpServerExchange default MAX_ENTITY_SIZE is -1, so no default upload cap is bypassed. areRequestHeadersValid already blocks TE+CL and duplicate headers, so the classic CL.TE/TE.CL variants are closed; this issue is value-level, not header-count-level. Strict parsers exist elsewhere (AjpReadListener uses Long.parseLong, ByteRange uses Long.parseLong), showing the overload is reachable but not universally accepted behavior.",
+      "id": "undertow-content-length-overflow",
+      "impact": "HTTP/1.1 message-boundary confusion on the server side: the server derives a body length that does not match the declared decimal value. When Undertow sits behind a proxy/gateway that forwards such a header (or normalizes it differently), this becomes an HTTP request-smuggling/desynchronization primitive affecting other users of the backend connection (auth/ACL or cache/routing confusion), and it can also evade entity-length assumptions used for request-size limits. Direct exposure allows a client to desynchronize its own persistent connection.",
+      "locations": [
+        {
+          "end_line": 359,
+          "path": "core/src/main/java/io/undertow/server/protocol/http/HttpTransferEncoding.java",
+          "start_line": 339
+        },
+        {
+          "end_line": 126,
+          "path": "core/src/main/java/io/undertow/server/protocol/http/HttpTransferEncoding.java",
+          "start_line": 115
+        },
+        {
+          "end_line": 581,
+          "path": "core/src/main/java/io/undertow/server/Connectors.java",
+          "start_line": 570
+        }
+      ],
+      "prerequisites": "Ability to send HTTP/1.1 requests to an Undertow listener (AJP uses strict Long.parseLong and is unaffected; HTTP/2 uses explicit frame framing). The strongest impact requires a front-end/proxy or connection-reuse chain in which another component interprets the same Content-Length differently (rejects, caps, or computes a different value), or an application/limit assumption keyed to the declared length. Self-connection desynchronization alone is at minimum a correctness/DoS issue.",
+      "root_cause": "HttpTransferEncoding.parsePositiveLong() accumulates value += digit * multiplier; multiplier *= 10 in a long with no overflow/range check. A decimal Content-Length longer than 19 digits silently wraps modulo 2^64 instead of throwing, so the parsed length can be 0 or an arbitrary small value (e.g. a value that is a multiple of 2^64 parses as 0). The request path then either calls Connectors.terminateRequest (treating the request as having no body) or installs a FixedLengthStreamSourceConduit with the wrapped length, while the bytes the peer considers to be the body remain on the connection and are parsed as a subsequent pipelined request. No earlier stage validates the numeric value: Connectors.areRequestHeadersValid() only rejects TE+CL and duplicate TE/CL headers, not oversized values, and the HTTP header parser accepts any run of digits.",
+      "title": "Unchecked Content-Length integer overflow in HttpTransferEncoding.parsePositiveLong allows HTTP/1.1 body-length desynchronization (request-smuggling primitive)",
+      "trace": "socket bytes -> HttpRequestParser stores Content-Length in the HeaderMap (any digit sequence) -> HttpReadListener.handleEventWithNoRunningRequest -> Connectors.areRequestHeadersValid passes because there is exactly one CL and no TE -> HttpTransferEncoding.setupRequest -> handleRequestEncoding -> parsePositiveLong(contentLengthHeader) wraps -> if wrapped value == 0, Connectors.terminateRequest is called and the request is processed as bodyless (remaining peer bytes become the next request); otherwise a FixedLengthStreamSourceConduit is created with the wrapped (shorter) length, and the surplus body bytes are left for the next request on the connection.",
+      "unverified": "I could not verify that upstream Undertow later hardened parsePositiveLong (master may still contain this method), nor that this specific flaw corresponds to the case's ground-truth fix/CVE. Runtime confirmation and the exact behavior of candidate intermediary proxies were not tested; only the source-level data flow and wrapping arithmetic were established. The exploitability rating therefore depends on deployment topology.",
+      "weakness_type": "CWE-190 Integer Overflow or Wraparound leading to CWE-444 Inconsistent Interpretation of HTTP Requests (request smuggling)"
+    }
+  ],
+  "coverage_summary": "Reviewed the core HTTP/1 request parser and conduits (HttpRequestParser, HttpReadListener, HttpTransferEncoding, ChunkReader/ChunkedStreamSourceConduit, FixedLengthStreamSourceConduit), HTTP/2 framing and validation (Http2Channel, Http2ReceiveListener, Http2HeaderBlockParser/HpackDecoder, Http2ServerConnection), AJP (AjpRequestParser, AjpReadListener), resource handling (PathResourceManager, ResourceHandler, DirectoryUtils, Paths, DefaultServlet), servlet path/security chain (ServletInitialHandler, ServletPathMatches, SecurityPathMatches, DefaultAuthorizationManager, CachedAuthenticatedSessionHandler), cookies/session/form parsers, and several handlers (ProxyHandler area, IPAccessControl, Forwarded). Not every one of the 923 files was read line-by-line; test sources are absent from the snapshot, so fix-presence could not be checked against tests.",
+  "limitations": [
+    "No test sources are present (all src/test are stripped), so no unit/integration test could be used to confirm or refute expected behavior.",
+    "No code was executed and no network payloads were sent; all conclusions are static source analysis.",
+    "I was unable to confirm the identity of the case's ground-truth CVE/fix commit from repository contents alone (only the pom version 2.2.15.Final-SNAPSHOT and file inventory were available).",
+    "Large portions of the tree (websockets, client, mod_cluster, benchmarks/examples, much of servlet spec) were only searched rather than fully read, so a stronger issue could exist there.",
+    "Intermediary proxy behavior relevant to the candidate's impact was not observable in this snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HttpReader/ChunkReader treats a non-hex first character in a chunk-size line as the zero-size terminating chunk (core/src/main/java/io/undertow/conduits/ChunkReader.java lines 101-145), another possible framing desync/smuggling primitive.",
+      "reason": "Real leniency is visible in the state machine, but it is also the documented legacy behavior of the logic that intentionally treats an empty size line and '0' extensions as termination; I could not establish that it is unintended or that a fix exists. Kept as unconfirmed rather than a second candidate."
+    },
+    {
+      "lead": "HTTP/2 receive path advertises HTTP2_SETTINGS_MAX_CONCURRENT_STREAMS but never enforces it (core/src/main/java/io/undertow/protocols/http2/Http2Channel.java lines 424-427 and 305-307), so a peer ignoring the setting can accumulate streams/state.",
+      "reason": "The default is -1 (no limit advertised), making this configuration-dependent, and the HTTP/2 spec makes the value advisory; impact is a generic resource-exhaustion gap rather than a demonstrated boundary violation."
+    },
+    {
+      "lead": "Chunked trailer parsing (ChunkReader.TrailerParser) accumulates header lines with no count/size limit and trailer bytes are not counted against maxEntitySize in ChunkedStreamSourceConduit.updateRemainingAllowed.",
+      "reason": "Default MAX_ENTITY_SIZE is -1 (the body itself is unbounded by default), so this does not add a distinct capability unless the operator configured a limit; weaker evidence of a discrete fix."
+    },
+    {
+      "lead": "Http2PriorityTree.streamRemoved uses evictionQueuePosition++ without modulo (out-of-bounds read/write after 10 removals) and Http2PriorityNode.removeDependent uses dependents[i] = dependents[i + i].",
+      "reason": "Dead code: streamRemoved has no callers anywhere in the tree, so the defect is not reachable through any exposed path."
+    },
+    {
+      "lead": "CanonicalPathUtils ignores the io.undertow.DONT_CANONICALIZE_BACKSLASH system property (Boolean.parseBoolean of a literal string, line 32).",
+      "reason": "Exactly identifies a genuine bug, but the effect is that backslashes are always canonicalized - stricter, not weaker, than the documented legacy mode; no adverse security impact."
+    },
+    {
+      "lead": "Paths.isForbidden only compares whole path segments to WEB-INF/META-INF, so Windows-specific forms (trailing dot/space, NTFS ADS) may bypass the block and expose protected files via PathResourceManager/DefaultServlet.",
+      "reason": "Environment-dependent (Windows filesystem semantics) and I could not verify the actual Files/Paths resolution behavior from source alone; no matching hardening/fix could be confirmed in this snapshot."
+    }
+  ],
+  "summary": "The snapshot is Undertow 2.2.15.Final-SNAPSHOT (core/servlet/websockets), 923 visible files, no test sources. I traced attacker-controlled request framing through the HTTP/1 parser, HttpTransferEncoding, the chunked conduit, the AJP listener, HTTP/2 framing/header validation, cookie/form parsers, resource managers, and the servlet security chain. Most defensive checks expected in this era are present (TE+CL rejection via Connectors.areRequestHeadersValid, Host-header checks, HTTP/2 pseudo-header validation and max header counts/size, RFC6265 cookie limits, Paths.isForbidden for WEB-INF/META-INF). The strongest source-evidenced issue I found is the unchecked integer arithmetic in HttpTransferEncoding.parsePositiveLong: an oversized all-digit Content-Length silently wraps modulo 2^64 instead of being rejected, while every other Content-Length consumer in the tree (e.g. the AJP listener) uses strict Long.parseLong. That yields a wrong body-length decision for the attacker-controlled header (including \"no body\" / shortened fixed-length body), a classic framing-desynchronization / request-smuggling primitive when any intermediary interprets the header differently, and it can bypass application/proxy assumptions about entity length. Confidence is medium: the parsing flaw is certain from the code, but I could not verify a later upstream fix/test, and full smuggling impact needs a divergent intermediary or connection sharing."
+}

@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Bucket names come directly from the HTTP request: either the raw first path segment (LocalS3Router.matchPath, line 72/75) or, when the router recognizes a virtual-host name, from the attacker-supplied Host header via VirtualHostParser.getBucketRegionFromHost (LocalS3Router.java:65, 79; VirtualHostParser.java:28-38,105-111). Nothing in the request pipeline validates the bucket name's character set; RequestAssertions.assertBucketNameProvided and CreateBucketService only require it to be non-blank. Reverse replication/policy/encryption bodies are also persisted through the same store, but the file path is fixed at bucket creation/update time.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether any bucket-name validation exists upstream: RequestAssertions.assertBucketNameProvided only asserts presence; BucketAssertions.assertBucketNameIsValid only rejects blank strings; no regex/normalization anywhere (searched bucketName.matches/isValidBucketName/normalize). Checked the in-memory deployment: LocalS3ServicesInvocationHandler is constructed with a null metadata store in InMemoryLocalS3Manager (lines 84, 91), so the traversal only applies in PERSISTENCE mode; the pure in-memory default of the programmatic API is not affected. Checked object data storage: LocalFileSystemStorage names files by numeric Long ids (lines 35, 43, 54, 61, 68), so the traversal is limited to the bucket-metadata store; there is no key-based file sink (searched new File(/Paths.get(/Files.write/Files.delete). Checked the fixed suffix '.bucket.meta' is always appended, limiting the set of overwritable/deletable target names and confirming the write content is JSON, not arbitrary bytes. Checked runtime read-back: MetadataStore.fetch is only invoked from fetchAll() during startup (DefaultFileSystemS3MetadataLoader.java:37-38), so no runtime arbitrary-file-read path was established through this sink.",
+      "id": "local-s3-bucket-name-path-traversal",
+      "impact": "Unauthenticated remote file write/overwrite and deletion constrained to paths ending in '.bucket.meta', anywhere the local-s3 process has write/delete permission (e.g. in the default Docker deployment a crafted bucket name can place or remove '<...>.bucket.meta' files outside /data). Content written is a Jackson-serialized BucketMetadata JSON document; after creating such a bucket, the attacker can additionally drive PutBucketPolicy/PutBucketReplication/PutBucketEncryption (which persist through the same store) so attacker-chosen strings are embedded in the traversed file. Realistic impact is corruption/denial of service of local-s3's own persisted state (overwriting or deleting other buckets' '.bucket.meta' files) and writing attacker-influenced files into arbitrary directories writable by the service, which may affect other software that consumes such files. No code-execution or arbitrary-content primitive was proven from source.",
+      "locations": [
+        {
+          "end_line": 60,
+          "path": "local-s3-core/src/main/java/com/robothy/s3/core/storage/FileSystemBucketMetadataStore.java",
+          "start_line": 38
+        },
+        {
+          "end_line": 33,
+          "path": "local-s3-core/src/main/java/com/robothy/s3/core/asserionts/BucketAssertions.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 88,
+          "path": "local-s3-rest/src/main/java/com/robothy/s3/rest/handler/LocalS3Router.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 111,
+          "path": "local-s3-rest/src/main/java/com/robothy/s3/rest/utils/VirtualHostParser.java",
+          "start_line": 105
+        },
+        {
+          "end_line": 91,
+          "path": "local-s3-core/src/main/java/com/robothy/s3/core/service/manager/LocalS3ServicesInvocationHandler.java",
+          "start_line": 76
+        },
+        {
+          "end_line": 39,
+          "path": "local-s3-core/src/main/java/com/robothy/s3/core/service/CreateBucketService.java",
+          "start_line": 30
+        },
+        {
+          "end_line": 32,
+          "path": "local-s3-docker/src/main/java/com/robothy/s3/docker/App.java",
+          "start_line": 27
+        }
+      ],
+      "prerequisites": "LocalS3 must run in PERSISTENCE mode with a filesystem data path (FileSystemLocalS3Manager / FileSystemBucketMetadataStore in use). This is exactly the shipped Docker configuration (Dockerfile: VOLUME /data, EXPOSE 80; App.java sets mode default PERSISTENCE and dataPath /data, port 80). Network reachability to the unauthenticated HTTP service is required. For the cross-platform Host-header vector, the Host value must end in one of the virtual-host suffixes recognized by VirtualHostParser (\".localhost\", \".127.0.0.1\", \".0.0.0.0\", or \".s3.amazonaws.com\") and contain the traversal prefix before it; for the path-style vector the separator character must be a filesystem separator on the host OS (backslash on Windows).",
+      "root_cause": "Bucket names are only checked for being blank (BucketAssertions.assertBucketNameIsValid, BucketAssertions.java:28-33), but the filesystem metadata store concatenates the bucket name into a path: new File(dataPath.toFile(), bucketName + \".bucket.meta\") in FileSystemBucketMetadataStore.store/fetch/delete (lines 42, 51, 57). \"..\" and separator characters are never rejected or normalized, so any request path that yields a bucket name containing a path separator (or, on Windows, a backslash) resolves outside the data directory. The bucket name can be taken from the Host header by the virtual-host parser without any syntax validation (LocalS3Router.java:63-88 + VirtualHostParser.java:105-111), and persistence is wired through LocalS3ServicesInvocationHandler.persistBucketIfNeeded (lines 76-91).",
+      "title": "Bucket name is used unsanitized as the bucket-metadata file name (path traversal in persistence mode)",
+      "trace": "1) PUT / (bucket operation) with Host header of the form '<dotdot-segments>.localhost' -> LocalS3Router.matchPath parses the Host (line 65), takes the virtual-host bucket name (lines 79-83) and stores it in request params (line 85). 2) CreateBucketController.handle reads the attacker bucket name (CreateBucketController.java:46) and calls BucketService.createBucket (line 47). 3) CreateBucketService.createBucket (lines 30-38) validates only non-blank via BucketAssertions.assertBucketNameIsValid (lines 28-33) and adds the metadata. 4) LocalS3ServicesInvocationHandler.persistBucketIfNeeded (lines 76-91) sees @BucketChanged(CREATE) and calls bucketMetaStore.store(bucketName, metadata) (line 85). 5) FileSystemBucketMetadataStore.store (line 51) builds new File(dataPath.toFile(), bucketName + \".bucket.meta\") and JsonUtils.toJson writes it; the '..'/separator segments in the bucket name traverse out of dataPath. The same unvalidated name reaches FileSystemBucketMetadataStore.delete (line 57) from the same invocation handler (line 88), giving a file-deletion primitive for names ending in '.bucket.meta'.",
+      "unverified": "The HTTP layer is the external io.github.robothy:netty-http-router 1.15 dependency, which is not in the snapshot. I could not verify from source that it forwards the Host header verbatim to VirtualHostParser and that Netty/pipeline header validation accepts '/' (or, on Windows, a backslash inside a path segment) in these positions; if a fronting component strictly validates Host or the path, the remote reachability would be reduced. I could also not execute the service, so the traversal is established only by static data-flow analysis, not runtime confirmation. Deleting arbitrary files is limited to names ending in '.bucket.meta'.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-73 External Control of File Name or Path"
+    }
+  ],
+  "coverage_summary": "Applied the source filters reported by get_source_scope (247 model-visible files, no excluded over-5MiB/symlink/sensitive-path files; binary-like files refused). Read in depth the local-s3-core service/storage/assertion/util layer (bucket, object, versioning, multipart, tagging, ACL, policy, replication, encryption, list services; FileSystemBucketMetadataStore, LocalFileSystemStorage, InMemoryStorage, LayeredStorage, CopyOnAccessStorage; FileSystem/InMemory managers and invocation handler; JSON/XML/ID/path utilities) and the local-s3-rest HTTP layer (router and its Host/virtual-host parsing, request utilities and aws-chunked decoders, XML mapper construction, exception handlers, and the request-handling controllers), plus datatypes used for XML/JSON (Tagging, AccessControlPolicy, Grantee/Grant, DeleteObjectsRequest, S3Error), build/deployment files (Dockerfile, App.java, gradle manifests, GitHub workflows) and the jupiter/docker/testcontainer wiring. Spot-checked the remaining model/exception/answer classes rather than reading every trivial class. No test sources are present in the snapshot, and third-party dependency sources (netty-http-router, Woodstox, Jackson, Netty) are not present, which bounds what could be verified about the HTTP and XML parsing layers.",
+  "limitations": [
+    "Static review only; no code, tests, or scanners were executed, so the traversal and all other flows are source-level conclusions, not runtime-confirmed.",
+    "The HTTP server/router dependency (io.github.robothy:netty-http-router 1.15), Netty header/path validation, Woodstox and Jackson are not in the snapshot; their exact behavior (Host header passthrough, Content-Length emission, external-entity resolution) could not be verified.",
+    "No test sources or git history are included, so intended behaviors, prior fixes, and any known-vulnerability regressions could not be cross-checked against tests.",
+    "The path-traversal impact is bounded by the always-appended '.bucket.meta' suffix; I did not find a way to make the written file content fully arbitrary (content is Jackson-escaped BucketMetadata JSON) or to read arbitrary files at runtime.",
+    "The pure in-memory programmatic deployment (no data path) is not affected by the submitted candidate; it applies to PERSISTENCE mode, including the published Docker image."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE / external entity resolution in the shared request-body XML parser (CWE-611): LocalS3.createServiceFactory and XmlUtils build a WstxInputFactory that only sets IS_NAMESPACE_AWARE=false (LocalS3.java:123-129, XmlUtils.java:17-24), and this mapper parses untrusted bodies in CreateBucket, CompleteMultipartUpload, DeleteObjects, PutBucketTagging, PutBucketAcl and PutObjectTagging. If Woodstox resolves external entities by default, this would allow local file disclosure/SSRF with higher impact than the traversal.",
+      "reason": "Woodstox/Jackson are external dependencies not present in the snapshot, so the decisive behavior (default IS_SUPPORTING_EXTERNAL_ENTITIES/XMLResolver handling) could not be verified from source; per the evidence threshold this remains a hardening gap, not a confirmed finding."
+    },
+    {
+      "lead": "Content-Length / body-size mismatch enabling HTTP response desynchronization: PutObject stores 'size' from the client-supplied x-amz-decoded-content-length (RequestUtils.getBody lines 32-41, PutObjectController.java:41, CompleteMultipartUploadService/UploadPartService), while GetObject/HeadObject write the real stored stream with that stored size as Content-Length (GetObjectController.java:45-51, HeadObjectController.java:45). A crafted aws-chunked payload could make the response header disagree with the body written on the connection.",
+      "reason": "Whether the declared Content-Length is honored or recomputed, and how duplicate/incorrect lengths are emitted, is determined by the netty-http-router response writer, which is not in the snapshot; no source-level confirmation possible."
+    },
+    {
+      "lead": "Malformed aws-chunked payload handling in AwsChunkedDecodingInputStream (lines 58-76, 91-107) and AwsUnsignedChunkedDecodingInputStream (lines 20-57): Integer.parseInt of an attacker chunk size can throw NumberFormatException, and readUntil can overflow its bounded 256 KiB ByteBuffer (BufferOverflowException) when no ';' delimiter arrives.",
+      "reason": "Produces only an unhandled exception/connection failure for the sending client (per-request availability impact); no data or privilege impact was traced, so it does not meet the bar."
+    },
+    {
+      "lead": "Delete operations on LayeredStorage/CopyOnAccessStorage do not remove data from the backend persistent store (LayeredStorage.java:59-70, CopyOnAccessStorage.java:63-74), leaving deleted object bytes on disk.",
+      "reason": "Data-remanence/logic defect without a demonstrated read or execution primitive through the S3 API; metadata is removed, so the residual files are not addressable via the service."
+    }
+  ],
+  "summary": "Reviewed the local-s3 snapshot (247 visible files; Java S3 mock with in-memory and filesystem/persistence storage). One candidate meets the evidence bar: an unauthenticated path-traversal input flow where a client-controlled bucket name is used unsanitized as the on-disk metadata file name, so names containing path separators escape the configured data directory and cause file writes/deletes outside it (CWE-22/CWE-73). No other issue found had both a clear attacker-controlled source and a concrete in-repo sink with comparable evidence."
+}

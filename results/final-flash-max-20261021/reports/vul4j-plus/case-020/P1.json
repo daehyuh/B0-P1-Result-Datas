@@ -1,0 +1,98 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the CMap text supplied to CMapParser: any font dictionary may carry a /ToUnicode stream, and Type0 fonts may carry an embedded /Encoding CMap stream. PDFont's constructor parses /ToUnicode (PDFont.java:130-148 -> readCMap -> CMapManager.parseCMap -> CMapParser.parse), and PDType0Font.readEncoding() parses embedded /Encoding CMaps (PDType0Font.java:288-319). The `beginbfrange` start/end codes and their byte length are fully attacker-chosen, so the iteration count is attacker-chosen.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the nearby guards: tokenBytes null/empty and empty-array cases are handled (CMapParser.java:366-381), but nothing bounds the code range; parseBegincidrange is effectively bounded because createIntFromBytes() only uses the first byte of codes longer than 2 bytes (CMapParser.java:696-705), which does NOT apply to the beginbfrange loop that compares whole byte arrays; increment() wraps only at the most significant byte yet the loop still terminates at equality with endCode, so a full 2^32 span is traversable; CMapParser.parse() has no global entry/token cap and CMap has no mapping cap; CMap parsing is lazy (triggered by font usage rather than by plain PDDocument.load), which I recorded as a prerequisite; XML entry points (fdf XMLUtil, PDXFAResource, xmpbox DomXmpParser) are hardened against DTD/external entities, so XXE was ruled out; no Runtime.exec/deserialization/archive-extraction sinks exist in the library core.",
+      "id": "pdfbox-cmap-bfrange-unbounded",
+      "impact": "Availability impact (DoS): CPU exhaustion for minutes to hours and/or java.lang.OutOfMemoryError raised from CMap.addCharMapping, which is an Error not an IOException, so it is not caught by the surrounding 'catch (IOException)' handlers and can abort the thread/process consuming the PDF. No code execution or memory corruption in this Java path; confidentiality/integrity are not directly affected. The same defect also lets an attacker turn a tiny malformed PDF into a resource-exhaustion primitive against services that convert, index, or display untrusted PDFs.",
+      "locations": [
+        {
+          "end_line": 409,
+          "path": "fontbox/src/main/java/org/apache/fontbox/cmap/CMapParser.java",
+          "start_line": 344
+        },
+        {
+          "end_line": 407,
+          "path": "fontbox/src/main/java/org/apache/fontbox/cmap/CMapParser.java",
+          "start_line": 382
+        },
+        {
+          "end_line": 198,
+          "path": "fontbox/src/main/java/org/apache/fontbox/cmap/CMap.java",
+          "start_line": 188
+        },
+        {
+          "end_line": 77,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdmodel/font/CMapManager.java",
+          "start_line": 70
+        },
+        {
+          "end_line": 148,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdmodel/font/PDFont.java",
+          "start_line": 130
+        },
+        {
+          "end_line": 211,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdmodel/font/PDFont.java",
+          "start_line": 185
+        },
+        {
+          "end_line": 319,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdmodel/font/PDType0Font.java",
+          "start_line": 288
+        }
+      ],
+      "prerequisites": "An application uses PDFBox on an untrusted PDF and processes page resources/fonts (e.g., text extraction, rendering, font enumeration) so the font and its CMap are loaded; the crafted font is reachable from page resources. Leniency/strictness does not matter, and only a small CMap stream is needed. Impact depends on heap size: small heaps abort quickly, large heaps spend a long time before exhaustion.",
+      "root_cause": "CMapParser.parseBeginbfrange() derives the number of generated mappings from attacker-supplied hex codes with no sanity limit. The loop at fontbox/src/main/java/org/apache/fontbox/cmap/CMapParser.java:382-407 is controlled solely by `compare(startCode, endCode)`, i.e. the lexicographic distance between the two codes in the `beginbfrange` entry, and increments startCode per iteration (increment() at lines 678-694). For 3- or 4-byte codes the distance can be up to 2^24 / 2^32. Each iteration calls CMap.addCharMapping() (fontbox/src/main/java/org/apache/fontbox/cmap/CMap.java:188-198), which allocates a String and inserts an entry into the `charToUnicode` HashMap (CMap.java:49), so both CPU use and retained heap grow with attacker-controlled magnitude. There is no cap on total mappings in CMapParser or CMap (`parse()` at CMapParser.java:88-136 has no size/count limit), and only the null/empty-token cases are guarded (lines 376-381, older PDFBOX-3450/3807 fixes).",
+      "title": "Unbounded beginbfrange expansion in fontbox CMapParser (crafted PDF CMap) causes CPU exhaustion / OutOfMemoryError",
+      "trace": "Untrusted PDF -> PDDocument.load(...) (document structure parsed) -> page /Resources /Font entry -> PDFontFactory/PDType0Font constructor -> /ToUnicode or /Encoding handling (PDFont.java:131-141, PDType0Font.java:291-319) -> PDFont.readCMap(COSStream) -> CMapManager.parseCMap(InputStream) (CMapManager.java:70-77) -> CMapParser.parse() -> parseBeginbfrange() (CMapParser.java:344-409) -> loop bounded only by compare(startCode,endCode) -> per-iteration CMap.addCharMapping() (CMap.java:188-198) -> unbounded HashMap growth and String allocation.",
+      "unverified": "Not runtime-confirmed (no code execution allowed). I could not consult upstream history/CVE data offline, so I could not verify whether/when upstream bounded this loop or which advisory (if any) it maps to; heap-size thresholds and exact mapping counts were not measured. Reachability assumes the consumer actually loads page fonts (text extraction/rendering), which is common but not universal.",
+      "weakness_type": "Uncontrolled resource consumption (CWE-400/CWE-834, excessive iteration leading to OOM/DoS)"
+    }
+  ],
+  "coverage_summary": "Scope: 1,200 files, all text-readable and all present in the P1 index (index_status complete; 0 files missing; 0 hash mismatches). I inspected the core parse path (COSParser, BaseParser, PDFStreamParser, PDFXrefStreamParser, PDFObjectStreamParser, XrefTrailerResolver), COS objects, filters (CCITT, LZW, Predictor, Flate, JBIG2, JPX, DCT), pdmodel font handling and CMap usage, encryption/signature handling, PDFont/CMapManager, fontbox CMap/TTF/CFF/Type1 entry points, xmpbox/fdf/preflight XML entry points, tools, and examples at a high level. I did not exhaustively read every one of the 1,200 files (e.g., full rendering/color/annotation/appearance pipelines, most preflight rules, debugger UI classes, and many examples were only sampled), and the index provides syntactic navigation only, so uncalled/indirect paths may exist. No build, tests, scanners, or exploit payloads were executed; nothing was runtime-confirmed.",
+  "limitations": [
+    "No code execution, tests, or scanners were run; the finding is a source-level lead, not a confirmed vulnerability.",
+    "No network/upstream access, so I could not verify whether the CMapParser loop was later bounded or which advisory/CVE (if any) corresponds to this snapshot; the snapshot contains no JIRA references above PDFBOX-4279, dating it roughly to late 2018/early 2019, which is consistent with multiple PDFBox DoS advisories of that period but does not identify the ground truth.",
+    "CMap parsing is lazy (triggered by font processing, e.g. text extraction/rendering, not by PDDocument.load alone), so exploitability depends on the consumer's workflow.",
+    "Resource-exhaustion outcomes (OOM vs very long CPU) depend on JVM heap size and were not measured.",
+    "Many library paths (rendering, appearance generation, preflight, debugger) were only high-level reviewed; other defects of the same DoS class may exist in uninspected areas.",
+    "The P1 relation index was used only for navigation; its edges are syntactic candidates and do not prove reachability or data flow."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "pdfbox/pdfparser/PDFXrefStreamParser.parse() (lines 75-100) materializes objNums from attacker-controlled /Index or /Size with no bound, so a tiny xref-stream PDF can drive ~2^31 ArrayList insertions (OOM/long loop) during PDDocument.load; also /Index type/parity and /W values are unchecked (ClassCastException/NoSuchElementException/NegativeArraySizeException).",
+      "reason": "Same resource-exhaustion class and very plausible, but I could not verify an upstream fix or advisory for it and the entry path is narrower than the CMap path; kept as a lead, not chosen to avoid splitting one resource-exhaustion theme into multiple candidates."
+    },
+    {
+      "lead": "pdfbox/pdfparser/PDFObjectStreamParser.parse() (lines 71-73) uses attacker-controlled /N as ArrayList initial capacity, allowing immediate huge allocation (OutOfMemoryError) or IllegalArgumentException for negative /N when compressed objects are dereferenced.",
+      "reason": "Real-looking missing validation, but requires the object-stream dereference path and I could not confirm it is the fixed issue; lower-confidence than the candidate."
+    },
+    {
+      "lead": "fontbox CMapParser hex-string parsing (lines 511-558): tokenParserByteBuffer is fixed at 512 bytes (line 42) but bufferIndex is incremented with no bounds check, so a >512-byte hex string throws ArrayIndexOutOfBoundsException despite the 'won't read more than 512 bytes' comment; compare() (lines 712-731) can also throw AIOOBE for codes of different lengths.",
+      "reason": "Clear crash bug (AIOOBE), adjacent to the candidate and possibly the injected/fixed spot, but impact is a single unchecked-exception crash rather than the candidate's unbounded CPU/memory consumption; could not confirm which is intended."
+    },
+    {
+      "lead": "pdfbox/filter/CCITTFaxDecoderStream changesCurrentRow/changesReferenceRow writes in decode1D/decode2D (lines 134-229) are not bounds-checked (arrays sized columns+2), so repeated zero-length runs in a crafted /CCITTFaxDecode image stream can overflow the arrays (AIOOBE).",
+      "reason": "Plausible decoder crash requiring a crafted image XObject; no bound check and no comment evidencing a fix; lower impact than the selected candidate."
+    },
+    {
+      "lead": "COSParser.bfSearchForObjStreams() skip-spaces loop (lines 1997-2002) indexes numbersBytes without checking start < numbersBytes.length (empty array when object-stream /First is 0; all-space first /First bytes), and Long.parseLong on attacker text can throw NumberFormatException; both are uncaught in lenient repair mode.",
+      "reason": "Narrower repair-mode path and crash-only impact; unverified whether upstream bounds it."
+    },
+    {
+      "lead": "PDPageTree.getInheritableAttribute (lines 100-115) recurses through /Parent with no cycle detection, so a self-referential or cyclic page tree can cause StackOverflowError; PDPageTree.get(int) is also recursive over a crafted deep tree.",
+      "reason": "Plausible DoS but simple recursion of this shape often remains upstream and I could not verify a fix; not the strongest evidence."
+    },
+    {
+      "lead": "Quadratic repair behaviour: parseXref/checkXRefOffset calls bfSearchForXRef -> searchNearestValue (linear scan of all xref/ObjStm offsets, lines 1602-1671) for each bogus /Prev or /XRefStm, so a crafted PDF with many xref markers and a long PREV chain can yield O(m^2) work ('extremely long running computation').",
+      "reason": "Matches the reported CVE class of long-running parsing but the argument is a multi-method reasoning chain rather than a single missing check; unverified whether upstream changed it, so treated as a lead."
+    },
+    {
+      "lead": "examples/src/main/java/org/apache/pdfbox/examples/pdmodel/ExtractEmbeddedFiles.java (lines 131-140) concatenates the PDF-provided embedded-file name with an output path and writes it verbatim, allowing path traversal / arbitrary file overwrite when the example is run on a malicious PDF.",
+      "reason": "Genuine CWE-22 pattern but in demonstration code, not library core; rejected as not the strongest single candidate."
+    }
+  ],
+  "summary": "Reviewed the Apache PDFBox 3.0.0-SNAPSHOT tree (1,200 source files; core pdfbox, fontbox, xmpbox, preflight, tools, examples, debugger). The dominant trust boundary is untrusted PDF bytes (document, page resources, fonts, streams) parsed by the core parser/font/filter code. After tracing attacker-controlled input into parsing, font, and decoder subsystems, the strongest source-evidenced issue is in fontbox's CMapParser: the `beginbfrange` handler expands a start/end code range without any upper bound on the number of generated mappings, so a crafted CMap (embedded in an untrusted PDF as a font /ToUnicode CMap or a Type0 /Encoding CMap stream) can force up to 2^32 loop iterations with a growing HashMap and one String allocation per iteration, causing CPU exhaustion and/or OutOfMemoryError in the consuming application. Other defects found (xref-stream /Index//Size allocation, object-stream /N ArrayList capacity, CMap 512-byte hex buffer bounds, CCITT decoder row-buffer bounds, COSParser repair-path bounds/quadratic behaviour, page-tree recursion, example path traversal) are noted as unconfirmed rejected leads rather than additional candidates. No runtime verification was performed and no upstream/CVE comparison was possible offline."
+}

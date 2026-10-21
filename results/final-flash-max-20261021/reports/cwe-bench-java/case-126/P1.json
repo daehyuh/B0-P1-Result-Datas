@@ -1,0 +1,88 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated non-superuser SQL session fully controls the statement text: the target table for UPDATE/DELETE, the subquery expression (including which other table/schema is read and how the value is compared), and the WHERE/SET/RETURNING expressions. Example shapes: `UPDATE t SET x = (SELECT secret_col FROM s LIMIT 1)` or `DELETE FROM t WHERE id = 1 AND (SELECT secret_col FROM s) = 'guess'`.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that this is not intended behavior: SELECT (AccessControlImpl:232-243) and INSERT ... SELECT (426-435) explicitly traverse subquery relations and require DQL, and CREATE VIEW/CTAS do likewise, so the policy is that subquery tables require DQL. Checked for compensating checks: ensureMayExecute is invoked only once per statement (Analyzer.java:229); Schemas.resolveTableInfo enforces only operational/read-only state, not privileges (Schemas.java:113-151); LogicalPlanner.planSubSelect contains no AccessControl usage; execution binds precomputed SubQueryResults without re-checking. Checked that UPDATE/DELETE subqueries are accepted by the parser/analyzer rather than rejected (UpdateAnalyzer:111-128, DeleteAnalyzer:68-82) and are reached by planSubQueries via visitSymbols, which confirms they read real table data. No test directory exists in the snapshot, so no test-level counterevidence was available.",
+      "id": "crate-126-authz-subquery-dml",
+      "impact": "Confidentiality breach across the privilege model: a user with only write (DML) rights on one table can read data from arbitrary other tables that they have no DQL privilege on, either by storing the subquery result into a table they can read (`UPDATE own_t SET col = (SELECT secret FROM other_s)`), or blind-inference via affected-row counts / conditional updates and deletes in systems without SELECT rights. Because the same session can repeat queries, a full table's contents can be exfiltrated value by value. No error is raised, so the existing exception-masking logic (MaskSensitiveExceptions) never comes into play.",
+      "locations": [
+        {
+          "end_line": 447,
+          "path": "server/src/main/java/io/crate/auth/AccessControlImpl.java",
+          "start_line": 419
+        },
+        {
+          "end_line": 95,
+          "path": "server/src/main/java/io/crate/analyze/AnalyzedUpdateStatement.java",
+          "start_line": 84
+        },
+        {
+          "end_line": 52,
+          "path": "server/src/main/java/io/crate/analyze/AnalyzedDeleteStatement.java",
+          "start_line": 49
+        },
+        {
+          "end_line": 128,
+          "path": "server/src/main/java/io/crate/analyze/UpdateAnalyzer.java",
+          "start_line": 111
+        },
+        {
+          "end_line": 82,
+          "path": "server/src/main/java/io/crate/analyze/DeleteAnalyzer.java",
+          "start_line": 68
+        },
+        {
+          "end_line": 64,
+          "path": "server/src/main/java/io/crate/planner/SubqueryPlanner.java",
+          "start_line": 60
+        }
+      ],
+      "prerequisites": "User management/HBA enabled and a connection authenticated as a non-superuser; the session user holds DML on at least one table (e.g. a write-only ingestion user) but lacks DQL/AL/superuser rights on the table read in the subquery. For direct (non-blind) exfiltration the attacker also holds DQL on the table they write to; otherwise the update/delete row-count and error behavior act as an inference oracle. No elevated role is needed beyond DML on one table.",
+      "root_cause": "AccessControlImpl.StatementVisitor checks only the DML privilege on the target table for UPDATE (lines 443-447) and DELETE (lines 419-423); it never extracts SelectSymbol subquery relations from the statement symbols (AnalyzedUpdateStatement.visitSymbols lines 84-95, AnalyzedDeleteStatement.visitSymbols lines 49-52) and therefore never calls Privileges.ensureUserHasPrivilege(DQL, ...) for tables referenced in subqueries. Those subqueries are nevertheless analyzed (UpdateAnalyzer/DeleteAnalyzer pass SubqueryAnalyzer for SET/WHERE) and planned/executed (SubqueryPlanner.planSubQueries, UpdatePlanner/DeletePlanner -> MultiPhasePlan), with the results bound into the DML predicate/assignments.",
+      "title": "Missing DQL privilege checks for subquery relations in UPDATE/DELETE statements",
+      "trace": "1) Analyzer.analyze() is the only caller of AccessControl.ensureMayExecute (server/src/main/java/io/crate/analyze/Analyzer.java:229); it dispatches to AccessControlImpl.StatementVisitor. 2) For an UPDATE, visitAnalyzedUpdateStatement (AccessControlImpl:443-447) accepts update.table() -> visitRelation(..., DML); the subquery relations inside update.query()/assignmentByTargetCol are not visited. DELETE behaves identically (AccessControlImpl:419-423, delete.relation() only). 3) The analyzer did build real subquery relations: UpdateAnalyzer:111-128 creates a SubqueryAnalyzer and uses it for assignments and WHERE; DeleteAnalyzer:68-82 does the same for WHERE. 4) Planning/execution has no compensating authorization check: SubqueryPlanner.planSubQueries(statement) walks statement.visitSymbols and plans each SelectSymbol (SubqueryPlanner:60-64) via LogicalPlanner.planSubSelect (LogicalPlanner:205-235, no AccessControl calls); UpdatePlanner:123-124 and DeletePlanner:80-85 wrap the DML plan in MultiPhasePlan, which executes the subquery plans first and binds their results into the DML via SubQueryResults/SubQueryAndParamBinder. 5) Contrast with the checks that do exist: QueriedSelectRelation traversal for SELECT (AccessControlImpl:232-243), analysis.subQueryRelation() DQL check for INSERT (AccessControlImpl:426-435), sourceRelation for CTAS (396-405), and view query for CREATE VIEW (711-720) - all of which extract/visit subquery relations. 6) resolveTableInfo (Schemas:113-151) performs no privilege check (only Operation.blockedRaiseException), so nothing else gates the subquery tables.",
+      "unverified": "Not runtime-confirmed: no code, tests or exploit payloads were executed. I could not verify against upstream CrateDB whether this behavior was later fixed (the snapshot has no VCS history), nor whether the project treats subquery reads in DML as intentionally covered by the outer DML privilege (nothing in the source or comments supports that reading). Exhaustiveness of the search for a downstream authorization check is limited to text/index navigation (71,967 unresolved call sites in the relation index); control/data-flow were not available, so a hidden compensating check outside the inspected paths cannot be fully excluded.",
+      "weakness_type": "Improper access control / missing authorization check (CWE-862 / CWE-863)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot only (3,659 model-visible files, 3,652 indexed; 3,578 Java files parsed; 7 files missing from the relation index; 10 omitted; no tests or blackbox Python in scope, and the P1 index provides syntax navigation only - no control/data-flow, no semantic resolution, 71,967 unresolved call sites). Focused on authentication/authorization (io.crate.auth, io.crate.user, session/access control), SQL analysis-to-planning-to-execution paths for SELECT/INSERT/UPDATE/DELETE/COPY/DDL/DCL, COPY file I/O, blob storage/HTTP handlers, static site serving, and logical replication metadata/actions. The relation index was used only for navigation (symbol lookup, call/containment edges), and every cited edge was verified against source text.",
+  "limitations": [
+    "No execution, tests, build, or scanners were run; findings are static source reasoning, not runtime-confirmed.",
+    "Test directories and documentation/release notes are absent from the snapshot, so no maintainer-intent or regression evidence was available (e.g., no release note confirming which issue was fixed).",
+    "The P1 index has no control-flow or data-flow and unresolved calls (71,967), so a hidden downstream authorization check outside the traced paths cannot be fully excluded.",
+    "Repository-wide review was targeted (auth/user/analyzer/planner/execution/protocols/replication/copy/blob); the ~1,671 files under io/crate plus bundled Elasticsearch code were not read line-by-line, and third-party dependency versions (e.g., GraalVM/lang-js sandbox, AWS SDK, Netty) were not audited.",
+    "Severity/prerequisite discussion assumes a standard HBA+user-management deployment; with authentication disabled all sessions are the 'crate' superuser and this issue is moot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "COPY FROM/COPY TO with file:// URIs allow reading/writing local files with only DML/DQL privileges (LocalFsFileInput/LocalFsFileOutput, CopyAnalyzer, AccessControlImpl.visitCopyFromStatement/visitCopyToStatement have no superuser check).",
+      "reason": "Real gap worth hardening, but it is implemented and documented as the feature itself (import/export to local filesystem on the node); no source evidence of an intended superuser boundary (no setting, comment or check), so it is ambiguous whether the snapshot treats it as a vulnerability. Rejected in favor of the check that is provably inconsistent with the codebase's own policy."
+    },
+    {
+      "lead": "AccessControlImpl.visitTableFunctionRelation (lines 218-230) checks only the function's schema and does not traverse function-argument symbols, so subqueries inside table-function arguments (e.g. INSERT ... VALUES ((SELECT ...)) / FROM unnest((SELECT ...))) appear similarly unchecked.",
+      "reason": "Same root cause (the statement/relation visitor does not consistently traverse subquery symbols); not split into a second candidate."
+    },
+    {
+      "lead": "HttpAuthUpstreamHandler (lines 92-127) caches authorizedUser per connection and forwards later requests with a matching username without re-validating the password.",
+      "reason": "Only affects requests on a connection that already authenticated as that same user; no cross-user impact found."
+    },
+    {
+      "lead": "HostBasedAuthentication.addressFromRequestOrChannel trusts the X-Real-Ip header for HBA address matching (HttpAuthUpstreamHandler:187-193).",
+      "reason": "Documented proxy/deployment assumption, not a code-level defect; requires a specific hostile-proxy deployment to matter."
+    },
+    {
+      "lead": "Path traversal in static file serving and blob storage.",
+      "reason": "Verified mitigations: StaticSite normalizes and prefix-checks the resolved path (StaticSite:62-73); HttpBlobHandler restricts digests to 40 lowercase hex chars (HttpBlobHandler:87), so no traversal reaches DigestBlob paths."
+    },
+    {
+      "lead": "Logical replication stores subscription passwords in cluster state and exposes pg_subscription.subconninfo.",
+      "reason": "pg_subscription uses ConnectionInfo.safeConnectionString() (PgSubscriptionTable:48); sys.repositories uses masked settings. No cleartext exposure path found in scope."
+    },
+    {
+      "lead": "ALTER USER self-service could be abused for role changes.",
+      "reason": "AlterUserPlan/UserActions only derive a password hash; no role/privilege properties are applied."
+    }
+  ],
+  "summary": "CrateDB 5.5.1-era snapshot (3,659 model-visible files; tests stripped). The strongest source-evidenced issue is an authorization gap in AccessControlImpl: for UPDATE and DELETE statements only the target table's DML privilege is checked, while subquery relations embedded in the SET/WHERE/RETURNING symbols are never privilege-checked even though they are analyzed and executed. SELECT, INSERT, CREATE VIEW and CTAS paths do traverse subquery relations, so the gap is an internal inconsistency in the privilege model. Other candidate areas (COPY file URIs, blob/static path handling, HTTP auth, logical replication) were inspected and rejected or left as unconfirmed leads."
+}

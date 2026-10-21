@@ -1,0 +1,78 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The escaped value comes from the rendered model (application/end-user data), e.g. a string field or a Map/ContextNode value filled from an HTTP parameter, stored content, or database row. `{{v}}` in a template is compiled to `formatter.format(escaper, out, \"v\", data.v)`/`data.get(\"v\")`, so the default `Html` escaper is the only transformation between the attacker value and the HTML response. A value such as `x' onmouseover='alert(document.cookie)` breaks out of a single-quoted attribute.",
+      "confidence": "medium",
+      "counterevidence_checked": "The Mustache 1.3 spec's HTML-escaping test only requires `&`, `\"`, `<`, `>` to be escaped, and the spec corpus in this snapshot (`spec/spec-generator/src/main/resources/spec-1.3.0/specs/interpolation.json`) tests exactly those four, so the implementation is spec-conformant and the project's own spec tests would not catch the gap. The `Html` javadoc explicitly says the escaper is content-agnostic and suggests a custom lambda for flexible attribute escaping, i.e. the maintainers treat attribute-context escaping as caller responsibility; this is counterevidence that the gap was an intentional limitation rather than a defect. I also checked that no other escaping stage compensates (generated code passes the escaper for `{{}}`; STACHE/PlainText modes are explicitly opt-in; `HtmlEscaper`'s native-type overloads cannot emit `'`), and that the JMustache fallback reuses the same escaper. Finding is source-derived; no exploit was executed and no upstream fix/advisory was inspected.",
+      "id": "C1",
+      "impact": "Cross-site scripting (script execution in a victim's browser, session/credential theft, request forgery) whenever an application places user-controlled data in a single-quoted attribute of a JStachio HTML template; the user-visible contract of `{{...}}` in an HTML template is 'safe from accidental insecure output' (doc overview), so callers reasonably rely on the escaper for attribute values.",
+      "locations": [
+        {
+          "end_line": 16,
+          "path": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+          "start_line": 10
+        },
+        {
+          "end_line": 57,
+          "path": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+          "start_line": 25
+        },
+        {
+          "end_line": 78,
+          "path": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 34,
+          "path": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/Html.java",
+          "start_line": 12
+        }
+      ],
+      "prerequisites": "1) The application uses the default HTML content type (`Html`, which is also the compiler fallback: `GenerateRendererProcessor.resolveContentType` defaults to Html and `Templates.EscaperProvider.defaultProvider()` is Html). 2) A template places an escaped interpolation (`{{var}}`, not `{{{var}}}`/`{{&var}}`) inside a single-quoted HTML attribute or another context where `'` is significant. 3) The interpolated value is attacker-influenced. No elevated privileges or unusual configuration are required; the gap is in the library default.",
+      "root_cause": "`HtmlEscaper` (the escaper installed for every template whose @JStacheContentType is the default `Html`) only translates four characters: `&`->`&amp;`, `<`->`&lt;`, `>`->`&gt;`, `\"`->`&quot;`. A literal `'` (and any other attribute-breaking character) is passed through unchanged in all three `append` overloads that handle text (`append(A,CharSequence)`, `append(A,CharSequence,int,int)`, `append(A,char)`). Because the escaper is content-agnostic (it is not told whether the interpolation is element content or an attribute value), a template that places an escaped interpolation inside a single-quoted HTML attribute (`<a href='{{url}}'>`, `<div class='{{cls}}'>`) emits attacker-controlled data that can close the attribute and inject new attributes/handlers.",
+      "title": "Default HTML escaper does not neutralize single quote, allowing attribute-context XSS",
+      "trace": "Template token `{{v}}` -> `TemplateCompiler._variable` uses `ContextType.ESCAPED_VAR` -> `TemplateCompilerContext.renderingCode()` -> `RenderingCodeGenerator.renderFormatCallJStache(...)` emits `formatter.format(escaper, unescapedWriter, \"v\", <expression>)` -> `DefaultFormatter`/`SpecFormatter` calls `downstream.append(a, String.valueOf(o))` where `downstream` is the generated template's `escaper` field -> `HtmlEscaper.append(...)` -> switch handles only `&`, `<`, `>`, `\"`; `'` is copied verbatim to the output by the trailing `a.append(csq, start, end)`. The same gap exists in the char overload. `Html`'s javadoc documents the limitation ('does not differentiate attribute and element content') rather than mitigating it, and the JMustache compatibility path uses the same `template.templateEscaper()` function, so both engines emit the un-neutralized `'`.",
+      "unverified": "Not runtime-confirmed and not compared against a later upstream revision (no history/patch available in the snapshot). Whether the project/benchmark classifies this spec-compliant attribute-context behavior as the repository's vulnerability is unverified; a single-quoted-attribute usage is required for real impact.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+    }
+  ],
+  "coverage_summary": "444-file snapshot; tests and .mustache/resources are absent (verified: no `src/test` or resource files exist), so coverage is main-source only. I read or searched all security-relevant main code: the whole `api/jstachio` runtime (Escaper/HtmlEscaper/Html/PlainText/NoEscaper, Formatter/Default/Spec, Output/ByteBufferedOutputStream, Appender, Template/TemplateModel/TemplateInfo/TemplateConfig/JStachio/Renderer, spi/* including Templates, JStachioFilter/JStachioExtensions/JStachioFactory/JStachioTemplateFinder/JStachioConfig), the annotation processor pipeline (GenerateRendererProcessor, TemplateClassWriter, TemplateCompiler, CodeWriter/CodeAppender, tokenizer states, all RenderingContext classes, JavaExpression, RenderingCodeGenerator, escape/*, Interpolator, TextFileObject, ServicesFiles, CatalogClassWriter), opt/ (jstachio-jmustache: JMustacheRenderer, CompilerAdapter, Loader, JStachioCollector; jstachio-spring, spring-webmvc, spring-webflux and examples), bin/ tools, spec/spec-generator, poms, and .github workflows. I did not exhaustively read every javadoc-only annotation file or every spec template model class, and I could not build, run, diff against upstream, or inspect git history/patches.",
+  "limitations": [
+    "No execution, build, or tests: findings are source-evidence only and no candidate is runtime-confirmed.",
+    "No git history, upstream revision, patch, advisory, or CVE data available in the run, so I could not confirm whether the single-quote gap is the project's fixed vulnerability rather than a spec-compliant by-design limitation; this is the main uncertainty behind the candidate's 'medium' confidence.",
+    "Tests and template/resource files were excluded from the snapshot, so test expectations that would confirm or refute escaping behavior (and any regression tests for the candidate) could not be inspected.",
+    "Dependency-level issues (Spring 6.0.9, jmustache 1.15, Jackson 2.15.0, build plugins) were only noted as version pins in poms and were not evaluated as vulnerabilities.",
+    "The CI workflows were reviewed at a high level only (pull_request with secrets in job env, workflow_run artifact consumption by dorny/test-reporter); no concrete exploitable condition was established and they are not presented as candidates."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Compile-time path traversal / arbitrary file read via template path: `TextFileObject.openInputStream` only strips a leading `/` and then resolves `Path.of(config.resourcesPath(), name)` against `projectPath` (`compiler/apt/src/main/java/io/jstach/apt/TextFileObject.java` lines 62-131), and `GenerateRendererProcessor`/`CodeWriter` pass `@JStache(path=...)`, `@JStachePath(prefix/suffix)` and partial names into it without `..`/absolute-path validation, so a `../..` path can be read and embedded into generated code.",
+      "reason": "Confirmed code-level gap, but the only inputs are annotations/template files that are part of the build's trusted source tree. There is no runtime or remote attacker path (annotations in dependency JARs are not processed), so the security impact is a local build-time file read by the developer, not a boundary crossing, and I found no runtime code that consumes attacker-controlled template paths."
+    },
+    {
+      "lead": "Runtime template/path handling in the JMustache fallback: `Loader.path` builds `Path.of(sourcePath, templatePath)` and `Loader.resource`/`openFile` read from the filesystem, `openPartialByPath` concatenates partial names into paths, and `JMustacheRenderer.init` enables the engine by default (`use(!config.getBoolean(JSTACHIO_JMUSTACHE_DISABLE))`, i.e. enabled unless explicitly disabled), so in production a writable `src/main/resources/<templatePath>` file is compiled/rendered by JMustache instead of the statically generated template.",
+      "reason": "Attacker must already be able to create a template file on the filesystem/classpath (equivalent to code/file-write capability), and the behavior is documented as development-only ('Strongly recommended you disable this in production', and both Spring example `application.properties` files set `jstachio.jmustache.disable=true` in the production profile). The JMustache path also reuses the same escaper/formatter, so escaping is preserved; kept only as a design/hardening concern."
+    },
+    {
+      "lead": "Build-time code injection into generated Java source: template identifiers and annotation strings are interpolated into generated code without Java-literal escaping — `JavaExpression.mapGet` builds `\"key\"` from the tag name (line 98-102), `RenderingCodeGenerator.renderFormatCallJStache` embeds the dotted path in a quoted literal (lines 148-161), and `TemplateClassWriter` writes `TEMPLATE_PATH`/`TEMPLATE_MEDIA_TYPE`/interface annotations raw (lines 247-260, 274).",
+      "reason": "Real string-concatenation sites with no escaping, but exploitability requires control of the template file or annotations being compiled, i.e. the same trust as adding Java to the project; ordinary names are additionally validated by member resolution. No untrusted remote input reaches these sinks."
+    },
+    {
+      "lead": "Spring integration fixes `text/html` as the response media type regardless of the template's content type: `JStachioHttpMessageConverter`/`JStachioEncoder` constructors pass `MediaType.TEXT_HTML`, and the WebFlux `JStachioModelView.getSupportedMediaTypes()` returns only `text/html` while `JStachioModelView.render` re-encodes output as hard-coded UTF-8 bytes.",
+      "reason": "A `PlainText` content-type model served through the HTML converter can be labeled `text/html`, but this requires an application deliberately opting out of escaping and mixing media types; it is an integration/configuration concern with no clear repo fix and much lower confidence than the submitted candidate."
+    },
+    {
+      "lead": "`ViewSetupHandlerInterceptor.findView` / `ViewSetupBeanPostProcessor.findView` perform `context.getBean(modelAndView.getViewName())` on a controller-supplied view name (and can throw when the view name is null).",
+      "reason": "View names are produced by application controllers, not request data, in the intended usage; no concrete attacker-controlled flow or impact could be established from this snapshot."
+    },
+    {
+      "lead": "`VersionHelper` builds shell commands (`bash -c`) from version strings (`git tag -a -m 'release <version>'`, `mvn versions:set -DnewVersion=<version>`) in `bin/src/main/java/io/jstach/script/VersionHelper.java`.",
+      "reason": "Rejected after tracing: every shell-interpolated value comes from `Version.of`, which is validated by the strict anchored regex `v?([0-9]+).([0-9]+).([0-9]+)(-SNAPSHOT)?`, so shell metacharacters cannot reach the command. It is also a developer-only release tool."
+    },
+    {
+      "lead": "STACHE (zero-dependency) mode uses an identity escaper by default (`__escaper(null) -> i -> i`), so `{{var}}` is not escaped in generated zero-dep renderers.",
+      "reason": "Explicitly documented and opt-in (`JStacheType.STACHE` javadoc and the overview FAQ state escaping is disabled by default in zero-dependency mode and must be supplied by the user), so it is intended behavior rather than a defect in this snapshot."
+    }
+  ],
+  "summary": "Reviewed the assigned jstachio snapshot (v1.0.0-era, pom 1.1.0-SNAPSHOT) as a defensive source review. Scope: 444 files; Java main sources under api/, compiler/apt + compiler/jstachio-prisms, opt/ (jmustache + Spring MVC/WebFlux), bin/, spec/ plus build/CI config. I traced the template-to-output pipeline end to end: tokenizer -> context resolution -> generated Java (`formatter.format(escaper, out, \"path\", value)`) -> runtime `Formatter`/`Escaper`/`Output` (Html/PlainText/NoEscaper) -> `Appender`, plus the runtime lookup/filter chain, the JMustache fallback, and the compile-time resource loading. The generated-code path was verified to pass the content-type escaper (not the no-op appender) for `{{var}}`, and `unescape` paths to use the appender, so the 4-character translation in the default HTML escaper is the deciding security-relevant behavior. I submit one candidate: the default HTML escaper does not neutralize the single-quote character (attribute-context escaping gap, CWE-79). Everything else I found is either documented/opt-in behavior or requires build-time/template-source control, and is listed as rejected leads. No code was executed; no tests/resources are present in the snapshot, so nothing is runtime-confirmed."
+}

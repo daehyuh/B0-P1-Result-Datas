@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The HTTP request supplies `value` (the remote SVN URL, fully attacker-chosen, including host/port and the `file://` scheme accepted by the plugin's URL handling) and `credentialsId` (which stored credential is looked up). Both are bound with @QueryParameter to the alias, so they are attacker-controlled query parameters; the only in-code restriction is the permission check performed inside the delegate against the request's ancestor Item/Jenkins instance.",
+      "confidence": "medium",
+      "counterevidence_checked": "The delegate does enforce a permission check (USE_ITEM / ADMINISTER), so this is not an unauthenticated endpoint; for the global `/descriptorByName/...` path the ancestor Item is null, which means Jenkins.ADMINISTER is required, reducing reachability to CSRF-against-admin (or direct admin use). The delegate's comment ('Test the connection only if we may use the credentials') and the @RequirePOST on the three sibling endpoints (SubversionSCM.java:3098, SubversionSCMSource.java:824, ListSubversionTagsParameterDefinition.java:403) show the intended guard, confirming that its absence on the alias is a deviation rather than an intentional exception. Credential lookup is constrained by the credential's domain requirements built from the attacker URL (line 3128/3257), so domain-scoped credentials are not returned for an unrelated attacker host; conversely, unscoped/global credentials do match. The plugin intentionally leaves the post-commit endpoint (SubversionRepositoryStatus.doNotifyCommit) unauthenticated, but that endpoint does call requirePOST() (line 96) and is documented as intentionally unguarded, so it was not treated as this finding.",
+      "id": "cand-1-legacy-doCheckRemote-post-guard-bypass",
+      "impact": "A request that the server treats as a harmless form-validation GET performs a server-side connection to an attacker-specified URL and can drive authentication against it using a Jenkins-stored SVN credential. Concrete effects: blind SSRF from the Jenkins controller to arbitrary hosts/ports (including `file://` handling), and disclosure of credential material to an attacker-controlled SVN endpoint (username/password or key/passphrase) when the credential id is known or guessable, since credential lookup is domain-filtered but not URL-ownership-verified. No file write or code execution is demonstrated from source alone.",
+      "locations": [
+        {
+          "end_line": 2328,
+          "path": "src/main/java/hudson/scm/SubversionSCM.java",
+          "start_line": 2316
+        },
+        {
+          "end_line": 3143,
+          "path": "src/main/java/hudson/scm/SubversionSCM.java",
+          "start_line": 3098
+        },
+        {
+          "end_line": 2427,
+          "path": "src/main/java/hudson/scm/SubversionSCM.java",
+          "start_line": 2405
+        }
+      ],
+      "prerequisites": "The endpoint must be reached by a victim (Jenkins ADMINISTER when the global descriptor context resolves to null, or Item/CONFIGURE-equivalent USE_ITEM when an item context is resolvable), which is achievable in the 2018-era deployment model by CSRF: GET on this path needs no CSRF crumb. To cause credential use the attacker also needs the id of a credential that matches the attacker-supplied URL (global/unscoped credentials, the default when no domain is configured, or a domain matching the attacker host). Getting the connection itself (blind SSRF toward internal hosts) only requires the admin context.",
+      "root_cause": "SubversionSCM.DescriptorImpl.doCheckRemote is a public Stapler web method that lacks the @RequirePOST annotation that every sibling credential-validation endpoint in this codebase carries. It simply delegates in-process to ModuleLocation.DescriptorImpl.doCheckCredentialsId, which is annotated @RequirePOST and enforces context.hasPermission(CredentialsProvider.USE_ITEM). Stapler's @RequirePOST interceptor is applied per-invoked-method, so delegating does not propagate the POST requirement; the legacy alias therefore exposes the same outbound connect-and-authenticate behavior over GET.",
+      "title": "Legacy descriptor endpoint doCheckRemote remains GET-reachable, bypassing the @RequirePOST guard on the credential-validation path (CSRF + SSRF + stored-credential use)",
+      "trace": "Stapler GET /descriptorByName/hudson.scm.SubversionSCM/doCheckRemote -> SubversionSCM.DescriptorImpl.doCheckRemote (no @RequirePOST, line 2316) -> ModuleLocation.DescriptorImpl.doCheckCredentialsId(req, context, remote=value, value=credentialsId) (line 3098-3108, permission check line 3103) -> checkCredentialsId (line 3113) -> SVNURL.parseURIEncoded(remote) (line 3127) -> lookupCredentials(context, value, repoURL) (line 3128 / 3257) -> descriptor().getRepository(context, repoURL, credentials, ...) (line 3129) -> SVNRepositoryFactory.create + SVNAuthenticationManager wired with a CredentialsSVNAuthenticationProviderImpl built from that credential (lines 2405-2424) -> repo.getRepositoryRoot(true) (line 3131) performs the remote request and, on an authentication challenge from the target, SVNKit calls back into the provider which returns the stored username/password (or key material) for the challenged kind.",
+      "unverified": "Not runtime-verified (no execution permitted/possible). I could not inspect Jenkins core's Stapler @RequirePOST interceptor or the jelly files (this snapshot contains no .jelly resources) to confirm which UI code paths call the alias; reachability is inferred from the standard descriptor endpoint naming plus the method's public @QueryParameter-bound signature. Whether a practical target credential is unscoped and its id discoverable in a given deployment is environment-dependent. The `file://` URL path was read from URL handling/URL_PATTERN (SubversionSCM.java:2634) but its concrete effect was not exercised.",
+      "weakness_type": "CWE-352 (cross-site request forgery) / CWE-862 (missing guard on a privileged action); leads to SSRF and use/disclosure of stored credentials"
+    }
+  ],
+  "coverage_summary": "All 313 files in the assigned tree were listed and the 53 Java sources were read (SubversionSCM.java read in full except import lines; all other Java files read in full or exhaustively searched); 260 resource files (.properties/.html) reviewed by targeted search for security-relevant strings. The P1 relation index reports complete coverage (313/313 indexed, 1141 symbols, 3138 call rows, no missing files), but its only security-oriented facts are name-based navigation hints (none for the chosen candidate, none for SVNRepositoryView), so candidate edges were verified in source text instead. No build, test, scanner, or exploit was run.",
+  "limitations": [
+    "Snapshot contains no src/test/**, no .jelly views, and no dependency JARs (Jenkins core, credentials, scm-api, SVNKit 1.8.14, MapDB), so web-endpoint reachability, annotation-interceptor behavior, and SVNKit's handling of a server-supplied repository UUID could not be confirmed empirically.",
+    "Line numbers refer to this snapshot only; no git history/patch was available (no .git directory) so it was not possible to diff against upstream or a fix commit.",
+    "The candidate is a lead, not a confirmed vulnerability: permission checks inside the delegate and domain-scoped credential matching materially constrain exploitation, and no runtime confirmation was performed.",
+    "Coverage of resource bundles was search-based; translated help/properties files were not read line-by-line since they do not carry code paths.",
+    "Uninspected areas: none of the Java sources were left unreviewed, but only search-based sampling was applied to the 260 non-Java resources."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SVNRepositoryView uses the repository-server-supplied UUID unvalidated in a filesystem path: uuid = repository.getRepositoryUUID(true) then new File($JENKINS_HOME/caches, \"svn-\" + uuid + \".db\"), followed by cacheFile.getParentFile().mkdirs(), MapDB creation, and cacheFile.delete() on open failure (src/main/java/jenkins/scm/impl/subversion/SVNRepositoryView.java:92-113). If a malicious SVN server can return a UUID containing path separators (e.g. a value beginning with '/'), files/directories could be created or deleted outside the intended cache directory (constrained to names ending in .db).",
+      "reason": "High potential impact, but the decisive link (that SVNKit 1.8.14 passes a non-UUID, traversal-capable string through getRepositoryUUID) is in a dependency not present in this snapshot, so it cannot be verified against source text here; the code also requires Jenkins to be pointed at a malicious/branch-source SVN server. Kept as an unconfirmed lead rather than a second candidate."
+    },
+    {
+      "lead": "SubversionTagAction.doSubmit performs a repository write (svn copy/tag) and lacks @RequirePOST (src/main/java/hudson/scm/SubversionTagAction.java:216-260), a pattern that in other plugins is a CSRF fix.",
+      "reason": "The method parses a multipart form via MultipartFormDataParser and is permission-checked (getACL().checkPermission(SCM.TAG)); triggering it with a cross-site GET is not established from source (multipart parsing behavior and the Jenkins crumb filter for POST forms make this an unverified exploit path), so evidence is weaker than for cand-1."
+    },
+    {
+      "lead": "SubversionSCM.checkout() persists server-reported authentication realm strings into the job configuration and to the build log, and additional credentials are matched by realm string only (SubversionSCM.java:938-963; CredentialsSVNAuthenticationProviderImpl.getBuilder, line 322-335).",
+      "reason": "Realm-based sharing of credentials with svn:externals is a documented, deliberate feature of the AdditionalCredentials UI (help-additionalCredentials.html), so the trust assumption is by design; impact is speculative/config-pollution rather than a concrete vulnerability from source evidence."
+    },
+    {
+      "lead": "SubversionRepositoryStatus.doNotifyCommit is unauthenticated and accepts caller-supplied affected paths and revision (src/main/java/hudson/scm/SubversionRepositoryStatus.java:95-150), so anyone who knows a repository UUID can schedule polling with a pinned revision.",
+      "reason": "Intentional and documented in the class Javadoc (post-commit hook convenience), POST is enforced via requirePOST(), and UUID matching limits it to repos already configured by an administrator; not a defect supported by the code's own intent."
+    },
+    {
+      "lead": "SvnExternalsFileManager / PerJobCredentialStore use XStream/XmlFile to read job-level files (subversion.credentials, svnexternals.txt); XStream deserialization is a known dangerous primitive.",
+      "reason": "These files are written by Jenkins itself under the job directory; the controllable values (external URLs, credential data) are strings/Secret-encrypted values, and no attacker-writable input path to the XML documents was identified in this snapshot."
+    }
+  ],
+  "summary": "Reviewed the Jenkins Subversion plugin snapshot (pom 2.10.3-SNAPSHOT): 53 Java files + 260 resource files, all 313 files indexed. Strongest source-verifiable issue: a legacy, still web-exposed descriptor method `SubversionSCM.DescriptorImpl.doCheckRemote(...)` (src/main/java/hudson/scm/SubversionSCM.java:2316-2328) performs the credential-consuming repository probe through a GET-reachable alias, while the method it delegates to (`ModuleLocation.DescriptorImpl.doCheckCredentialsId`, line 3098) is explicitly annotated `@RequirePOST` and permission-checked. Because Stapler interceptors are not inherited by internal Java delegation, the POST/CSRF guard is bypassed by the alias: a GET on `/descriptorByName/hudson.scm.SubversionSCM/doCheckRemote?value=<url>&credentialsId=<id>` reaches `checkCredentialsId` (line 3113) -> `SVNURL.parseURIEncoded(remote)` -> `lookupCredentials(context, value, repoURL)` -> `getRepository(...)` (line 2405) -> `repo.getRepositoryRoot(true)`, i.e. an outbound SVN connection that will authenticate to a caller-specified URL with a Jenkins-stored credential. This is the same class of issue (missing POST + CSRF + SSRF/credential use) that the other credential-validation endpoints in this codebase are already guarded against, which makes the surviving alias the clearest, fully in-repository defect. A higher-impact but less verifiable lead (unvalidated repository-UUID used in a cache file path in SVNRepositoryView) is recorded as an unconfirmed/rejected lead, not as a second candidate."
+}

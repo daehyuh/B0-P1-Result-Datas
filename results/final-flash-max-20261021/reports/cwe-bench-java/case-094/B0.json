@@ -1,0 +1,72 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An attacker who can get a Library resource loaded into the validator context (e.g., via ValidationEngine.seeResource / NativeHostServices ingestion, an untrusted -ig package/folder/URL, or an IG containing a Library) controls the bytes of Library.content.data. Setting contentType to application/elm+xml causes those bytes to be parsed by XMLUtil.parseToDom. The trigger fires whenever a validated Measure references that Library (MeasureValidator.validateMeasure, lines 56-68); no valid CQL criteria are needed for the parse to occur. PackageVisitor.processFeed also feeds a downloaded XML feed into XMLUtil.parseToDom.",
+      "confidence": "medium",
+      "counterevidence_checked": "The main FHIR resource XML parsers are already hardened (r3/r4/r4b/r5 elementmodel XmlParser and ValidatorUtils set disallow-doctype-decl and related features), so ordinary resource XML input is not the affected path. The sink requires a resolvable Library with an application/elm+xml attachment and a referencing Measure; the parsed DOM is not directly returned to the caller, so file-disclosure may be blind in some deployments. No global javax.xml hardening property was found in the repo. No runtime proof was performed; default JDK external-entity behavior was assumed from source and standard JAXP defaults.",
+      "id": "case-094-xxe-xmlutil",
+      "impact": "XXE: server-side request forgery/outbound fetches for external DTDs/entities, disclosure of local file content via resolved entities (error messages from parsing are captured and can surface in validation output, supporting error-based exfiltration), and denial of service via entity expansion. Impact is on the process running the validator (CLI, library host, or service embedding NativeHostServices).",
+      "locations": [
+        {
+          "end_line": 469,
+          "path": "org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/xml/XMLUtil.java",
+          "start_line": 436
+        },
+        {
+          "end_line": 40,
+          "path": "org.hl7.fhir.validation/src/main/java/org/hl7/fhir/validation/instance/type/MeasureContext.java",
+          "start_line": 29
+        }
+      ],
+      "prerequisites": "Deployment where the validator/validator-service loads resources or IGs from an untrusted party, and a validated Measure references the attacker-influenced Library. The JVM's default DocumentBuilderFactory must retain default external-entity behavior (standard JDK behavior); a container/JVM that globally disables external DTD access would mitigate.",
+      "root_cause": "XMLUtil.create*DocumentBuilderFactory call sites are created without XXE hardening: parseToDom(String) lines 436-441, parseToDom(byte[]) 443-448, parseToDom(byte[], boolean) 450-455, parseFileToDom(String) 457-462, parseFileToDom(String, boolean) 464-469. Unlike the hardened parsers elsewhere in the repository, no setFeature(disallow-doctype-decl/external-general-entities/external-parameter-entities/load-external-dtd), setXIncludeAware(false) or setExpandEntityReferences(false) is applied, so DOCTYPE declarations and external entity resolution remain enabled for any XML handed to these utilities.",
+      "title": "XXE in XMLUtil XML parsing reached from FHIR Measure/Library validation",
+      "trace": "InstanceValidator.java:4983-4985 dispatches Measure resources to MeasureValidator.validateMeasure. validateMeasure (MeasureValidator.java:56-68) resolves each Measure.library reference via context.fetchResource(Library.class, ref) and calls mctxt.seeLibrary(l). MeasureContext.seeLibrary (MeasureContext.java:29-40) iterates l.getContent() and, for contentType application/elm+xml, calls XMLUtil.parseToDom(att.getData(), true) (XMLUtil.java:450-455). The unprotected factory parses the attacker XML with external entities enabled, performing file access/SSRF/entity expansion during parsing; parse exceptions are stored in userData (line 35-37) and can later be surfaced in validation messages (MeasureValidator.java:176-183).",
+      "unverified": "Runtime exploitability not confirmed. Exact reachability depends on how the deployment populates the validator context (seeResource vs. -ig loading) and on JDK/container XML parser defaults. Other XMLUtil call sites were not exhaustively traced across external consumers of the published artifacts. Scope of the eventual upstream fix (XMLUtil-only vs. also XLS/CDA/TranslatorXml) is unknown.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Coverage was source-only and read-only across the 7,202-file snapshot (filters: binary-like files refused/skipped, per-file 5 MiB text limit, 0 sensitive-name/symlink exclusions). I enumerated and read all DocumentBuilderFactory/SAXParserFactory/TransformerFactory/SAXParser sites; the zip/tar extraction sites (Utilities.unzip, Scanner.unzip, TerminologyCacheManager.unzip, NpmPackage.readStream/fromZip, IgLoader.readZip, TxCacheResourceExtractor, FilesystemPackageCacheManager.addPackageToCache); package/registry network code (PackageClient, FilesystemPackageCacheManager, SimpleHTTPClient, StandAloneValidatorFetcher); and the validation dispatch path for Measure/Library handling (InstanceValidator, MeasureValidator, MeasureContext, NativeHostServices). Generated model classes, most convertor mappings, renderers, and terminology expansion code were not read line-by-line.",
+  "limitations": [
+    "No runtime, test, or scanner execution; findings are source-level leads only.",
+    "No git history/patch information is available in the snapshot, so pre-/post-fix state could not be confirmed.",
+    "JDK/container XML parser defaults (external entity resolution) were assumed; some hardened JVMs or containers could mitigate the XXE.",
+    "Attack reachability of the selected sink depends on deployment-specific context loading (seeResource vs. untrusted -ig loading); not all external consumers of the published library could be inspected.",
+    "Dependency versions and other modules' generated code were not audited for separate vulnerabilities."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XLSXmlParser.parseXml (org.hl7.fhir.utilities/.../xls/XLSXmlParser.java:167-176) and XLSXmlNormaliser.parseXml (XLSXmlNormaliser.java:217-222) create unhardened DocumentBuilderFactory instances for SpreadsheetML input.",
+      "reason": "Same XXE class, but no in-repo callers of XLSXmlParser were found (appears to be tooling/dead code in this snapshot), so attacker-controlled reachability is weaker than the selected candidate."
+    },
+    {
+      "lead": "TranslatorXml.load (org.hl7.fhir.utilities/.../TranslatorXml.java:71-74) parses XML with an unhardened factory.",
+      "reason": "Input is a locally supplied translation file, not clearly attacker-controlled in a service path."
+    },
+    {
+      "lead": "CDAUtilities(InputStream) (org.hl7.fhir.convertors/.../misc/CDAUtilities.java:54-57) parses attacker-supplied CDA documents without XXE hardening; used by CCDAConverter.convert and ArgonautConverter.",
+      "reason": "Plausible same-class XXE in the convertors module, but it is a separate artifact/entry point and the selected candidate has a clearer in-repo validator reachability story; not enough evidence to prefer it."
+    },
+    {
+      "lead": "Scanner.unzip (org.hl7.fhir.validation/.../Scanner.java:335-357) extracts a ZIP with no path containment.",
+      "reason": "Only invoked for a hard-coded http://fhir.org/archive/comparison.zip download during the scan command; exploitation requires MITM of that host and affects a CLI-only workflow, so lower confidence/impact than the selected candidate."
+    },
+    {
+      "lead": "TerminologyCacheManager.unzip (r5 and r4b .../TerminologyCacheManager.java:97-113) relies on Utilities.path + String.startsWith for zip-slip protection; interior '..' segments are not normalized, so entries such as a/../../evil pass the check.",
+      "reason": "The archive is fetched over HTTP from tx.fhir.org and the path requires a MITM/compromised endpoint; a real weakness but not selected over the source-clearer XXE."
+    },
+    {
+      "lead": "FilesystemPackageCacheManager.addPackageToCache (org.hl7.fhir.utilities/.../npm/FilesystemPackageCacheManager.java:388-424) writes package files to paths derived from tarball folder keys via Utilities.path, which can normalize '..' segments and write outside packRoot; PackageClient.PRIMARY_SERVER is plain http://packages.fhir.org.",
+      "reason": "Requires installation of an attacker-controlled package (MITM of the HTTP registry or a rogue package server). Kept as an unconfirmed lead because the full exploit chain and upstream fix status could not be verified from source alone."
+    },
+    {
+      "lead": "SSLCertTruster.trustAllHosts / SimpleHTTPClient.trustAllhosts accept all TLS certificates.",
+      "reason": "Opt-in helper (only effective when a caller explicitly invokes trustAllhosts()); the default client path does not use it, so it is a hardening gap rather than an active vulnerability here."
+    },
+    {
+      "lead": "NativeHostServices.seeResource tests FhirFormat.JSON twice (lines 220-226), leaving the XML branch unreachable.",
+      "reason": "Functional bug, not a security-relevant flaw."
+    }
+  ],
+  "summary": "Reviewed the HL7 FHIR core snapshot (7,202 files; no binary/symlink/sensitive-name exclusions). The single strongest candidate is an XXE (CWE-611) in org.hl7.fhir.utilities.xml.XMLUtil: its parseToDom/parseFileToDom methods build a DocumentBuilderFactory with no DTD/external-entity hardening, unlike the FHIR resource parsers in the same repository (r3/r4/r4b/r5 elementmodel XmlParser and ValidatorUtils all set disallow-doctype-decl, external-general-entities=false, external-parameter-entities=false, load-external-dtd=false, XInclude/entity-expansion=false). One in-repo sink is attacker-reachable during validation: MeasureValidator → MeasureContext.seeLibrary parses a Library attachment of contentType application/elm+xml through XMLUtil.parseToDom while validating an attacker-supplied Measure. Same-class unprotected parsers (XLSXmlParser/XLSXmlNormaliser, TranslatorXml, CDAUtilities in convertors) and several zip-extraction paths were examined but not selected."
+}

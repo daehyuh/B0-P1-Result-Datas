@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote HTTP/2 client fully controls regular request headers. It can send a valid `:method` and `:path` (for example `/public`) plus a regular `x-http2-path: /protected`, or a CONNECT request with `x-http2-protocol: websocket` and an `x-http2-path` value, even when it never sent the corresponding `:protocol` pseudo-header.",
+      "confidence": "medium",
+      "counterevidence_checked": "The header is removed after being read, but the URI override has already occurred. `HttpServerOperations` only performs this for `isHttp2`/HTTP3-shaped operations, which are the affected protocols. `ProtocolHeaderHandler` is only installed when `connectProtocolEnabled` is true, but the constructor does not check that setting, and the handler is absent for ordinary HTTP/2 requests, so it does not strip a client-supplied header. The websocket path does validate CONNECT and version 13, but it validates a forgeable regular `x-http2-protocol` header rather than the pseudo-header. Direct clients can already set `:path`; the strongest impact requires a proxy or other trust boundary that treats `:path` as authoritative. No runtime or intermediary test was possible in this read-only review.",
+      "id": "reactor-netty-x-http2-path-override",
+      "impact": "Potential path-based authorization/access-control bypass through a reverse proxy or service mesh, cache poisoning or cache-key confusion, bypass of HTTP/2 extended-CONNECT/websocket policy checks, and inconsistent security logging/auditing. It does not by itself provide command execution or a direct memory-safety primitive.",
+      "locations": [
+        {
+          "end_line": 217,
+          "path": "reactor-netty-http/src/main/java/reactor/netty/http/server/HttpServerOperations.java",
+          "start_line": 212
+        },
+        {
+          "end_line": 1662,
+          "path": "reactor-netty-http/src/main/java/reactor/netty/http/server/HttpServerConfig.java",
+          "start_line": 1650
+        },
+        {
+          "end_line": 353,
+          "path": "reactor-netty-http/src/main/java/reactor/netty/http/server/HttpServerRoutes.java",
+          "start_line": 347
+        },
+        {
+          "end_line": 181,
+          "path": "reactor-netty-http/src/main/java/reactor/netty/http/server/Http2WebsocketServerOperations.java",
+          "start_line": 176
+        }
+      ],
+      "prerequisites": "The server must enable HTTP/2/H2C (or the analogous HTTP/3 path, which also enters the HTTP/2-style constructor). For an access-control or cache impact, an intermediary must base routing, authorization, WAF rules, or cache keys on the real `:path`/`:protocol` while forwarding regular `x-http2-*` headers to Reactor. A direct client can already choose `:path`, so header-only access expansion requires that policy/routing boundary; the same flaw still creates inconsistent URI state and misleading logs/audit records.",
+      "root_cause": "The server's extended-CONNECT support converts the HTTP/2 `:protocol`/`:path` pseudo-header state into ordinary `x-http2-protocol` and `x-http2-path` regular headers. Later, `HttpServerOperations` unconditionally treats any `x-http2-path` regular header as trusted internal state and calls `setUri` on every HTTP/2 request. It does not require the actual `:protocol` pseudo-header, the CONNECT method, or proof that the header was inserted by `ProtocolHeaderHandler`. The same design also lets a regular `x-http2-protocol: websocket` header satisfy the HTTP/2 websocket route/upgrade checks. Because regular headers are client-controlled and normally forwarded by intermediaries, the `:path`/`:protocol` seen by a proxy can differ from the URI/protocol state used by Reactor.",
+      "title": "Client-controlled x-http2-path header overrides the HTTP/2 request URI, enabling path-based request smuggling",
+      "trace": "HTTP/2 HEADERS -> Netty HTTP/2-to-HTTP/1 conversion -> `Http2StreamBridgeServerHandler` constructs `HttpServerOperations(..., isHttp2=true)` -> the constructor reads `x-http2-path`, removes it, and calls `nettyRequest.setUri(uri)` -> `HttpPredicate`/`HttpServerRoutes` and the application handler use the attacker-supplied URI while the proxy's `:path` remains the original value. For websockets, `HttpServerRoutes.ws` tests the regular `x-http2-protocol` header, and `Http2WebsocketServerOperations.isValid()` again trusts that regular header; a forged value can satisfy the CONNECT/websocket checks without a genuine HTTP/2 `:protocol=websocket` pseudo-header.",
+      "unverified": "Netty dependency source is not present in the snapshot, so I could not directly verify that its HTTP/2/3-to-HTTP/1 codecs retain an arbitrary regular `x-http2-path` header; however, Reactor's own extended-CONNECT mechanism depends on regular x-http2 headers surviving that same conversion. The real behavior of specific proxies/WAFs/caches and whether they forward `x-http2-*` headers was not tested. HTTP/3 appears to share the same path because `Http3ServerOperations` passes `true` into the HTTP/2-aware base constructor, but that protocol was not separately exercised.",
+      "weakness_type": "Inconsistent HTTP request interpretation / request-target spoofing (CWE-444, CWE-807)"
+    }
+  ],
+  "coverage_summary": "The source scope reports 539 model-visible files, no symlink/sensitive-name exclusions, no files over 5 MiB, and a 512 KiB per-file text limit. I used ordinary repository-relative listing/search/read tools and inspected the main Reactor Netty HTTP server/client request pipelines, HTTP/2 and HTTP/3 stream bridges, routing/websocket upgrade logic, redirect/cookie/form handling, TLS/proxy configuration, server/client helpers, QUIC configuration, examples, and build configuration. The docs/assets and minified bundled JavaScript were not security-reviewed line by line; no test sources are present in the assigned snapshot. Findings are source-level only and were not runtime-confirmed.",
+  "limitations": [
+    "The assigned snapshot contains no test sources, so behavior and counterexamples could not be checked against repository tests.",
+    "Netty 4.1.122 dependency sources are not in the snapshot; header-conversion and ownership behavior was inferred from the Reactor code and standard Netty semantics.",
+    "No code, server, proxy, WAF, or exploit was executed; all impact and exploitability statements are candidates, not runtime confirmations.",
+    "The intermediary/trust-boundary condition required for the strongest access-control impact was not reproduced.",
+    "Not every one of the 539 files was read line by line; coverage was broad but targeted by security-relevant packages and searches."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Open redirect / Host-header cache poisoning in NonSslRedirectHandler when redirectHttpToHttps is enabled",
+      "reason": "The handler does reflect an untrusted Host header into Location, but the feature is opt-in and direct browser exploitation normally requires a proxy/cache with a poisoned Host; it is a weaker and more configuration-dependent lead than the HTTP/2 request-target override."
+    },
+    {
+      "lead": "Path traversal in DefaultHttpServerRoutes.directory",
+      "reason": "The route decodes the URI path and normalizes the resolved Path, then checks p.startsWith(absPath). I found no source-level bypass of that check; symlink escapes require local filesystem control."
+    },
+    {
+      "lead": "SslProvider equality/hash only compares builderHashCode and may not distinguish composed handlerConfigurators such as hostname verification",
+      "reason": "This may cause provider/pool equivalence surprises, but it requires local application configuration of colliding SSL providers and no remote input path was established. It remains an unconfirmed config/security lead."
+    },
+    {
+      "lead": "Unbounded HTTP pipelining queue or unbounded multipart form storage as remote DoS",
+      "reason": "The source shows unbounded logical structures/default limits, but HTTP pipelining is gated by non-auto-read behavior and per-read buffering, while multipart limits are explicitly configurable and documented. No concrete attacker-controlled unbounded growth was established."
+    },
+    {
+      "lead": "Spin-loop in Cookies.getCachedCookies() if decoding fails while state is READING",
+      "reason": "The code can spin indefinitely only if cookie decoding throws after the state transition; Netty's decoders normally return results rather than throw, and no source evidence demonstrated a reachable exception path."
+    }
+  ],
+  "summary": "Reviewed the assigned 539-file Reactor Netty snapshot, focusing on HTTP/2/3 request conversion, server routing, websocket upgrade, redirects, TLS/proxy configuration, cookies/forms, and QUIC. The strongest lead is a request-target trust flaw: Reactor transports internal extended-CONNECT state in ordinary `x-http2-*` headers and later trusts those headers on HTTP/2 requests without proving they were generated internally. A client-supplied `x-http2-path` can therefore replace the request URI used by routing/application code while a front-end proxy or WAF still sees the original `:path`. This is a candidate lead, not a runtime-confirmed exploit; direct impact is strongest when an intermediary makes path/protocol decisions."
+}

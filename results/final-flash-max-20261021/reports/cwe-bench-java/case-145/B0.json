@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `path` string is supplied by the JSON-RPC caller (WebSocket `/q/dev-ui/json-rpc-ws`): the Dev UI JavaScript sends the URI it received for a workspace item (qwc-workspace.js getWorkspaceItemContent/saveWorkspaceItemContent), but a custom client can send any URI/absolute path such as `file:///etc/passwd` or `file:///home/user/.ssh/authorized_keys`. JsonRpcRouter.routeToDeployment passes the raw parameter map to DevConsoleManager.invoke with no sanitization. The only gate in front of the WebSocket is LocalHostOnlyFilter, which derives the host from the request's own Host header via request().absoluteURI(); a direct network client can send `Host: localhost` (the method is not bound to the TCP peer address), so the filter can be passed whenever the dev-mode HTTP port is reachable (e.g. quarkus.http.host=0.0.0.0, containers, port forwards; CORS/Origin checks are likewise optional for non-browser clients).",
+      "confidence": "medium",
+      "counterevidence_checked": "Dev UI registers only for local development (DevUIProcessor registers handlers only when isNotLocalDevModeType() is false), dev mode binds to loopback by default, and LocalHostOnlyFilter plus DevUICORSFilter attempt to restrict access to localhost origins. However, LocalHostOnlyFilter validates the Host header rather than the connection's remote address, so a direct client on a reachable port can pass it; the CORS filter also allows requests without an Origin header. I found no server-side containment of the client path against WorkspaceBuildItem.getRootPath() anywhere (searching getWorkspaceItemContent, saveWorkspaceItemContent, readContents, writeContent, Paths.get(URI.create(...))). This is a dev-mode-only surface; I could not confirm a runtime exploit or compare against an upstream fixed revision.",
+      "id": "quarkus-devui-workspace-arbitrary-file-access",
+      "impact": "Arbitrary file read and write as the developer's OS user while dev mode runs. Read exposes secrets (SSH/cloud keys, .env, tokens, source). Write is worse: overwriting source/resources triggers dev-mode recompilation/hot-reload (code execution), and writing files such as ~/.ssh/authorized_keys or shell startup files yields persistence/RCE.",
+      "locations": [
+        {
+          "end_line": 226,
+          "path": "extensions/vertx-http/deployment/src/main/java/io/quarkus/devui/deployment/menu/WorkspaceProcessor.java",
+          "start_line": 185
+        },
+        {
+          "end_line": 293,
+          "path": "extensions/vertx-http/deployment/src/main/java/io/quarkus/devui/deployment/menu/WorkspaceProcessor.java",
+          "start_line": 269
+        },
+        {
+          "end_line": 285,
+          "path": "extensions/vertx-http/runtime-dev/src/main/java/io/quarkus/devui/runtime/comms/JsonRpcRouter.java",
+          "start_line": 270
+        },
+        {
+          "end_line": 70,
+          "path": "extensions/vertx-http/runtime-dev/src/main/java/io/quarkus/devui/runtime/LocalHostOnlyFilter.java",
+          "start_line": 46
+        },
+        {
+          "end_line": 175,
+          "path": "extensions/vertx-http/deployment/src/main/java/io/quarkus/devui/deployment/DevUIProcessor.java",
+          "start_line": 158
+        }
+      ],
+      "prerequisites": "Dev/local development mode with Dev UI enabled (default true in dev mode) and the HTTP port reachable outside loopback; LocalHostOnlyFilter satisfied via spoofed Host header (or a host whitelisted with quarkus.dev-ui.hosts). Dev UI is not registered in production, so this is a build/dev-time attack surface, not a production RCE.",
+      "root_cause": "The Dev UI Workspace build-time actions accept a caller-supplied `path` parameter and convert it directly with Paths.get(URI.create(path)) / Path.of(URI.create(...)) without confining it to the workspace root (WorkspaceBuildItem.getRootPath()). `getWorkspaceItemContent` then calls readContents() -> Files.readString()/readAllBytes(), `saveWorkspaceItemContent` calls writeContent() -> Files.createDirectories()+Files.writeString() (TRUNCATE_EXISTING, CREATE), and `executeAction` likewise dereferences the client path. Nothing between the JSON-RPC WebSocket and these helpers validates or canonicalizes the path.",
+      "title": "Dev UI Workspace JSON-RPC actions allow arbitrary file read/write via client-controlled path",
+      "trace": "Attacker -> HTTP/WebSocket Dev UI endpoint (/q/dev-ui/json-rpc-ws) -> LocalHostOnlyFilter host check passes with forged Host -> JsonRpcRouter.routeToDeployment() -> DevConsoleManager.invoke('devui-workspace.getWorkspaceItemContent'|'saveWorkspaceItemContent', params) -> WorkspaceProcessor action -> Paths.get(URI.create(params.get(\"path\"))) -> readContents()/writeContent() -> Files.readString()/Files.writeString() on an arbitrary path. `saveWorkspaceItemContent` even creates missing parent directories and the file when absent.",
+      "unverified": "Reachability depends on the developer exposing the dev-mode port and on the Host-header check being the effective gate (I did not execute the server). I could not verify whether upstream Quarkus later added a root-path containment check, nor whether a specific CVE/ground-truth patch corresponds to this location. The exact JSON-RPC namespace string (extensionPathName + '.' + method) and the WebSocket handshake requirements were inferred from BuildTimeContentProcessor/JsonRpcRouter, not executed.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-73 External Control of File Name or Path (arbitrary file read and write)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned Quarkus source tree (12,982 root files; 12,976 model-visible; 6 sensitive-name files excluded by policy) using listing, text search and bounded reading only. Concentrated on runtime/deployment security-relevant modules: extensions/vertx-http (auth mechanisms, form auth, CORS, CSRF, path matchers, persistent login, static resources, proxy/forwarded handling), extensions/oidc and oidc-common (code flow state/nonce/cookie encryption, token claim validation, redirect handling), Dev UI runtime/deployment (JSON-RPC router, LocalHostOnlyFilter, Workspace, Readme, Maven/npm handlers), extensions/security and panache/rest-data-panache (sort validation), tls-registry (Let's Encrypt), plus selected devtools/CLI build paths. I could not exhaustively read all ~13k files; large areas (many extensions, native-image substitutions, tests) were covered by targeted searches and sampling, not line-by-line review.",
+  "limitations": [
+    "No repository history/diff or upstream comparison was available, so I cannot distinguish a deliberately introduced change from long-standing upstream code.",
+    "No internet/CVE lookup or ground-truth access; the candidate is not tied to a confirmed advisory identifier.",
+    "No compilation, tests, scanners, or runtime execution were performed; the attacker path is a source-level trace and was not runtime-confirmed.",
+    "Dev UI reachability depends on deployment configuration; I verified the Host-header-based filter logic but not real-world binding/exposure of a running dev server.",
+    "Only bounded reading was used (line ranges), so surrounding logic in some large classes (e.g., HttpAuthenticator, CodeAuthenticationMechanism) was reviewed partially."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Remote-dev file write: RuntimeUpdatesProcessor.updateFile(String,byte[]) strips only the leading slash and resolves the path against the application root without normalization/containment (core/deployment/.../RuntimeUpdatesProcessor.java:428-441), reached from RemoteSyncHandler.handlePut (extensions/vertx-http/runtime/.../devmode/RemoteSyncHandler.java:218-241).",
+      "reason": "Remote-dev handlers are only installed when quarkus.live-reload.password is configured, and each PUT/DELETE is authenticated by a session header and a SHA-256-based password HMAC (checkSession), so an unauthenticated remote attacker cannot reach it; prerequisites are much heavier than for the Dev UI lead."
+    },
+    {
+      "lead": "LetsEncryptRecorder management endpoints (/q/lets-encrypt/challenge, /q/lets-encrypt/certs) accept anonymous POST/GET/DELETE to set/clear ACME challenge data and trigger certificate reload (extensions/tls-registry/runtime/.../LetsEncryptRecorder.java:141-256).",
+      "reason": "Requires quarkus.tls.lets-encrypt.enabled=true; worst case is challenge manipulation/DoS against the local ACME flow, and management routes are conventionally expected to be protected by configuration. No clear confidentiality/integrity of credentials and no attacker-controlled content beyond the challenge itself."
+    },
+    {
+      "lead": "Dev UI DatabaseInspector executes arbitrary SQL for the dev datasource (extensions/agroal/runtime-dev/.../DatabaseInspector.java:226-305).",
+      "reason": "Dev-mode-only and gated by quarkus.datasource.dev-ui.allow-sql (default false); arbitrary SQL is the documented dev UI behaviour, and exportTable's tableName comes from database metadata, not request input."
+    },
+    {
+      "lead": "devtools/maven CreateUtils parses plugin.xml with a DocumentBuilderFactory that is not hardened against XXE (devtools/maven/.../CreateUtils.java:56-70).",
+      "reason": "The parsed plugin.xml is a local resource bundled in the Maven plugin jar, not attacker-controlled in the normal threat model."
+    },
+    {
+      "lead": "quarkus tls CLI AcmeClient unconditionally sets trustAll/verifyHost=false for https management URLs (extensions/tls-registry/cli/.../letsencrypt/AcmeClient.java:49-53).",
+      "reason": "CLI-side, user-specified own management URL; disabling TLS verification is a hardening weakness rather than a remotely exploitable vulnerability in the distributed Quarkus runtime."
+    },
+    {
+      "lead": "GrpcCodeGen proto extraction resolves archive-relative paths without an explicit parent-containment check (extensions/grpc/codegen/.../GrpcCodeGen.java:381-405).",
+      "reason": "Build-time codegen against dependency artifacts; would require a malicious dependency and I could not confirm that path names can escape the extraction directory (PathTree relativization semantics unverified)."
+    },
+    {
+      "lead": "DevUICORSFilter host check uses origin.startsWith(\"http://localhost\") (extensions/vertx-http/runtime-dev/.../DevUICORSFilter.java:80-90).",
+      "reason": "Origins are re-validated by CORSFilter against exact configured origins/same-origin rules, so the startsWith pre-check does not by itself admit an origin; dev-mode-only and no bypass demonstrated."
+    }
+  ],
+  "summary": "Quarkus snapshot (~3.22-era main, 999-SNAPSHOT; ~13k readable files). I reviewed the HTTP security stack (vertx-http auth mechanisms, form auth, CORS, CSRF, path matching, persistent login cookies), OIDC runtime token/state/cookie handling, the Dev UI runtime/deployment plumbing, REST Data Panache sort validation, and several build/CLI file-handling paths. One issue stands out with concrete source evidence and real security impact: the Dev UI \"Workspace\" build-time actions trust a client-supplied path and read/write arbitrary files on the developer machine. Other suspicious spots (remote-dev file write, ACME admin routes, dev-only SQL console, XXE in local plugin parsing, CLI trust-all TLS) either require heavy preconditions or are not clearly attacker-controlled, and are listed as rejected/unconfirmed leads. No finding was runtime-confirmed; this is a source-evidence lead."
+}

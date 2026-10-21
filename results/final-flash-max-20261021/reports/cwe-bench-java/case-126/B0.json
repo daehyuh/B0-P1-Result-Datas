@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls a relation name through SQL DDL: after ALTER TABLE ... RENAME TO \"<crafted name>\" (DDL/ALTER privilege on a table the user owns is sufficient; the rename path does not apply the index-name validation used by CREATE TABLE), the name is stored verbatim in cluster metadata. The name is later interpolated unescaped at AlterTableOperation.java:150 whenever ALTER TABLE <name> ADD COLUMN ... (with PRIMARY KEY or a generated column) is executed, so the crafted name is parsed as SQL.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the system session is really the superuser (Sessions.newSystemSession -> CoordinatorSessionSettings.systemDefaults -> User.CRATE_USER; AccessControlImpl.ensureMayExecute returns immediately when isSuperUser). Verified CREATE TABLE / template creation reject '\"' index names via MetadataCreateIndexService.validateIndexOrAliasName/Strings.INVALID_FILENAME_CHARS, and that RelationName only rejects '.' and empty names. Verified ALTER TABLE ... RENAME does not call validateIndexName and IndexMetadata.Builder.index(String) merely assigns the name. Verified the sink is reached only for ADD COLUMN with PRIMARY KEY or generated column (AlterTableOperation lines 124-141) and that the injected text cannot contain '.' so it cannot reference qualified names; SqlParser.createStatement parses a single statement (no stacked statements). Verified the codebase has and commonly uses safe quoting helpers (Identifiers.quote/quoteIfNeeded, RelationName.sqlFqn) that this sink does not use. Did not find any later index-name validation on the rename path in the inspected sources.",
+      "id": "case-126-candidate-1",
+      "impact": "Privilege escalation and unauthorized data disclosure: a low-privileged authenticated user with DDL on a table can cause attacker-influenced SQL to be analyzed and executed under the built-in 'crate' superuser, bypassing CrateDB privilege checks, and can extract information via the success/failure oracle (and via error messages) from tables the user has no privileges on. On clusters where authentication is enabled (non-default crate-as-superuser trust is disabled), this crosses a real trust boundary.",
+      "locations": [
+        {
+          "end_line": 161,
+          "path": "server/src/main/java/io/crate/execution/ddl/tables/AlterTableOperation.java",
+          "start_line": 148
+        },
+        {
+          "end_line": 141,
+          "path": "server/src/main/java/io/crate/execution/ddl/tables/AlterTableOperation.java",
+          "start_line": 124
+        },
+        {
+          "end_line": 116,
+          "path": "server/src/main/java/io/crate/metadata/cluster/RenameTableClusterStateExecutor.java",
+          "start_line": 102
+        },
+        {
+          "end_line": 114,
+          "path": "server/src/main/java/io/crate/analyze/AlterTableAnalyzer.java",
+          "start_line": 112
+        },
+        {
+          "end_line": 159,
+          "path": "server/src/main/java/io/crate/action/sql/Sessions.java",
+          "start_line": 157
+        },
+        {
+          "end_line": 93,
+          "path": "server/src/main/java/io/crate/metadata/settings/CoordinatorSessionSettings.java",
+          "start_line": 91
+        }
+      ],
+      "prerequisites": "An authenticated non-superuser who (a) has DDL/ALTER on at least one table and can add a PRIMARY KEY or generated column (standard DDL-on-schema setups include this), and (b) reaches the cluster with a non-superuser identity, i.e., auth.host_based.enabled=true and an HBA entry mapping that user (with HBA disabled the client is already trusted as 'crate', so the escalation is moot). The crafted name cannot contain '.', because RelationName rejects it.",
+      "root_cause": "AlterTableOperation.getRowCount composes SQL by string interpolation: String.format(Locale.ENGLISH, \"SELECT COUNT(*) FROM \\\"%s\\\".\\\"%s\\\"\", ident.schema(), ident.name()) and executes it via Sessions.newSystemSession(), whose session user is User.CRATE_USER (superuser). Double quotes are permitted in relation names (RelationName only rejects '.' and empty names) and are not escaped, so a relation name containing '\"' terminates the quoted identifier and lets the attacker inject SQL. Because the session is the built-in superuser, AccessControlImpl.ensureMayExecute is skipped for the parsed statement and no privilege checks apply. The enabling precondition is reachable: CREATE TABLE validates index names (MetadataCreateIndexService.validateIndexName -> Strings.validFileName rejects '\"'), but ALTER TABLE ... RENAME TO only rejects a target with a schema and a '.' (AlterTableAnalyzer line 113 + RelationName.ensureValidForRelationCreation) and RenameTableClusterStateExecutor writes the raw target name via IndexMetadata.Builder.index(String) with no name-character validation.",
+      "title": "Unescaped relation identifier interpolated into superuser SQL in AlterTableOperation.getRowCount",
+      "trace": "ALTER TABLE t RENAME TO \"x\"\"...\" -> AlterTableAnalyzer.analyze (line 112-114) builds RelationName(doc, 'x\"...') without character validation -> RenameTableClusterStateExecutor.execute (lines 102-116) writes the raw name through IndexMetadata.Builder.index(...) with no validateIndexName -> later ALTER TABLE \"x\"\"...\" ADD COLUMN c INT PRIMARY KEY -> AnalyzeAlterTableAddColumn/AddColumnRequest carries RelationName = x\"... -> AlterTableAddColumnPlan.executeOrFail (line 60) -> AlterTableOperation.addColumn (line 124) sees pk/generated column -> getRowCount -> String.format at line 150 produces SELECT COUNT(*) FROM \"doc\".\"x\"...\" with the embedded quote closing the identifier and the remainder parsed as SQL -> sessions.newSystemSession() (crate superuser) -> Session.quickExec -> Analyzer.analyze -> AccessControlImpl.ensureMayExecute short-circuits because sessionUser.isSuperUser() -> injected single SELECT statement is planned/executed with full privileges. The statement's summed first-column result is compared to 0 in addColumn, so the caller observes 'Cannot add a primary key column to a table that isn't empty' vs. the statement proceeding, yielding a boolean/error oracle over superuser-executed reads of relations resolvable in the system session search path (pg_catalog/doc), including other users' tables in doc.",
+      "unverified": "No runtime verification: it was not confirmed that a '\"'-containing index name created via rename survives all cluster-state listeners or that the renamed relation can subsequently be resolved and altered on a live node, nor was the injection confirmed by executing it. Also unverified whether some non-inspected path (e.g., metadata upgrade, restored snapshots, or plugin code) independently prevents or provides '\"'-containing relation names. Impact is bounded by the fact that relation names cannot contain '.', so the injected statement can only reference unqualified relations in the system session's search path.",
+      "weakness_type": "CWE-89 SQL Injection (with CWE-269 privilege escalation)"
+    }
+  ],
+  "coverage_summary": "Scope per get_source_scope: 3659 readable files, no symlinks, no excluded sensitive names, binary-like files skipped; the snapshot contains main sources/config/CI only (server/src/test and docs are absent). I reviewed source across server/src/main/java/io/crate (auth, user/privileges, action/sql/Session, analyze/planner DDL and COPY paths, protocol handlers, sys/pg_catalog table filtering, replication/logical, expression/UDF), libs (sql-parser quoting/Identifiers, shared), plugins (repositories/S3/URL), extensions (lang-js), and app/bootstrap/workflows. I used targeted text searches for SQL string construction, privilege checks, file/URI handling, deserialization, command execution, randomness, and quoting helpers. The candidate is the only unescaped interpolation into a superuser-executed statement that I found; the SHOW rewrite path is a second SQL-injection sink but without a privilege boundary crossing.",
+  "limitations": [
+    "No code was executed; the exploit chain (rename to a quote-containing name, later ALTER TABLE ADD COLUMN trigger) is source-based reasoning, not runtime-confirmed.",
+    "Only a fraction of the 3659 files was read in depth; large Elasticsearch-fork areas (cluster state, indices, snapshots, transport) and most scalar/aggregation implementations were only spot-checked via searches.",
+    "Tests and documentation are not present in the snapshot, so intended-vs-actual behavior for COPY/file access and identifier rules could not be cross-checked against the project's own specifications.",
+    "No git history, patch, CVE/CWE metadata, or upstream comparison was available, so I cannot confirm whether the interpolated getRowCount code is an injected regression or a longstanding upstream issue.",
+    "It was not verified whether any non-inspected cluster-state listener or index-name validation rejects a quote-containing index name created via rename, nor whether index-name-invalid names cause later resolution problems that would block the second step."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ShowStatementAnalyzer.singleQuote (lines 257-259) appends user-influenced strings such as SHOW ... LIKE '<pattern>' into a rewritten SQL string without escaping embedded single quotes.",
+      "reason": "The rewritten query is analyzed with the caller's own session settings and still passes through AccessControlImpl.ensureMayExecute, so the injection stays within the caller's privileges (self-injection), not a privilege boundary crossing. Kept as unconfirmed/weaker lead, not submitted."
+    },
+    {
+      "lead": "COPY TO / COPY FROM local file access: LocalFsFileOutput acquires a FileOutputStream for the URI path and FileReadingIterator/LocalFsFileInput read local paths, with no explicit superuser/privilege gate found in CopyAnalyzer or AccessControlImpl.",
+      "reason": "Appears to be longstanding intended behavior (operations are gated by DQL/DML on the target table), and the docs directory is excluded from the snapshot so the documented authorization model could not be checked. Weaker evidence of an injected/known vulnerability than the superuser SQL-injection sink."
+    },
+    {
+      "lead": "HttpAuthUpstreamHandler.addressFromRequestOrChannel trusts the client-supplied X-Real-Ip header when matching HBA address rules (lines 187-193).",
+      "reason": "Header-based client address override is an intentional reverse-proxy feature (AuthSettings.HTTP_HEADER_REAL_IP), and exploiting it requires the operator to configure HBA rules that trust loopback/private ranges. No source evidence that this branching was modified; left unconfirmed."
+    },
+    {
+      "lead": "HttpAuthUpstreamHandler sets authorizedUser = username even if authMethod.authenticate() returns null (lines 113-118).",
+      "reason": "All shipped AuthenticationMethod implementations either return a non-null user or throw (trust/password/cert), so no reachable null path that would authorize a failed login was found."
+    },
+    {
+      "lead": "TasksService.killAll/killTasks/killJobs treat a caller as superuser solely by comparing the user name to the literal 'crate'.",
+      "reason": "Only the built-in account can bear that name (User.CRATE_USER; users metadata is keyed by name), and session-user renaming requires superuser, so no bypass was found."
+    },
+    {
+      "lead": "session cancel secret generated with ThreadLocalRandom.current().nextInt() (Session.java line 177) and predictable session ids.",
+      "reason": "Weak-ish 32-bit cancel secret, but this matches the PostgreSQL cancel-key design; impact is limited to cancelling/rejecting queries and no source evidence of a deliberately weakened check."
+    }
+  ],
+  "summary": "Reviewed the CrateDB 5.5.1 main-source snapshot (3659 files; tests/docs are not part of the exposed tree) with emphasis on authentication/authorization, privilege checks, SQL session/analyzer/planner paths, COPY/file and URI handling, HTTP/blob handling, and logical replication. The strongest source-evidenced issue is an SQL-injection sink that executes with superuser rights: `AlterTableOperation.getRowCount` interpolates the schema/table name unescaped into a `SELECT COUNT(*)` statement and runs it through `Sessions.newSystemSession()` (user `crate`, ACL short-circuited). Relation names may legally contain `\"` (only `.` is rejected by `RelationName`), and while `CREATE TABLE` rejects such index names, the `ALTER TABLE ... RENAME TO` path writes the new index name without the index-name validation, giving a low-privileged user the attacker-controlled input needed. The injected SQL is executed as the superuser account and its result is exposed to the caller as a success-vs-\"table isn't empty\" oracle, enabling unauthorized reads/privilege escalation on HBA-secured clusters. Other leads (SHOW-statement quoting, COPY file access, X-Real-Ip trust, kill/superuser name check) were weaker or appeared intentional and are listed as rejected."
+}

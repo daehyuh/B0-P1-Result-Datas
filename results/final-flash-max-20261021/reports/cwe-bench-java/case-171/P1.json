@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client that can reach the DataNode client RPC port (dn_rpc_port, default 6667) fully controls: (a) the request type, (b) the target file name string encoded in the request body (PipeTransferFilePieceReq.translateFromTPipeTransferReq reads it verbatim via ReadWriteIOUtils.readString), (c) the start offset and file bytes written, and (d) the handshake timestamp precision needed to obtain a receiver directory. No session, password, or privilege is required for the file-piece path; the legacy sendFile path likewise takes the file name from the client-supplied TSyncTransportMetaInfo.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified against source: (a) whether a login is required before writing - handleTransferFilePiece never calls tryLogin, and handleTransferHandshakeV1 (which creates the receiver dir) accepts only a timestamp precision; V2 does call tryLogin on the DataNode, but file-piece requests are not gated by it; (b) whether the Thrift/server layer blocks unauthenticated calls - ProcessorWithMetrics/RPCServiceThriftHandler contain no auth check, and other methods of the same implementation explicitly call SESSION_MANAGER.checkLogin while pipeTransfer/sendFile/handshake/sendPipeData do not; (c) whether the file name is validated elsewhere - no separator, '..', canonical-path, or startsWith check exists in the request classes, the receivers, or ExecutableManager; (d) file cleanup on disconnect - ClientRPCServiceImpl.handleClientExit -> receiver.handleExit() deletes only the currently referenced writingFile, and seal-v1 nulls writingFile before load, so the write is most durable while the connection is held open or when the seal path is used; overwriting existing files and writing into directories consumed by background tasks still have effect during the session, so the primitive is real but its persistence depends on connection lifetime; (e) deployment precondition - the receiver APIs live on the normal client RPC service (dn_rpc_port 6667, as used by IoTDBSyncClient/IClientRPCService), not a separate disabled port.",
+      "id": "case-171-cand-1",
+      "impact": "Remote arbitrary file write outside the receiver directory with attacker-chosen content on the DataNode, executed with the DataNode OS privileges. Depending on the deployment this allows overwriting configuration files, startup scripts, or library/JAR files (persistence or code execution after restart/reload), writing into the DataNode's auto-load directories to inject crafted data, or destroying configuration/data (denial of service). Because the write APIs are not authenticated, no IoTDB account is needed. The legacy sendFile path gives the same primitive.",
+      "locations": [
+        {
+          "end_line": 404,
+          "path": "iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/pipe/receiver/IoTDBFileReceiver.java",
+          "start_line": 362
+        },
+        {
+          "end_line": 565,
+          "path": "iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/pipe/receiver/IoTDBFileReceiver.java",
+          "start_line": 561
+        },
+        {
+          "end_line": 88,
+          "path": "iotdb-core/node-commons/src/main/java/org/apache/iotdb/commons/pipe/connector/payload/thrift/request/PipeTransferFilePieceReq.java",
+          "start_line": 76
+        },
+        {
+          "end_line": 267,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/pipe/receiver/protocol/thrift/IoTDBDataNodeReceiver.java",
+          "start_line": 233
+        },
+        {
+          "end_line": 2697,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/protocol/thrift/impl/ClientRPCServiceImpl.java",
+          "start_line": 2694
+        },
+        {
+          "end_line": 305,
+          "path": "iotdb-core/datanode/src/main/java/org/apache/iotdb/db/pipe/receiver/protocol/legacy/IoTDBLegacyPipeReceiverAgent.java",
+          "start_line": 269
+        }
+      ],
+      "prerequisites": "Network access to the DataNode client RPC port; timestamp precision of the target (defaults to ms and is echoed in handshake error messages); the parent directory of the intended target path must already exist (RandomAccessFile does not create parent directories); the receiver directory is created by the unauthenticated HANDSHAKE_DATANODE_V1 request.",
+      "root_cause": "Pipe transfer requests carry a file name that is never validated for path separators, parent-directory references, or absolute paths. In IoTDBFileReceiver.updateWritingFileIfNeeded the name is combined directly with the receiver directory (writingFile = new File(receiverFileDirWithIdSuffix.get(), fileName); new RandomAccessFile(writingFile, \"rw\")), so the OS resolves the relative path outside the receiver directory. The same construction is used for seal-v2 file names (new File(receiverFileDirWithIdSuffix.get(), fileName)) and in the legacy receiver (new File(fileDir, fileName + PATCH_SUFFIX)). In addition, the request types that perform the write (TRANSFER_TS_FILE_PIECE / TRANSFER_TS_FILE_PIECE_WITH_MOD) are dispatched without any login/session check, and the V1 handshake that creates the receiver directory authenticates nothing (payload contains only timestampPrecision), so the traversal is remotely reachable without credentials.",
+      "title": "Unauthenticated path traversal file write in pipe receiver via attacker-controlled transfer file name",
+      "trace": "1) ClientRPCServiceImpl.pipeTransfer (lines 2694-2697) forwards any TPipeTransferReq to PipeDataNodeAgent.receiver().thrift().receive(req) with no SESSION_MANAGER.checkLogin call, unlike neighboring data methods (e.g. lines 268-287, 1268-1272); the Thrift processor (ProcessorWithMetrics) and RPCServiceThriftHandler add no per-method authentication, and this service is bound to dn_rpc_port in RPCService.initThriftServiceThread. 2) IoTDBDataNodeReceiver.receive dispatches HANDSHAKE_DATANODE_V1 to handleTransferHandshakeV1 (lines 173-182), which only compares timestamp precision and then creates/attaches receiverFileDirWithIdSuffix (IoTDBFileReceiver lines 94-189); no credentials are involved. 3) receive dispatches TRANSFER_TS_FILE_PIECE / _WITH_MOD to handleTransferFilePiece (IoTDBDataNodeReceiver lines 233-267). 4) handleTransferFilePiece calls updateWritingFileIfNeeded(req.getFileName(), ...) (IoTDBFileReceiver line 313), which executes writingFile = new File(receiverFileDirWithIdSuffix.get(), fileName); writingFileWriter = new RandomAccessFile(writingFile, \"rw\") (lines 398-399) and then writes the attacker-supplied bytes (line 343) at the attacker-supplied offset. 5) The seal-v2 handler also resolves request-provided names with new File(receiverDir, fileName) (lines 561-565) and passes the resulting absolute paths to loadFileV1/V2. No sanitization of fileName exists anywhere in this chain (no separator/'..' check was found). 6) The legacy receiver has the same pattern: sendFile (ClientRPCServiceImpl lines 2688-2692, also without a login check) -> IoTDBLegacyPipeReceiverAgent.transportFile builds new File(fileDir, fileName + PATCH_SUFFIX) and opens it with RandomAccessFile (lines 280-297) after a handshake that does not validate credentials (lines 100-119).",
+      "unverified": "No execution, no runtime confirmation: reachability of dn_rpc_port in a specific deployment, the exact effects of the per-connection cleanup (handleExit) on the written file, and whether the upstream fix targeted the naming validation or the missing authentication. The thrift IDL source is not present in the snapshot (generated stubs only referenced), so the exposure of pipeTransfer/sendFile on the client RPC service was established from ClientRPCServiceImpl implementing IClientRPCService and from IoTDBSyncClient extending IClientRPCService.Client.",
+      "weakness_type": "CWE-22 Path Traversal (enabled by CWE-306 Missing Authentication for Critical Function)"
+    }
+  ],
+  "coverage_summary": "Reviewed scope: 4194 source files (24.4 MB), Apache IoTDB 1.3.4-SNAPSHOT (rel/1.3 development after 1.3.3, per RELEASE_NOTES.md and pom.xml). P1 index coverage: 4103/4194 files indexed, 91 missing, 88 omitted, no parse errors, but the index implements only syntax-level relations (no control/data flow, no semantic resolution, Spring DI/security unverified), so every navigation hit used here was re-verified in source text. I focused on external trust boundaries: DataNode client RPC service (ClientRPCServiceImpl, RPCService/ProcessorWithMetrics/RPCServiceThriftHandler), pipe receivers and payload decoders (IoTDBFileReceiver, IoTDBDataNodeReceiver, IoTDBConfigNodeReceiver, legacy/air-gap/consensus receivers), REST v1/v2 auth/statement construction, auth manager and AuthorityChecker, UDF/trigger/pipe-plugin loading and class loaders, CLI remote TsFile import, and searched for common sink patterns (Runtime.exec/ProcessBuilder, ObjectInputStream/XML parsers/YAML, zip/tar extraction, TrustManager overrides, path normalization/containment checks). Uninspected/weakly inspected: consensus protocol internals, TsFile format internals (external tsfile dependency), AINode Python code, C++/Python clients, large parts of the query engine and storage engine that are not on an external input path, and the generated thrift IDL (not in snapshot).",
+  "limitations": [
+    "No code was executed, no tests or scanners were run; all conclusions are static source reading plus the P1 navigation index, which does not prove reachability or exploitability.",
+    "The vulnerability candidate was not runtime-confirmed; exposure depends on network access to the DataNode RPC port and on the target parent directory existing.",
+    "Persistence of a traversed write after disconnect depends on receiver cleanup (handleClientExit/handleExit) and on whether the seal path is used; this was reasoned from source but not tested.",
+    "The thrift IDL files are absent from the snapshot, so the client-facing exposure of pipeTransfer/sendFile is inferred from implementations and client classes rather than the IDL itself.",
+    "The precomputed index omits 91 source files and does not model Spring/annotation-driven behavior, runtime DI, or data flow; unreported code areas were not reviewed merely because the index had no record there."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unauthenticated configuration/schema plan execution through the same pipe receiver: ConfigNode-bound requests (HANDSHAKE_CONFIGNODE_V1/V2, TRANSFER_CONFIG_PLAN) are forwarded by IoTDBDataNodeReceiver.receive/ClusterConfigTaskExecutor.handleTransferConfigPlan without a login check, IoTDBConfigNodeReceiver.tryLogin is a no-op, and its username field defaults to the connector default 'root' (PipeConnectorConstant), so IoTDBConfigNodeReceiver.checkPermission would evaluate root privileges for a caller that never authenticated (IoTDBConfigNodeReceiver.java lines 199-341, 452-455; ClusterConfigTaskExecutor.java lines 3135-3160).",
+      "reason": "Same receiver trust boundary, but I selected the file-write path traversal as the single candidate with the most direct source evidence. This alternative requires additionally crafting a serialized ConfigPhysicalPlan body and assuming the forwarding path is reachable exactly as read; I could not verify that combination to the same standard within this review, so it remains an unconfirmed secondary lead."
+    },
+    {
+      "lead": "UDF/trigger/pipe-plugin loading with a client-specified jar URI: the default trusted_uri_pattern is 'file:.*', so a user holding USE_UDF/USE_TRIGGER/USE_PIPE can make a DataNode read a local file and ship its bytes to the ConfigNode (ClusterConfigTaskExecutor.createFunction lines 465-531, CommonConfig line 369).",
+      "reason": "Requires an administrative system privilege that is already intended to allow code execution, and no path by which the read file contents are returned to the caller was found; not a distinct unauthenticated primitive."
+    },
+    {
+      "lead": "REST API authorization and SQL construction (AuthorizationFilter/AuthorizationHandler, RestApiServiceImpl, StatementConstructionHandler).",
+      "reason": "Authorization is checked on the same statement object that is executed; measurement/device names are validated with PathUtils, and no injection sink into a separately executed SQL string was found in v1/v2 handlers."
+    },
+    {
+      "lead": "Command injection, XXE, Java deserialization, and unauthenticated internal-RPC review (Runtime.exec/ProcessBuilder, XML parsers, ObjectInputStream, DataNodeInternalRPC/ConfigNodeRPC processors).",
+      "reason": "No server-side sinks matched: exec/ProcessBuilder uses are confined to integration-test harness code; no XML parser or ObjectInputStream usage exists in the snapshot; internal node-to-node services are outside the external trust boundary I focused on and were only spot-checked."
+    }
+  ],
+  "summary": "Apache IoTDB 1.3.4-SNAPSHOT. I traced the strongest issue to the pipe file-transfer receiver: file names supplied inside pipe-transfer RPC requests are used verbatim to build local write paths, with no validation that the resolved path stays inside the receiver directory, and the transfer methods are reachable from the DataNode's client RPC port without authentication (the V1 handshake that creates the receiver directory carries only a timestamp precision). A remote unauthenticated client can therefore make the DataNode create/write a file at an attacker-chosen path with attacker-chosen content (path traversal, CWE-22; missing auth is the enabling condition, CWE-306). Static verification covers the complete call chain: IClientRPCService.pipeTransfer -> IoTDBDataNodeReceiver.receive (TRANSFER_TS_FILE_PIECE / _WITH_MOD / SEAL) -> IoTDBFileReceiver.handleTransferFilePiece -> updateWritingFileIfNeeded -> new RandomAccessFile(new File(receiverDir, fileName)). The same unvalidated-name pattern exists in the legacy pipe receiver (sendFile/transportFile). Impact: arbitrary file write as the IoTDB OS user (overwrite configuration/scripts/JARs for persistence or code execution on restart, drop files into the active-listening load directory for data injection/DoS); also an unauthenticated configuration/schema operation path exists through the same receiver (noted as an unconfirmed secondary lead)."
+}

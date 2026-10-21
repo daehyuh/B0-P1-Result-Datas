@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any URL string supplied by an end user (request parameter, stored content field) and passed through the public `XSSAPI.getValidHref`/`XSSFilter.isValidHref` services, which are the documented, intended API for producing safe href/src values in Sling applications (JSP/HTL).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that a literal colon in the raw string is rejected: AntiSamy's attributed-value check performs full-string matching against onsiteURL/offsiteURL, and the onsiteURL character class has no literal `:`, so the bypass cannot be achieved with a literal colon; it depends on post-validation entity decoding by the browser. Checked numeric entities (`&#58;`/`&#x3a;`) - these are decoded by `NumericEntityUnescaper` inside `unescapeXml`, so the decoded string contains a colon and is correctly rejected. Verified the allow-list regexes in config.xml explicitly include `&` and `;`. Verified the returned value is not passed through any `Encode` routine on this path. Did not verify browser entity handling at runtime in this environment (knowledge-based), and did not inspect any upstream fix commit or external advisory.",
+      "id": "cand-1",
+      "impact": "Validator bypass leading to cross-site scripting in the context the API exists to protect: script execution in the victim's session when the crafted link is activated (session/token theft, authenticated actions), or other dangerous schemes in href/src/action attributes. It also affects applications that call `XSSFilter.isValidHref` as a gate and emit the raw URL.",
+      "locations": [
+        {
+          "end_line": 262,
+          "path": "src/main/java/org/apache/sling/xss/impl/XSSAPIImpl.java",
+          "start_line": 229
+        },
+        {
+          "end_line": 155,
+          "path": "src/main/java/org/apache/sling/xss/impl/XSSFilterImpl.java",
+          "start_line": 127
+        },
+        {
+          "end_line": 71,
+          "path": "src/main/resources/SLING-INF/content/config.xml",
+          "start_line": 70
+        }
+      ],
+      "prerequisites": "A caller uses the validator's return value as a link/URL attribute (the API contract: percent-encoding of attribute-breaking characters is done by the library, so callers are not expected to HTML-escape the result again), and a victim activates the rendered link. If the caller re-escapes `&` (e.g. to `&amp;`) or percent-encodes the result before output, the bypass is neutralized.",
+      "root_cause": "The href path validates a string in which only URL percent-encoding and the five XML predefined entities (amp, lt, gt, quot, apos) plus numeric references have been decoded. `StringEscapeUtils.unescapeXml` (commons-lang3 3.6) does not decode HTML5 named character references such as `&colon;`, `&Tab;`, `&NewLine;`, and the allowed-attribute regex in the policy treats `&` and `;` as ordinary allowed characters (onsiteURL/offsiteURL). The sanitizer never escapes `&` in its output (it only percent-encodes `\"`, `'`, `>`, `<`, backtick, space and `:` after a query mark), so the returned value still contains `&colon;`. A browser HTML-parses that attribute value and resolves the entity to `:` after validation, reconstructing a dangerous scheme (e.g. `javascript:`), which the validator had rejected in its decoded form. The sibling `XSSFilterImpl.isValidHref` has the same decoding gap: when `unescapeXml`/`URLDecoder` leave the string unchanged it validates the raw input, which contains no literal `:` and therefore matches the allow-list.",
+      "title": "Href validation/sanitization bypassed by HTML named character references (e.g. &colon;) yielding javascript: URLs",
+      "trace": "Input containing an entity-encoded colon, e.g. `javascript&colon;<code>`: (1) `XSSAPIImpl.getValidHref` runs `URLDecoder.decode` (no percent sequences, unchanged); (2) `StringEscapeUtils.unescapeXml` leaves `&colon;` untouched because it only handles the five XML entities and numeric references; (3) the four `replaceAll` calls do not touch `&`, `;` or `:`; (4) `mangleNamespaces` is a no-op without `://`; (5) `xssFilter.isValidHref` repeats decode/unescape, `xmlDecodedURL.equals(url)` is true, so `runHrefValidation(url)` validates the raw string against onsiteURL/offsiteURL; every character (`&`, `;`, letters, digits, `(`, `)`) is in the allow-list, so validation passes and the raw string with `&colon;` is returned; (6) the browser HTML-parses the attribute value and resolves `&colon;` to `:`, so the effective URL starts with `javascript:` and executes on activation. Numeric references (`&#58;`) are decoded by `unescapeXml` and are consequently rejected, which shows the intended decode-before-validate defense is present but incomplete for named HTML5 entities.",
+      "unverified": "Runtime confirmation of the browser-side `&colon;` decoding in an href attribute was not possible here. It was also not verified which exact upstream commit/version remediated this, and whether every downstream caller inserts the returned value into an attribute without additional HTML escaping (callers that escape `&` are unaffected). The `XSSFilterImpl` direct-use path additionally depends on the caller emitting the raw URL.",
+      "weakness_type": "CWE-79 (improper neutralization of input during web page generation) / incomplete URL scheme validation"
+    }
+  ],
+  "coverage_summary": "All 17 files in scope were enumerated per get_source_scope (17 visible text files, no binary/symlink/size exclusions). I fully read all Java sources (XSSAPIImpl, XSSFilterImpl, PolicyHandler, LongValidationRule, HtmlToHtmlContentContext, PlainTextToHtmlContentContext, XSSFilterRule, ProtectionContext, XSSFilter, XSSAPI, package-info), pom.xml, README.md and validation.properties, and searched ESAPI.properties and the 106 KB config.xml for policy-relevant entries (href/onsiteURL/offsiteURL definitions, tag list, style handling, entity/script-related entries). config.xml and ESAPI.properties were not read line-by-line end-to-end; only the security-relevant sections were inspected. No tests, call sites of the API, or dependency sources are present in the snapshot.",
+  "limitations": [
+    "No runtime execution was performed; browser-side decoding of HTML5 named character references (e.g. `&colon;`) in attribute values is asserted from spec/domain knowledge, not observed in this environment.",
+    "The snapshot contains no tests and no downstream call sites, so the exact usage pattern (direct insertion of getValidHref output into href vs. additional escaping by callers) could not be confirmed from repository evidence.",
+    "config.xml (AntiSamy policy, ~107 KB) and ESAPI.properties were only partly read; a policy-level weakness outside the inspected sections cannot be excluded.",
+    "Dependency implementations (AntiSamy 1.5.2 Attribute.containsAllowedValue semantics, commons-lang3 3.6 StringEscapeUtils.unescapeXml entity set, OSGi/ESAPI runtime behavior) were reasoned about from knowledge, not from sources in this snapshot.",
+    "No external advisory/CVE/ground-truth information was consulted, per the assignment constraints."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "getValidJSON can return JSON containing literal `</script>` (JSON generator does not escape `<` or `/`), enabling script-context breakout if the caller embeds the result in a `<script>` block.",
+      "reason": "Recognized weakness, but impact depends entirely on caller usage not defined in this repository; the API contract frames the method as JSON validation, and no in-repo call site shows script-block embedding. Weaker and less certain than the href validator bypass."
+    },
+    {
+      "lead": "getValidStyleToken's CSS_TOKEN regex admits legacy IE `expression(identifier)`/`url(identifier)` tokens and getValidCSSColor permits letter-only strings.",
+      "reason": "Only reachable in obsolete IE CSS-expression semantics, and the accepted argument forms do not permit a function call with nested parentheses/string payload; no concrete script-execution impact in supported browsers."
+    },
+    {
+      "lead": "getValidXML may permit entity-expansion (billion-laughs) denial of service; the three parser features are set in a single try block, so a parser rejecting the first feature would skip the remaining external-entity restrictions.",
+      "reason": "All three features are supported by the standard JDK SAX parser used in practice, so the partial-configuration branch is speculative; internal entity expansion is a resource-exhaustion concern rather than an XSS/security-boundary failure and was not traced to an attacker-facing call path."
+    },
+    {
+      "lead": "PlainTextToHtmlContentContext.escapeXml does not escape quote characters.",
+      "reason": "The class and ProtectionContext documentation scope it to HTML element content (cheat-sheet rule #1), where quoting `&`, `<`, `>` is the correct encoding; attribute-context use would be caller misuse."
+    },
+    {
+      "lead": "XSSFilterImpl.defaultHandler/hrefAttribute are mutable fields updated without synchronization/volatility, so a concurrent request could validate against a stale policy.",
+      "reason": "Race window only; no source evidence that an attacker can supply a policy that weakens validation to a concrete bypass."
+    },
+    {
+      "lead": "Unconditional `handler = defaultHandler` fallback in check/filter when a named policy is unknown.",
+      "reason": "Fails closed to the default policy; no weakening of validation demonstrated."
+    }
+  ],
+  "summary": "Review of the Apache Sling XSS Protection bundle snapshot (2.0.3-SNAPSHOT, 17 files). The strongest source-supported issue is an incomplete character-reference decoding in the href sanitization path: `XSSAPI.getValidHref`/`XSSFilter.isValidHref` validate the raw string after only XML-entity and numeric-reference decoding, allow `&`/`;` in the policy regex, and return the string without escaping `&`, so browser-side decoding of HTML5 named references (e.g. `&colon;`) reconstructs a `javascript:` URL after validation. No other issue in the snapshot reached the same evidence/impact bar; the other leads examined are listed as rejected."
+}

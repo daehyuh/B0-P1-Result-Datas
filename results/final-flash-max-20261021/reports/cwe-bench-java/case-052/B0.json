@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Full control of the unmarshalled stream (XML/JSON/binary): the root element name, the raw 'class' and 'resolves-to' attributes, and the names/class attributes of all child elements.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the normal converter paths (HierarchicalStreams.readClassType, AbstractCollectionConverter.readBareItem, AbstractReflectionConverter.doUnmarshal, SerializableConverter, DynamicProxyConverter, OptionalConverter, AtomicReferenceConverter) all route type names through mapper.realClass and therefore enforce the whitelist, making RecordConverter the outlier. Checked that SecurityMapper only overrides realClass and that TreeUnmarshaller.convertAnother/mapper.defaultImplementationOf/ConverterLookup perform no permission check. Checked that the root record type is still permission-checked, so the child-attribute bypass requires a whitelisted record (or permissive permissions); in the root-only variant only class initialization is reachable (isRecord rejects non-records). Checked that SerializableConverter additionally checks its inner class-wrapper names via mapper.realClass, which limits some readObject-based gadget chains; the remaining primitive is arbitrary class initialization plus arbitrary class instantiation/configuration through converters (e.g. ReflectionConverter constructor/field/readResolve). Also considered and rejected other leads listed below. I could not verify the upstream 1.5.0 state offline and did not execute anything.",
+      "id": "xstream-recordconverter-security-bypass",
+      "impact": "Violation of XStream's central security guarantee ('only whitelisted types are touched'): attacker can force initialization of arbitrary classes on the classpath (static initializers) and, when a record type is whitelisted, force instantiation/field population/readResolve of arbitrary non-whitelisted classes. This restores the classic XStream gadget-class threat model (CWE-502) that the 1.4.7+ whitelist framework exists to prevent: code execution or denial of service depending on classes available on the target classpath, plus information disclosure/state corruption as side effects of those constructors/initializers. The class initialization primitive alone is reachable whenever any record type is allowed, because the raw 'class' attribute can differ from the 'resolves-to' attribute that the permission check reads.",
+      "locations": [
+        {
+          "end_line": 177,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/extended/RecordConverter.java",
+          "start_line": 154
+        },
+        {
+          "end_line": 232,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/extended/RecordConverter.java",
+          "start_line": 220
+        },
+        {
+          "end_line": 247,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/extended/RecordConverter.java",
+          "start_line": 237
+        },
+        {
+          "end_line": 1067,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 1064
+        },
+        {
+          "end_line": 80,
+          "path": "xstream/src/java/com/thoughtworks/xstream/mapper/SecurityMapper.java",
+          "start_line": 71
+        },
+        {
+          "end_line": 35,
+          "path": "xstream/src/java/com/thoughtworks/xstream/core/util/HierarchicalStreams.java",
+          "start_line": 26
+        }
+      ],
+      "prerequisites": "Java 14 or newer (JVM.isVersion(14) in XStream.setupConverters), a default XStream instance (RecordConverter registered at PRIORITY_NORMAL), and a security configuration that permits at least one record class (e.g. allowTypes(MyRecord.class)/allowTypesByWildcard on the application's package) or a permissive permission such as AnyTypePermission. The root type itself is still checked by TreeUnmarshaller.start -> HierarchicalStreams.readClassType -> mapper.realClass, so a permitted record type is needed to reach RecordConverter; the child 'class' attributes are then unchecked.",
+      "root_cause": "RecordConverter.unmarshal() (xstream/src/java/com/thoughtworks/xstream/converters/extended/RecordConverter.java:154-177) resolves the record class with findClass() and each child element's class attribute with classForName() (lines 220-232). Both use raw Class.forName(...) instead of mapper.realClass(...), so SecurityMapper.realClass (mapper/SecurityMapper.java:71-80) and the configured TypePermissions are never evaluated for those names. The resulting Class is passed straight to context.convertAnother(null, c) (line 172); TreeUnmarshaller.convertAnother/convert (core/TreeUnmarshaller.java:51-88) only calls mapper.defaultImplementationOf() and ConverterLookup, which are not permission checks, so the converter instantiates/configures an arbitrary class. Additionally, one-argument Class.forName initializes the class (runs static initializers), whereas DefaultMapper.realClass deliberately passes initialize=false for non-array names (mapper/DefaultMapper.java:72-81). The converter is registered by default on Java 14+ (XStream.java:1064-1067). Contrast: normal paths, e.g. HierarchicalStreams.readClassType (core/util/HierarchicalStreams.java:26-35) and AbstractCollectionConverter.readBareItem (converters/collections/AbstractCollectionConverter.java:134-138), always resolve element/class-attribute names through mapper.realClass, which performs the whitelist check.",
+      "title": "RecordConverter bypasses XStream's security framework when resolving stream types (Class.forName instead of Mapper.realClass)",
+      "trace": "1) Application calls fromXML on attacker data and its whitelist allows a record type R. 2) TreeUnmarshaller.start resolves the root name via mapper.realClass (allowed), DefaultConverterLookup selects RecordConverter (canConvert true for records; priority NORMAL beats SerializableConverter LOW and ReflectionConverter VERY_LOW). 3) RecordConverter.findClass (line 228) reads the raw 'class' attribute/node name and calls Class.forName(className) (line 222) with initialization on; this call is not gated by SecurityMapper. 4) For each child element that has a raw 'class' attribute (line 166-167), the attacker-named class is loaded unchecked and passed to context.convertAnother(null, c) (line 172), which looks up the converter by class and instantiates/populates it (e.g. ReflectionConverter: no-arg constructor, attacker-chosen field values, then readResolve; or converter-specific behavior for maps/collections/atomic/optional types) with no TypePermission evaluation. 5) orderValues/invokeCanonicalConstructor then invoke R's canonical constructor. 6) A root-only variant works even without knowing record components: <allowed.Record resolves-to='allowed.Record' class='forbidden.Class'> causes readClassType to check resolves-to (allowed) while findClass initializes forbidden.Class via Class.forName before the isRecord check rejects it.",
+      "unverified": "No runtime/test validation (test sources are not present in the snapshot and execution is out of scope); practical RCE depends on target classpath gadgets; I could not confirm whether upstream XStream later routes RecordConverter type resolution through the mapper (which would confirm this snapshot as the vulnerable pre-fix revision). The exact set of child classes reachable through non-permission-checked converters was not exhaustively enumerated.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data / CWE-693 Protection Mechanism Failure (type-permission bypass)"
+    }
+  ],
+  "coverage_summary": "Reviewed 489 visible files (no test sources included in the snapshot; binary files skipped). Deep-read security-critical code: SecurityMapper and all TypePermission implementations (realClass enforcement verified), XStream.setupSecurity default whitelist, TreeMarshaller/TreeUnmarshaller, AbstractReflectionConverter/ReflectionConverter, SerializableConverter, ExternalizableConverter, DynamicProxyConverter, LambdaConverter, JavaClass/Method/Field/Record/Throwable/Optional/Atomic converters, mappers (DefaultMapper, CachingMapper, LambdaMapper, AnnotationMapper, ImplicitCollectionMapper), IO drivers (Dom, Dom4J, JDom/JDom2, Xom, Stax family, Xpp family, binary), JsonWriter/AbstractJsonWriter escaping, persistence package, XStreamer, xstream-builder, xstream-hibernate, build files and docs (changes.html, security.html, CVE pages, faq.html) for consistency checks. Lesser depth: large SaxWriter/TraxSource internals, ISO8601 converters, JVM static init details, JMH benchmark sources, distribution templates/assembly descriptors. No tests were available to confirm intended behavior and no code was executed.",
+  "limitations": [
+    "No test sources are exposed in the snapshot, so expected behavior could not be validated against unit/acceptance tests.",
+    "No execution/build/scanning was performed; findings are source-level only and are not runtime-confirmed.",
+    "The repository state (1.5.0-SNAPSHOT master, mid-development changes.html) means part of the code is unreleased work; I could not compare against upstream git history or later fixes offline, so I cannot definitively say whether RecordConverter's missing mapper checks were fixed in a later commit.",
+    "Exploitability of the RecordConverter bypass is classpath-dependent (gadget classes available to the application), which was not enumerated.",
+    "Not every one of the 489 files was read line-by-line; large output-side files (SaxWriter, TraxSource), time converters, and benchmark code received targeted rather than exhaustive review."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CachingMapper caches successful realClass lookups and is never flushed when denyTypes/addPermission are called at runtime (CachingMapper.java:38-53; no flushCache call from XStream.addPermission), so a previously cached class could bypass a later deny rule.",
+      "reason": "This is a configuration-time ordering issue, not attacker-controlled input; the cache only pre-dates an application's own later permission change, and addPermission/denyTypes normally happen before any unmarshalling. It does not constitute an attacker-triggerable vulnerability in this snapshot."
+    },
+    {
+      "lead": "JavaClassConverter/JavaFieldConverter/JavaMethodConverter construct their own DefaultMapper (JavaClassConverter.java:40-42, JavaFieldConverter.java:44-45), so Class/Method/Field objects can be created for types outside the whitelist.",
+      "reason": "Long-standing upstream design: these paths return metadata objects only; DefaultMapper uses initialize=false for non-array names (no static initialization), and I found no in-tree chain that turns the metadata into code execution without an additional application-side invocation. Weaker than the RecordConverter bypass, which resolves and converts arbitrary instances."
+    },
+    {
+      "lead": "SubjectConverter reads a system property keyed by stream content via Boolean.getBoolean(reader.getValue()) (SubjectConverter.java:106-111).",
+      "reason": "It only reads an existing system property name; no write/execution primitive, and it matches the upstream implementation. Functional oddity, not a vulnerability."
+    },
+    {
+      "lead": "XXE exposure of specific drivers (XomDriver, BEAStaxDriver, vendor-dependent StaxDriver) and missing XMLInputFactory.SUPPORT_DTD in StaxDriver.createInputFactory.",
+      "reason": "StaxDriver does set IS_SUPPORTING_EXTERNAL_ENTITIES=false and the driver matrix matches the project's own documented status (faq.html lines 875-902, which explicitly lists XomDriver/BEAStaxDriver as vulnerable upstream). DomDriver/Dom4JDriver/JDom/JDom2 disable DOCTYPE; XPP parsers do not process DTDs. No deviation from documented behavior was found."
+    },
+    {
+      "lead": "Denial-of-service hardening (deep nesting, recursive hash structures, O(n^2) sibling access) might be missing.",
+      "reason": "The snapshot contains the 1.4.19/1.4.20 mitigations: StackOverflowError is converted to InputManipulationException in XStream.unmarshal (XStream.java:1422-1423), collection/map update time limits via SecurityUtils.checkForCollectionDoSAttack, and DomReader child-element caching (DomReader.java:139-161). No clear gap found."
+    },
+    {
+      "lead": "FilePersistenceStrategy filename generation could allow path traversal with attacker-influenced keys.",
+      "reason": "The default illegal-character set includes '%', '/', '\\' and the escaper percent-encodes all illegal/control characters (FilePersistenceStrategy.java:57, 150-161); I found no traversal or overwrite path outside the configured base directory."
+    }
+  ],
+  "summary": "XStream master snapshot (1.5.0-SNAPSHOT, Java 14+ paths). I reviewed the core deserialization chain (TreeUnmarshaller, Mapper chain incl. SecurityMapper/CachingMapper, reflection/Serializable/Externalizable converters, extended converters, XML/JSON/binary IO, persistence, XStreamer, builder/hibernate modules). Most security controls are intact (default whitelist in XStream.setupSecurity, mapper.realClass used by standard converters, DOCTYPE/XXE hardening in DomDriver/Dom4JDriver/JDom*/Stax drivers, StackOverflowError and collection-update DoS guards). The strongest issue found is the new RecordConverter, which resolves stream-supplied class names with Class.forName instead of the mapper chain and then hands those classes to context.convertAnother without any TypePermission check. That defeats the security framework for child elements and also forces class initialization (Class.forName one-arg) that DefaultMapper deliberately avoids. I submit this single candidate; other leads (CachingMapper cache not flushed on runtime permission changes, JavaClassConverter/JavaMethodConverter internal DefaultMapper, SubjectConverter Boolean.getBoolean, driver-specific XXE notes) are rejected for the reasons below."
+}

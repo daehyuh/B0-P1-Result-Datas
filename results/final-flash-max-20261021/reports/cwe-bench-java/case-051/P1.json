@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the request target of a link sent to the victim (e.g. `https://victim.example/app//evil.example/login`), i.e. the path portion that is stored verbatim in `SavedRequest.requestURI` (`web/.../SavedRequest.java:46`) and subsequently used as the redirect target. The query string is likewise attacker-controlled and is appended verbatim (`SavedRequest.java:61-66`).",
+      "confidence": "medium",
+      "counterevidence_checked": "`InvalidRequestFilter` (default global filter) does not block this input: its lists cover `;`, backslash, non-ASCII, `%2e`, `%2f` and unnormalized `.`/`..` segments, but not plain `//` (`InvalidRequestFilter.java:48-62,73-79,119-126`); Shiro's `normalize()` collapsing `//` only affects chain matching, not the value stored in `SavedRequest`. POST requests are excluded because `redirectToSavedRequest` only reuses GET saved requests (`WebUtils.java:687`). The session-ID-append variant is disabled by default (`DefaultWebSessionManager.java:61` sets `sessionIdUrlRewritingEnabled=false`, and `ShiroHttpServletResponse.java:140-141` then returns false from `isEncodeable`). Containers/front proxies that merge duplicate slashes, or that re-absolutize a `//` Location to the request host, would neutralize the redirect; this was not verified at runtime.",
+      "id": "case-051-cand-1",
+      "impact": "Post-authentication open redirect: the user has just entered credentials on the legitimate site and is then bounced to an attacker-chosen origin, enabling convincing phishing (fake 'session expired' login page), credential/OAuth-style token capture, and referrer leakage. If Shiro's native sessions with URL rewriting are explicitly enabled, `ShiroHttpServletResponse.encodeRedirectURL()`/`toEncoded()` can append `;JSESSIONID=<sessionId>` to the off-site URL, disclosing the authenticated session ID to the attacker's origin (secondary, non-default configuration).",
+      "locations": [
+        {
+          "end_line": 703,
+          "path": "web/src/main/java/org/apache/shiro/web/util/WebUtils.java",
+          "start_line": 682
+        },
+        {
+          "end_line": 47,
+          "path": "web/src/main/java/org/apache/shiro/web/util/SavedRequest.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 67,
+          "path": "web/src/main/java/org/apache/shiro/web/util/SavedRequest.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 204,
+          "path": "web/src/main/java/org/apache/shiro/web/util/RedirectView.java",
+          "start_line": 190
+        },
+        {
+          "end_line": 305,
+          "path": "web/src/main/java/org/apache/shiro/web/util/RedirectView.java",
+          "start_line": 295
+        },
+        {
+          "end_line": 201,
+          "path": "web/src/main/java/org/apache/shiro/web/filter/authc/FormAuthenticationFilter.java",
+          "start_line": 196
+        }
+      ],
+      "prerequisites": "1) Victim is not yet authenticated and follows the crafted link to a URL that matches a Shiro-protected chain so that the authc filter runs `saveRequestAndRedirectToLogin()` (`AccessControlFilter.java:190-193`, `FormAuthenticationFilter.java:148-171`). 2) The saved request method is GET (`WebUtils.java:687`). 3) The victim then logs in successfully via `FormAuthenticationFilter.onLoginSuccess()` -> `AuthenticationFilter.issueSuccessRedirect()` -> `redirectToSavedRequest()`. 4) The servlet container must preserve the raw path in `HttpServletRequest.getRequestURI()` (spec behaviour; Tomcat does not collapse duplicate slashes) and must not rewrite a protocol-relative `Location` into an absolute same-host URL.",
+      "root_cause": "The authc filters save the raw request URI into the session (`SavedRequest.requestURI = request.getRequestURI()`, undecoded and unvalidated) and later replay it as an absolute redirect target: `WebUtils.redirectToSavedRequest()` sets `contextRelative = false` and passes `savedRequest.getRequestUrl()` straight to `WebUtils.issueRedirect()` -> `RedirectView.renderMergedOutputModel()` -> `sendRedirect()` -> `response.sendRedirect()`. Nothing checks that the target is a same-site path (e.g. rejects a leading `//` or an embedded scheme), so a path such as `//evil.example/x` (which Shiro's own `normalize()` collapses to `/evil.example/x` only for chain *matching*, while `getRequestURI()` keeps the original value) is emitted as a protocol-relative `Location` header and resolved by the browser to the attacker's origin.",
+      "title": "Open redirect after login via unvalidated saved-request URL (`//host/...`) in WebUtils.redirectToSavedRequest",
+      "trace": "Crafted GET `/app//evil.example/x` -> container preserves `//evil.example/x` in `getRequestURI()`; Shiro chain resolution uses `WebUtils.getPathWithinApplication()` which collapses `//` (`WebUtils.java:201-208`) so the request still matches the configured/global chain and reaches the authc filter -> unauthenticated -> `saveRequest` stores `new SavedRequest(httpRequest)` with `requestURI=\"//evil.example/x\"` (`WebUtils.java:635-641`, `SavedRequest.java:43-47`) and redirects to the login URL -> victim authenticates -> `redirectToSavedRequest()` (`WebUtils.java:682-703`) sets `contextRelative=false` and calls `issueRedirect(request,response,\"//evil.example/x\",null,false)` (`WebUtils.java:541-544`) -> `RedirectView` prepends no context path for contextRelative=false (`RedirectView.java:194-201`) -> `sendRedirect()` (`RedirectView.java:295-300`) -> `response.sendRedirect(\"//evil.example/x\")`, i.e. `Location: //evil.example/x`, which browsers resolve to `https://evil.example/x`.",
+      "unverified": "No code, build, container or runtime execution was performed (and execution is disallowed in this review), so the exploitability depends on unverified container behaviour for `getRequestURI()`/`sendRedirect()` with a leading `//`. I could not confirm that this specific file region was the subject of the 1.12.0->1.13.0 security fix; the mapping to a published advisory is inferred from the affected version and the code shape, not verified against a patch.",
+      "weakness_type": "CWE-601 URL Redirection to Untrusted Site ('Open Redirect')"
+    }
+  ],
+  "coverage_summary": "Scope: 759 model-visible files, 3.3 MB, main sources only (no `src/test` files exist in the snapshot); binary files are refused/skipped by the tools. Relation index covers 705 files with 54 source files missing from the index and no data-flow/control-flow/semantic analysis, so index facts were used only for navigation and every cited location was verified by reading source text. I read in depth: web module - all authc/authz filters, `AccessControlFilter`, `PathMatchingFilter`, `AdviceFilter`, `OncePerRequestFilter`, `AbstractShiroFilter`, `InvalidRequestFilter`, `DefaultFilterChainManager`, `PathMatchingFilterChainResolver`, `WebUtils`, `SavedRequest`, `RedirectView`, `Cookie`/`SimpleCookie`, `ShiroHttpServletRequest/Response`, `ShiroHttpSession`, `DefaultWebSessionManager`, `CookieRememberMeManager`, `ShiroFilterConfiguration`, `IniFilterChainResolverFactory`, JSP tags; core - `AuthenticatingRealm`, `AuthorizingRealm`, `ModularRealmAuthorizer`, `ModularRealmAuthenticator`, credential matchers/hash services, `SimpleSecurityManager`/`DefaultSecurityManager`, `DefaultSubjectDAO`, `AbstractRememberMeManager`, session managers/DAO/ID generators, `WildcardPermission`, annotation handlers; crypto cipher and hash modules; `lang` (ClassUtils, ResourceUtils, codecs); config (`Ini`, `ReflectionBuilder`); support modules spring/spring-boot/cas/guice/jaxrs/quartz covered at method level; samples and integration tests spot-checked (controllers, shiro.ini). No build, tests, scanners or payloads were executed.",
+  "limitations": [
+    "No test sources are present in the snapshot, so behavior-named hints/tests available in the upstream repository could not be used to confirm intended semantics.",
+    "54 source files are absent from the relation index and several modules (LDAP realm/JndiLdapContextFactory, ActiveDirectoryRealm, TextConfigurationRealm/PropertiesRealm, hasher tool, ehcache/hazelcast/jcache cache managers, some samples) were only skimmed or spot-checked rather than fully read.",
+    "The P1 index provides only syntactic/navigation candidates (no data flow, reachability, or semantic resolution); it was not used as evidence of exploitability.",
+    "Runtime behaviour of servlet containers (raw `getRequestURI()` for `//`, `sendRedirect`/`Location` absolutization), of servlet/framework routing for encoded or duplicate slashes, and any actual CVE-to-file mapping were not and cannot be verified in this read-only review; the candidate is a lead, not a confirmed vulnerability.",
+    "No build, unit test, integration test, static-analysis or exploit execution was performed (and none is permitted in this run), so all impact statements remain static-analysis inferences."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal / filter-chain confusion in `WebUtils.getPathWithinApplication()` (`web/.../WebUtils.java:113-115,139-147,183-234`) and `PathMatchingFilterChainResolver.getChain()` (lines 97-135): the matching path is built from container-decoded servletPath+pathInfo with only textual `/./`/`/../` normalization, and can even be `null` (normalize returns null for a leading `/../`), which makes every chain pattern fail to match and lets the request fall through to the original chain with no Shiro filters applied.",
+      "reason": "Real weakness class but not a defensible finding from this snapshot alone: mainstream containers normalize/reject `..`, `%2e`/`%2f` inputs are blocked by the default global `InvalidRequestFilter`, and I could not construct a concrete container-independent traversal that makes Shiro match a weaker chain than the resource actually served."
+    },
+    {
+      "lead": "`DefaultWebSessionManager.getReferencedSessionId()` (`web/.../session/mgt/DefaultWebSessionManager.java:121-162`) accepts a session ID from a `;JSESSIONID=` path parameter or a `JSESSIONID` query parameter even when `sessionIdUrlRewritingEnabled` is false (default), which is the classic session-fixation shape.",
+      "reason": "Left unconfirmed: I could not verify that Shiro does not rotate/bind the session on login in a way that defeats the attack, and the behaviour is a documented (if questionable) compatibility feature rather than the specific 1.12.0->1.13.0 fix; treated as a separate lead to avoid splitting/duplicating the submitted candidate."
+    },
+    {
+      "lead": "`PrincipalTag` writes the principal value to the JSP output without HTML escaping (`web/.../tags/PrincipalTag.java:143-148`), a potential XSS sink if a principal contains attacker-influenced markup.",
+      "reason": "Sink only; depends on application-specific principal data and is the long-standing documented behaviour of Shiro's tags, with no attacker-controlled flow demonstrable inside this snapshot."
+    },
+    {
+      "lead": "Untrusted-input sinks surfaced by the relation index (ReflectionBuilder `${...}`/bean instantiation, `JndiTemplate`/`JndiObjectFactory` lookups, `ResourceUtils.loadFromUrl`, sample `shiro.ini` with `securityManager.rememberMeManager.cipherKey = kPH+bIxk5D2deZiIxcaaaA==`, `BootstrapDataPopulator` SQL/process hints).",
+      "reason": "All inputs are deployment/configuration-controlled (INI files, bean names, JNDI names, sample data), not attacker-controlled at runtime; no injection or trust-boundary crossing could be traced from a remote request."
+    }
+  ],
+  "summary": "Snapshot is Apache Shiro 1.12.0 main sources only (pom `shiro-root-1.12.0` tag; no test sources). I read the web filter-chain/path/cookie/session/redirect code, core authc/authz/credential/session/rememberMe code, crypto cipher+hash, config, lang, and the spring/spring-boot/cas/guice/jaxrs support modules; nothing indicates a synthetically injected backdoor. The strongest source-evidenced issue I can trace end to end is an unvalidated, request-derived redirect target in the authc \"saved request\" flow: the raw (undecoded) request path is captured in `SavedRequest`, then replayed as an *absolute* (`contextRelative=false`) redirect after login without any same-origin/`//`-prefix validation, yielding an open redirect (CWE-601). This matches the class of web-module issues in this exact version that were addressed in Shiro 1.13.0. Related path-handling and session-ID handling concerns are plausible but could not be pinned to a concrete, container-independent exploit from source and are listed as unconfirmed leads."
+}

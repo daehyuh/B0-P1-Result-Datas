@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Two parties are involved. (1) A user/operator who can create or modify labeled secrets in the namespace the plugin watches controls the credential ID (secret name), type, description and, importantly, the `jenkins.io/credentials-scope` label. (2) A Jenkins user who can configure an item (Job/Configure) or execute a pipeline but who is not intended to have access to a system-scoped credential can reference/consume that credential ID inside the item, which the plugin then resolves for them.",
+      "confidence": "low",
+      "counterevidence_checked": "The framework/UI listing path is protected: KubernetesCredentialsStore.hasPermission() only grants CredentialsProvider.VIEW and delegates to the Jenkins ACL (KubernetesCredentialsStore.java 38-42), and the store's getCredentials() additionally checks VIEW before returning anything (lines 46-51). The provider path itself restricts to ACL.SYSTEM only and returns an immutable empty list otherwise (lines 211, 226-233), so there is no anonymous/unauthenticated read path. Logging does not print secret values. docs/examples/README.md does not explicitly state that `system` scope is enforced by the provider. The credentials-plugin/core code that performs the actual item-level lookups and the reference scope-filtering behavior (including whether that filtering is done centrally or per provider) is not part of this snapshot, so the claim that scope filtering is this provider's responsibility rests on the interface contract rather than on source available here.",
+      "id": "KCP-01",
+      "impact": "Credential confidentiality / privilege boundary violation: a credential deliberately marked as system-scoped (i.e. intended not to be available to items) remains usable and exfiltratable by lower-privileged Jenkins users who can configure or run items, defeating the only protective control the plugin offers for that label. If the repo's own `ACL.SYSTEM` check were the sole intended gate, the scope label's 'system' value would be security-meaningless.",
+      "locations": [
+        {
+          "end_line": 227,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/kubernetes_credentials_provider/KubernetesCredentialProvider.java",
+          "start_line": 208
+        },
+        {
+          "end_line": 123,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/kubernetes_credentials_provider/SecretUtils.java",
+          "start_line": 106
+        },
+        {
+          "end_line": 51,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/kubernetes_credentials_provider/KubernetesCredentialsStore.java",
+          "start_line": 44
+        },
+        {
+          "end_line": 14,
+          "path": "docs/examples/README.md",
+          "start_line": 12
+        }
+      ],
+      "prerequisites": "Plugin active with a Kubernetes service account able to get/list/watch labeled secrets; at least one converted Secret carrying `jenkins.io/credentials-type` and `jenkins.io/credentials-scope: system`; a credential lookup performed on behalf of an item (non-null ItemGroup) with ACL.SYSTEM authentication, e.g. credentials binding / withCredentials or a build step resolving the credential id.",
+      "root_cause": "KubernetesCredentialProvider.getCredentials(Class<C>, ItemGroup, Authentication) (lines 208-227) returns all credentials stored in its map whenever `ACL.SYSTEM.equals(authentication)` is true; the `itemGroup` parameter is accepted but never used and the credential's CredentialsScope is never inspected. The plugin nevertheless implements scope: SecretUtils.getCredentialScope() (SecretUtils.java lines 106-123) parses the `jenkins.io/credentials-scope` label and every converter stamps that scope onto the produced credential (e.g. UsernamePasswordCredentialsConvertor.java line 56, StringCredentialConvertor.java line 54), and docs/examples/README.md line 13 documents `global`/`system` as the supported scopes. The `system` value therefore only has meaning if the provider excludes such credentials when credentials are requested for a non-null item group, which this implementation does not do.",
+      "title": "SYSTEM-scoped Kubernetes credentials are returned to item-level lookups because getCredentials ignores itemGroup and credential scope",
+      "trace": "Secret labeled type+scope=system -> SecretUtils.getCredentialScope() maps 'system' to CredentialsScope.SYSTEM (SecretUtils.java 112-123) -> converter constructs the credential with that scope (e.g. UsernamePasswordCredentialsConvertor.java 56) -> addSecret() stores it keyed by secret name (KubernetesCredentialProvider.java 239-244) -> getCredentials() iterates all stored credentials for any ACL.SYSTEM caller and never filters on itemGroup or getScope() (KubernetesCredentialProvider.java 211-224) -> item-level consumer receives the system-scoped credential and can bind/expose its plaintext through the job.",
+      "unverified": "Not lifecycle-verified: the plugin was not built or run, no Jenkins/credentials-plugin/fabric8 sources are in scope, and no runtime lookup was performed. The exact behavior of credentials-plugin 2.3.15 (`findCredentialById`/`lookupCredentials` passing ACL.SYSTEM plus the item group and any central scope filtering) could not be read in this snapshot; if that library filters SYSTEM-scoped credentials centrally, this candidate collapses to a defense-in-depth gap. The same applies to whether any consumer (credentials-binding) re-checks scope before binding.",
+      "weakness_type": "Improper authorization / scope restriction not enforced (CWE-863-style; system-scoped credential exposed to items)"
+    }
+  ],
+  "coverage_summary": "All 56 snapshot files were visible and inspected: 20 Java sources (provider, store, extension point, SecretUtils, exception, helper, and all 12 convertors) were read in full, plus pom.xml, README/docs/examples, CI workflows, and dev manifests. The P1 index reports complete coverage (56/56 indexed, 0 missing, 0 hash mismatches) but contains only 1 fact, 114 symbols and 319 syntactic edges, so every relation candidate used (getCredentials -> provider/store, converters -> SecretUtils, eventReceived/startWatchingForSecrets -> addSecret/convertSecret) was verified against source text; no build, test, scanner or exploit execution was performed.",
+  "limitations": [
+    "Only the plugin snapshot is in scope: Jenkins core, credentials/credentials-binding, fabric8 kubernetes-client, and the other credential plugins whose classes are referenced are unavailable, so their actual permission/scope-filtering and watch-callback semantics could not be verified. This is the main uncertainty behind the submitted candidate.",
+    "No tests exist in the snapshot (the repository's test sources are absent), so no behavior could be inferred or validated from test expectations.",
+    "No build, dependency resolution, bytecode, or runtime execution was performed (and was not permitted); all conclusions are static and unproven at runtime.",
+    "The P1 index is navigation-only (declarations/calls/containment) with no data-flow or reachability analysis, and it contains no test/configuration facts; index edges were treated as hints only.",
+    "Deployment-time assumptions (which namespaces/service accounts the plugin watches, and whether a second credential provider defines colliding IDs) are environment-specific and were not evaluated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Secrets controlled by Kubernetes users become Jenkins credentials under their own (attacker-chosen) IDs, including IDs matching Jenkins-managed credentials, potentially shadowing/hijacking credential references resolved across providers.",
+      "reason": "This is the documented purpose of the plugin (docs/README.md 23-47, docs/examples/README.md 9-20) and its stated operational model (unique service account and namespace advised). No source evidence in the snapshot establishes a resolution-order or precedence flaw, and the lookup order lives in the credentials plugin, which is out of scope; no concrete privilege gain over 'can define credentials' was demonstrable."
+    },
+    {
+      "lead": "Unchecked null dereferences in SecretUtils.getOptionalSecretData (line 215 uses s.getData() without a guard) and in KubernetesCredentialProvider.convertSecret (line 291 uses getLabels() without a guard) can throw NullPointerException that is not caught by convertSecret (it catches only CredentialsConvertionException), disrupting initialization/watch processing.",
+      "reason": "Every converter shipped in this snapshot calls SecretUtils.requireNonNull(secret.getData(), ...) before any getOptionalSecretData call (verified for all 12 convertors), so the NPE is not reachable through the plugin's own code paths; labels are guaranteed present for objects delivered by a label-filtered list/watch. Impact is limited to availability at most, and reachability depends on fabric8 watch/exception behavior that is not in scope."
+    },
+    {
+      "lead": "Unescaped label-selector system property interpolated into the AdministrativeError HTML message (KubernetesCredentialProvider.java 166-169), and secret annotation values (jenkins.io/credentials-description, keybinding mappings) flowing into credential metadata rendered by the credentials UI.",
+      "reason": "The label selector is JVM system-property input (administrator-controlled, not remotely attacker-controlled) and the monitor is admin-only, so this is a hardening/sanitization observation rather than a vulnerability. The description/value path is annotation-controlled by the same K8s user who defines the credential, and the rendering/escaping logic lives in the credentials plugin, which is out of scope; no in-snapshot evidence of an XSS sink was found."
+    },
+    {
+      "lead": "Dev manifests (docs/dev/secret-reader-role.yaml, jenkins-kube-creds.yaml) grant secret read access and run the container as root.",
+      "reason": "Developer-only testing assets explicitly documented as such (docs/dev/README.md 8-13, 46-64) and not part of the shipped plugin; no production trust boundary is crossed by the source, and the RoleBinding at least scopes the ClusterRole to the testing namespace."
+    }
+  ],
+  "summary": "Reviewed all 56 source files in the snapshot (20 Java main sources, pom.xml, docs, CI/config manifests) both by direct reading and by navigating the P1 relation index (56/56 files indexed, 114 symbols, 319 edges; index has no test/config facts and cannot prove reachability). The plugin is a Jenkins CredentialsProvider/CredentialsStore backed by Kubernetes Secrets: it lists/watches secrets labeled `jenkins.io/credentials-type*`, converts them to Jenkins credentials by ID (secret name), and returns them to callers.\n\nThe strongest single candidate is an authorization/scope-enforcement gap: `KubernetesCredentialProvider.getCredentials(Class, ItemGroup, Authentication)` returns every K8s-derived credential whenever `authentication` is `ACL.SYSTEM` and never consults the `itemGroup` argument or the credential's declared `CredentialsScope`, even though the plugin itself defines and parses a `jenkins.io/credentials-scope: system` label. Since item/job credential resolution is performed with `ACL.SYSTEM` and a non-null item group, credentials an operator marked `system` (intended to be unavailable to items) remain bindable/readable by anyone who can configure or run an item. All other leads I examined were either by-design trust-boundary consequences, dependent on code outside the snapshot, or unreachable through the plugin's own call paths; they are listed as rejected rather than as additional candidates."
+}

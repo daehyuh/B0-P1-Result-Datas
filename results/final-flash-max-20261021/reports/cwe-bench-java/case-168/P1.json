@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The email/CC values come from the plugin configuration form (AdvisorGlobalConfiguration.doConfigure → DescriptorImpl.configure, lines 264-284 / 498-526), which requires Jenkins.ADMINISTER, or from JCasC YAML (AdvisorRootConfigurator.instance, lines 56-118), which requires config-file write access. No anonymous/Overall-Read path to set these values was found in the snapshot, so the value is admin-controlled rather than broadly attacker-controlled.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the value is not reachable by low-privileged users: doConfigure is @RequirePOST + ADMINISTER (line 269) and DescriptorImpl.configure is only invoked from there; both doTestSendEmail endpoints (AdvisorGlobalConfiguration.java:476-481, Recipient.java:47-53) check ADMINISTER and are @POST, so they cannot be abused to submit an arbitrary value into the URL path (they only feed the fixed testEmailURI JSON body). doCheckEmail rejects blank and ';'/',' but never applies EMAIL_REGEX either. The CC list is URL-encoded in AdvisorClient.doUploadFile (lines 83-86), so only the recipient path segment is unencoded. EmailUtil.fixEmptyAndTrimAllSpaces strips spaces and nulls/blanks only (EmailUtil.java:16-22); it does not sanitize path/query characters. There is no other caller of isValidEmail and no additional format check anywhere in the snapshot.",
+      "id": "advisor-email-validation-bypass",
+      "impact": "A non-address value containing '/' , '..', '?', '#', '@' or ':' changes the path/query of the outbound advisor request: path segments can be added/removed (the advertised '/api/users/<user>/upload/<id>' shape can be rewritten) and query parameters can be injected (e.g., a forged 'cc=' parameter on the upload URL). The scheme and host stay fixed to the configured advisorURL, so this is not a general SSRF or host takeover, but it is an unvalidated, unencoded value being interpolated into a security-relevant outbound request and persisted configuration. Severity is bounded by the ADMINISTER prerequisite. (Safe description only; no exploitation steps are provided.)",
+      "locations": [
+        {
+          "end_line": 23,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/advisor/utils/EmailValidator.java",
+          "start_line": 13
+        },
+        {
+          "end_line": 400,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/advisor/AdvisorGlobalConfiguration.java",
+          "start_line": 368
+        },
+        {
+          "end_line": 97,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/advisor/client/AdvisorClient.java",
+          "start_line": 81
+        },
+        {
+          "end_line": 62,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/advisor/client/AdvisorClientConfig.java",
+          "start_line": 52
+        }
+      ],
+      "prerequisites": "Jenkins.ADMINISTER (or JCasC file-write) to store the value; a valid configuration (acceptToS true, non-blank email/CCs) so that BundleUpload does not skip the upload; plugin enabled; bundle generation succeeding.",
+      "root_cause": "EmailValidator declares EMAIL_REGEX and compiles it into PATTERN (EmailValidator.java:13-14) but isValidEmail() returns StringUtils.isNotBlank(...) only (lines 20-23), so the compiled pattern is never applied anywhere. AdvisorGlobalConfiguration.isValid(boolean, boolean, String, List) (lines 372-400) uses isValidEmail() as the sole format gate for the configured email and the CC list, and validateEmail() (form-validation helper, lines 25-35) likewise only rejects blank and ';'/','. Arbitrary non-blank strings are therefore accepted and persisted. The recipient address is then interpolated into the upload request path without URL-encoding in AdvisorClient.doUploadFile (line 88) and AdvisorClientConfig.apiUploadURI (lines 52-62), whereas the CC list is URL-encoded (AdvisorClient.java:83-86).",
+      "title": "Declared e-mail format validation (EMAIL_REGEX/PATTERN) is dead code, so arbitrary strings reach the advisor upload URL unencoded",
+      "trace": "Configured email → AdvisorGlobalConfiguration.isValid → EmailValidator.isValidEmail (format regex never applied) → persisted in AdvisorGlobalConfiguration.xml → BundleUpload.execute/executeInternal(config.getEmail(), bundle, version) (BundleUpload.java:75-78, 117-123) → new AdvisorClient(new Recipient(email)) → doUploadFile (AdvisorClient.java:81-99) → AdvisorClientConfig.apiUploadURI(username, instanceId, cc) builds 'advisorURL() + /api/users/<email>/upload/<instanceId>[?cc=...]' with the email unencoded → MultipartConnection → ProxyConfiguration.open(new URL(requestURL)) issues the request against the configured advisor host.",
+      "unverified": "No build, test, or runtime execution was performed (prohibited), so the end-to-end request is reconstructed from source only. I could not verify how the configured email is produced in real deployments, whether the advisor service penalizes the rewritten path/query, or whether any out-of-snapshot code (e.g., unlisted views, removed tests) adds a second validation layer. The legacy readResolve() path (AdvisorGlobalConfiguration.java:245-256) also converts the deprecated 'cc' string into Recipients via the same weak check, but it only reads the admin-controlled config XML.",
+      "weakness_type": "Improper input validation (CWE-20) leading to injection into an outbound request URL"
+    }
+  ],
+  "coverage_summary": "Source scope: 34 model-visible files, no sensitive-name/path or symlink exclusions, no binary skips. All 17 Java files were read in full (AdvisorGlobalConfiguration, BundleUpload, BundleUploadMonitor, Reminder, casc/AdvisorRootConfigurator, client/AdvisorClient, client/AdvisorClientConfig, client/MultipartConnection, client/HttpUrlConnectionFactory, client/PluginHelper, client/dto/UserInfo, client/model/{ClientResponse,ClientUploadRequest,Recipient}, utils/{EmailUtil,EmailValidator,FileHelper}), plus all 8 resource files, the pom, docs, and CI/ignore files. P1 relation scope: 34/34 files indexed, 0 omitted, 0 parse errors, 209 symbols / 586 calls / 371 syntactic edges, but the index supports only syntax-level navigation (no control-flow, data-flow, semantic resolution, or Spring runtime verification) and 407 calls are unresolved; every candidate above was verified against source text, and index hints were not treated as verdicts. Not present in the snapshot (and therefore not inspectable): src/main/resources Jelly views (index.jelly, validateOnLoad.jelly, monitor message.jelly), src/main/webapp assets, and src/test code. No build, test, scanner, or exploit execution was performed.",
+  "limitations": [
+    "View-layer files (.jelly) are absent from the snapshot, so all output-escaping questions (including the unescaped lastBundleResult/advisor-server-response lead) could not be resolved.",
+    "No tests are included, so intended behavior (e.g., whether isValidEmail was originally meant to apply EMAIL_REGEX) cannot be confirmed from test assertions.",
+    "The configuration email value is administratively controlled in every reachable path I found; the practical severity of the submitted candidate depends on deployment/configuration practices that source code alone cannot establish.",
+    "The submitted candidate is a lead, not a confirmed vulnerability: no runtime confirmation of URL manipulation, and the response behavior of the advisor service to a rewritten path/query is unknown.",
+    "P1 index limitations: syntax-based call/inheritance candidates only, no data-flow or reachability proof, 407 unresolved calls, and no semantic/DI resolution; entity interpretation of external APIs (support-core, Jenkins core, Stapler) rests on source reading, not the index."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Stored XSS via the unescaped Advisor-server response: BundleUpload.executeInternal stores response.getMessage() (from MultipartConnection.finish(), i.e. the remote HTTP response body) HTML-wrapped into lastBundleResult (BundleUpload.java:126-132, 139-142), which BundleUploadMonitor.getFailureMessage() exposes and BundleUploadMonitor/message.properties renders inside raw HTML (<strong>…</strong><p>{0}</p>).",
+      "reason": "The decisive step (whether the view emits lastBundleResult escaped via <j:out> or with escape=\"false\") cannot be verified: no .jelly view files exist in the assigned snapshot, and the Java code contains no escaping helper to compare against. It also requires a malicious/compromised advisor endpoint or a TLS-intercepting intermediary (advisorURL defaults to https://advisor.cloudbees.com). Too many unverified premises to select as the top candidate."
+    },
+    {
+      "lead": "DescriptorImpl.doCheckAcceptToS (AdvisorGlobalConfiguration.java:463-468) has neither a permission check nor @POST, unlike its sibling doCheckEmail/doTestSendEmail methods.",
+      "reason": "The method has no side effect and returns only two static strings; no attacker-controlled data or sensitive information is disclosed, so it is not an evidence-supported vulnerability."
+    },
+    {
+      "lead": "MultipartConnection and HttpUrlConnectionFactory enable instance follow-redirects (MultipartConnection.java:38, HttpUrlConnectionFactory.java:19), so a redirect could forward the support bundle to another host.",
+      "reason": "Redirect-following is the HttpURLConnection default and is not itself a deviation; exploitation needs a malicious/compromised advisor endpoint or DNS/proxy control, and redirect handling is not otherwise evidenced as unsafe in the snapshot."
+    },
+    {
+      "lead": "BundleUpload.cleanup() deletes *.zip files older than the recurrence period under a system-property-controlled directory (BundleUpload.java:35-37, 156-171).",
+      "reason": "The directory and period are set through JVM system properties (administrator/host access), no user-supplied path is involved, and the deletion is limited to the plugin's own temp bundle directory by default. Not an attacker-reachable issue."
+    },
+    {
+      "lead": "Reminder.doAct / BundleUploadMonitor.doAct lack an explicit permission check (Reminder.java:35-48, BundleUploadMonitor.java:38-47).",
+      "reason": "Both require POST and only perform redirects/forwardToPreviousPage with no state change or data exposure; no exploitable impact identified."
+    },
+    {
+      "lead": "AdvisorGlobalConfiguration.getInstance() returns getExtensionList(...).get(0) and several callers dereference it without a null check (e.g., BundleUploadMonitor.isActivated, Reminder.isActivated, BundleUpload.updateLastBundleResult).",
+      "reason": "This is a robustness/lifecycle concern (IndexOutOfBoundsException if the extension is not registered), not an attacker-controlled security issue."
+    }
+  ],
+  "summary": "Reviewed the complete model-visible snapshot of the CloudBees Jenkins Health Advisor plugin (34 files; 17 Java classes, 8 resources, build/CI/docs files). No .jelly views, tests, or webapp assets are included in the scope, so view-layer rendering and runtime behavior could not be checked. The HTTP surface is generally well hardened in this snapshot: doConfigure is @RequirePOST + Jenkins.ADMINISTER, both doTestSendEmail endpoints are @POST + ADMINISTER, the support-contour component list is filtered through an explicit ALLOWED_COMPONENTS allowlist, and the CC list is URL-encoded. The single strongest in-scope defect I can source-verify is that e-mail validation is declared but never applied: EmailValidator compiles EMAIL_REGEX into PATTERN, yet isValidEmail() only checks \"not blank\", and that is the only format gate used by AdvisorGlobalConfiguration.isValid(). The accepted value is then persisted and, for the recipient address, interpolated without URL-encoding into the outbound upload request path (AdvisorClient → AdvisorClientConfig.apiUploadURI(\"/api/users/%s/upload/%s\")), unlike the CC list which is encoded. Configuration is ADMINISTER-gated, so the prerequisite limits severity; a possible stored-XSS path via the unescaped remote advisor response is noted as a rejected, unverifiable lead because the rendering views are outside the snapshot. No runtime/test confirmation was performed (prohibited)."
+}

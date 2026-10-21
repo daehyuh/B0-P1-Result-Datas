@@ -1,0 +1,72 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Untrusted Groovy source compiled with SandboxTransformer (the library's stated purpose: 'Executes untrusted Groovy script safely'). The attacker chooses the receiver expression of a method-pointer/lambda expression, e.g. `\"cmd\".execute().&toString` or `new File(\"/etc/passwd\").&text`, so the nested call is attacker-authored and evaluates at pointer-creation time.",
+      "confidence": "low",
+      "counterevidence_checked": "Checked that most other branches do re-transform children (CastExpression line 599; transformArguments lines 290-303; transformObjectExpression; AttributeExpression/PropertyExpression read paths), which shows the intended invariant and makes this branch an outlier rather than deliberate. Checked that the framework default path (super.transform(exp) -> exp.transformExpression(this)) is the only thing that would transform children of an unmatched node, and it is not reached for matched MethodPointerExpression. Checked that if children were pre-transformed bottom-up by the framework, the explicit transform(...) calls used elsewhere in the same class would double-wrap already-generated Checker.checked* calls and break the library, indicating traversal is top-down and omitted children truly remain raw. Checked SandboxedMethodClosure.doCall overloads: they check invocation of the pointer, so the residual issue is specifically pointer-creation-time evaluation. Not verified: behavior under Groovy 2.4.7 by compilation/execution.",
+      "id": "case-052-c1",
+      "impact": "Sandbox policy bypass / sandbox escape: operations the host's interceptor intends to forbid (process execution, file access, reflection, etc.) are performed unchecked, contradicting the library's guarantee that every such operation is routed through Checker for interception; later invocation checks do not undo the side effect.",
+      "locations": [
+        {
+          "end_line": 400,
+          "path": "src/main/java/org/kohsuke/groovy/sandbox/SandboxTransformer.java",
+          "start_line": 394
+        },
+        {
+          "end_line": 318,
+          "path": "src/main/java/org/kohsuke/groovy/sandbox/SandboxTransformer.java",
+          "start_line": 311
+        },
+        {
+          "end_line": 392,
+          "path": "src/main/java/org/kohsuke/groovy/sandbox/SandboxTransformer.java",
+          "start_line": 347
+        }
+      ],
+      "prerequisites": "Host compiles the script with SandboxTransformer and registers a GroovyInterceptor (e.g. whitelist/deny-all value filter) intended to mediate every external interaction; the attacker's nested operation in the receiver position is denied by that interceptor if it were intercepted.",
+      "root_cause": "In SandboxTransformer.VisitorImpl.innerTransform (src/main/java/org/kohsuke/groovy/sandbox/SandboxTransformer.java:394-400), a MethodPointerExpression is rewritten to `new SandboxedMethodClosure(mpe.getExpression(), mpe.getMethodName())` using the original, untransformed child expressions. Unlike the other branches (e.g. CastExpression line 599, PropertyExpression lines 429/432, AttributeExpression 419/422, constructor/static-call arguments via transformArguments lines 290-304), the receiver sub-expression is never run through transform(). Because VisitorImpl.transform() returns the replacement node as soon as innerTransform matches (lines 311-318) and never lets the framework's default `super.transform(exp)`/exp.transformExpression(this) path process this node's children, any method call, property read, or constructor call embedded in the receiver expression is emitted into the transformed class as a plain call with no Checker.checked* wrapper. (The same omission pattern also exists for the dynamic method-name expression `arg1 = call.getMethod()` at line 360; treated here as the same root cause, not a second candidate.)",
+      "title": "Method-pointer receiver expression is copied into the rewritten AST without transform(), leaving nested calls un-instrumented (sandbox interception bypass)",
+      "trace": "Script text -> parser produces MethodPointerExpression(expression = MethodCallExpression(`\"cmd\".execute()`), methodName = `toString`) -> SandboxTransformer.call() -> VisitorImpl.transform(exp) -> innerTransform matches the `exp instanceof MethodPointerExpression` branch (line 394) -> replacement ConstructorCallExpression contains the raw receiver child -> transform() returns immediately (lines 311-318), so neither the raw child nor the replacement is visited again -> codegen emits a direct `String.execute()` call with no Checker.checkedCall wrapper -> GroovyInterceptor.onMethodCall is never consulted for that call -> command/file/reflection side effect happens inside the host JVM. Invoking the resulting SandboxedMethodClosure later is checked (SandboxedMethodClosure.doCall -> Checker.checkedCall), but that is too late: the un-instrumented receiver call has already executed.",
+      "unverified": "No code was executed and no Groovy compiler/interceptor run was performed; Groovy 2.4.7 traversal semantics (ClassCodeExpressionTransformer/Expression.transformExpression) were reasoned from this repository's source structure, since the Groovy framework sources are outside the snapshot. It is not confirmed that a real script such as `\"cmd\".execute().&toString` compiles to the AST shape assumed, nor whether upstream later wrapped this child in transform() (external comparison was out of scope), so this remains a lead, not a confirmed vulnerability.",
+      "weakness_type": "CWE-693 Protection Mechanism Failure / sandbox escape via incomplete AST instrumentation"
+    }
+  ],
+  "coverage_summary": "Snapshot contains 22 files (all main sources plus pom/README/site docs); there is no src/test tree, so no tests could corroborate expected behavior. I read every main source file in full (SandboxTransformer, ScopeTrackingClassCodeExpressionTransformer, Checker, GroovyInterceptor, GroovyValueFilter, ClosureSupport, InvokerChain family, Ops, Super, SandboxedMethodClosure, StackVariableSet) and the build/site files. P1 relation scope reports 22/22 files indexed, 194 symbols, 744 call rows, 419 edges, no file hash mismatches, and explicitly no SAST/oracle findings or runtime reachability analysis; the only navigation fact was pom.xml as a configuration file. No builds, tests, scans, or code execution were performed, and no external/upstream diff, CVE, or patch data was consulted.",
+  "limitations": [
+    "No execution or compilation was possible: all conclusions are static, and the Groovy 2.4.x AST traversal semantics (ClassCodeExpressionTransformer.transform / Expression.transformExpression) are outside the snapshot and were inferred from how this code must behave to avoid double-wrapping its own Checker.checked* output.",
+    "The snapshot has no tests and no upstream history/patches, so intended-versus-injected changes could not be diffed; the candidate may correspond to a long-standing upstream limitation rather than the case's specific defect.",
+    "The P1 index is navigational only (no data flow, reachability, or taint proof), and it exposed no security findings to corroborate or refute the candidate.",
+    "Scope-tracking, exception/control-flow, and Closure delegation paths were reviewed by reading only; no dynamic confirmation of exact runtime dispatch (e.g. which doCall overload Groovy 2.4.7 selects) was obtained."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Variable-scope over-approximation in ScopeTrackingClassCodeExpressionTransformer (visitIfElse/visitBlockStatement share one StackVariableSet per construct, lines 68-123): a name declared in one branch can be treated as a local variable while visiting another branch.",
+      "reason": "I could not demonstrate an unchecked evaluation: method calls and property reads/writes on such a name are still wrapped in Checker.checked* with the actual runtime receiver value, so interceptors still see the operation; only bare identifier reads would skip a property-get check, which was not shown to reach a forbidden value. Upstream-looking design, no concrete bypass."
+    },
+    {
+      "lead": "FieldExpression left-hand sides of assignments are not intercepted (SandboxTransformer.java:512-516).",
+      "reason": "Documented in-code limitation; the expression only concerns fields of the class being transformed (script/this-local state), and no source evidence showed attacker-reachable cross-object field access through it."
+    },
+    {
+      "lead": "Checker.checkedComparison bypasses interceptors when lhs is null (Checker.java:514-518).",
+      "reason": "The shortcut only performs static ScriptBytecodeAdapter dispatch on a null operand; no user-controlled method is invoked at that point, and the comment states the rationale. No concrete interceptor bypass demonstrated."
+    },
+    {
+      "lead": "checkedCast deliberately ignores return values and invokes every interface method with default arguments (Checker.java:539-606).",
+      "reason": "These invocations are deliberately routed through the interceptor chain (onMethodCall/onStaticCall/onNewInstance), so interception still occurs; no missing check found in the source."
+    },
+    {
+      "lead": "Incomplete interception of Closure built-in properties and Closure delegation (ClosureSupport/Checker.java:246-293, BUILTIN_PROPERTIES list including thisObject/metaClass).",
+      "reason": "BUILTIN_PROPERTIES only skips delegation of the access to owner/delegate; the access is still delivered to onGetProperty with the closure receiver, and sandboxing of Closure methods is explicitly the interceptor's responsibility. No attacker-controlled bypass was established from the source alone."
+    },
+    {
+      "lead": "SandboxedMethodClosure single-argument invocation bypass (historically caused by missing doCall(Object) override).",
+      "reason": "The snapshot already overrides doCall(Object[]) , doCall() and doCall(Object) (all routed to Checker.checkedCall), so the classic single-arg bypass appears covered; any residual concern is about the pointer receiver evaluation, which is the submitted candidate."
+    },
+    {
+      "lead": "Untransformed dynamic method-name expression (`arg1 = call.getMethod()`, SandboxTransformer.java:360).",
+      "reason": "Same root-cause pattern as the submitted candidate (a child copied into a replacement node without transform()); not listed as a separate candidate per the one-candidate rule."
+    }
+  ],
+  "summary": "Reviewed the full 22-file snapshot of groovy-sandbox 1.20-SNAPSHOT (compile-time Groovy sandbox: SandboxTransformer rewrites untrusted script AST so every external interaction routes through Checker/GroovyInterceptor). All main sources were read; no tests are present in the snapshot. The strongest source-evidence lead is an instrumentation gap in VisitorImpl.innerTransform: the MethodPointerExpression branch builds the replacement SandboxedMethodClosure node from the raw receiver expression without recursively calling transform(), so nested calls inside a method-pointer receiver are emitted un-wrapped and never reach any registered interceptor. One candidate is submitted; several other observed weaknesses were considered but rejected as unconfirmed or by-design."
+}

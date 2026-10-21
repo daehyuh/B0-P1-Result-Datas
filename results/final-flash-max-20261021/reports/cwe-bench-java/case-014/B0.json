@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A malicious ZIP archive fully controls each central-directory entry name (bytes read in HeaderReader.readZipInfo lines 306-331, decoded as UTF-8 or a caller-specified charset). The name can contain \"../\" segments or platform separators. The attacker does not need any other input from the victim application; the API call ZipFile.extractAll(destPath) / extractFile(fileHeader, destPath) is the normal documented usage.",
+      "confidence": "high",
+      "counterevidence_checked": "Searched the whole source tree for getCanonicalPath, normalize, and \"..\" handling and for any is-valid-file-name/startswith containment check: none exist in extraction paths. Zip4jUtil.checkOutputFolder only checks the destination directory exists and is writable; Zip4jUtil.isStringNotNullAndNotEmpty only tests null/empty. HeaderReader has a single path-related normalization at lines 326-328 that strips a leading drive-letter prefix after \":\" + File.separator, which does not block relative traversal (and can even remove a legitimately unsafe prefix). No tests or callers performing pre-validation were present in the snapshot (no src/test tree).",
+      "id": "zip4j-132-zipslip",
+      "impact": "Arbitrary file write/overwrite outside the chosen extraction directory, with the privileges of the extracting process. Depending on deployment this can overwrite configuration files, scripts, cron entries, SSH authorized_keys or application resources, enabling code execution or data destruction; it can also create directories anywhere writable and follow existing symlinks when opening the output stream. Because the target file is deleted first if it exists, existing content is destroyed.",
+      "locations": [
+        {
+          "end_line": 331,
+          "path": "src/main/java/net/lingala/zip4j/core/HeaderReader.java",
+          "start_line": 306
+        },
+        {
+          "end_line": 490,
+          "path": "src/main/java/net/lingala/zip4j/core/ZipFile.java",
+          "start_line": 463
+        },
+        {
+          "end_line": 173,
+          "path": "src/main/java/net/lingala/zip4j/unzip/Unzip.java",
+          "start_line": 123
+        },
+        {
+          "end_line": 207,
+          "path": "src/main/java/net/lingala/zip4j/unzip/Unzip.java",
+          "start_line": 180
+        },
+        {
+          "end_line": 447,
+          "path": "src/main/java/net/lingala/zip4j/unzip/UnzipEngine.java",
+          "start_line": 416
+        }
+      ],
+      "prerequisites": "An application uses zip4j 1.3.2 to extract an archive from an untrusted source (download, upload, attachment, shared storage) with extractAll/extractFile. The process must have write permission to the path targeted by the traversing entry; impact scales with process privileges. On Windows both '/' and '\\' entry separators are relevant; entry names are limited to the central-directory name-length field (manageable for traversal).",
+      "root_cause": "The extraction code trusts the ZIP central-directory file name (FileHeader.getFileName()) as a relative path fragment and builds the output path by plain string concatenation: `outPath + fileName` in Unzip.checkOutputDirectoryStructure / directory handling, and `outPath + System.getProperty(\"file.separator\") + fileName` in UnzipEngine.getOutputFileNameWithPath. The resulting File is used for mkdirs, delete and FileOutputStream without comparing it to a canonical destination root, so entry names containing \"../\" (or separators/absolute fragments) escape the destination directory. The only input filtering found, HeaderReader's stripping of a \"<letter>:\" drive prefix, does not address relative traversal.",
+      "title": "Path traversal (Zip Slip) when extracting archive entries: entry names are concatenated to the destination path without validation",
+      "trace": "HeaderReader.readZipInfo → FileHeader.setFileName(decoded central-directory name) (HeaderReader.java 306-331) → ZipFile.extractAll(destPath) (ZipFile.java 463-490; checkOutputFolder only verifies the destination itself exists/is writable) → Unzip.extractAll → Unzip.initExtractFile (Unzip.java 45-173). For a regular file: checkOutputDirectoryStructure computes compOutPath = outPath + fileName and calls parentDirFile.mkdirs() (Unzip.java 196-203); UnzipEngine.getOutputStream builds getOutputFileNameWithPath = outPath + separator + fileName (UnzipEngine.java 439-447), deletes an existing target (lines 428-430) and opens FileOutputStream (line 432). For a directory entry, outPath + fileName is passed to file.mkdirs() directly (Unzip.java 145-149). UnzipEngine.unzipFile later re-derives the same unsanitized path for UnzipUtil.applyFileAttributes (UnzipEngine.java 93), so attributes are applied to the traversed path as well.",
+      "unverified": "Not runtime-confirmed (no code execution permitted). Exact exploitability details on Windows (backslash handling, reserved names) and the set of paths the process can reach were not verified. The decompiled snapshot may differ cosmetically from the original 1.3.2 jar, though the vulnerable code paths above are coherent and consistent.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Reviewed the full 58-file Java snapshot listing (source scope reports 58 model-visible files, 0 excluded). Deep-read the extraction path end to end: HeaderReader central-directory parsing, ZipFile extractAll/extractFile entry points, Unzip, UnzipEngine, UnzipUtil, and the relevant Zip4jUtil helpers; searched repo-wide for canonicalization, normalization, \\\"..\\\", isValid*, startsWith, mkdir(s), and FileOutputStream usages to enumerate all entry-name-driven filesystem writes. Also skimmed crypto (StandardDecrypter, ZipCryptoEngine, AES/PBKDF2), IO streams, models, and ZipEngine/ArchiveMaintainer write paths to check for other attacker-controlled filesystem writes.",
+  "limitations": [
+    "Source-only review; no compilation, tests, or runtime confirmation were allowed.",
+    "The snapshot is decompiled from zip4j 1.3.2 and contains no tests or build metadata beyond pom.xml, so behavior of downstream callers cannot be checked.",
+    "Crypto and zip-writing paths were reviewed at a skim level only; they are not the basis of the submitted candidate.",
+    "No internet/CVE/ground-truth lookups were used; the README's mention of a path traversal was treated as untrusted repository text and independently verified against the code."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Decompression bomb / unbounded output during extraction (UnzipEngine copies input stream to output with no uncompressed-size cap).",
+      "reason": "Plausible DoS, but it is not a trust-boundary path violation and impact is weaker than the traversal; the archive format intentionally carries sizes and many extractors behave this way. Not selected."
+    },
+    {
+      "lead": "Predictable temporary file name in ArchiveMaintainer: tmpZipFileName = zipModel.getZipFile() + currentTimeMillis()%1000, created without exclusive/open-no-follow semantics.",
+      "reason": "Requires a local attacker racing a specific maintenance operation; no remote attacker control and no clear source-level guard omission beyond temp-file hygiene. Rejected as weaker."
+    },
+    {
+      "lead": "Legacy ZipCrypto password verification checks only part of the encryption header (StandardDecrypter.init, lines 63-95), and the CRC check at header parse is effectively disabled.",
+      "reason": "Inherent weakness of the legacy ZipCrypto format and a robustness/error-detection issue, not an attacker-controlled write or disclosure in this library's API. Not selected."
+    },
+    {
+      "lead": "HeaderReader allocates byte arrays from archive-declared lengths (e.g., file name, extra data) without explicit caps.",
+      "reason": "Fields are bounded by short/zip64 structures; at most a memory-exhaustion DoS, no source evidence of allocation controlled at arbitrary scale. Rejected."
+    },
+    {
+      "lead": "ZipFile.extractFile(..., newFileName) allows the caller to supply the output file name.",
+      "reason": "newFileName is supplied by the trusted application, not the archive; it shares the same missing-containment weakness but is not attacker-controlled. Same root cause, not a separate candidate."
+    }
+  ],
+  "summary": "The assigned snapshot is decompiled zip4j 1.3.2 (58 Java source files, no test tree). The extraction pipeline takes the ZIP entry file name directly from the archive's central directory and concatenates it onto the caller-supplied destination path with no canonicalization or containment check, then creates directories and writes/overwrites the file at that path. This is a classic archive path traversal (\"Zip Slip\") and is the strongest evidence-backed finding in this repository. All entry-name-to-filesystem write paths share this single root cause, so it is submitted as one candidate. Other leads (decompression bombs, predictable temp files, legacy ZipCrypto verification weakness) were considered but rejected as weaker or out of scope."
+}

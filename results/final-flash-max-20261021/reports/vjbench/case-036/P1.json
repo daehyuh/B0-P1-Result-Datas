@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "For HTTP/1: arbitrary request bytes reaching an HttpRequestDecoder/HttpServerCodec with default validateHeaders=true. The attacker chooses every byte of the header line. For HTTP/2: HPACK-encoded header names/values in HEADERS frames are decoded by HpackDecoder and added to DefaultHttp2Headers, whose name validator checks only for uppercase letters; the value converter performs no validation at all.",
+      "confidence": "medium",
+      "counterevidence_checked": "The decode path is not unvalidated: NUL, HT, LF, VT, FF, CR, SP, ',', ':', ';', '=', and non-ASCII are rejected (DefaultHttpHeaders 368-415), and header values are checked by a CRLF state machine (462-512); trailer names are restricted (DefaultLastHttpContent 117-134); HttpMethod rejects control/whitespace characters (HttpMethod.java 122-130); the HTTP/2-to-HTTP/1 translator deliberately removes Transfer-Encoding/Trailer (HttpConversionUtil 416-417); Http2StreamFrameToHttpObjectCodec defaults validateHeaders=true (lines 69-77); other decoders checked (Snappy/Bzip2/zlib limits, DNS loop guard) already contain their hardening. So the finding depends on the residual non-token characters and on a mismatched peer, not on a total absence of validation. I could not prove a concrete smuggling PoC with a named peer from source alone.",
+      "id": "netty-header-name-validation-gap",
+      "impact": "HTTP request smuggling / header injection when Netty is used as an HTTP front end, back end, or HTTP/2-to-HTTP/1 gateway: a request whose header name is parsed one way by Netty and another way by an adjacent parser can be split, prefixed, or re-routed, potentially bypassing access control, cache keying, or authentication enforced by the other component. HTTP/2 additionally allows control/CR-LF-bearing pseudo-header values to reach HTTP/1 request-line encoding. Impact is conditional on a parser differential in the deployment, hence request smuggling rather than a standalone crash.",
+      "locations": [
+        {
+          "end_line": 415,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/DefaultHttpHeaders.java",
+          "start_line": 368
+        },
+        {
+          "end_line": 73,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/DefaultHttpHeaders.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 869,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 819
+        },
+        {
+          "end_line": 656,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 622
+        },
+        {
+          "end_line": 73,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2Headers.java",
+          "start_line": 34
+        },
+        {
+          "end_line": 571,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java",
+          "start_line": 542
+        }
+      ],
+      "prerequisites": "A Netty HTTP/1 or HTTP/2 decoder is exposed to untrusted input (typical server/proxy). For the smuggling impact there must be a second HTTP parser in the path that delimits header names differently (front-end proxy / back-end server / h2-to-h1 gateway such as Http2StreamFrameToHttpObjectCodec + HttpConversionUtil). Names using only the residual allowed set (e.g. control chars 0x01-0x08/0x0E-0x1F/0x7F, or separators such as '/', '@', '(' and ')') are required; the explicitly blocked chars cannot be used. If the application also sets validateHeaders=false, even the partial blacklist is skipped.",
+      "root_cause": "Header-name validation is a partial blacklist instead of the RFC 7230 token grammar. DefaultHttpHeaders.validateHeaderNameElement (both the byte and char overloads) rejects only 0x00, HT, LF, VT, FF, CR, SP, ',', ':', ';', '=' and values >127/non-ASCII. All other C0 control characters (0x01-0x08, 0x0E-0x1F), DEL (0x7F) and the RFC separator characters (\" ( ) / < > ? @ [ \\ ] { }) are accepted. DefaultHttp2Headers.HTTP2_NAME_VALIDATOR even weaker: it only rejects uppercase ASCII letters, so an HTTP/2 peer can place arbitrary bytes (including control characters) in a header name that Netty stores and later copies during HTTP/2-to-HTTP/1 translation.",
+      "title": "HTTP/1 and HTTP/2 header names are not validated as RFC 7230 tokens, allowing malformed names to pass through decode/convert paths (request smuggling / header injection)",
+      "trace": "HTTP/1: socket bytes -> HttpObjectDecoder.HeaderParser.process (lines 928-971) appends every byte except LF (a CR is dropped only immediately before LF) -> readHeaders (622-656) -> splitHeader (819-869) takes every byte before the first ':' as the header name with no token check -> headers.add(name, value) (641/655) -> DefaultHeaders.add (294-301) -> DefaultHttpHeaders.HttpNameValidator (54-73) -> validateHeaderNameElement (368-415), which accepts control characters and separators that RFC 7230 forbids in a token. The malformed header name is stored and can be re-emitted verbatim when Netty re-encodes/forwards the message, so a peer that terminates or normalizes the name at such a byte will disagree with Netty about header/request boundaries. HTTP/2: HpackDecoder.Http2HeadersSink.appendToHeaderList (542-571) validates only pseudo-header ordering; headers.add -> DefaultHttp2Headers.HTTP2_NAME_VALIDATOR (34-73) only rejects uppercase, so control characters survive; HttpConversionUtil's translator (632-701) copies names into HTTP/1 headers, and pseudo-header values (:path and CONNECT :authority, HttpConversionUtil.toHttpRequest lines 327-343) are written into the HTTP/1 request line by HttpRequestEncoder.encodeInitialLine (line 68) without any CR/LF validation.",
+      "unverified": "No runtime confirmation and no end-to-end PoC with a second HTTP implementation; the exact set of characters a given front-end/back-end treats as name delimiters was not verified. The mapping to a specific CVE/advisory cannot be checked offline (no web access), and the snapshot's version string (4.1.71.Final-SNAPSHOT) is the only dating signal used to favor this vulnerability class.",
+      "weakness_type": "CWE-444 HTTP request smuggling / CWE-93 CRLF (header-name) injection / improper input validation"
+    }
+  ],
+  "coverage_summary": "Coverage: the source scope exposes 2115 files (1971 Java files, all parsed by the relation index; 2 files omitted from the index). I inspected in source text the HTTP/1 codec (HttpObjectDecoder, DefaultHttpHeaders, DefaultHttp2Headers, HttpObjectEncoder/HttpRequestEncoder, HttpUtil, DefaultLastHttpContent), HTTP/2 (HpackDecoder, HttpConversionUtil, Http2StreamFrameToHttpObjectCodec), TLS/SNI (SniHandler, AbstractSniHandler, SslClientHelloHandler), HAProxy (HAProxyMessageDecoder, HAProxyMessage), compression decoders (Snappy, SnappyFrameDecoder, Bzip2Decoder, zlib maxAllocation) and DNS name decoding, plus targeted searches for header validation, content-length handling, temp-file creation, process execution and CVE markers. P1 index used for navigation only; its capabilities state control-flow/data-flow/semantic resolution are not implemented and Spring enforcement is unverified, so index labels were not treated as verdicts. Areas not fully reviewed: buffer/transport internals, native transports (epoll/kqueue C sources are outside Java parsing), resolver-dns internals, SSL/OpenSSL engines, MQTT/STOMP/Redis/SOCKS/Memcache codecs, XML codec, and the majority of example/testsuite code; the snapshot contains no test sources, so behavior could not be checked against tests.",
+  "limitations": [
+    "No code was executed and no tests were run; all conclusions are static source reading only, and the candidate is a lead, not a confirmed vulnerability.",
+    "The source tree is a large real-world project containing several real unfixed issues; the one-candidate cap forced selection, so additional real defects may exist outside the chosen candidate.",
+    "The relation index has no control/data flow or semantic resolution (declared in get_relation_scope), so cross-component data-flow claims were verified manually only along the traced paths.",
+    "Exact upstream fix diffs, CVE identifiers and advisory text could not be consulted (no network), so the release-window-based prioritization of the candidate is an inference, not verified ground truth.",
+    "Impact for the selected candidate relies on a parser differential with a second HTTP implementation that was not inspected or demonstrated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SslClientHelloHandler.decode allocates ctx.alloc().buffer(handshakeLength) from the attacker-controlled 24-bit TLS handshake length (handler/src/main/java/io/netty/handler/ssl/SslClientHelloHandler.java lines 117-136), allowing up to ~16 MB per unauthenticated connection before any handshake completes (memory-exhaustion DoS, the issue later fixed with maxClientHelloLength).",
+      "reason": "Real and source-verified, but not selected: the strongest impact requires many concurrent connections plus fragmented ClientHello handling, and the version window suggests this snapshot predates the case's relevant fix; kept as an unconfirmed alternate lead."
+    },
+    {
+      "lead": "HAProxyMessage.readNextTLV recurses into nested PP2_TYPE_SSL TLVs without a depth limit and reads length-prefixed slices without a readableBytes check (codec-haproxy/src/main/java/io/netty/handler/codec/haproxy/HAProxyMessage.java lines 260-303), allowing StackOverflowError/IndexOutOfBoundsException DoS from a crafted HAProxy v2 header.",
+      "reason": "Plausible and source-visible, but exploitation depends on HAProxyMessageDecoder being installed and on stack size versus achievable nesting depth; not verified at runtime, and it does not align with the snapshot's release window."
+    },
+    {
+      "lead": "HttpConversionUtil converts attacker-controlled HTTP/2 :path / CONNECT :authority values into the HTTP/1 request line without CR/LF validation (HttpConversionUtil.java lines 271-343; HttpRequestEncoder.encodeInitialLine line 68 writes the URI verbatim), a possible request-line injection path.",
+      "reason": "Kept as an unconfirmed lead rather than a second candidate: the injection requires an application that forwards the converted request over HTTP/1 to another server, which could not be demonstrated from the snapshot alone; it may also be the subject of a different later fix."
+    },
+    {
+      "lead": "SelfSignedCertificate writes key/certificate via Files.createTempFile (PlatformDependent.createTempFile, common/.../PlatformDependent.java lines 1430-1444; SelfSignedCertificate.java lines 333-372).",
+      "reason": "Rejected: on Java 7+ the code path uses java.nio.file.Files.createTempFile, which creates owner-only files on POSIX; the class is documented as test-only, so no clear exploitable information disclosure was established here."
+    }
+  ],
+  "summary": "Reviewed the Netty 4.1.71.Final-SNAPSHOT server-side sources (2115 files; 1971 Java files parsed by the relation index). I focused on the attacker-facing codecs and trust boundaries: HTTP/1 (HttpObjectDecoder, DefaultHttpHeaders, HttpObjectEncoder), HTTP/2 (HpackDecoder, DefaultHttp2Headers, HttpConversionUtil, Http2StreamFrameToHttpObjectCodec), TLS/SNI (SslClientHelloHandler), HAProxy (HAProxyMessageDecoder/HAProxyMessage) and compression decoders. The single strongest case-aligned candidate is the incomplete HTTP header-name validation in DefaultHttpHeaders/DefaultHttp2Headers: names that are not valid RFC 7230 tokens (most C0 control characters, DEL, and the RFC 2616/7230 separator set) are accepted by the decode path and can be re-emitted or converted, giving a header-name parsing differential across a proxy/gateway boundary (request smuggling / header injection). This matches the vulnerability class fixed in the 4.1.71 release window that the snapshot's version string points to. Other real but non-selected issues are listed as rejected leads."
+}

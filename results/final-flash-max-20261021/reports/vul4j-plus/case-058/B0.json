@@ -1,0 +1,64 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `value` query parameter of the descriptor form-validation endpoint (e.g. .../descriptorByName/hudson.scm.browsers.Sventon/checkUrl?value=<URL>) is used unmodified as the target URL; the attacker chooses host, port, path and scheme. No crumb/POST is required for this read-style validation.",
+      "confidence": "low",
+      "counterevidence_checked": "(1) A permission check IS present, so this is not an unauthenticated SSRF; the project==null branch requires full ADMINISTER. (2) Item.EXTENDED_READ may be the deliberate upstream permission choice for this legacy browser validator, and no upstream history/patches are available in this run to confirm that the check was weakened. (3) The validator response is an OK/error FormValidation, not a full response body, so information disclosure is limited (content-match and error-class oracle). (4) The sibling FishEyeSVN validator does enforce ADMINISTER before connecting, which is the main internal inconsistency supporting this lead.",
+      "id": "case-058-cand-1",
+      "impact": "Server-side request forgery from the Jenkins controller: internal network/host/port probing and interaction with services reachable only from the controller, with a boolean content oracle (response body match for \"sventon\"/\"sventon 1\") and differentiated connection-error messages. Depending on the URL schemes accepted by the JVM, this can also probe local resources. Impact is amplified when Jenkins is reachable by lower-privileged users through a matrix-authorization setup where Extended Read is granted without Configure.",
+      "locations": [
+        {
+          "end_line": 128,
+          "path": "src/main/java/hudson/scm/browsers/Sventon.java",
+          "start_line": 100
+        },
+        {
+          "end_line": 149,
+          "path": "src/main/java/hudson/scm/browsers/Sventon2.java",
+          "start_line": 121
+        }
+      ],
+      "prerequisites": "Attacker is authenticated (or anonymous if granted the item permissions) and either has Jenkins.ADMINISTER with no item context, or has Item/EXTENDED_READ on any item so that a non-null `project` ancestor is present. The Jenkins controller must be able to reach the attacker-chosen target (which is the point of the attack).",
+      "root_cause": "Sventon.DescriptorImpl.doCheckUrl and Sventon2.DescriptorImpl.doCheckUrl are Stapler form-validation methods that take the fully attacker-controlled `value` query parameter, append a slash, construct `new URL(v)` and fetch it from the Jenkins controller (URLCheck.open / findText). The only gate is `project == null && !ADMINISTER || project != null && !project.hasPermission(Item.EXTENDED_READ)`. Unlike FishEyeSVN.DescriptorImpl.doCheckUrl (which requires Jenkins.ADMINISTER before connecting, lines 141-143), and unlike this plugin's other connection-making validators (SubversionSCM.ModuleLocation.DescriptorImpl.doCheckCredentialsId and SubversionSCMSource/ListSubversionTagsParameterDefinition use @RequirePOST plus CredentialsProvider.USE_ITEM), these two validators allow a user holding only Job/Extended Read on any item to make the Jenkins process issue outbound requests. There is also no URL scheme/format restriction in Sventon (unlike FishEyeSVN's URL_PATTERN check), so any scheme the JVM URL/URLConnection stack supports is accepted.",
+      "title": "Sventon/Sventon2 URL validation performs controller-side requests to arbitrary URLs for users with only Item/ExtendedRead (SSRF)",
+      "trace": "Sventon/Sventon2 DescriptorImpl.doCheckUrl(value) -> permission check (EXTENDED_READ) -> URLCheck.check() -> `new URL(v)` and `open(...)`/`findText(..., \"sventon\"/\"sventon 1\")` in Sventon.java:116-118 and Sventon2.java:137-139 -> outbound HTTP(S)/other-protocol request executed as the Jenkins controller process; connection failures are rendered back through URLCheck.handleIOException(v, e).",
+      "unverified": "Not runtime-confirmed. Upstream intended permission level for these two methods could not be verified from the snapshot or from any patch/history (out of scope for this run). Actual prerequisite permissions depend on the deployment's authorization strategy; the reachability of file:/other URL schemes depends on the Jenkins-core URLCheck.open implementation, which is not part of this snapshot.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery (insufficient authorization for a network operation; missing URL validation)"
+    }
+  ],
+  "coverage_summary": "All 53 Java sources in the assigned tree were read (hudson/scm root, hudson/scm/browsers, hudson/scm/subversion, hudson/scm/listtagsparameter, jenkins/scm/impl/subversion), plus pom.xml, README and representative resource bundles. Focus areas: credential lookup/use and permission checks on all doCheck*/doFill*/doSubmit/doNotifyCommit Stapler endpoints; checkout/update workspace path handling and deletion; changelog XML production (DirAwareSVNXMLLogHandler/SubversionChangeLogBuilder) and parsing (SubversionChangeLogParser/Digester); post-commit hook handling; workflow SCMSource revision/path handling; credential persistence/migration; remoting callables and role checks. The snapshot contains no test sources and no Jelly/view files, so UI rendering paths (potential XSS in changelog/tag views) could not be reviewed. No code was executed and no external services were contacted.",
+  "limitations": [
+    "The assigned tree appears to omit all .jelly view files (only .java, .properties, .html resources and pom.xml are present), so server-side HTML rendering/escaping in UI views could not be checked; any XSS in the changelog, tag form, or credential form UI would be invisible in this run.",
+    "No tests, no git history, no patches and no upstream version to diff against are available; the review relies on internal consistency of the snapshot, so a deliberately reverted hardening change cannot be distinguished from long-standing upstream behavior with certainty.",
+    "Endpoints and permission semantics (e.g. the effective holders of Item.EXTENDED_READ, or whether Item.CONFIGURE was the intended gate) could not be verified against Jenkins core or documentation, which is out of scope for this run.",
+    "Not runtime-confirmed: no builds, scans, or exploit payloads were executed; the candidate is a source-evidence lead only.",
+    "Dependency versions in pom.xml (svnkit 1.8.14, mapdb-api 1.0.1.0, credentials 2.1.15) were not evaluated for known CVEs, as external vulnerability data is out of scope."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Workspace path traversal via parameter/env expansion of the module 'local' directory (SubversionSCM.ModuleLocation.getExpandedLocation(EnvVars) expands build-parameter values into localDir; CheckoutUpdater.perform uses `new File(ws, location.getLocalDir())` for Util.deleteContentsRecursive and as the checkout target; UpdateWithCleanUpdater deletes unversioned files under the same unvalidated path).",
+      "reason": "The plugin's only guard is the UI-level ModuleLocation.DescriptorImpl.doCheckLocal check (rejects values starting with '/', '\\', '..' or a Windows drive), which is not applied at use time and does not cover embedded '../' or ${PARAM}-expanded values. However, exploiting requires a job whose SVN module local directory actually references a build parameter controlled by a user with only Item/Build permission, and the deletion path only occurs with the checkout-style updaters; the same pattern appears in long-standing upstream code. Left unconfirmed rather than submitted as a second candidate."
+    },
+    {
+      "lead": "Unauthenticated post-commit endpoint SubversionRepositoryStatus.doNotifyCommit (and SubversionSCMSource.ListenerImpl.onNotify) accepts arbitrary payloads and, with a known repository UUID, can trigger SCM polling/builds with an attacker-supplied revision.",
+      "reason": "The source comment explicitly documents the lack of protection as intentional ('Because this URL is not guarded ... we intentionally don't protect this URL to simplify post-commit script set up'), requirePOST() is enforced, and matching requires knowledge of the repository UUID. Cannot be treated as an injected/unknown vulnerability on this evidence."
+    },
+    {
+      "lead": "SubversionSCM.DescriptorImpl.doPostCredential lacks @RequirePOST (it has a crumb check inside UserProvidedCredential.fromForm and requires Item.CONFIGURE) and connects the controller to a user-supplied repository URL to test credentials.",
+      "reason": "Crumb validation plus the Item.CONFIGURE check are present; no state is persisted by the operation and no evidence of a permission or CSRF bypass was found. At most a hardening gap."
+    },
+    {
+      "lead": "SVNRepositoryView uses the repository-server-provided UUID directly in a cache file name (JENKINS_HOME/caches/svn-<uuid>.db).",
+      "reason": "The 'svn-' prefix plus Java File/OS path resolution prevents escaping the caches directory in practice, and the value is server-controlled rather than user-controlled; no concrete arbitrary-write path was established."
+    },
+    {
+      "lead": "SshPublicKeyCredential generates its on-disk key-file id with java.util.Random (SubversionSCM.java:1898-1902) rather than a CSPRNG.",
+      "reason": "The predictable filename only matters with existing file-read access to JENKINS_HOME/subversion-credentials (mode 600 set via chmod); no attacker-controlled path was demonstrated, and the pattern appears to be long-standing code."
+    },
+    {
+      "lead": "CredentialsSVNAuthenticationProviderImpl.acceptServerAuthentication always returns ACCEPTED_TEMPORARY, potentially accepting unknown server certificates.",
+      "reason": "No attacker-controlled server parameter was tied to a concrete exploit path in this snapshot, and SVNKit trust handling for https is delegated to the default trust manager; treated as a hardening concern, not an evidence-backed candidate."
+    }
+  ],
+  "summary": "Reviewed the Jenkins Subversion plugin snapshot (pom version 2.10.3-SNAPSHOT; 313 visible files, 53 Java sources; no Jelly views or tests present in the assigned tree). I traced credential handling, form-validation endpoints, checkout/update workspace path handling, changelog XML generation/parsing, post-commit hook handling, and the workflow SCM source. One candidate lead is submitted: the Sventon/Sventon2 repository-browser URL validators perform controller-side HTTP requests to a fully attacker-supplied URL while being gated only by Item.EXTENDED_READ (or ADMINISTER when no item context), which is weaker than the equivalent FishEyeSVN validator and the plugin's other connection-making validators. Several other plausible-but-unconfirmed weaknesses (parameter-expanded local workspace paths, the intentionally unauthenticated post-commit endpoint, arbitrary-URL credential testing in doPostCredential, server-provided UUID used in a cache filename) are recorded as rejected leads rather than additional candidates."
+}

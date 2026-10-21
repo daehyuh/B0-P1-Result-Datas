@@ -1,0 +1,77 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Indirect: the content and configuration of the directory in which JUnit runs (its `.git` directory and `.git/config`, e.g. `remote.origin.url`, `core.fsmonitor`) plus the executable resolved for the literal command `git` on PATH. Anyone who can influence the checkout/extraction directory or PATH of the test JVM (shared build hosts, downloaded/extracted repositories, wrapper scripts) influences what is executed and what is captured into the report.",
+      "confidence": "low",
+      "counterevidence_checked": "Confirmed the git arguments are hardcoded string literals, so there is no attacker-controlled argument or shell interpolation (not classic command injection); confirmed the listener is only active when the opt-in property is set; confirmed the JVM in which the listener runs normally already executes the project's own test code, which weakens the code-execution angle to environments where the `.git`/working-directory state is attacker-influenced but the test code is not; confirmed no redaction/escaping is applied to the origin URL or status output before serialization; noted that Git versions with dubious-ownership protection may refuse operations in repositories owned by another user, which further narrows exploitability.",
+      "id": "case-139-candidate-1",
+      "impact": "(1) Local code-execution surface: `git status --porcelain` is executed inside the working directory and therefore processes repository-local configuration; Git features such as `core.fsmonitor` cause Git to spawn a configured helper program, so JUnit can end up executing code chosen by whoever controls that repository state. (2) Information disclosure: the repository's origin URL (frequently `https://user:TOKEN@host/...` in CI), HEAD commit, branch and the full dirty-file listing are written unredacted into a report file that is typically uploaded as a CI artifact or published with test reports, exposing credentials/repository details to anyone who can read the artifact. (3) Robustness/DoS: `exec` reads stdout to EOF before stderr, so a child that blocks on stderr (large output) hangs the reader past the intended 10-second `waitFor` timeout, and process-start failures are rethrown as UncheckedIOException from a listener callback.",
+      "locations": [
+        {
+          "end_line": 235,
+          "path": "junit-platform-reporting/src/main/java/org/junit/platform/reporting/open/xml/OpenTestReportGeneratingListener.java",
+          "start_line": 175
+        },
+        {
+          "end_line": 143,
+          "path": "junit-platform-reporting/src/main/java/org/junit/platform/reporting/open/xml/OpenTestReportGeneratingListener.java",
+          "start_line": 139
+        },
+        {
+          "end_line": 30,
+          "path": "junit-platform-reporting/src/module/org.junit.platform.reporting/module-info.java",
+          "start_line": 29
+        }
+      ],
+      "prerequisites": "Open Test Reporting is enabled (`junit.platform.reporting.open.xml.enabled=true`) so that the ServiceLoader-registered listener activates (isEnabled(), lines 151-153); the JVM working directory contains a Git repository or an attacker-influenced `.git`; `git` is resolvable via PATH (otherwise startProcess throws UncheckedIOException, which is not caught).",
+      "root_cause": "OpenTestReportGeneratingListener.addGitInfo() runs `git` (hardcoded subcommands) through ProcessBuilder without an absolute executable path, with the child working directory set to the JVM's current directory (workingDir = Paths.get(\".\").toAbsolutePath()). Repository metadata obtained this way is inserted into the Open Test Reporting XML document without sanitization or redaction: `git config --get remote.origin.url` -> repository.withOriginUrl(gitUrl), plus branch, HEAD commit and the full `git status --porcelain` output; the document is written to <outputDir>/open-test-report.xml, which CI/build tooling archives and publishes.",
+      "title": "Open Test Reporting listener executes git in the JVM working directory and copies repository metadata (origin URL, status) into report artifacts",
+      "trace": "testPlanExecutionStarted -> isEnabled(config) -> reportInfrastructure() -> addGitInfo() -> exec(\"git\", ...) -> startProcess(args) -> new ProcessBuilder().directory(workingDir.toFile()).command(command).start() -> output captured via buffered readers -> Optional<String> returned -> repository().withOriginUrl(gitUrl) / branch() / commit() / status() appended to the report -> fileEntry/XML document written under outputDir (open-test-report.xml).",
+      "unverified": "Could not verify at runtime whether a Git installation actually executes a configured `core.fsmonitor` helper for `git status` under all supported Git versions/ownership checks, whether upstream JUnit considers this behavior intended, or whether a later JUnit version added an opt-out/removal (no upstream history, tests, or release notes are present in the snapshot; no execution allowed).",
+      "weakness_type": "CWE-426 Untrusted Search Path / CWE-73 External Control of File Name or Path (with CWE-200 Exposure of Sensitive Information)"
+    }
+  ],
+  "coverage_summary": "P1 relation scope: sqlite index of 1,047 files / 860 parsed Java files / 8,052 symbols / 15,677 call sites / 20,623 edges; 3 source files missing from the index, 9,384 unresolved calls, syntax-only relations (no control flow, no data flow, no semantic resolution, Spring/DI/enforcement unverified, build/tests not run). Reading covered the launcher core and listeners (LauncherDiscoveryRequestBuilder, LauncherConfigurationParameters, HierarchicalOutputDirectoryProvider, OutputDir, UniqueIdTrackingListener, TestIdentifier), reporting (LegacyXmlReportGeneratingListener, XmlReportWriter, XmlReportData, OpenTestReportGeneratingListener), the console options/tasks, platform-commons utilities (ReflectionUtils, Preconditions, StringUtils, ClassLoaderUtils, ClassNamePatternFilterUtils, ClasspathScanner/CloseablePath, ResourceUtils, PackageUtils, LruCache), platform-engine discovery/UniqueId/UniqueIdFormat/configuration/descriptors, Jupiter engine TempDirectory and configuration converters, Jupiter params providers (CsvFileArgumentsProvider), Jupiter api conditions/Assertions surface, JFR listener, and the Gradle plugin / GitHub workflow files. Text searches covered process execution, deserialization, XML parsing, zip handling, random/temp-file handling, symlink/normalize/canonical-path handling, security-manager usage, and system property/environment access.",
+  "limitations": [
+    "Tests and AsciiDoc documentation (release notes/user guide) are absent from the snapshot, so upstream fix history, security notes and regression tests could not be inspected; no diff against upstream was possible.",
+    "No code was executed and no build/tests/scanners were run; all conclusions are static-source based and were not runtime-confirmed.",
+    "The P1 index is syntactic only: no data/control flow, no semantic resolution, 9,384 unresolved calls, 3 files missing from the index; index 'security_call' facts are name-based hints and were not treated as findings.",
+    "Git behavior assumptions (core.fsmonitor execution on `git status`, dubious-ownership protections, credential-bearing remote URLs in practice) could not be validated in this environment.",
+    "Only main/tooling sources were in scope; generated code, shaded artifacts and platform-tooling-support fixtures were skimmed rather than exhaustively reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HierarchicalOutputDirectoryProvider (junit-platform-launcher) sanitizes unique-ID segments with `[^a-z0-9.,_\\-() ]` but allows `.` and `..`, so `Paths.get(\"..\")` survives and Files.createDirectories(root.resolve(\"..\")) could create directories outside the configured output root.",
+      "reason": "Verified all first-party engines (Jupiter dynamic tests/containers/template invocations/class templates, vintage, suite) generate segment values like names and `#<index>`, not `..`; a value of `..` requires a malicious TestEngine, which is arbitrary code already. Real but not reachable from a plausible attacker-controlled input."
+    },
+    {
+      "lead": "UniqueIdTrackingListener.createOutputFile / OutputDir.createFile build a path from configuration (`junit.platform.listeners.uid.tracking.output.dir`, output-file prefix) and FileName from a configurable prefix via path.resolve, plus a non-atomic exists/delete/create sequence.",
+      "reason": "Inputs are operator-supplied configuration parameters, not attacker-controlled data; no traversal primitive from an untrusted source was identified. Hardening opportunity rather than a demonstrated vulnerability."
+    },
+    {
+      "lead": "LegacyXmlReportGeneratingListener writes `TEST-` + root-segment value + `.xml` under the reports directory, taking the file name from an engine-controlled unique-ID segment.",
+      "reason": "Root segment values come from TestEngine.getId()/root descriptor code, i.e. already-trusted code, and the file name is limited to the engine ID; no attacker-controlled path element identified."
+    },
+    {
+      "lead": "XmlReportWriter.writeSystemProperties() copies every JVM system property name/value into the generated legacy XML report.",
+      "reason": "This is the documented de-facto Ant JUnit XML format behavior and by design, not an injected defect; flagged only as an information-exposure consideration (secrets passed as -D properties into the test JVM would appear in report artifacts)."
+    },
+    {
+      "lead": "GitHub Actions release.yml interpolates workflow_dispatch inputs (`releaseVersion`, `deploymentId`) into `run:` steps and an env URL (java src/Updater.java ${{ inputs.releaseVersion }}, java src/StagingRepoInjector.java ${{ env.STAGING_REPO_URL }}).",
+      "reason": "Shell metacharacters in these inputs would be interpreted by bash, but workflow_dispatch can only be triggered by users with write access to the repository, so no untrusted actor controls the values."
+    },
+    {
+      "lead": "StandardStreamsHandler redirects System.out/System.err to `--redirect-stdout`/`--redirect-stderr` paths, and ConsoleTestExecutor creates those files.",
+      "reason": "Paths are chosen by the local operator running the console launcher; same-user file writes are intended behavior, no trust boundary crossed."
+    },
+    {
+      "lead": "TestIdentifier.readObject deserializes UniqueId/displayName/source/tags fields and parses UniqueId strings.",
+      "reason": "readObject uses readFields with fixed fields and only parses UniqueId text; no defaultReadObject on attacker graphs and no gadget chain identified. Not a viable deserialization finding from source alone."
+    },
+    {
+      "lead": "TempDirectory cleanup (junit-jupiter-engine) deletes directories and resets permissions; guard `isLinkWithTargetOutsideTempDir` uses toRealPath().startsWith(rootRealPath).",
+      "reason": "The snapshot already contains the symlink/junction guard, SKIP_SUBTREE handling and warning path; no bypass was identified from source text (a TOCTOU window between check and delete would require concurrent local filesystem access and is speculative)."
+    }
+  ],
+  "summary": "Snapshot reviewed: JUnit 5.13.2-SNAPSHOT (platform 1.13.2-SNAPSHOT) main sources only - 1,050 model-visible files / 860 indexed Java files (platform launcher, engine, commons, console, reporting; Jupiter api/engine/params; vintage; suite; testkit; jfr; migrationsupport), plus Gradle plugins, GitHub workflows and docs assets. No test sources and no AsciiDoc release notes/user guide are in the snapshot, so fix/regression history could not be inspected. Strongest source-visible issue: the Open Test Reporting listener spawns `git` (resolved via PATH, run with the JVM working directory as child CWD) whenever reporting is enabled, and copies repository metadata (remote origin URL, branch, commit, full `git status --porcelain` output) verbatim into `open-test-report.xml`. That is an untrusted-search-path / untrusted-repository interaction (CWE-426/CWE-73) combined with unredacted information capture (CWE-200): `git status` honors repo-local configuration such as `core.fsmonitor`, and `remote.origin.url` often embeds credentials in CI clones, which then land in archived report artifacts. Arguments are hardcoded (not classic command injection) and the listener is opt-in."
+}

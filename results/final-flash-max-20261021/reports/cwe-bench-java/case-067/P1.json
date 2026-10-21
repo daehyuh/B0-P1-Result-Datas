@@ -1,0 +1,77 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Full control of the value of the HTTP request cookie named JSPWikiUID (LOGIN_COOKIE_NAME, line 69). Cookie values may contain '.' and '/' characters; a crafted Cookie header is sufficient, and an unauthenticated GET to Logout.jsp triggers processing of the value.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that the deletion path is not gated by allowsCookieAuthentication() (AuthenticationManager lines 507-510) and that only setLoginCookie (lines 240-286) uses a server-generated UUID; no sanity check, regex, canonicalization or directory-prefix verification exists anywhere between cookie receipt and File.delete(). Confirmed Logout.jsp is part of the shipped webapp and that the default web.xml leaves the container security constraints commented out (lines 286-357), so the page is reachable anonymously. Checked for mitigating escaping/validation in HttpUtil.retrieveCookieValue (only quote trimming, lines 70-89). Counter-arguments retained: File.delete() silently returns false without filesystem permission, so exploitation depends on the target file being deletable by the servlet user and on knowledge of a path relative to <workDir>/logincookies; absolute cookie values on Unix are resolved under the parent path rather than replacing it, so traversal must use '..' components. I could not run the application or tests (none are present in the snapshot), so the primitive is source-evidenced, not runtime-confirmed.",
+      "id": "case-067-candidate-1",
+      "impact": "Remote, unauthenticated arbitrary file deletion within the privileges of the servlet-container user: destruction of wiki page data, attachments, user/group databases (XMLUserDatabase/XMLGroupDatabase/groupdatabase.xml/userdatabase.xml), work-dir state (reference caches, login cookies) or other server files the process can write, causing data loss and denial of service, and tampering with application configuration/state. Secondary impact when cookie authentication is enabled: the traversed file's content is read and used as the session's login principal (file-content disclosure via the displayed user name and potential login-name spoofing if a readable file's contents match a user's login name).",
+      "locations": [
+        {
+          "end_line": 228,
+          "path": "jspwiki-main/src/main/java/org/apache/wiki/auth/login/CookieAuthenticationLoginModule.java",
+          "start_line": 223
+        },
+        {
+          "end_line": 215,
+          "path": "jspwiki-main/src/main/java/org/apache/wiki/auth/login/CookieAuthenticationLoginModule.java",
+          "start_line": 205
+        },
+        {
+          "end_line": 312,
+          "path": "jspwiki-main/src/main/java/org/apache/wiki/auth/login/CookieAuthenticationLoginModule.java",
+          "start_line": 295
+        },
+        {
+          "end_line": 35,
+          "path": "jspwiki-war/src/main/webapp/Logout.jsp",
+          "start_line": 23
+        }
+      ],
+      "prerequisites": "Network access to the wiki web application; ability to send a crafted Cookie header (no account/session needed); a target file that exists and that the servlet-container user can unlink (POSIX requires write permission on its parent directory), addressed by a path relative to the configured work directory plus 'logincookies'. Default work-dir layout (e.g. /tmp/jspwiki or the container temp dir) and default page/attachment/config/log locations are publicly documented, so traversal targets are largely guessable. No configuration toggle is needed for the deletion path: Logout.jsp -> clearLoginCookie -> getCookieFile -> delete() executes regardless of jspwiki.cookieAuthentication. The additional read path (login(), lines 118-140) is only exercised when an admin has enabled cookie authentication.",
+      "root_cause": "CookieAuthenticationLoginModule never validates the JSPWikiUID cookie value before using it as a filesystem path. getLoginCookie() (lines 223-228) returns the raw cookie (HttpUtil.retrieveCookieValue performs no format check), getCookieFile() (lines 175-215) resolves it with new File(cookieDir, uid) (line 213), and clearLoginCookie() (lines 295-312) calls cf.delete() (line 309). java.io.File does not normalize '..' components, and the JSP container does not reject '/' or '.' in cookie values, so uid='../../<path>' escapes the <workDir>/logincookies directory. Logout.jsp invokes clearLoginCookie() on every request (line 31) with no authentication or authorization check, and the call is not gated by AuthenticationManager.allowsCookieAuthentication() (the jspwiki.cookieAuthentication property, default false).",
+      "title": "Path traversal via unvalidated JSPWikiUID cookie leads to unauthenticated arbitrary file deletion (and file read used as login name)",
+      "trace": "1) Unauthenticated request: GET /Logout.jsp with header 'Cookie: JSPWikiUID=../../../../<target>'. 2) Logout.jsp lines 24-31: wiki.getAuthenticationManager().logout(request) (only invalidates session state, no cookie validation) then CookieAuthenticationLoginModule.clearLoginCookie(wiki, request, response). 3) clearLoginCookie line 301: uid = getLoginCookie(request) -> HttpUtil.retrieveCookieValue returns the raw JSPWikiUID value with no format validation (CookieAuthenticationLoginModule lines 223-228). 4) clearLoginCookie line 305: getCookieFile(engine, uid) -> line 213 new File(cookieDir, uid); File(File,String) does not canonicalize '..' sequences, so the abstract path <workDir>/logincookies/../../../../<target> escapes the intended directory; the only checks (lines 184-194) concern the logincookies directory itself. 5) clearLoginCookie line 309: cf.delete() unlinks the attacker-chosen file if the servlet user has permission. Related read path: login() lines 113-133 checks cookieFile.canRead(), reads the file contents (line 125) and installs them as a WikiPrincipal with LOGIN_NAME (line 133) when cookie authentication is enabled.",
+      "unverified": "No dynamic verification was possible: the snapshot contains no test sources, no container was started, and no exploit was executed (per review rules). The exact default work-dir path and servlet-user permissions depend on deployment; the login-name spoofing variant additionally depends on cookie authentication being enabled and on locating a readable file whose contents match a real login name. Whether Apache JSPWiki ever published a CVE/fix commit for this exact class (which would make it the dataset's ground truth) could not be checked without external data.",
+      "weakness_type": "CWE-22 Path Traversal (arbitrary file delete; secondary arbitrary file read)"
+    }
+  ],
+  "coverage_summary": "Scope: 1,155 model-visible source files (jspwiki-main, jspwiki-util, jspwiki-markdown, jspwiki-war JSP/templates/JS, it-tests, portable/pom/config files). I read and traced the main security-relevant components: AttachmentServlet/AttachmentManager/attachment providers, AuthenticationManager/AuthorizationManager/DefaultAclManager/SecurityVerifier/UserManager, all login modules, JDBC/XML user and group databases, WikiEngine/WikiContext/WikiSession/WikiServlet/CommandResolver/EditorManager/Installer/TemplateManager/Installer, the URL constructors, SpamFilter and the filters, the JSPWiki markup/link parser and renderers, several plugins (InsertPage, Weblog, RecentChanges, Search, PageView), the ajax dispatcher, ReferenceManager and the file providers, plus the default/210 JSP templates and WAR deployment descriptors. The relation index was used only for navigation; every indexed edge/label relied on was re-verified in source text. This is a broad sample, not exhaustive coverage of all 1,155 files (e.g. many localized resource pages, JavaScript libraries, image/asset and wikipages resources were only skimmed).",
+  "limitations": [
+    "The relation index is partial and Java-only: 1,018 of 1,155 files are indexed (137 omitted), 401 Java files are parsed, symbols/calls are name/arity-based candidates with no control-flow, data-flow, semantic resolution or reachability analysis; JSP, properties, XML and script files are not indexed, so JSP sink triage was done by manual reading.",
+    "No build, tests, scanners or dynamic checks were executed, and no exploit payload was run: all findings are source-evidence based and could not be runtime-confirmed. The snapshot contains no test sources, so intended security tests could not be consulted.",
+    "Default configuration assumptions (work-dir location, servlet-user filesystem permissions, commented-out container security constraints, `jspwiki.cookieAuthentication=false` by default) come from the shipped properties/web.xml files and document comments; a redeployed or hardened installation may differ, and files such as WEB-INF/jspwiki.policy are absent from the snapshot so the default permission grant matrix could not be verified from source.",
+    "Whether a given real-world CVE/fix commit maps to any specific candidate could not be verified (no external data, patches or ground truth consulted), so candidate selection is an evidence-and-impact judgment, not a confirmed identification."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected XSS via the raw 'page' request parameter in the default (haddock) template: templates/default/Header.jsp lines 56-64 output ${fn:replace(param.page,...)} inside <wiki:Link> whose body is written verbatim (LinkTag.doEndTag lines 453-459), and PageTab.jsp line 49 outputs value=\"${param.page}\" inside an HTML attribute.",
+      "reason": "Real-looking and unauthenticated, but every manifestation is in JSP files (no Java root cause, and the P1 relation index does not parse JSPs), so I judged the Java-cookie traversal to be the stronger single candidate; kept as an unconfirmed lead rather than a second candidate."
+    },
+    {
+      "lead": "Stored XSS via page/attachment change notes: templates/default/InfoContent.jsp lines 206-207 and 373-374 use <c:set var=\"changenote\" .../> followed by raw ${changenote}; templates/default/AttachmentTab.jsp lines 154-155 and the 210-template equivalents print the attribute with <%= ... %>; Edit.jsp line 73 stores the raw request 'changenote'.",
+      "reason": "Plausible stored XSS, but it needs an attacker with edit/upload permission and the JSP sink is a template pattern used in several places; not selected as the single candidate."
+    },
+    {
+      "lead": "Reflected XSS via the 'renameto' parameter in templates/default/InfoContent.jsp line 126 and templates/210/InfoContent.jsp line 146 (raw <%= parm_renameto %> in an input value, request.getParameter without escaping).",
+      "reason": "Clear sink but rendered only for users holding the 'rename' permission, so lower reachability than the page-parameter reflection; retained as an unconfirmed lead."
+    },
+    {
+      "lead": "Stored XSS via attachment file names: PageNameTag (Java) prints ((Attachment)page).getFileName() unescaped (lines 43-52), and AttachmentTab.jsp/InfoContent.jsp interpolate ${att.fileName} raw; AttachmentManager.validateFileName blocks .jsp/.jspf and strips [/\\\\] but not '<'/'>'.",
+      "reason": "Requires upload permission and a victim opening the attachment page; plausible but not verified end-to-end, so not selected."
+    },
+    {
+      "lead": "Workflow fact values rendered with escapeXml=\"false\": templates/default/WorkflowContent.jsp line 104 and templates/210/WorkflowContent.jsp line 118 output fact.value raw, while the comment states the value can contain a page-content dump/diff.",
+      "reason": "Stored-XSS shape but conditional on the approval workflow being configured and on an approver viewing the workflow page; unverified, kept as a lead."
+    },
+    {
+      "lead": "Open redirect via the attachment 'nextpage' parameter: AttachmentServlet.validateNextPage (lines 434-449) only rejects values containing '://' that do not start with the base URL, so a protocol-relative value such as '//attacker.tld' passes and is used in res.sendRedirect (lines 304, 418, 426).",
+      "reason": "Lower impact (redirect after an authenticated upload) and depends on permission; noted as a lead only."
+    },
+    {
+      "lead": "WikiServlet 'do' parameter forwarded to a RequestDispatcher: WikiServlet.doGet lines 96-100 builds '/'+jspPage where jspPage derives from the 'do' request parameter through ShortURLConstructor.getForwardPage (line 223) with no allow-list.",
+      "reason": "Only reachable when the short-URL constructor is configured; no direct arbitrary-file/JSP inclusion could be confirmed against servlet container path normalization rules, so it remains unverified."
+    }
+  ],
+  "summary": "Reviewed the Apache JSPWiki 2.11.0.M3 snapshot (1,155 visible files; 1,018 indexed with 137 omitted; no test sources present). I traced attacker-controlled input through validation, trust boundaries, and dangerous sinks in the attachment, authentication/authorization, URL/command, provider, plugin and template layers.\n\nStrongest source-evidenced issue: the `JSPWikiUID` cookie value is used unvalidated as a file name in `CookieAuthenticationLoginModule`. The login cookie is attacker-controlled and unaudited between `HttpUtil.retrieveCookieValue()` and `new File(cookieDir, uid)`; `clearLoginCookie()` (called unconditionally by the world-accessible `Logout.jsp`, independent of the `jspwiki.cookieAuthentication` property, which only gates the login/read path) then calls `File.delete()` on that path. Because `File(parent, child)` does not normalize, a cookie such as `../../<relative path>` resolves outside the `logincookies` directory, giving a remote, unauthenticated arbitrary-file-deletion primitive (bounded by servlet-user filesystem permissions and knowledge of a path relative to the work dir). When cookie authentication is enabled, `login()` additionally reads the traversed file and installs its content as the session's LOGIN_NAME principal.\n\nI chose this as the single candidate because the taint source and sinks are in one Java class with no clearing validation, the concrete dangerous operation (`delete()`) is reachable without authentication in the default configuration, and it is the one high-impact issue whose decisive code is Java (the P1 relation index only covers Java symbols, and no JSP is parsed/held by the index). Several further real-looking issues are listed as unconfirmed rejected leads, not candidates."
+}

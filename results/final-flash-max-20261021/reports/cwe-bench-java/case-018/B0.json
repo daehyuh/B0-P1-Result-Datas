@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the contents of the zip archive that is fetched and extracted. Both call sites download that archive over the network with no checksum, signature, or content validation (FileMisc.download), then unzip it: P2BootstrapInstallation.install() fetches `GoomphCacheLocations.p2bootstrapUrl()` (default https://repo.diffplug.com/misc/goomph-p2-bootstrap, but overridable via the public static `override_p2bootstrapUrl` or the project property `goomph_override_p2bootstrapUrl`, which any project can set before afterEvaluate initialization), and PdeInstallation.install() fetches `GoomphCacheLocations.pdeBootstrapUrl()` / `override_pdeBootstrapUrl` or a caller-supplied p2 update site. A malicious mirror, a compromised first-party host, an HTTP override (FileMisc.download accepts any URL scheme), or a project that overrides the URL can therefore supply a zip with '../' entry names.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the default bootstrap URL is HTTPS to a first-party host (repo.diffplug.com) and that the supported p2-bootstrap releases are a fixed set, which raises the bar for the default configuration. Checked that the extracted bootstrap is subsequently loaded/run by JarFolderRunner/JarFolderRunnerExternalJvm, so an attacker who controls the zip may in principle already reach code execution via a replaced org.eclipse.osgi bundle - i.e. the Zip Slip is not the only primitive in the compromised-source scenario, though it is a direct, pre-execution arbitrary-write primitive and it also bypasses the release allow-list for writes outside the cache. Verified that Java's File(parent, child) treats a leading '/' child as relative on Unix, so the practical bypass relies on '..' components (and Windows '..\\'), which ZipInputStream passes through unchanged. Searched for any caller-side sanitization (normalize/canonical/startsWith/assertInside) - none exists in the repository. No regression tests are present in the snapshot, and no runtime/exploit testing was performed.",
+      "id": "zip-slip-zipmisc-unzip",
+      "impact": "Arbitrary file write outside the intended cache directory (~/.goomph/...) with the privileges of the user running the Gradle build, plus arbitrary directory creation. This can overwrite user-controlled files that lead to code execution or persistence (for example shell startup files, ~/.gradle/init.gradle, build outputs or source files) and can clobber unrelated files elsewhere on disk. Because extraction happens before any use of the downloaded content, the write primitive is available independently of the intended p2/Eclipse execution.",
+      "locations": [
+        {
+          "end_line": 191,
+          "path": "src/main/java/com/diffplug/gradle/ZipMisc.java",
+          "start_line": 176
+        },
+        {
+          "end_line": 101,
+          "path": "src/main/java/com/diffplug/gradle/p2/P2BootstrapInstallation.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 188,
+          "path": "src/main/java/com/diffplug/gradle/pde/PdeInstallation.java",
+          "start_line": 175
+        },
+        {
+          "end_line": 72,
+          "path": "src/main/java/com/diffplug/gradle/FileMisc.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 61,
+          "path": "src/main/java/com/diffplug/gradle/GoomphCacheLocations.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 155,
+          "path": "src/main/java/com/diffplug/gradle/GoomphCacheLocations.java",
+          "start_line": 113
+        }
+      ],
+      "prerequisites": "A build uses a goomph feature that triggers the bootstrap download (e.g. p2AsMaven, oomphIde, PDE/p2 tasks) and the zip source is attacker-influenced (mirror/MITM/compromised server, or an attacker-set goomph_override_p2bootstrapUrl / goomph_override_pdeBootstrapUrl property). The process runs with the build user's filesystem privileges; ZipInputStream/ZipFile must accept the crafted entry names (they do).",
+      "root_cause": "ZipMisc.unzip(File input, File destinationDir) builds the output path as `new File(destinationDir, entry.getName())` and then calls FileMisc.mkdirs(dest.getParentFile()) / FileOutputStream(dest) with no normalization or containment check (no canonical/absolute-path prefix check, no rejection of '..' or absolute/UNC-like names) on the zip entry name. java.util.zip.ZipInputStream performs no sanitization of entry names, so entries such as '../../../../.bashrc' escape the intended extraction directory.",
+      "title": "Zip Slip: ZipMisc.unzip() writes attacker-controlled zip entries outside the destination directory",
+      "trace": "P2BootstrapInstallation.install() creates target = getRootFolder()/goomph-p2-bootstrap.zip, calls FileMisc.download(url, target) (no integrity check), then ZipMisc.unzip(target, target.getParentFile()) at line 99. PdeInstallation.install() does the same at line 186. Inside ZipMisc.unzip (lines 179-189) each ZipEntry name is joined to destinationDir and written: for entries with '../' the unresolved path escapes destinationDir, FileMisc.mkdirs(dest.getParentFile()) creates arbitrary parent directories, and new FileOutputStream(dest) writes arbitrary file content. No prefix/canonical check or '..' rejection exists anywhere in the flow.",
+      "unverified": "Not runtime-confirmed; no exploit payload executed. The practical prerequisite (attacker control of the zip source) is inferred from the configurable URL/property mechanism and the absence of integrity verification, not observed in a live build. Whether upstream considered this a security advisory (and the precise patched version) is unknown from the snapshot. I did not inspect the vendored launcher bytecode or dependency jars for additional constraints.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / Zip Slip (CWE-409-adjacent)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 145 model-visible files of the snapshot (src/main/java, src/main/resources, Gradle/build metadata). Deep-read the core utilities (ZipMisc, FileMisc, CmdLine, SerializableMisc, JavaExecable*, JavaExecWinFriendly, GoomphCacheLocations, ConfigMisc, EnvMisc, NativeFileManager), the p2 package (P2BootstrapInstallation, P2Model, P2AntRunner, MavenRepoBuilder, ParsedJar, AsMaven* plugins), the pde package (PdeInstallation, PdeBuildProperties, PdeProductBuildConfig, ProductFileUtil, PluginCatalog, CopyJarsUsingProductFile, EclipseRelease), the eclipse package (MavenCentralMapping/Extension/Plugin, BuildPropertiesPlugin, ResourceFilter), the eclipserunner package (EclipseIni, EclipseApp, EquinoxLauncher, EquinoxLaunchSource/Task, NativeRunner, JarFolderRunner), the osgi package, parts of the oomph package and the vendored launcher Main.java, plus build.gradle/gradle.properties/CHANGES.md. Ran targeted searches for ZipInputStream/ZipFile/ZipEntry, new File(...) from remote names, normalize/canonical/startsWith sanitization, DocumentBuilder/SAXParser/XXE features, ObjectInputStream, ProcessBuilder/Runtime.exec, createTempFile, URL/openConnection, and shell quoting. Not every line of the ~2,800-line vendored launcher Main.java, the apt package, or all oomph/ thirdparty files was read line-by-line.",
+  "limitations": [
+    "No tests or git history are present in the snapshot, so I could not compare against a fixing commit or a regression test.",
+    "No code was executed and no network access was used; findings are static source analysis only and are not runtime-confirmed.",
+    "The exact attacker model for the bootstrap download URL (mirror compromise vs. MITM vs. project-property override) could not be confirmed from the snapshot; exploitability depends on the deployment configuration.",
+    "Dependency-level vulnerabilities (okhttp, commons-io, spotless-lib, bndlib) were out of scope and not assessed.",
+    "The ~2,800-line vendored eclipserunner launcher Main.java and several small plugin classes (apt package, some oomph/thirdparty classes) were only partially inspected; a second path-traversal sink may exist there."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE in MavenCentralMapping.parse (DocumentBuilderFactory defaults, src/main/java/com/diffplug/gradle/eclipse/MavenCentralMapping.java lines 79-84)",
+      "reason": "DocumentBuilderFactory is created without disallowing DOCTYPE/external entities, but the parsed artifacts.xml comes from an Eclipse release update site (HTTPS, official list) or a caller-configured site, and the values consumed are attribute values, where XML forbids external-entity references; practical impact is limited to DoS/SSRF-style behavior, weaker and less directly evidenced than the Zip Slip write primitive."
+    },
+    {
+      "lead": "Path traversal in MavenRepoBuilder.close/install via jar manifest Bundle-SymbolicName (src/main/java/com/diffplug/gradle/p2/MavenRepoBuilder.java lines 58-64, 88-99; ParsedJar.java lines 47-84)",
+      "reason": "artifactFolder = new File(groupFolder, coord.artifactId) is built from an attacker-supplied manifest value with no validation, but exploitation requires a malicious p2 repository jar and only yields writes of jar content under an attacker-chosen path; a less direct and lower-impact primitive than ZipMisc.unzip."
+    },
+    {
+      "lead": "Shell metacharacter injection via FileMisc.quote plus /bin/sh -c or cmd /c (FileMisc.java lines 156-168; NativeRunner.java lines 37-48; NativeFileManager.java lines 25-32)",
+      "reason": "quote() only quotes when a space is present and does not escape quotes/;/$( ), so command injection is possible when values contain shell metacharacters; however the values reaching NativeRunner/EclipseApp/NativeFileManager are build-configuration values supplied by the build author, who can already execute arbitrary code, so no meaningful trust boundary is crossed with the source evidence available."
+    },
+    {
+      "lead": "Java deserialization of an attacker-tamperable file in SerializableMisc.read (SerializableMisc.java lines 39-45; callers JavaExecableImp, OsgiExecable, OsgiExecImp)",
+      "reason": "ObjectInputStream.readObject is used on a temp file, but the file is created by File.createTempFile and written/read by the same build process (per-user temp directory), so there is no remote untrusted-input path shown; rejected as a local-tampering-only lead."
+    },
+    {
+      "lead": "Zip entry name used to build an extraction path in the vendored Equinox launcher (src/main/java/com/diffplug/gradle/eclipserunner/launcher/Main.java, getLibraryFromFragment lines 530-555 and extractFromJAR lines 2278-2333)",
+      "reason": "An entry selected by the weak 'startsWith(\"eclipse_\")' test is joined into the config-area path and extracted, which has Zip-Slip-like shape; but it requires a malicious fragment jar inside the plugin installation, is far less reachable than ZipMisc.unzip, and overlaps the same root-cause class, so it was not submitted as a separate candidate."
+    }
+  ],
+  "summary": "Snapshot is goomph 3.37.1 (com.diffplug.gradle:goomph, June 2022), a Gradle plugin suite that downloads and runs p2/Eclipse tooling. I traced the strongest source-level issue to ZipMisc.unzip(), which extracts remote-downloaded zips without checking zip-entry names against the destination directory (classic \"Zip Slip\", CWE-22), and is reachable from both bootstrap installers. Other candidate classes (XXE, manifest-driven path traversal, shell-quoting in the native runner, Java deserialization of temp files) were reviewed and rejected as weaker or unsupported at the source-evidence level. No runtime confirmation was performed."
+}

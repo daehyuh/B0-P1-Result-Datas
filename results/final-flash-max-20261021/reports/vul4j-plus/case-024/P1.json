@@ -1,0 +1,82 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The raw POST body of the Sling Distribution importer endpoint (resource type sling/distribution/service/importer, e.g. POST /libs/sling/distribution/services/importers/{name}) is passed unvalidated: DistributionPackageImporterServlet line 57 request.getInputStream() -> line 64 importStream(...). The same byte stream also arrives over the remote distribution transport (SimpleHttpDistributionTransport delivers package bytes to that endpoint). DistributionPackageUtils.readInfo() resets the stream when its DSTRPACKMETA magic is absent, and SimpleDistributionPackage.fromStream() only detects its own DSTRPCK: prefix, so a plain Kryo payload reaches the reader unchanged. The caller only needs to resolve the importer service resource with POST; the servlet performs no distribution-specific authorization check (JCR read on the resource is the only gate), and the deserialization/gadget execution is not constrained by the caller's JCR privileges.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that the same package-header path uses a class allow-list (DistributionPackageUtils.getSafeObjectInputStream, lines 406-430), so the Kryo reader is an outlier rather than a project-wide pattern; verified readInfo() and SimpleDistributionPackage.fromStream() both reset the stream and return without consuming a non-matching payload, so no header is required to reach the sink; verified the import path is used by both Resource and File package builders; confirmed no occurrence of setRegistrationRequired/registrationRequired anywhere in the snapshot and that Kryo 3.0.3 is embedded (contrib/extensions/distribution/extensions/pom.xml line 334); noted that Kryo is not the default serializer (VLT is) so the issue requires a specific, legitimate deployment configuration; considered but could not confirm a CVE/fix mapping or runtime gadget availability.",
+      "id": "case-024-c1",
+      "impact": "Deserialization of untrusted data in the Sling JVM: arbitrary object instantiation and invocation of deserialization hooks, i.e. potential remote code execution with the OSGi process's privileges (independent of JCR permissions), plus denial of service via crafted streams (e.g. InputStreamSerializer.read() allocates byte[size] from an attacker-controlled int). Impact is limited to deployments that configure the Kryo serialization format, and no exploit chain was validated at runtime.",
+      "locations": [
+        {
+          "end_line": 122,
+          "path": "contrib/extensions/distribution/extensions/src/main/java/org/apache/sling/distribution/serialization/impl/kryo/KryoContentSerializer.java",
+          "start_line": 106
+        },
+        {
+          "end_line": 64,
+          "path": "contrib/extensions/distribution/core/src/main/java/org/apache/sling/distribution/servlet/DistributionPackageImporterServlet.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 146,
+          "path": "contrib/extensions/distribution/core/src/main/java/org/apache/sling/distribution/packaging/impl/importer/LocalDistributionPackageImporter.java",
+          "start_line": 88
+        },
+        {
+          "end_line": 165,
+          "path": "contrib/extensions/distribution/core/src/main/java/org/apache/sling/distribution/packaging/impl/AbstractDistributionPackageBuilder.java",
+          "start_line": 141
+        },
+        {
+          "end_line": 133,
+          "path": "contrib/extensions/distribution/core/src/main/java/org/apache/sling/distribution/packaging/impl/ResourceDistributionPackageBuilder.java",
+          "start_line": 124
+        },
+        {
+          "end_line": 125,
+          "path": "contrib/extensions/distribution/core/src/main/java/org/apache/sling/distribution/packaging/impl/FileDistributionPackageBuilder.java",
+          "start_line": 115
+        }
+      ],
+      "prerequisites": "Sling Distribution bundles deployed with a DistributionContentSerializer configured for the Kryo format (KryoDistributionContentSerializerFactory is ConfigurationPolicy.REQUIRE, so it is opt-in; the shipped sample configuration uses VLT), a package builder/importer or agent bound to that serializer (DistributionPackageBuilderFactory binding by format target), and a caller able to resolve the importer service resource and issue a POST (depends on repository ACLs for the mounted /libs/sling/distribution/services/importers path).",
+      "root_cause": "KryoContentSerializer.importFromStream() constructs a default Kryo instance (registrationRequired remains false), installs Kryo.DefaultInstantiatorStrategy with Objenesis StdInstantiatorStrategy, and calls kryo.readObject(input, LinkedList.class) directly on the package stream. Kryo's default class resolver reads class names from the stream, loads them with Class.forName and instantiates them (constructor bypass via StdInstantiatorStrategy) with no allow-list, so arbitrary classes on the classpath can be instantiated and their read/deserialization hooks invoked. Notably, the same module's Java-serialization metadata path IS hardened (DistributionPackageUtils.getSafeObjectInputStream whitelists HashMap/HashSet/String/Long/Number/Boolean/Enum/DistributionRequestType), showing the Kryo path was left unprotected.",
+      "title": "Unsafe Kryo deserialization of Sling Distribution package content (CWE-502)",
+      "trace": "DistributionPackageImporterServlet.doPost() line 57 gets the raw request body and line 64 calls DistributionPackageImporter.importStream(resolver, stream) -> LocalDistributionPackageImporter.importStream() lines 135/142 call packageBuilder.installPackage(resolver, stream) -> AbstractDistributionPackageBuilder.installPackage(stream) lines 141-165 calls installPackageInternal(resolver, stream) because SimpleDistributionPackage.fromStream() returns null for non-DSTRPCK streams -> ResourceDistributionPackageBuilder.installPackageInternal() line 128 (and FileDistributionPackageBuilder line 119) call distributionContentSerializer.importFromStream(resolver, stream) -> KryoContentSerializer.importFromStream() lines 107-113 create the unprotected Kryo instance and execute kryo.readObject(input, LinkedList.class) on the attacker-supplied bytes.",
+      "unverified": "Runtime reachability and anonymous access to the importer endpoint on a default installation, actual Kryo 3.0.3 gadget availability on the Sling classpath, whether real deployments use the Kryo serializer, and whether upstream subsequently added class registration (no upstream diff, CVE/CWE labels or patch data were available in this run). No code was executed and no payload was constructed.",
+      "weakness_type": "CWE-502: Deserialization of Untrusted Data"
+    }
+  ],
+  "coverage_summary": "Source scope: 4,630 readable files; get_source_scope reports 0 excluded files (binary-like files are refused by read tools). P1 relation scope: index status complete, 4,630/4,630 source files indexed, 0 missing, 0 hash mismatches; the index is explicitly syntactic/navigation-only (no dataflow, reachability, or exploitability proof), so all its edges/facts were re-verified in source before use. Work performed: broad sink-oriented sweeps (redirects, file/path handling, JNDI, XML/SAX parsing, Java/Kryo/Avro deserialization, SQL/CQL, process execution, request-parameter flows) and deep reads of auth core/form, xss, servlets get/post, healthcheck, distribution core/extensions, jcr base/usermanager/accessmanager, engine, installer and selected contrib modules. Coverage gap: the repository is far too large for line-by-line review of all 4,630 files; numerous modules (tooling, karaf, testing, samples, most contrib extensions) were only sampled via search, and no build, test, or scanner was run.",
+  "limitations": [
+    "No code, tests, builds or scanners were executed; the candidate is a source-evidence lead, not a runtime-confirmed vulnerability.",
+    "Upstream diffs, CVE/CWE labels, patches and prior experiment outputs were not available/consulted, so I could not confirm the intended ground-truth issue or whether a fix exists upstream.",
+    "The P1 index is name-based navigation only: absence of a fact for a file/path does not mean that area is safe or was reviewed, and its presence is not a verdict.",
+    "Exploitation of the Kryo sink depends on a specific deployment configuration (Kryo DistributionContentSerializer selected for a package builder/importer or agent); reachability with anonymous credentials depends on repository ACLs for the importer service path, which cannot be settled from source alone.",
+    "Gadget-chain availability for Kryo 3.0.3 plus Objenesis on the Sling classpath was not validated; impact is stated as potential code execution.",
+    "Binary-like files (e.g. minified assets caught by the NUL-byte filter) were skipped by the read/search tools, and very large files were only partially sampled.",
+    "Several plausible but weaker issues were left as rejected/unconfirmed leads rather than additional candidates, per the one-candidate cap."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Open redirect via the :redirect parameter in legacy POST servlets: bundles/jcr/jackrabbit-usermanager/.../AbstractPostServlet.getRedirectUrl (lines 189-226) and bundles/jcr/jackrabbit-accessmanager/.../AbstractAccessPostServlet.getRedirectUrl (lines 174-211) return the raw user-supplied target which is passed to httpResponse.sendRedirect (line 146/131) with no host/authority check, unlike SlingPostServlet which rejects URIs with an authority (bundles/servlets/post/.../SlingPostServlet.java lines 307-321).",
+      "reason": "Genuine missing validation and reachable in the default launchpad provisioning, but impact (phishing/open redirect) is lower than the deserialization candidate, and these legacy bundles may simply never have been hardened, so I could not establish it as the intended/only issue. Noted as an unconfirmed secondary lead."
+    },
+    {
+      "lead": "Health check JSONP callback reflection: bundles/extensions/healthcheck/core/.../HealthCheckExecutorServlet.java lines 233-235 plus ResultJsonSerializer.java lines 65-70 concatenate the unvalidated request callback parameter into an application/javascript response on the unauthenticated /system/health endpoint.",
+      "reason": "Reflection is clear, but the response is served as application/javascript and the data set is health information, so direct XSS impact is limited/uncertain; rejected as weaker than the deserialization candidate."
+    },
+    {
+      "lead": "Unescaped HTML output in the default GET servlet renderer: bundles/servlets/get/.../HtmlRendererServlet.java prints resource path, resource type, property names and values without HTML escaping (lines 103-118, 143-162), while the POST HtmlResponse escapes via ResponseUtil.escapeXml (bundles/servlets/post/.../HtmlResponse.java line 160).",
+      "reason": "Potential stored/reflected XSS, but this appears to be a long-standing debug dump and I could not establish that it deviates from upstream or that it is the intended finding; retained only as a lower-confidence lead."
+    },
+    {
+      "lead": "Other deserialization sinks flagged by the index: JcrPropertyMapCacheEntry (lines 325-347), installer EntityResourceList/PersistentResourceList, SlingSettingsServiceImpl (lines 241-248), event ResourceHelper/UpgradeTask, DistributionPackageUtils header path.",
+      "reason": "Installer/settings/event paths deserialize local or diagnostic files with no clear attacker-controlled remote input; JcrPropertyMapCacheEntry only deserializes when application code requests a Serializable subtype; DistributionPackageUtils already uses an explicit allow-list. Rejected in favor of the Kryo sink."
+    },
+    {
+      "lead": "JNDI/RMI repository lookup in bundles/jcr/base/.../RepositoryAccessor.java (InitialContext.lookup driven by a URL/system property).",
+      "reason": "Input originates from the sling.repository.url system property/configuration, not remote request data, so remote attacker control could not be established from source."
+    }
+  ],
+  "summary": "Reviewed the Apache Sling monorepo snapshot (4,630 source files) as a defensive source review, using the P1 relation index only for navigation and verifying every candidate edge against source text. The strongest issue found is in the Sling Distribution serialization stack: the Kryo content serializer deserializes attacker-influenceable package bytes with a default, unprotected Kryo instance (no class registration/allow-list) plus an Objenesis instantiator strategy, reachable from the distribution importer HTTP POST endpoint. This is CWE-502 with potential code execution in the Sling JVM. Other security-relevant surfaces (auth core/redirect validation, XSSAPI, GET/POST servlets, health check servlet, JNDI repository accessor, installer/settings deserialization) were inspected and either already mitigated or left as lower-confidence leads. No runtime confirmation was performed; this is a source-evidence lead."
+}

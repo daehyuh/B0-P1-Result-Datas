@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "HTTP query parameters of `GET /admin/realms/{realm}/users` (`search`, `username`, `email`, `firstName`/`first`, `lastName`/`last`, and free-form `q` fields) are copied verbatim into `Map<String,String> attributes` (UsersResource lines 280-335) and passed through `UserStorageManager.searchForUserStream` (lines 423-446) to `LDAPStorageProvider.searchForUserStream`/`searchLDAP`, where they are embedded in the LDAP search filter without escaping LDAP metacharacters.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the direct login/lookup paths are similarly unescaped: `LDAPStorageProvider.loadLDAPUserByUsername` (line 816), `queryByEmail` (line 578) and `searchForUserByUserAttributeStream` (line 261) all use `EscapeStrategy.DEFAULT`, which escapes `* ( ) \\ NUL`, so those paths are not injectable. Checked all other `conditionsBuilder.equal(...)` call sites in federation/ldap (MembershipType, Group/Role mappers) - they use DEFAULT or non-user-controlled values. Checked that the injection does not reach unauthenticated login flows (`KeycloakModelUtils.findUserByNameOrEmail` uses getUserByEmail/getUserByUsername, both DEFAULT). Checked whether the LDAP search path is exposed to unauthenticated users via account/REST resources - only the admin `UsersResource` and unrelated internal callers use `searchForUserStream`, so this is not an unauthenticated bypass. Noted that `NON_ASCII_CHARS_ONLY` may be an intentional legacy behavior to support LDAP wildcard search in the admin console; if so, the residual risk is the absence of any escaping of user input and of a documented restriction, but this interpretation could not be confirmed from source alone (no git history/upstream comparison available).",
+      "id": "case-103-c1",
+      "impact": "An authorized admin-level caller (or a lower-privileged user holding only query/view-users permission on a group scope) can alter the LDAP search filter, e.g. `username=*` to enumerate/confirm all directory entries matching the query, or use other LDAP metacharacters to broaden/redirect the search against the configured directory. This breaks the intended exact-search semantics and can disclose LDAP directory content beyond the intended query scope; confidentiality impact, no write primitive identified in this path.",
+      "locations": [
+        {
+          "end_line": 484,
+          "path": "federation/ldap/src/main/java/org/keycloak/storage/ldap/LDAPStorageProvider.java",
+          "start_line": 437
+        },
+        {
+          "end_line": 42,
+          "path": "federation/ldap/src/main/java/org/keycloak/storage/ldap/idm/query/EscapeStrategy.java",
+          "start_line": 25
+        },
+        {
+          "end_line": 62,
+          "path": "federation/ldap/src/main/java/org/keycloak/storage/ldap/idm/query/internal/EqualCondition.java",
+          "start_line": 52
+        },
+        {
+          "end_line": 335,
+          "path": "services/src/main/java/org/keycloak/services/resources/admin/UsersResource.java",
+          "start_line": 259
+        },
+        {
+          "end_line": 446,
+          "path": "model/legacy-private/src/main/java/org/keycloak/storage/UserStorageManager.java",
+          "start_line": 423
+        }
+      ],
+      "prerequisites": "The realm must have an LDAP User Federation provider configured and the provider must be reachable for search; the requester must pass the admin endpoint authorization check (`auth.users().requireQuery()`), i.e. a realm administrator, or a user delegated the fine-grained `query-users`/view-users permission (especially a group-scoped admin). LDAP query filter injection occurs at the directory server.",
+      "root_cause": "`LDAPStorageProvider.searchLDAP()` builds LDAP equality conditions for USERNAME, EMAIL, FIRST_NAME and LAST_NAME using `EscapeStrategy.NON_ASCII_CHARS_ONLY`, whose own documentation states that LDAP special characters such as `*`, `(`, `)`, and `\\` are NOT escaped (only non-ASCII bytes are). `EqualCondition.applyCondition()` therefore emits `(attr=<raw user-supplied value>)` into the JNDI LDAP search filter, so an attacker who controls the search value can inject LDAP filter syntax/wildcards instead of an exact match.",
+      "title": "LDAP filter injection in LDAP user federation search (LDAP special characters not escaped)",
+      "trace": "1) `UsersResource.getUsers(...)` takes `search`/`username`/`email`/`first`/`last`/`q` query params and builds `attributes` with `UserModel.USERNAME`, `UserModel.EMAIL`, `UserModel.FIRST_NAME`, `UserModel.LAST_NAME` (services/.../admin/UsersResource.java 259-335). 2) `searchForUser(...)` calls `session.users().searchForUserStream(realm, attributes, ...)` (UsersResource 446). 3) `UserStorageManager.searchForUserStream` forwards the map to each `UserQueryProvider` (model/legacy-private/.../UserStorageManager.java 439-446). 4) `LDAPStorageProvider.searchForUserStream` maps the `search` string into USERNAME/EMAIL/FIRST_NAME/LAST_NAME and calls `searchLDAP` (federation/ldap/.../LDAPStorageProvider.java 360-393). 5) `searchLDAP` creates `conditionsBuilder.equal(..., EscapeStrategy.NON_ASCII_CHARS_ONLY)` for those attributes (lines 445, 458, 472, 475). 6) `EscapeStrategy.NON_ASCII_CHARS_ONLY.escape()` leaves `* ( ) \\` intact (EscapeStrategy.java 28-42), and `EqualCondition.applyCondition()` concatenates the value into `(attr=value)` (EqualCondition.java 53-62), producing an injectable LDAP filter passed to `LDAPIdentityStore`/`LDAPOperationManager.search`.",
+      "unverified": "No runtime/build verification was performed. I could not compare against the upstream fix commit or CVE/patch metadata (not exposed in this run). Whether the LDAP wildcard behavior is intentional for admin search versus a genuine injection bug is the main uncertainty; the permissive escaping contract of `EscapeStrategy.NON_ASCII_CHARS_ONLY` and its use on request-controlled values is verified from source.",
+      "weakness_type": "CWE-90: Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')"
+    }
+  ],
+  "coverage_summary": "Exposed snapshot: 5,889 readable text files under the repository root (per get_source_scope; 0 excluded for size/sensitive-name/symlink reasons; binary-like files are skipped at read/search time). No source-relation index is available in this condition, so coverage was search-driven: I examined the LDAP federation provider and query/escaping internals, OIDC token/authorization endpoints (authorization/logout/token/CIBA/PAR/device), redirect validation, SAML endpoint signature logic and XML parsing hardening, admin REST authorization (UsersResource and permission helpers), credential providers (password/OTP/recovery codes/WebAuthn), theme resource path handling, FreeMarker sanitization, and adapter-side token verification. Notable listing filter: template/UI source files such as `*.ftl` and `*.tsx` are absent from this snapshot (e.g. `themes/.../login/login.ftl` and the v2 account UI components), so template-driven XSS classes were largely out of scope of the visible files. Findings are limited to source reading; no build, tests, scanners, or exploit execution were used, and no upstream/fix-commit comparison was possible (no .git metadata, no web access).",
+  "limitations": [
+    "No git history, patch, CVE/CWE label, or upstream fix-commit metadata is available in this run, so I could not confirm which single real-world fix this snapshot precedes; candidates were judged from source behavior alone.",
+    "No code was compiled or executed; all conclusions are static and unverified at runtime.",
+    "The snapshot lacks FreeMarker templates and other non-indexed file types, so vulnerability classes that depend on those files (e.g. template XSS) are not fully assessable.",
+    "The strongest candidate requires an authenticated administrator or delegated query-users permission; no unauthenticated or low-privilege path to the same LDAP sink was found, which limits severity/confidence.",
+    "Large areas (model/map* storage, Kubernetes operator, JS/TS admin and account front ends, testsuite) were sampled rather than exhaustively line-by-line reviewed, so an injected issue there could have been missed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CIBA callback uses TokenVerifier.createWithoutSignature for the authentication-channel bearer token (services/.../grants/ciba/endpoints/BackchannelAuthenticationCallbackEndpoint.java 111-120).",
+      "reason": "Not a bypass: the token is first passed through `session.tokens().decode(...)` and the default `DefaultTokenManager.decode` verifies the JWS signature against the realm SIG key (services/.../jose/jws/DefaultTokenManager.java 84-112); `createWithoutSignature` only re-applies claim checks to the already-verified token."
+    },
+    {
+      "lead": "TrustedHostClientRegistrationPolicy domain matching uses `host.endsWith(trustedDomain)` for both remote-host and client-URL checks (services/.../clientregistration/policy/impl/TrustedHostClientRegistrationPolicy.java 233-236, 172-176), which can match suffix-sharing hosts such as `evil-example.com` for trusted domain `example.com`.",
+      "reason": "Real suffix-matching weakness but it appears to be long-standing upstream behavior tied to the `*.domain` configuration convention, requires the optional dynamic client-registration trusted-host policy to be enabled, and the affected files show no evidence of being the snapshot's changed/faulty code; left as an unconfirmed lead."
+    },
+    {
+      "lead": "Path-containment checks based on `URL.getPath().startsWith(rootPath)` in theme resource loading (services/.../theme/ClassLoaderTheme.java 108-127; services/.../theme/ClasspathThemeResourceProviderFactory.java 46-62).",
+      "reason": "This matches the shape of the earlier Keycloak theme path-traversal fix (checks are present in the snapshot); I could not demonstrate a concrete traversal in this snapshot (classpath/JAR URL handling and container path normalization not testable here), so it did not meet the evidence threshold."
+    },
+    {
+      "lead": "AccountConsole.getReferrer calls RedirectUtils.verifyRedirectUri with a `referrerClient` that is always null in that branch (services/.../account/AccountConsole.java 239-248).",
+      "reason": "Fails closed: `verifyRedirectUri(session, uri, null)` returns null, so no attacker-controlled referrer_uri is retained; at most a functional regression, not a vulnerability."
+    },
+    {
+      "lead": "OIDC identity-provider signature validation defaults to disabled unless configured (services/.../broker/oidc/OIDCIdentityProviderConfig.java 82-84, OIDCIdentityProvider.verify 579-581).",
+      "reason": "Configuration-dependent upstream behavior (tokens are then validated via the userinfo endpoint); no source evidence that this snapshot changed it, and no attacker-controlled input bypass demonstrated."
+    }
+  ],
+  "summary": "Reviewed the assigned Keycloak (999-SNAPSHOT, Quarkus 2.13.6 era) source snapshot as a defensive source-code vulnerability assessment. Coverage was broad but bounded: 5,889 text files are exposed, binary-like files are refused/skipped, and the snapshot contains no git metadata, so verification against upstream history/fix commits was not possible. I traced the strongest plausible taint flow from an HTTP entry point into a dangerous sink and found an LDAP query injection in the LDAP user-federation path: LDAP special characters are deliberately left unescaped (`EscapeStrategy.NON_ASCII_CHARS_ONLY`) when building user search filters, and attacker-supplied `search`/`username`/`email`/`firstName`/`lastName` values from the admin `GET /admin/realms/{realm}/users` endpoint reach those filters unchanged. This matches the class of the LDAP-injection issue fixed in Keycloak 20.0.5/21.0.0 (the period of this snapshot), with a plausible single-spot fix in `LDAPStorageProvider.searchLDAP` / `EscapeStrategy`. Impact is bounded by the requirement for an authenticated admin or a delegated `query-users` permission (a privilege/authorization boundary rather than an unauthenticated bypass), so it is submitted as a source-evidenced lead, not a confirmed exploit."
+}

@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The entry names, entry types, and symlink destinations come from an untrusted ZIP/TAR archive consumed through AbstractArchiver.addArchivedFileSet(...), addResources(...), or addResource(...) when the target Archiver is DirectoryArchiver (the @Named(\"dir\") implementation). PlexusIoResource.getName() preserves archive entry names such as '../../outside/pwn' or a symlink entry whose destination is outside the destination directory.",
+      "confidence": "medium",
+      "counterevidence_checked": "AbstractUnArchiver.extractFile has a canonical-directory guard, but DirectoryArchiver extends AbstractArchiver and never calls it; ResourceUtils.isSame() only prevents copying the destination directory into itself; the duplicate-name and prefix logic in AbstractArchiver does not sanitize '..'; FileUtils.resolveFile() is not used in DirectoryArchiver; no src/test tree exists to show a guard or intended safe usage. The only unverified counter-hypothesis is that the dependency-side PlexusIoProxyResourceCollection could theoretically rewrite names, but name-rewriting is normally driven by explicit FileMapper/prefix settings and no such default sanitization is visible in the repository.",
+      "id": "case-102-dir-archiver-path-traversal",
+      "impact": "Arbitrary file write or overwrite outside the intended destination with the privileges of the process creating the directory archive, potentially leading to configuration tampering, overwriting of build/deployment files, or code execution. Archive-controlled symlinks can also be planted inside the destination pointing at arbitrary filesystem targets, and chmod/mtime operations in setFileModes() are then applied to those output paths.",
+      "locations": [
+        {
+          "end_line": 91,
+          "path": "src/main/java/org/codehaus/plexus/archiver/dir/DirectoryArchiver.java",
+          "start_line": 72
+        },
+        {
+          "end_line": 128,
+          "path": "src/main/java/org/codehaus/plexus/archiver/dir/DirectoryArchiver.java",
+          "start_line": 111
+        },
+        {
+          "end_line": 162,
+          "path": "src/main/java/org/codehaus/plexus/archiver/dir/DirectoryArchiver.java",
+          "start_line": 154
+        }
+      ],
+      "prerequisites": "An application uses DirectoryArchiver with a destination directory and with an archive-backed resource collection whose archive is attacker-influenced; alternatively any caller that passes an archive-derived destination name to DirectoryArchiver.addResource/addFile. The process must have write permission to the paths targeted by the traversal. For the symlink variant, the source archive must contain a symlink entry followed by a file entry below that symlink.",
+      "root_cause": "DirectoryArchiver.execute() takes ArchiveEntry.getName() from an archive-backed resource collection and builds the output path as destDirectory.getCanonicalPath() + File.separator + fileName, then passes it to copyFile() or SymlinkUtils.createSymbolicLink(). No canonical-path containment check, no rejection of '..' path elements, and no NOFOLLOW handling is applied to the final output path. Consequently archive entry names can traverse above the destination, and an archive-created symlink can redirect later writes.",
+      "title": "DirectoryArchiver writes archive-controlled entry names and symlinks outside the destination directory",
+      "trace": "1) Malicious archive entry '../../outside/pwn' becomes an ArchiveEntry whose getName() returns that string. 2) DirectoryArchiver.execute() (lines 79-81) sets fileName = destDirectory.getCanonicalPath() + File.separator + '../../outside/pwn'. 3) copyFile() (line 118) does new File(vPath); makeParentDirectories() and ResourceUtils.copyFile() then call Files.newOutputStream(outFile.toPath()) at ResourceUtils.java line 71/82, which follows the '..' components and writes outside destDirectory. 4) Symlink variant: execute() lines 83-88 create the archive-supplied symlink at dest/link with an attacker-chosen target such as '/outside'; a later entry 'link/pwn' is written through that symlink by the same unguarded copyFile() path. 5) No call to getCanonicalFile()/Path.startsWith() is made here, unlike AbstractUnArchiver.extractFile lines 297-302.",
+      "unverified": "No runtime exploit or test execution was performed. PlexusIoProxyResourceCollection and ResourceUtils.copyFile's dependency implementations are outside the assigned source tree, so their exact name handling was not inspected. Reachability from a specific Maven Assembly Plugin configuration was not proven from this snapshot; the source-level public API path is clear, but deployment-specific preconditions remain unverified.",
+      "weakness_type": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / arbitrary file write (Zip Slip)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reported 435 model-visible files, no binary/symlink/sensitive-name exclusions and no files over 5 MiB excluded. All source paths were enumerated; main Java sources were searched for path construction, file writes, symlink creation, canonicalization, temp files, deletion, permissions, and archive extraction. Key files read in detail include AbstractUnArchiver, DirectoryArchiver, AbstractZipUnArchiver, TarUnArchiver, AbstractArchiver, JarArchiver, JarToolModularJarArchiver, zip/tar resource collections, Manifest, Streams/ResourceUtils, and several compression unarchivers. Historical Jira JSON was searched for security/path-traversal/symlink terms but contains legacy issues and provided no evidence of the current fix. No src/test files exist in the snapshot. Dependency sources (plexus-io, plexus-utils, commons-compress) were not part of the assigned tree and could not be inspected.",
+  "limitations": [
+    "No execution, archive crafting, or runtime validation was performed; the candidate is a source-level lead, not a confirmed exploit.",
+    "Dependency sources are outside the assigned tree, so behavior of PlexusIoProxyResourceCollection name rewriting, SymlinkUtils.createSymbolicLink, and AttributeUtils.chmod could not be verified and may affect exploitability or impact.",
+    "The snapshot has no src/test tree, so intended safe usage and existing regression tests for DirectoryArchiver and AbstractUnArchiver could not be reviewed.",
+    "The exact Maven Assembly/plugin call site that feeds an attacker-controlled archive into DirectoryArchiver was not present in this repository; reachability from a concrete deployed configuration remains unverified.",
+    "Jira JSON files are historical project data and were not treated as authoritative vulnerability evidence."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AbstractUnArchiver.extractFile creates archive-controlled symlinks without validating the symlink destination (src/main/java/org/codehaus/plexus/archiver/AbstractUnArchiver.java lines 315-328).",
+      "reason": "The symlink target is genuinely unvalidated, and setLastModified/chmod may follow it, but the same method's canonical check (lines 297-302) appears to block extraction of a later file through such a symlink during normal sequential extraction. Remaining impact (metadata/permission changes on the link target, or symlink planting for downstream consumers) is lower-confidence and partly dependent on uninspected plexus-io AttributeUtils behavior, so it was not selected as the strongest candidate."
+    },
+    {
+      "lead": "Zip-bomb protection only exists in AbstractZipUnArchiver via setMaxOutputSize; TarUnArchiver has no equivalent output-size cap.",
+      "reason": "This is a resource-exhaustion/DoS hardening gap rather than a clear source-level vulnerability; the default limit is also unlimited, and no explicit trust-boundary failure was demonstrated."
+    },
+    {
+      "lead": "PlexusIoZipFileResourceCollection builds resource URLs from archive entry names (src/main/java/org/codehaus/plexus/archiver/zip/PlexusIoZipFileResourceCollection.java lines 111-122), potentially allowing unusual relative URLs for names beginning with '/' or containing '../'.",
+      "reason": "The normal getContents() path uses JarFile.getEntry() and does not read outside the archive; a concrete arbitrary-file-read/write impact through getURL() could not be established from this snapshot."
+    },
+    {
+      "lead": "DotDirectiveArchiveFinalizer resolves directive operands as new File(dotFileDirectory, s[0]) and adds the result to the archive (src/main/java/org/codehaus/plexus/archiver/DotDirectiveArchiveFinalizer.java lines 48-67).",
+      "reason": "This can include arbitrary directories in an archive, but the dot-file directory is a local build configuration input rather than an archive-supplied input, and the impact is information inclusion rather than a direct write outside a destination."
+    },
+    {
+      "lead": "AbstractZipArchiver update mode uses a same-directory generated temporary file (FileUtils.createTempFile(\"zip\", \".tmp\", ...), lines 227-241).",
+      "reason": "No concrete attacker-controlled symlink/race impact could be established from this snapshot, and the temporary file is handled with rename/delete semantics that replace the link entry rather than an arbitrary target."
+    }
+  ],
+  "summary": "The snapshot is plexus-archiver 4.7.2-SNAPSHOT (435 model-visible files: Maven project metadata, historical Jira JSON, and ~180 main Java sources; no tests). The strongest source-evidenced issue is an arbitrary-write path traversal in DirectoryArchiver: archive-derived entry names are concatenated with the destination directory and written directly to the filesystem with no canonical containment check. Archive-controlled symlink entries create a second, closely related escape vector in the same method. The extraction-side AbstractUnArchiver already contains a canonical-directory guard, which highlights the missing equivalent protection in DirectoryArchiver. No runtime confirmation was performed; this is a source-level candidate only."
+}

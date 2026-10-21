@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "HTTP request parameter names are fully attacker-controlled. Dispatcher.createContextMap copies request.getParameterMap() into ActionContext.PARAMETERS (core Dispatcher.java line 618, line 655), and ParametersInterceptor.retrieveParameters() reads that map (lines 258-260). Cookie names are attacker-controlled when the optional cookie interceptor is configured with wildcard cookiesName/cookiesValue (CookieInterceptor lines 226-234, 261-288), and are written to the stack via stack.setValue(cookieName, cookieValue) at lines 274/285.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked for compensating controls: struts.ognl.allowStaticMethodAccess=false only blocks static methods, not instance getters; DENY_METHOD_EXECUTION only guards explicit method calls (XWorkMethodAccessor 104-137) and is irrelevant to property traversal; the ACCEPTED_PARAM_NAMES whitelist still permits dotted property names; the defaultStack/basicStack/paramsPrepareParamsStack excludeParams contain only ^action:.*/^method:.* and xwork-default's defaultStack sets none; grep shows ExcludedPatterns/EXCLUDED_PATTERNS/CLASS_ACCESS_PATTERN have no active production reference (only the two commented lines); OgnlUtil.setValue with evalName=false rejects eval-style expression names but not property names; no other subclass of ParametersInterceptor re-adds the check (ActionMappingParametersInteceptor only overrides parameter retrieval); no tests exist in the snapshot that would demonstrate intended behavior.",
+      "id": "case-027-class-access-exclusion-disabled",
+      "impact": "The parameter-name denylist that the framework itself added to stop 'class' property traversal is absent, so remote users can steer OGNL binding through the action's Class object and into the runtime object graph that is reachable via public getters (class-loader and container objects included), and can write properties through any reachable setters. This is a class-loader/property manipulation primitive; in servlet containers this class of flaw has been used to tamper with container internals and ultimately execute code, while at minimum it enables unauthorized modification of reachable objects and disclosure of class-loader state. Impact depth is deployment-dependent (needs a reachable setter chain), and the double evaluation of the parameter path also affects ActionMappingParametersInteceptor, which inherits the same class and performs a second binding pass.",
+      "locations": [
+        {
+          "end_line": 513,
+          "path": "xwork-core/src/main/java/com/opensymphony/xwork2/interceptor/ParametersInterceptor.java",
+          "start_line": 503
+        },
+        {
+          "end_line": 20,
+          "path": "xwork-core/src/main/java/com/opensymphony/xwork2/ExcludedPatterns.java",
+          "start_line": 7
+        },
+        {
+          "end_line": 250,
+          "path": "core/src/main/java/org/apache/struts2/interceptor/CookieInterceptor.java",
+          "start_line": 247
+        },
+        {
+          "end_line": 304,
+          "path": "core/src/main/resources/struts-default.xml",
+          "start_line": 288
+        }
+      ],
+      "prerequisites": "Application uses the params interceptor (defaultStack/basicStack/paramsPrepareParamsStack; an XWork app using xwork-default.xml defaultStack gets no exclusions at all). Parameter name is at most 100 chars and matches ACCEPTED_PARAM_NAMES, i.e. plain dotted/indexed property expressions with no '=', '#', call syntax - 'class.classLoader...' qualifies. The action does not implement ParameterNameAware rejecting the name, and the deployment does not add its own excludeParams containing class. The cookie variant additionally requires the cookie interceptor with wildcard cookie name/value configuration. Deep impact depends on which getters/setters are reachable from the action's Class object in the target runtime (e.g., servlet-container class-loader objects).",
+      "root_cause": "The framework ships a hard-coded denylist for parameter/cookie names that traverse the OGNL 'class' property, but its enforcement is commented out at both call sites: (1) xwork-core ParametersInterceptor.setExcludeParams() replaces excludeParams with only the configured patterns and the line that adds the CLASS_ACCESS_PATTERN is commented out (lines 510-511); (2) core CookieInterceptor.isAcceptableName() returns only the permissive legacy `acceptedPattern.matcher(name).matches()` while the `ExcludedPatterns.CLASS_ACCESS_PATTERN` check is commented out (lines 247-250). The constants class xwork-core ExcludedPatterns (CLASS_ACCESS_PATTERN/EXCLUDED_PATTERNS, lines 7-20) now has zero reference from production code, and the default stacks only exclude ^action:.* and ^method:.* (core/src/main/resources/struts-default.xml lines 199-201, 255-257, 265-267, 302-304). Consequently attacker-controlled dotted names such as class.classLoader... pass acceptableName()/isAcceptableParameter() and are evaluated by OGNL with a member access whose exclude set no longer contains the class pattern.",
+      "title": "Hard-coded 'class' access exclusion (ExcludedPatterns.CLASS_ACCESS_PATTERN) is disabled in ParametersInterceptor and CookieInterceptor, re-enabling OGNL class-loader property injection",
+      "trace": "(1) Request parameter name/value -> Dispatcher.createContextMap (Dispatcher.java 618/655) -> ActionContext parameters. (2) ParametersInterceptor.doIntercept (ParametersInterceptor.java 222-250) sets DENY_METHOD_EXECUTION/CREATE_NULL_OBJECTS (236-238) and calls setParameters (275-341). (3) isAcceptableParameter -> acceptableName (411-417): length check passes; isExcluded (446-457) only checks excludeParams, which contains just the XML-configured ^action:.*,^method:.* because the hard-coded class pattern add is commented out at 510-511; isAccepted (427-444) uses ACCEPTED_PARAM_NAMES, which matches 'class.classLoader'. (4) newStack.setParameter(name, value) (line 329) -> OgnlValueStack.setParameter (147-149) -> OgnlUtil.setValue (OgnlUtil.java 229-235, evalName=false, so only plain property expressions) -> Ognl.setValue. (5) The stack context's SecurityMemberAccess (OgnlValueStack.java 87-88) receives excludeProperties from excludeParams (OgnlValueStack 472-473, set at ParametersInterceptor 313-315) and allows any property not excluded (SecurityMemberAccess.java 78-116); DENY_METHOD_EXECUTION only blocks explicit method invocation in XWorkMethodAccessor (104-137), not OGNL property getters/setters, so traversal of 'class' -> 'classLoader' -> ... and writes through reachable setters proceed. (6) Cookie path: CookieInterceptor.isAcceptableName (247-250) no longer rejects the class pattern, so a malicious cookie name reaches populateCookieValueIntoStack -> stack.setValue (274/285).",
+      "unverified": "No runtime/build execution was performed, so the full exploit chain is unproven. The OGNL library itself is an external Maven dependency (xwork-core/pom.xml lines 124-127) not present in the snapshot, so the exact runtime behavior of getter traversal and property writes depends on the resolved OGNL version. Whether a specific deployment exposes a useful setter chain (e.g., container class-loader objects) could not be verified from source. The '// Patch:' comments and the orphaned ExcludedPatterns class are strong source evidence that a protection was removed, but no VCS history or upstream diff is available in this snapshot to confirm intent.",
+      "weakness_type": "CWE-470 (Use of Externally-Controlled Input to Select Classes or Code / unsafe reflection), with CWE-184 (incomplete denylist) and CWE-915 (improperly controlled modification of object attributes)"
+    }
+  ],
+  "coverage_summary": "Scope: 2,841 source files, 2,841 indexed by the P1 relation index (index_status complete, 0 missing files, 0 hash mismatches; no SAST findings loaded; index is syntactic navigation only, no data-flow/reachability proof). Reviewed the framework security-critical paths in source: xwork-core interceptors (ParametersInterceptor, ActionMappingParametersInteceptor, CookieInterceptor, StaticParametersInterceptor, FileUploadInterceptor, debugging interceptor, validation interceptors), OGNL utilities and accessors (OgnlUtil, OgnlValueStack, SecurityMemberAccess, ExcludedPatterns, CompoundRootAccessor, XWorkMethodAccessor, ReflectionContextState), configuration (struts-default.xml, xwork-default.xml, default.properties, XmlConfigurationProvider/InterceptorBuilder/DefaultInterceptorFactory), dispatcher/mappers (Dispatcher, DefaultActionMapper, multipart handling), plus targeted spot checks in core components/results and the bundled apps/plugins/archetypes. Tests are absent from this snapshot (0 files under any src/test path), so behavioral tests could not be consulted. The relation index was used only to navigate (symbols/edges around ParametersInterceptor and CLASS_ACCESS_PATTERN) and every edge used was re-verified against source text.",
+  "limitations": [
+    "No code was executed and no build/scanner/test was run; the finding is a source-evidence lead, not a runtime-confirmed vulnerability.",
+    "The snapshot contains no test sources (src/test absent), so intended-behavior tests and upstream-diff evidence could not be consulted; the '// Patch:' annotations and the orphaned ExcludedPatterns class are source-level indicators only.",
+    "The OGNL runtime library is an external artifact (not in the snapshot), so the exact property-getter access semantics at evaluation time could not be verified from this tree.",
+    "Impact depth depends on deployment-specific reachable object graphs (servlet container classes, application beans); no such environment was inspected.",
+    "The P1 index provides syntactic candidate edges only (no complete control/data-flow or reachability); index facts were used for navigation and verified against source."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CookieInterceptor class-access check (core/.../CookieInterceptor.java 247-250)",
+      "reason": "Treated as part of the same root cause (disabled ExcludedPatterns.CLASS_ACCESS_PATTERN enforcement) rather than a separate candidate; it additionally requires the optional cookie interceptor to be configured with wildcard cookiesName/cookiesValue, so it is a secondary vector."
+    },
+    {
+      "lead": "DebuggingInterceptor evaluates `debug` parameters (expression/object) via the value stack (core/.../debugging/DebuggingInterceptor.java 147-221)",
+      "reason": "Entirely gated by devMode, which defaults to false and is not attacker-settable in source; no vulnerability without a dev-mode deployment misconfiguration."
+    },
+    {
+      "lead": "Showcase JSPEvalAction/OGNL demo actions (apps/showcase/.../action/JSPEvalAction.java, struts-interactive.xml)",
+      "reason": "Sample application actions that intentionally evaluate expressions for a demo; not a framework flaw, and the app is not part of the library surface."
+    },
+    {
+      "lead": "Archetype listener calling OgnlRuntime.setSecurityManager(null) (archetypes/struts2-archetype-convention/.../InitListener.java 18-20)",
+      "reason": "Template sample code documented as a Google-App-Engine workaround; it processes no untrusted input itself and is not deployed by the framework."
+    },
+    {
+      "lead": "DefaultActionMapper dynamic method/action prefix handling (core/.../mapper/DefaultActionMapper.java 133-190, 270-283)",
+      "reason": "Matches the post-S2-021 hardened design: dynamic method calls default to false and action-prefix handling is gated by allowActionPrefix; no deviation from upstream hardening found in source."
+    },
+    {
+      "lead": "File upload and multipart handling (JakartaMultiPartRequest, FileUploadInterceptor)",
+      "reason": "No attacker-controlled path traversal or unsafe file write identified at the level inspected; upload size/parsing checks appeared consistent with upstream behavior."
+    }
+  ],
+  "summary": "This snapshot is Apache Struts/XWork 2.3.16.2-SNAPSHOT (2,841 files, fully indexed by the P1 relation index; no test sources are present in the snapshot). While reviewing the parameter/OGNL trust boundary I found that the framework's own hard-coded \"class\" parameter/cookie-name exclusion is present in source only as commented-out code, leaving a single security-relevant breakdown of that control: an attacker-supplied parameter name is bound as an OGNL property expression starting at the action object, and the `class` segment is no longer filtered, so expressions such as `class.classLoader...` are evaluated during parameter binding. The strongest evidence is the annotated, commented-out enforcement lines in `ParametersInterceptor.setExcludeParams` and `CookieInterceptor.isAcceptableName`, plus the security-constants class `ExcludedPatterns` (containing `CLASS_ACCESS_PATTERN`/`EXCLUDED_PATTERNS`) that is no longer referenced by any production code. This is the class of control that historically protected Struts against class-loader parameter manipulation (S2-020/S2-021 style). One candidate is submitted; all other inspected areas were either upstream behavior, dev-mode-gated, or sample/demo code."
+}

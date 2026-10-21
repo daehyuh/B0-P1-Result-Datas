@@ -1,0 +1,102 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Unauthenticated HTTP client. The print request body is fully client-controlled JSON; its `attributes` are parsed against the template's declared attributes (Values.populateFromAttributes / MapfishParser). A map attribute's `layers` array is parsed by GenericMapAttribute.parseLayers/parseSingleLayer (GenericMapAttribute.java:437-500), and for a layer of type `image` the attacker supplies `baseURL` (ImageLayer.ImageParam.baseURL, ImageLayer.java:192), which ImageLayer passes verbatim to `new URI(...)` and to the HTTP request factory (ImageLayer.java:82-94). Other request-controlled URI strings reach the same loader (e.g. layer `style` references via ParserPluginUtils.loadStyleAsURI, table image URLs via HttpImageResolver, `!northArrow` `graphic`).",
+      "confidence": "medium",
+      "counterevidence_checked": "The sibling branches in resolveChildFile and resolveFileAssumingPathIsFile do call FileUtils.assertIsSubDirectory (lines 149/157/167/192), and the 2-arg loadFile only reads what resolveChildFile returns, so this is a single missing check rather than a documented exception. Explicit `file:` URIs, `file://host/...`, and absolute paths are rejected by the asserts; java.io.File(parent,child) concatenates absolute children on Unix, so only `../`-style relative traversal bypasses the directory restriction. `!geojson`, `!gml` and `!geotiff` layer URLs are additionally screened by FileUtils.testForLegalFileUrl, and the 1-arg ConfigFileLoaderManager.loadFile(URI) (which the ClasspathConfigFileLoader would read for any existing `file:` URI) is only invoked with administrator-configured config files, so those are not the primary vector. The GenericMapAttribute layer-loop and Values population confirm attacker control of layer params; ImageIO rejects non-image content, which bounds direct exfiltration to images (Jobs' error strings are derived from the unwrapped root cause, which usually drops content-bearing wrapper messages such as FeaturesParser's 'Invalid geoJSON: <data>').",
+      "id": "mfp-fileloader-path-traversal",
+      "impact": "Arbitrary local file read with the privileges of the servlet/JVM user, bypassing the documented guarantee that file URLs/relative paths must resolve inside the configuration directory. Full disclosure of any decodable image file on the server through the generated report (e.g. other apps' images, user-uploaded content); existence/type oracle and server-side read of all other readable files (configuration/secret files, /etc/passwd, etc.), whose content may additionally surface in debug logs or in downstream parsers. The scheme-less URI also bypasses !restrictUris/!mapUri matcher logic.",
+      "locations": [
+        {
+          "end_line": 199,
+          "path": "core/src/main/java/org/mapfish/print/servlet/fileloader/AbstractFileConfigFileLoader.java",
+          "start_line": 133
+        },
+        {
+          "end_line": 121,
+          "path": "core/src/main/java/org/mapfish/print/servlet/fileloader/AbstractFileConfigFileLoader.java",
+          "start_line": 114
+        },
+        {
+          "end_line": 124,
+          "path": "core/src/main/java/org/mapfish/print/http/ConfigFileResolvingHttpRequestFactory.java",
+          "start_line": 112
+        },
+        {
+          "end_line": 563,
+          "path": "core/src/main/java/org/mapfish/print/config/Configuration.java",
+          "start_line": 541
+        },
+        {
+          "end_line": 95,
+          "path": "core/src/main/java/org/mapfish/print/map/image/ImageLayer.java",
+          "start_line": 78
+        },
+        {
+          "end_line": 59,
+          "path": "core/src/main/java/org/mapfish/print/http/AbstractMfClientHttpRequestFactoryWrapper.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 500,
+          "path": "core/src/main/java/org/mapfish/print/attribute/map/GenericMapAttribute.java",
+          "start_line": 437
+        },
+        {
+          "end_line": 428,
+          "path": "core/src/main/java/org/mapfish/print/servlet/MapPrinterServlet.java",
+          "start_line": 399
+        }
+      ],
+      "prerequisites": "A deployed print app/template that declares a map attribute (standard) and permits a layer type that forwards a scheme-less URI, or any other template flow that calls Configuration.loadFile with an attacker-influenced path string. The default servlet security config permits all URLs unauthenticated (mapfish-spring-security.xml:20-23), and app/attribute names are discoverable via /apps.json and /capabilities.json. The target file must exist relative to the configuration directory (`.getDirectory()` is in the repository?); the loader's other branches block `file:` URIs and absolute paths via FileUtils.assertIsSubDirectory.",
+      "root_cause": "AbstractFileConfigFileLoader.resolveFileAssumingPathIsFile() (core/src/main/java/org/mapfish/print/servlet/fileloader/AbstractFileConfigFileLoader.java:183-199) handles a non-URI sub-resource by doing `new File(configFile.getParentFile(), pathToSubResource)` and returning it whenever it exists (lines 185-188), WITHOUT calling FileUtils.assertIsSubDirectory(). All sibling resolution branches enforce containment (lines 149, 157, 167, 192), and Configuration.loadFile()/ConfigFileLoaderPlugin javadoc explicitly promise that only files inside the configuration (or working) directory can be loaded. Because `pathToSubResource` is attacker-influenced and `File(parent, child)` simply concatenates on Unix, a value containing `../` segments (e.g. `../../../../../etc/passwd`) escapes the configuration directory and is read by AbstractFileConfigFileLoader.loadFile(URI,String) (lines 114-121).",
+      "title": "Path traversal in AbstractFileConfigFileLoader allows arbitrary local file read from print requests",
+      "trace": "1) POST /print/{app}/report.pdf (or /print/report.pdf with `app` in the JSON) -> MapPrinterServlet.createReport (MapPrinterServlet.java:399-428) -> job submitted (createAndSubmitPrintJob, lines 978-1023). 2) PrintJob runs MapPrinter.print -> AbstractJasperReportOutputFormat.getJasperPrint -> Values -> CreateMapProcessor, which passes the per-template `clientHttpRequestFactoryProvider.get()` to the layers (CreateMapProcessor.java:235-239). 3) ImageLayer.loadImage does `new URI(layerParam.getBaseUrl())` and `requestFactory.createRequest(commonUri, HttpMethod.GET)` (ImageLayer.java:82-94) with baseURL = `../../../../../../etc/passwd`. 4) If any http processor wraps the factory, AbstractMfClientHttpRequestFactoryWrapper.createRequest (line 51) passes the request through because `uri.getScheme() == null`, so `!restrictUris` matchers do not apply. 5) ConfigFileResolvingHttpRequestFactory.ConfigFileResolvingRequest.executeInternal (lines 112-124) calls `configuration.loadFile(uriString)` before any real HTTP request. 6) Configuration.loadFile(String) -> ConfigFileLoaderManager.loadFile(configUri, path) -> FileConfigFileLoader/AbstractFileConfigFileLoader.isAccessible(URI,String) (lines 104-112) -> resolveChildFile (lines 133-181) -> resolveFileAssumingPathIsFile (lines 183-199): `new File(configFile.getParentFile(), '../../../../../../etc/passwd')` exists and is returned with no containment assert, so isAccessible() is true and loadFile(URI,String) (lines 114-121) returns Files.readAllBytes() of the traversed file. 7) The bytes are handed back to ImageLayer.fetchImage (ImageLayer.java:153-218); decodable images are rendered into the report, which the attacker retrieves via GET /report/{ref} (MapPrinterServlet.java:914-937). For non-image files ImageIO returns null and the job either succeeds with an error tile (failOnError=false) or fails - a file existence/readability oracle.",
+      "unverified": "No runtime/test execution was performed: the traversal and the image-based exfiltration were established by source tracing only. Whether a particular deployed template exposes a suitable attribute/layer was not verified. Full disclosure of non-image (text) files is not demonstrated end-to-end; the concrete evidence there is unauthorized server-side read plus an existence oracle. The upstream fix history could not be inspected to confirm this exact check was the patched root cause.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal'); CWE-73 External Control of File Name or Path"
+    }
+  ],
+  "coverage_summary": "Scope reported by get_source_scope: 442 model-visible files, no over-5MiB, sensitive-name, or symlink exclusions; binary-like files are refused/skipped. I reviewed the core Java sources of the servlet/login boundary (MapPrinterServlet, BaseMapServlet, security/app factory, file loaders), the request/attribute/parser path (Values, MapfishParser, GenericMapAttribute, MapAttribute, layer params), the HTTP layer (ConfigFileResolvingHttpRequestFactory, MfClientHttpRequestFactoryImpl, AbstractMfClientHttpRequestFactoryWrapper, URI matchers, processors), map/vector/raster layer readers (image, WMS/WMTS/OSM, GeoJSON/GML/GeoTIFF, NorthArrowGraphic, CachingUrihandler), Jasper/table/legend/data-source processors, job queue/storage/servlet registry classes, config classes (Configuration, S3ReportStorage, SmtpConfig, WorkingDirectories, PDFConfig), webapp/Spring resources (web.xml, mapfish-spring-*.xml, properties) and the CLI. Not deeply reviewed: the 2 MB example GeoJSON/jMeter payloads, docs assets/Groovy generators, and third-party library internals; no tests are present in the snapshot. The strongest issue traced across files is the missing directory-containment check in the configuration file loader.",
+  "limitations": [
+    "Static review only; no code was executed, built, or tested, and no request was sent to any server. The traversal and exfiltration chain is inferred from source.",
+    "The snapshot contains no tests, so intended loader behavior could only be compared against in-code javadoc/assert patterns, not against existing test expectations.",
+    "Whether a given deployment exposes a template/attribute that reaches the loader with attacker-controlled path strings depends on configuration; the default security config permits unauthenticated requests but app templates are administrator-defined.",
+    "Direct content disclosure is demonstrated for decodable image files only; for other file types the evidence supports unauthorized read plus an existence/type oracle and possible debug-log exposure, not guaranteed client-side exfiltration.",
+    "Upstream fix history / advisories could not be consulted (no network, no git history in scope), so the exact patched root cause is not confirmed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AbstractMfClientHttpRequestFactoryWrapper.createRequest passes scheme-less and 'file' URIs through without consulting the URI matchers (line 51), which lets requests bypass !restrictUris rules.",
+      "reason": "Real matcher bypass, but by itself 'file:' URIs are still containment-checked inside the loader (asserts at AbstractFileConfigFileLoader.java:149/157/167), so it enables the traversal candidate rather than being an independent disclosure; kept as supporting condition in the main finding."
+    },
+    {
+      "lead": "MfClientHttpRequestFactoryImpl builds its HttpClient with HttpClients.custom() and no custom RedirectStrategy, so Apache HttpClient default redirect-following could bypass !restrictUris by redirecting an allowed URL to an internal address (SSRF).",
+      "reason": "Plausible but configuration-dependent and not verifiable from this snapshot without running the client; no source-level assertion that redirects are unchecked besides the absent custom strategy. Rejected in favour of the file-loader defect with direct source evidence."
+    },
+    {
+      "lead": "ServletMapPrinterFactory.checkForAddedApp (lines 222-250) builds a URI from the attacker-supplied app id after replacing ':' with '/', allowing '..' traversal to register a config.yaml outside appsRootDirectory.",
+      "reason": "Only works when appsRootDirectory is configured in URI form; it can only load a directory that already contains config.yaml and exposes that app's capabilities rather than returning file contents; weaker and more deployment-specific than the loader traversal."
+    },
+    {
+      "lead": "RequestSizeFilter compares request.getContentLength() against the limit (RequestSizeFilter.java:38), which is -1 for chunked requests, so the 1 MB limit can be bypassed (DoS).",
+      "reason": "Generic body-size-limit bypass; impact is availability only and depends on the container's chunked handling. Lower severity than the file read."
+    },
+    {
+      "lead": "Reflected JSONP callback is written unescaped (appendJsonpCallback, MapPrinterServlet.java:1089-1096) on /status, /apps.json and /capabilities.json.",
+      "reason": "Response is application/javascript; no demonstrable cross-origin XSS against the print server origin from a navigable URL, and the callback is not used for secrets. Not compelling enough."
+    },
+    {
+      "lead": "XML parsing without secure processing: SLDParserPlugin.tryLoadSLD DocumentBuilderFactory (lines 95-99), AbstractJasperReportOutputFormat.parseXML (lines 320-326) and NorthArrowGraphic.parseSvg via Batik SAXSVGDocumentFactory (lines 316-322).",
+      "reason": "XXE could be reachable through attacker-supplied style/SVG content, but the parsed entity data is not clearly returned to the client and the effective parser configuration (Batik/JDK defaults, xercesImpl excluded from the build) could not be confirmed statically. Unconfirmed lead."
+    },
+    {
+      "lead": "MapPrinterServlet.checkReferer defaults a missing Referer header to 'http://localhost/' (lines 1025-1043), so the allowed-referers restriction can be bypassed by not sending Referer when a localhost matcher is configured.",
+      "reason": "Empty-Referer handling is plausibly intentional (non-browser clients); the feature is disabled when allowedReferers is null and is a secondary abuse control, not an authentication boundary."
+    },
+    {
+      "lead": "ClasspathConfigFileLoader.isAccessible(URI) has no scheme check and loadResources() returns file-system URLs for 'file:' URIs.",
+      "reason": "The 1-arg ConfigFileLoaderManager.loadFile(URI) path that would read such resources is only called with administrator-configured configuration files, not with attacker input."
+    }
+  ],
+  "summary": "MapFish Print 3.22.0: the configuration file loader returns files resolved relative to the configuration directory without any containment check, so an unauthenticated print request that supplies a scheme-less relative URI (e.g. an `!image` layer `baseURL` such as `../../../../etc/passwd`) is read off the server filesystem. The same loader branches that handle absolute paths and `file:`/scheme URIs do call FileUtils.assertIsSubDirectory, and the method's own javadoc states files outside the configuration directory must not be reachable, so the missing check is an asymmetry/oversight rather than intended behavior. Confidence in the code defect is high; confidence in end-to-end disclosure is medium because the cleanest delivery path (`!image` layer) only returns fully decoded images to the client, while other files are read into memory and act only as an existence/type oracle (content may also appear in debug logs or be parsed by style/SVG consumers)."
+}

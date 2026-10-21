@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The entire 'Range' header value is attacker-controlled (HttpHeaders.getRange() -> HttpRange.parseRanges). The attacker chooses both the number of comma-separated range specs (bounded only by the container's max header size, e.g. ~8 KiB on Tomcat, i.e. hundreds-to-thousands of specs) and their contents; repeated full-resource or overlapping specs each yield count = resource length.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) Multi-range responses are legitimate HTTP (RFC 7233) and the multipart/byteranges code is intentional; the security issue is the absence of range coalescing/capping, not the feature itself. (2) Servlet containers impose max header sizes, bounding the number of ranges to roughly hundreds/thousands, so this is amplification-bounded rather than infinite. (3) Checked ResourceRegion (spring-core) for any merge/coalesce helper - none exists in this snapshot. (4) Checked ResourceRegionHttpMessageConverter.writeInternal/writeResourceRegionCollection for dedupe, cap, or Content-Length limiting - none. (5) Checked the WebFlux path (ResourceHttpMessageWriter/ResourceRegionEncoder) - same unbounded conversion. (6) Checked the @ResponseBody Resource path - same conversion. (7) Could not inspect the upstream fix commit or run anything; the recollection that the upstream fix coalesces overlapping/adjacent regions (e.g. via a ResourceRegion merge helper added in 5.1.1) is unverified in this environment.",
+      "id": "case-070-range-amplification-dos",
+      "impact": "Remote denial of service through resource amplification: a single small request can make the server emit and re-read a resource thousands of times (amplification proportional to the number of range specs), exhausting bandwidth, disk I/O and request-processing capacity; slow client reads can prolong the consumption. No memory-corruption or data-disclosure impact is claimed.",
+      "locations": [
+        {
+          "end_line": 142,
+          "path": "spring-web/src/main/java/org/springframework/http/HttpRange.java",
+          "start_line": 127
+        },
+        {
+          "end_line": 183,
+          "path": "spring-web/src/main/java/org/springframework/http/HttpRange.java",
+          "start_line": 174
+        },
+        {
+          "end_line": 77,
+          "path": "spring-core/src/main/java/org/springframework/core/io/support/ResourceRegion.java",
+          "start_line": 29
+        },
+        {
+          "end_line": 215,
+          "path": "spring-web/src/main/java/org/springframework/http/converter/ResourceRegionHttpMessageConverter.java",
+          "start_line": 171
+        },
+        {
+          "end_line": 504,
+          "path": "spring-webmvc/src/main/java/org/springframework/web/servlet/resource/ResourceHttpRequestHandler.java",
+          "start_line": 485
+        },
+        {
+          "end_line": 237,
+          "path": "spring-web/src/main/java/org/springframework/http/codec/ResourceHttpMessageWriter.java",
+          "start_line": 198
+        }
+      ],
+      "prerequisites": "An application serves static/classpath/file resources through Spring MVC's ResourceHttpRequestHandler (default configuration for resource handlers), or returns a Resource / List<ResourceRegion> from a controller (AbstractMessageConverterMethodProcessor:199-215), or uses Spring WebFlux resource handling (ResourceHttpMessageWriter:189-237). The target resource only needs to be reachable; no authentication is inherently required. A reasonably large resource maximizes the amplification factor.",
+      "root_cause": "The framework accepts an unbounded list of byte ranges from the request header and converts it 1:1 into ResourceRegion objects without merging overlapping/adjacent ranges or imposing any cap, then streams every region separately. HttpRange.parseRanges (spring-web/.../HttpRange.java:127-142) splits the attacker-supplied 'Range' value into as many tokens as fit in the header, and HttpRange.toResourceRegions (:174-183) creates one ResourceRegion per range with the requested length (a 'start-' or suffix range yields the full resource length). ResourceRegion (spring-core/.../ResourceRegion.java:29-77) has no merge/coalesce support. ResourceRegionHttpMessageConverter.writeResourceRegionCollection (spring-web/.../ResourceRegionHttpMessageConverter.java:171-215) then writes each region in full, opening a fresh InputStream and calling StreamUtils.copyRange per range, so the body length equals the SUM of requested range lengths rather than the size of their union.",
+      "title": "Unbounded HTTP Range header is expanded into one response part per range (no coalescing/cap), enabling amplification DoS when serving resources",
+      "trace": "Request with a multi-range 'Range' header -> ResourceHttpRequestHandler.handleRequest (ResourceHttpRequestHandler.java:485-498) -> ServletServerHttpRequest.getHeaders().getRange() (HttpHeaders.getRange, HttpHeaders.java:1219-1221) -> HttpRange.parseRanges (127-142, no length/count limit) -> HttpRange.toResourceRegions (174-183, N ranges -> N ResourceRegions, each with full requested count) -> ResourceRegionHttpMessageConverter.writeInternal (:127-141) and writeResourceRegionCollection (:171-215) loop over all regions, opening the resource per region and copying each range to the multipart/byteranges body. Total bytes written = sum of all requested ranges, so N overlapping/full ranges force the server to stream the resource N times (plus N stat/open operations), consuming server CPU, disk/network I/O and connection/thread time. The same uncoalesced conversion is reachable through the @ResponseBody Resource path (AbstractMessageConverterMethodProcessor:204-210) and the WebFlux writer.",
+      "unverified": "Upstream patch/fix content was not inspected and no runtime test was performed; the amplification factor depends on the container's header-size limit and the targeted resource size. The exact intended fix (coalescing vs. capping range count) is inferred from the source gap, not confirmed.",
+      "weakness_type": "Uncontrolled resource consumption / algorithmic amplification (CWE-400, CWE-770)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned tree (4158 files, main and config sources only; no test sources, no VCS history). Deep review: the HTTP Range/resource-serving path across spring-web (HttpRange, HttpHeaders, ResourceRegionHttpMessageConverter, ResourceHttpMessageWriter), spring-core (ResourceRegion, ResourceRegionEncoder, StaxUtils), spring-webmvc (ResourceHttpRequestHandler, PathResourceResolver, AbstractMessageConverterMethodProcessor) and spring-webflux (ResourceWebHandler, PathResourceResolver, ResourceHttpMessageWriter). Spot checks: spring-messaging broker/selector evaluation, spring-expression parser entry points, XML converters, spring-web util classes (UrlPathHelper, UriUtils, HtmlUtils, WebUtils, ForwardedHeaderFilter), redirect views, spring-context scripting/JNDI, spring-core utilities (StringUtils.cleanPath, FileSystemUtils, SerializationUtils). Search sweeps for command execution, ProcessBuilder, script engines, JNDI lookups, raw ObjectInputStream use, XML parser feature configuration, and URL-decoding sinks were performed. Not exhaustive: most of the ~20 modules (spring-beans, spring-orm, spring-jms, spring-oxm, spring-jdbc, spring-tx, spring-websocket, etc.) were only sampled, not line-by-line audited.",
+  "limitations": [
+    "No test sources and no git history are present, so the intended fix/diff could not be confirmed against this snapshot; the verdict relies on source inspection plus version-timeline reasoning.",
+    "No code was executed, no exploit was attempted, and no container limits were measured; amplification figures are analytic, not empirically validated.",
+    "Coverage is partial: ~4158 files across 20 modules were inspected by targeted reading/search, not exhaustively; other latent issues may exist in unread files.",
+    "The candidate is a lead: it identifies a reachable unbounded resource-consumption path in source, but the deployment-dependent impact (header-size cap, resource size, caching layers) was not validated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "STOMP/WebSocket selector SpEL remote code execution (CVE-2018-1270 class)",
+      "reason": "DefaultSubscriptionRegistry already evaluates selector expressions with a restricted SimpleEvaluationContext.forPropertyAccessors(new SimpMessageHeaderPropertyAccessor()) (spring-messaging/.../DefaultSubscriptionRegistry.java:68-70, 156-176, 226), so no method-invocation/constructor access is exposed; no evidence of the old vulnerable evaluation context."
+    },
+    {
+      "lead": "XXE via XML message converters",
+      "reason": "SourceHttpMessageConverter disables DTDs and external entities by default and installs no-op entity/stream resolvers (spring-web/.../converter/xml/SourceHttpMessageConverter.java:167-230); StaxUtils.createDefensiveInputFactory likewise disables DTD/external entities (spring-core/.../util/xml/StaxUtils.java:64-68)."
+    },
+    {
+      "lead": "Static resource path traversal",
+      "reason": "ResourceHttpRequestHandler.getResource applies processPath plus isInvalidPath and isInvalidEncodedPath (ResourceHttpRequestHandler.java:508-531, 595-613, 631-651) and PathResourceResolver re-checks encoded '../' and resource-under-location (PathResourceResolver.java:225-296). No concrete bypass was identified from source alone; a targeted traversal test was not possible."
+    },
+    {
+      "lead": "Unsafe deserialization",
+      "reason": "Only intentional, configuration-gated uses exist (SerializationUtils.deserialize for caller-provided bytes; HttpInvoker's CodebaseAwareObjectInputStream). These are documented remote-remoting features, not framework-default exposure, so no concrete attacker path was established."
+    },
+    {
+      "lead": "Open redirect / header injection in RedirectView and ForwardedHeaderFilter",
+      "reason": "Redirect target handling (RedirectView.sendRedirect:612-636, ForwardedHeaderFilter:317-352) contains the expected relative/absolute-URL handling and encoding; no unauthenticated attacker-controlled redirect sink was identified with source evidence."
+    }
+  ],
+  "summary": "Snapshot is the Spring Framework 5.1.x maintenance branch at 5.1.1.BUILD-SNAPSHOT (gradle.properties; @since 5.1.1 markers present, no 2019 markers), containing only main/config sources (4158 files, no test sources). I traced the HTTP Range path end-to-end and found one strongest candidate: unbounded, uncoalesced Range handling that permits response amplification (DoS). Additional security-sensitive areas (SpEL/STOMP selector evaluation, XML converters, static-resource path validation, redirects, JNDI/scripting) were sampled and did not yield an equal-or-stronger source-evidenced issue."
+}

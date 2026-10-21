@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A registered target (or a gateway acting for targets) that can authenticate to the DDI API with its target security token / gateway token, or a DMF client that can send UPDATE_ATTRIBUTES, fully controls the attribute keys and values (free text up to 128 characters each, e.g. `<img src=x onerror=alert(document.cookie)>`).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the value is sanitized on input: @SafeHtml/ValidString is applied only to repository builder fields (names, descriptions, etc.), not to controller-attribute map entries; JpaControllerManagement only enforces lengths. Checked whether the UI escapes: the sink explicitly uses ContentMode.HTML and raw concatenation; the sibling device-controlled sink (ActionStatusMsgGrid action-status messages) uses a TextArea/text rendering, which shows the codebase does not uniformly protect HTML sinks. Checked whether the value is tenant-scoped/limited: it is stored per target and returned by TargetManagement.getControllerAttributes(); it is not escaped on read. Note this appears to be long-standing-looking UI code rather than a clearly reverted patch, so it may be pre-existing upstream behavior rather than an injected regression.",
+      "id": "stored-xss-target-controller-attributes",
+      "impact": "Stored XSS in the Management UI. Arbitrary JavaScript executes with the origin of the hawkBit server in an authenticated operator's browser and can drive the Vaadin UI as that operator (objectives include reading target security tokens via the UI/REST, changing tenant configuration, approving/starting rollouts, or otherwise performing operations with the victim's permissions).",
+      "locations": [
+        {
+          "end_line": 269,
+          "path": "hawkbit-ui/src/main/java/org/eclipse/hawkbit/ui/management/targettable/TargetDetails.java",
+          "start_line": 240
+        },
+        {
+          "end_line": 207,
+          "path": "hawkbit-ui/src/main/java/org/eclipse/hawkbit/ui/components/SPUIComponentProvider.java",
+          "start_line": 200
+        },
+        {
+          "end_line": 782,
+          "path": "hawkbit-repository/hawkbit-repository-jpa/src/main/java/org/eclipse/hawkbit/repository/jpa/JpaControllerManagement.java",
+          "start_line": 726
+        },
+        {
+          "end_line": 462,
+          "path": "hawkbit-rest/hawkbit-ddi-resource/src/main/java/org/eclipse/hawkbit/ddi/rest/resource/DdiRootController.java",
+          "start_line": 456
+        },
+        {
+          "end_line": 329,
+          "path": "hawkbit-dmf/hawkbit-dmf-amqp/src/main/java/org/eclipse/hawkbit/amqp/AmqpMessageHandlerService.java",
+          "start_line": 323
+        }
+      ],
+      "prerequisites": "Target-token or gateway-token authentication enabled (system default in hawkbit-update-server application.properties sets targettoken/gatewaytoken enabled=true; tenant configuration can also enable it), a valid target whose configData/attributes can be set, and an operator with READ_TARGET opening/selecting that target in the Management UI (TargetDetails.populateDetailsWidget() runs on selection).",
+      "root_cause": "Target controller attribute keys/values coming from the device-facing DDI/DMF APIs are persisted with only length checks (no HTML/character validation), and the management UI renders the same values as raw HTML. JpaControllerManagement.updateControllerAttributes() only verifies key length <=128 and value length <=128 (isAttributeKeyValid/isAttributeValueValid). On the UI side, TargetDetails.updateAttributesLabelsList() passes the raw map entries to SPUIComponentProvider.createNameValueLabel(), which builds `new Label(getBoldHTMLText(label) + valueStr, ContentMode.HTML)` — i.e. the unescaped device-supplied value is concatenated into an HTML string and sent as innerHTML. No output encoding occurs at either the input or output side.",
+      "title": "Stored XSS via device-controlled target controller attributes rendered as HTML in the Management UI",
+      "trace": "PUT `/{tenant}/controller/v1/{controllerId}/configData` -> DdiRootController.putConfigData() -> ControllerManagement.updateControllerAttributes() -> JpaControllerManagement.updateControllerAttributes() stores the raw value in JpaTarget.controllerAttributes (sp_target_attributes) after only a length check. Later, in the UI: TargetDetails.populateDetailsWidget() -> updateAttributesLayout() -> updateAttributesLabelsList() -> SPUIComponentProvider.createNameValueLabel(key+': ', value) -> new Label(getBoldHTMLText(label) + valueStr, ContentMode.HTML) -> browser innerHTML executes the injected markup/JS in the operator's authenticated session.",
+      "unverified": "Not runtime-confirmed (no code execution permitted). The exact CSP configuration is deployment-dependent (a Content-Security-Policy header can be configured via hawkbit.server.security.content-security-policy). Whether an operator must explicitly open the target details (selection is sufficient in the code) and whether target-token authentication is enabled for a given tenant are deployment-configuration dependent.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting'), stored"
+    }
+  ],
+  "coverage_summary": "Reviewed the security core and integration modules (SpPermission/SpringEvalExpressions, PreAuthTokenSourceTrustAuthenticationProvider, HeaderAuthentication, DDI security filters, HttpDownloadAuthenticationFilter, SystemSecurityContext), the Spring Security configuration (SecurityManagedConfiguration, Oidc/InMemory user management), the DDI/DMF controllers and AMQP handlers, the management REST resources and the repository-api @PreAuthorize annotations (Artifact/Target/Deployment/Rollout/Tag/Type/TenantConfiguration/System/TargetFilterQuery management interfaces), RSQL/FIQL parsing and sorting utilities, artifact/file handling and download paths, tenant-aware caching and system management, and a sample of the Vaadin UI sinks that render server/device data (TargetDetails, SPMetadata/Attributes layouts, action-status grids, login cookie handling). The approximately 600 other UI classes and parts of the JPA repository implementations were not exhaustively read; no tests or build execution were available.",
+  "limitations": [
+    "No code execution, tests, or scanners were run; findings are based on source reading only.",
+    "The snapshot contains no test sources and no version-control metadata, so I could not diff against upstream hawkBit to distinguish injected regressions from pre-existing upstream behavior.",
+    "The UI rendering claim is based on static control/data-flow reading (source device input -> persistence -> HTML sink); it was not confirmed at runtime.",
+    "Coverage of the large hawkbit-ui module (hundreds of classes) was sampling-based, so an additional issue in an unread UI class cannot be excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "RegexCharacterCollection.getPatternFindAnyCharacter() compiles `.*[<chars>]+.*` without Pattern.DOTALL, and stringContainsCharacter() uses matches(); a filename containing a line terminator before an illegal character (<, >, /, \\\\) makes the regex fail, so the UI artifact-filename sanity check (FileTransferHandlerStreamVariable / FileTransferHandlerVaadinUpload -> AbstractFileTransferHandler.ILLEGAL_FILENAME_CHARACTERS) can be bypassed.",
+      "reason": "Impact is limited/unclear: the same uploads flow through ArtifactManagement.create() where ArtifactUpload.filename is constrained by @SafeHtml(WhiteListType.NONE), which rejects HTML tags, and delivering a raw newline in a multipart filename is not generally possible with conforming parsers; could not confirm vs. upstream."
+    },
+    {
+      "lead": "ArtifactFilesystemRepository.getSha1DirectoryPath() builds the storage path from `sanitizeTenant(tenant)` (only trim().toUpperCase()) and tenant is taken from the URL path in MgmtDownloadResource.downloadArtifactByDownloadId(); a tenant value containing `..` could escape the configured artifact base directory (and getFile() calls mkdirs()).",
+      "reason": "The file that would be read must be named exactly the 40-hex-character SHA1 stored in the server-side downloadId cache, so this is at most an unintended directory-creation primitive, not arbitrary file read; it is also likely pre-existing upstream behavior."
+    },
+    {
+      "lead": "SecurityManagedConfiguration.RestSecurityConfigurationAdapter registers authorizeRequests().anyRequest().authenticated() before the /system/admin/** hasAnyAuthority(SYSTEM_ADMIN) matcher.",
+      "reason": "Even if the URL rule ordering is ineffective, every affected system-admin operation is additionally protected by method-level @PreAuthorize(HAS_AUTH_SYSTEM_ADMIN) on SystemManagement/MgmtSystemManagementResource, so no privilege escalation was demonstrated."
+    },
+    {
+      "lead": "IpUtil.getClientIpFromRequest() trusts the X-Forwarded-For header by default (trackRemoteIp=true) and the value feeds the DosFilter blacklist check and stored target addresses.",
+      "reason": "Deployment/configuration dependent (documented reverse-proxy design), and the impact is limited to spoofed/absent IP information, not an authorization bypass."
+    }
+  ],
+  "summary": "Scope: the Eclipse hawkBit 0.3.0-SNAPSHOT snapshot (1,387 model-visible text files; no test sources are present in the visible tree). I traced the DDI/DMF/Management authentication filters, Spring Security chains, repository-layer @PreAuthorize annotations, tenant isolation, artifact handling, RSQL/FIQL parsing, and the Vaadin UI rendering paths. The strongest issue found is a stored cross-site-scripting chain: target “controller attributes”, which are supplied by devices over the DDI API (or DMF) and are validated only for length, are later rendered unescaped into a Vaadin Label with ContentMode.HTML on the Management UI target-details panel. Every other lead I examined was either mitigated by method-level authorization, config-dependent, or had no realistic attacker-controlled path."
+}

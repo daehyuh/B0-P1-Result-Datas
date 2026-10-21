@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote OAuth client controls the Bearer access token, HTTP method and request path sent to jans-config-api. Those method/path values are handed to the interception script (requestParameters METHOD/PATH, lines 205-212), and the script holds the policy decision (ConfigApiType.authorize returns boolean). If the script returns false (deny), the request is still processed with the token's identity.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified scope validation still runs independently (OpenIdAuthorizationService.validateScope lines 121-199; AuthUtil.validateScope/findMissingScopes), so the gap is specific to the custom/external authorization decision. Verified ExternalConfigService.checkAuthorization and ExternalInterceptionService.authorization only return a boolean and never throw/abort/write an error themselves (so absence of the check is not compensated). Verified AuthorizationFilter aborts only on exceptions and otherwise accepts the returned token (lines 84-96). Searched for other consumers of externalInterceptionService/checkAuthorization — none exist. Confirmed the interface contract is boolean (ConfigApiType.authorize -> boolean; jans-core/script/.../DummyConfigApiType) and docs/script-catalog/config_api/config-api.md states the `authorize` return value indicates whether the client is authorized. Checked whether an upstream/fix diff exists in the snapshot — there is no VCS metadata, so I could not prove the branch was removed rather than never written; no runtime testing was performed.",
+      "id": "case-142-configapi-external-authz-not-enforced",
+      "impact": "Broken access control on the Config API: requests that a deployment's configured custom authorization policy explicitly denies are still authorized, defeating the documented CONFIG_API interception control (e.g., per-method/path/tenant/IP restrictions encoded in the script). Because only OAuth scopes are still enforced, any client holding a token with the required scopes can perform administrative Config API operations (clients, scopes, attributes, scripts, configuration) that the script intended to block; JWT access tokens bypass the control entirely. The pattern of a computed-but-unused authorization boolean is strong source evidence that an enforcement branch is absent.",
+      "locations": [
+        {
+          "end_line": 119,
+          "path": "jans-config-api/server/src/main/java/io/jans/configapi/security/service/OpenIdAuthorizationService.java",
+          "start_line": 85
+        },
+        {
+          "end_line": 48,
+          "path": "jans-config-api/server/src/main/java/io/jans/configapi/security/service/ExternalInterceptionService.java",
+          "start_line": 35
+        },
+        {
+          "end_line": 73,
+          "path": "jans-config-api/server/src/main/java/io/jans/configapi/external/service/ExternalConfigService.java",
+          "start_line": 42
+        },
+        {
+          "end_line": 96,
+          "path": "jans-config-api/server/src/main/java/io/jans/configapi/filters/AuthorizationFilter.java",
+          "start_line": 84
+        }
+      ],
+      "prerequisites": "jans-config-api running with OAuth protection (apiProtectionType=oauth; AppInitializer selects OpenIdAuthorizationService) and at least one enabled CONFIG_API custom script, so ExternalConfigService.isEnabled()/ExternalInterceptionService actually invoke the script. The attacker's token must pass the checks in the same class (issuer allow-list, JWT signature / introspection active, and scope validation in validateScope()). For the JWT branch, no external script invocation happens at all, so a JWT token that satisfies validateToken()/scope checks is sufficient to skip the custom authorization.",
+      "root_cause": "In OpenIdAuthorizationService.processAuthorization() the result of externalAuthorization(token, issuer, method, path) is assigned to the local variable `boolean isAuthorized` (line 115), only logged (line 116), and then discarded: the method returns the access token (line 118) with no `if (!isAuthorized) throw ...` enforcement. Its downstream collaborators only return/aggregate a boolean and never abort: ExternalInterceptionService.authorization() propagates ExternalConfigService.checkAuthorization(), which ANDs ConfigApiType.authorize() per script and returns false on denial. The only caller, AuthorizationFilter.filter(), wraps processAuthorization() in try/catch and aborts the request only when an exception is thrown (lines 84-96), so a script's `false` (deny) verdict is functionally ignored. In the JWT access-token branch the external authorization is not even invoked (return at line 92).",
+      "title": "jans-config-api does not enforce the CONFIG_API external authorization script decision (broken access control)",
+      "trace": "AuthorizationFilter.filter() -> AuthorizationService.processAuthorization() -> OpenIdAuthorizationService.processAuthorization(): reference-token path lines 111-118 calls externalAuthorization() -> ExternalInterceptionService.authorization() (lines 42-47) -> ExternalConfigService.checkAuthorization() (lines 45-51) -> ConfigApiType.authorize() returns false. The false value reaches line 115 (`isAuthorized`) but is only logged at line 116; line 118 returns the access token, so the filter sees no exception and forwards the request to the protected resource. In the JWT branch (lines 85-98) processAuthorization() returns from validateScope() at line 92 without ever calling externalAuthorization().",
+      "unverified": "Not runtime-confirmed and not confirmed against an upstream fix commit or advisory. Impact depends on a deployment that configures a CONFIG_API interception script; the JWT-token omission of the external call may be intended design (script only documented as called after introspection). Exploitability of a specific Config API operation was not traced end-to-end, and the snapshot contains no tests to validate the intended behavior.",
+      "weakness_type": "Missing/Incorrect Authorization (CWE-862, CWE-863)"
+    }
+  ],
+  "coverage_summary": "Per get_source_scope: 4,915 source-root files, 4,914 model-visible (one file excluded by sensitive name/path filter; binaries refused/skipped), 0 excluded by size, 0 symlinks. Per get_relation_scope: the P1 index is partial — 4,736 files indexed, 2,712 Java files parsed, 38,731 symbols, 71,135 edges, 53,842 unresolved calls, 180 omitted files and 179 source files missing from the index; capabilities explicitly lack control flow, data flow and semantic resolution (syntactic/navigation candidates only). I therefore could not treat index edges as proof and verified each reviewed relation in source text. I inspected the largest security-relevant Java surfaces (jans-auth-server server/model/auth/authorize/token/session/servlet, jans-config-api security/api/rest/external services, jans-orm SQL/LDAP operation services, jans-scim auth/bulk, jans-lock policy download/protection, jans-core util/cache/document-store/saml, agama engine webservlets/serialization) using literal searches for dangerous sinks (process execution, file/stream I/O, XML parsing, deserialization, TLS trust managers, redirects, random generators, JWT none-algorithm handling) plus the index's security_call facts. Non-Java material (Kotlin/TS/YAML/charts/docs) was only spot-checked and is not covered by the Java index; Python and Rust sources are absent from this snapshot, and no test trees exist, so behavior was not validated by tests or execution.",
+  "limitations": [
+    "No VCS metadata, upstream branch, fix commit, or advisory data is available in the snapshot, so I cannot prove whether the missing external-authorization enforcement is an introduced regression or a pre-existing upstream defect.",
+    "All conclusions are static; no code, build, test, or scanner was executed and nothing is runtime-confirmed.",
+    "The P1 index is syntactic-only (no data flow/semantic resolution; 53,842 unresolved calls; 179 source files missing), so reachability of the reported sink through every filter/resource path was reasoned from source reading, not from complete call-chain analysis.",
+    "Exploitability of the reported candidate depends on deployment configuration (at least one enabled CONFIG_API interception script) and on an attacker holding a token that satisfies issuer/signature/scope validation; per-operation impact inside Config API was not traced end-to-end.",
+    "Non-Java code, Kubernetes/Helm YAML, shell/JS assets and documentation were not systematically reviewed; source files of Python/Rust modules are not present in this snapshot, so any vulnerability there is out of scope of this review.",
+    "One repository file is excluded from visibility by the sensitive-name/path filter and could not be inspected."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "jans-auth-server AuthenticationFilter.processJwtAuth: `authenticator.authenticateClient(servletRequest, true); authorized = true;` (lines 573-574) and `filterChain.doFilter(...)` placed before the `if (!authorized) sendError(...)` check (lines 579-586) look like a removed boolean assignment/check.",
+      "reason": "Behaviorally near-equivalent to the intended code: Authenticator.clientAuthentication (Authenticator.java lines 273-281) treats `skipPassword=true` as already logged-in, so authenticateClient(...,true) returns true for any non-empty client id, and the client-assertion JWT is itself fully verified (issuer/subject/audience/expiration/signature) in ClientAssertion.load (lines 66-146). I could not establish an exploitable authentication bypass, so this remains an unconfirmed lead."
+    },
+    {
+      "lead": "jans-config-api AuthUtil.findMissingElements (lines 361-366) returns an empty 'missing' list when the token's scope list is null/empty, so findMissingScopes() can report no missing scopes for an active token that carries no scopes (possible scope-check bypass).",
+      "reason": "Requires an AS-issued token whose `scope` claim is absent/empty; I could not confirm such tokens are obtainable by an attacker, and the symmetric null/empty guards on the sibling helpers (containsAnyElement/isEqualCollection) suggest this may be deliberate defensive coding rather than a regression. Unconfirmed; not submitted."
+    },
+    {
+      "lead": "jans-config-api AssetService.loadServiceAsset (line 232) has an inverted condition: `if (assets == null || !assets.isEmpty())` returns 'No asset found' exactly when assets exist, so the asset-processing loop is skipped.",
+      "reason": "Clear logic inconsistency, but no security impact (the loop only reads/validates streams and returns a message); treated as a functional defect, not a vulnerability candidate."
+    },
+    {
+      "lead": "jans-core/saml SAMLMetadataParser.parse (line 65) explicitly sets disallow-doctype-decl=false on a DocumentBuilderFactory with no external-entity hardening (SAXUtils.java line 34 too), suggesting a potential XXE.",
+      "reason": "Input is SAML metadata uploaded/configured through admin-protected config-api/kc-saml flows; metadata extraction uses XPath over specific attributes/elements, so only blind/error-based XXE could be plausible. No reachable attacker path or exfiltration channel was verified; unconfirmed."
+    },
+    {
+      "lead": "jans-fido2 UserVerificationVerifier: verification bodies for `preferred`/`discouraged` user-verification are commented out (lines 68-82), and HttpService.getHttpsClientTrustAll / BaseHttpService provide trust-all TLS clients.",
+      "reason": "Both look like pre-existing upstream design/legacy code (HttpService is @Deprecated and not on attacker-controlled paths that I could trace); no concrete attacker-controlled exploit path was established. Rejected as unconfirmed."
+    },
+    {
+      "lead": "CORS handling (jans-config-api CorsFilter lines 85-101) reflects the request Origin and can emit Access-Control-Allow-Credentials when allowedOrigin lists are empty.",
+      "reason": "Behavior depends on deployment configuration (corsConfiguration enabled/origins); could not confirm a default-enabled insecure configuration in the snapshot, so not submitted."
+    }
+  ],
+  "summary": "Reviewed the Janssen (jans) snapshot as a local, read-only source assessment. The snapshot is a post-v1.7.0 (2025-05-20) main-branch tree with Java modules plus YAML/docs; all `src/test` trees and Python/Rust sources are absent, so no tests could be used as evidence. The strongest source-supported issue is in jans-config-api: `OpenIdAuthorizationService.processAuthorization()` collects the boolean verdict of the deployment's CONFIG_API external authorization script, logs it, and then returns the access token without ever enforcing it (and never invokes the external script at all for JWT access tokens). The only caller (`AuthorizationFilter`) aborts solely on exceptions, so a script \"deny\" decision has no effect — a broken/missing authorization control (CWE-862/863). Other suspicious spots (auth-server JWT client-assertion handling, empty-scope handling in AuthUtil.findMissingElements, an inverted condition in AssetService, permissive DOCTYPE in the SAML metadata parser, commented-out FIDO2 UV checks, trust-all TLS helpers) were inspected and are listed as unconfirmed/rejected leads rather than additional candidates. All findings are static and unverified at runtime."
+}

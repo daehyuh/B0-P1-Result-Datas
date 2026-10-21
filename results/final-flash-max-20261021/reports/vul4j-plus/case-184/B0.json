@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker controls the snapshot name string in the master RPC payloads (SnapshotRequest.snapshot.name / DeleteSnapshotRequest.snapshot.name). Any client that can speak the HBase master protobuf RPC or a co-located gateway can omit the client-side validation performed by HBaseAdmin (calling the RPC directly or via a modified client), so the name may contain '/', '..' or be an absolute path. Snapshot-name input ultimately reaches filesystem operations.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified client-side validation exists (ClientSnapshotDescriptionUtils.assertSnapshotRequestIsValid, TableName.isLegalTableQualifierName(..., true)), confirming the intended invariant and the server/client asymmetry. Verified server-side SnapshotDescriptionUtils.validate (hbase-server, lines 300-323) contains no name check, and SnapshotManager.isSnapshotCompleted's javadoc (line ~712) claims IllegalArgumentException for invalid names although none is thrown, further indicating the missing check. Checked whether other layers compensate: REST/Thrift gateways do not perform snapshot ops; AccessController only enforces authorization, not name validity; deleteSnapshot does require a readable .snapshotinfo at the target path (limits delete-only traversal to attacker-created or existing snapshot dirs), but takeSnapshot's prepareToTakeSnapshot deletes the resolved working dir before any such requirement, so the deletion primitive stands. Not runtime-confirmed; Hadoop Path(parent, child) dot-segment/'absolute child' resolution semantics were inferred from source semantics, not executed.",
+      "id": "hbase-snapshot-name-path-traversal",
+      "impact": "Remote arbitrary directory deletion and file/directory creation in the filesystem backing HBase, performed with the master process's credentials. In unsecured or table-admin scenarios this allows destruction of HBase data/other tenants' directories and creation of attacker-named snapshot artifacts outside .snapshot, i.e. data-destruction/denial-of-service and integrity compromise of the shared filesystem namespace.",
+      "locations": [
+        {
+          "end_line": 1526,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java",
+          "start_line": 1503
+        },
+        {
+          "end_line": 709,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java",
+          "start_line": 696
+        },
+        {
+          "end_line": 247,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/snapshot/SnapshotDescriptionUtils.java",
+          "start_line": 199
+        },
+        {
+          "end_line": 323,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/snapshot/SnapshotDescriptionUtils.java",
+          "start_line": 300
+        },
+        {
+          "end_line": 342,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/SnapshotManager.java",
+          "start_line": 309
+        },
+        {
+          "end_line": 493,
+          "path": "hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/SnapshotManager.java",
+          "start_line": 450
+        },
+        {
+          "end_line": 48,
+          "path": "hbase-client/src/main/java/org/apache/hadoop/hbase/snapshot/ClientSnapshotDescriptionUtils.java",
+          "start_line": 40
+        }
+      ],
+      "prerequisites": "Ability to send snapshot/delete-snapshot RPCs to the active master. In secure clusters, table-level ADMIN permission on the target table (AccessController.preSnapshot) or ownership/ADMIN for delete (preDeleteSnapshot); in clusters without authorization (default hbase.security.authorization=false) no extra privilege is needed. The master must be able to resolve/write the traversed path with its own filesystem credentials (HBase master process user).",
+      "root_cause": "Snapshot names supplied by RPC clients are validated only in the client library (ClientSnapshotDescriptionUtils.assertSnapshotRequestIsValid -> TableName.isLegalTableQualifierName(..., true)), not on the server. MasterRpcServices.deleteSnapshot passes request.getSnapshot() straight to SnapshotManager.deleteSnapshot, and MasterRpcServices.snapshot only calls SnapshotDescriptionUtils.validate(), which checks table presence/creation-time/ACL but never the snapshot name. SnapshotDescriptionUtils.getCompletedSnapshotDir/getWorkingSnapshotDir then build paths as new Path(snapshotsDir, snapshotName) (Hadoop Path(parent, child) performs URI resolution that resolves '..' and accepts absolute children), so '..'/absolute-path snapshot names escape the .snapshot directory. SnapshotManager then uses those resolved paths in destructive filesystem operations: recursive delete of the working dir before creating a snapshot, recursive delete of the completed snapshot dir, mkdirs and rename.",
+      "title": "Server-side snapshot name is not validated, allowing path traversal in filesystem operations (arbitrary directory deletion/write)",
+      "trace": "Client RPC -> MasterRpcServices.snapshot() (line ~1513, uses SnapshotDescriptionUtils.validate, which performs no name check) -> SnapshotManager.takeSnapshot -> takeSnapshotInternal -> snapshotEnabledTable/snapshotDisabledTable -> prepareToTakeSnapshot (SnapshotManager lines 450-493): workingDir = SnapshotDescriptionUtils.getWorkingSnapshotDir(<root>/.snapshot/.tmp, name) via new Path(parentPath, snapshotName); then workingDirFS.delete(workingDir, true); workingDirFS.mkdirs(workingDir); later writeSnapshotInfo writes .snapshotinfo and completeSnapshot renames the directory. delete path: MasterRpcServices.deleteSnapshot (line 704) -> SnapshotManager.deleteSnapshot(SnapshotDescription) (lines 309-342) -> getCompletedSnapshotDir(snapshotName) then fs.delete(snapshotDir, true). A name such as '../../../../<target>' is resolved by Hadoop Path(parent, child) URI resolution relative to <root>/.snapshot/.tmp (or .snapshot for delete), so the delete/mkdir/rename applies to the attacker-chosen directory instead of the snapshot directory.",
+      "unverified": "Exploitability of '..' resolution depends on Hadoop Path(parent, child) URI-resolution semantics and on the target filesystem honoring the normalized path (for file:// and URI-resolving filesystems it is direct); not executed or runtime-tested. Whether the exact upstream HBase fix for this issue added the name check in SnapshotDescriptionUtils.validate/SnapshotManager could not be confirmed from the snapshot alone. Also unverified: behavior on HDFS NameNode side for paths already resolved by Path; deleteSnapshot additionally needs a parseable .snapshotinfo at the target directory.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-20 Improper Input Validation"
+    }
+  ],
+  "coverage_summary": "Inspected the repository structure and modules (hbase-server, hbase-client, hbase-rest, hbase-thrift, hbase-common, hbase-mapreduce, hbase-backup, hbase-http, hbase-shell, etc.). Reviewed security-relevant network/API surfaces including REST resources/filters, Thrift HTTP servlet, IPC framing, filter parsing, authorization core classes, snapshot and filesystem-path handling, JMX servlet, and crypto helpers. Test sources and .jsp/.tmpl UI templates are absent from this snapshot, so those areas (and generated/gateway-specific code) could not be reviewed. Only read-only search/read tools were used; no code was executed.",
+  "limitations": [
+    "Test sources and webapp .jsp/.tmpl UI templates are missing from the visible snapshot, limiting coverage of UI/XSS and test-defined security invariants.",
+    "No build execution or runtime verification; Hadoop Path(parent, child) traversal/resolution behavior and filesystem behavior were reasoned from source, not executed.",
+    "Large generated files (e.g., thrift/protobuf generated classes) were not exhaustively read.",
+    "Dependency-level vulnerabilities (e.g., old Jackson/Jetty versions in pom.xml) are out of scope for this source review and were not validated.",
+    "Only one candidate is reported by design; other plausible-but-unverified leads are listed as rejected leads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "JVM.getOpenFileDescriptorCount uses bash -c with a string built from RuntimeMXBean name (hbase-common/.../util/JVM.java:160-162)",
+      "reason": "The pid/host string comes from the JVM process name (system property), not from a remote or file input; no realistic attacker control, and the command runs only on IBM JVMs."
+    },
+    {
+      "lead": "XXE in REST client XML parsing (hbase-rest/.../client/RemoteAdmin.java)",
+      "reason": "The code explicitly disables DTD and external entities (XMLInputFactory.SUPPORT_DTD=false, IS_SUPPORTING_EXTERNAL_ENTITIES=false), so this hardening is present."
+    },
+    {
+      "lead": "Arbitrary filter class instantiation via ParseFilter (hbase-client/.../filter/ParseFilter.java)",
+      "reason": "parseSimpleFilterExpression enforces a filterHashMap whitelist and rejects unknown filter names; registerFilter is server-config/extension controlled, so the classic CVE-2018-8025-style path is closed in this snapshot."
+    },
+    {
+      "lead": "REST server authentication/CSRF/doAs handling (hbase-rest AuthFilter, RESTServletContainer, RestCsrfPreventionFilter)",
+      "reason": "Filters exist and use Hadoop AuthenticationFilter plus ProxyUsers.authorize for doAs; no missing check identified in the inspected code."
+    },
+    {
+      "lead": "AccessController/AuthManager authorization logic",
+      "reason": "Inspected core permission methods; checks appear consistent with upstream intent (global/namespace/table/family implications, superuser cache initialization). No concrete bypass evidenced."
+    },
+    {
+      "lead": "NettyRpcFrameDecoder/NettyRpcServer request size handling",
+      "reason": "Length is read unsigned, compared against maxFrameLength, and oversized frames are handled/closed; no overflow or missing bound found in the inspected range."
+    }
+  ],
+  "summary": "Reviewed the HBase 3.0.0-SNAPSHOT tree (2,591 visible text files; test sources and .jsp/.tmpl UI templates are not present in the snapshot, so those areas could not be inspected). I traced the strongest plausible security defect to the master-side snapshot RPC path: snapshot names coming from RPC requests are never validated server-side before being used as filesystem path components, unlike the client-side path where ClientSnapshotDescriptionUtils.assertSnapshotRequestIsValid enforces TableName.isLegalTableQualifierName(..., true). Because SnapshotDescriptionUtils builds snapshot directories with new Path(parentPath, snapshotName) (Hadoop Path URI-resolution, which resolves \"..\" and can replace an absolute path), a crafted snapshot name containing traversal segments can make the master resolve and then recursively delete/mkdir/rename directories outside .snapshot, e.g. via SnapshotManager.prepareToTakeSnapshot's workingDirFS.delete(workingDir, true) reached from MasterRpcServices.snapshot, or via SnapshotManager.deleteSnapshot's fs.delete(snapshotDir, true). This is a validation/trust-boundary defect with concrete data-destruction impact (arbitrary directory deletion / file creation as the HBase process, typically the HDFS superuser in unsecured deployments). I selected this as the single candidate; several other leads were checked and rejected as unsupported or already hardened."
+}

@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Fully remote and unauthenticated. Any HTTP client can POST `logoutRequest=<XML>` (default parameter name, application/x-www-form-urlencoded, non-multipart) or GET `?SAMLRequest=<base64+deflate XML>&RelayState=x` to any URL handled by SingleSignOutFilter/SingleSignOutValve. The XML string is taken verbatim from the request (SingleSignOutHandler.java:174/187/288-291) and handed to the SAX parser; there is no CAS-server authentication, signature check or IP allowlist on this path.",
+      "confidence": "medium",
+      "counterevidence_checked": "1) The explicit `load-external-dtd=false` (XmlUtils.java:58) blocks the external DTD subset, which prevents the common parameter-entity-based out-of-band exfiltration and removes one XXE vector; however it does not block external general entities declared in an internal DTD subset, which Xerces still dereferences unless `external-general-entities`/`disallow-doctype-decl` is disabled (OWASP XXE guidance). 2) The parsed value is only used as a session-lookup key, so file content is not echoed to the attacker (impact is blind, not direct file disclosure). 3) Modern JDKs bound entity expansion (entityExpansionLimit), which may reduce the DoS amplitude on newer runtimes; era-appropriate JDK 6/7 parsers are more exposed. 4) No tests are present in the snapshot and I did not execute anything, so parser behavior is inferred from JAXP/Xerces documented defaults, not runtime-confirmed. 5) SLO is a server-to-server channel by protocol intent, but the implementation performs no source authentication, so the parameter is still attacker-reachable.",
+      "id": "CASE038-XXE-SLO",
+      "impact": "Server-side request forgery / blind SSRF from the application server to arbitrary URLs chosen by the attacker (including internal-only services), plus blind reads of local files referenced by file:// entities (content is consumed by the parser but not returned to the client), plus entity-expansion resource exhaustion (billion-laughs style) against JDK parsers without expansion limits, causing CPU/memory denial of service. The same parser configuration is shared by all XmlUtils callers (SLO handler, Cas20ServiceTicketValidator, Cas20ProxyTicketRetriever).",
+      "locations": [
+        {
+          "end_line": 63,
+          "path": "cas-client-core/src/main/java/org/jasig/cas/client/util/XmlUtils.java",
+          "start_line": 53
+        },
+        {
+          "end_line": 188,
+          "path": "cas-client-core/src/main/java/org/jasig/cas/client/session/SingleSignOutHandler.java",
+          "start_line": 171
+        },
+        {
+          "end_line": 295,
+          "path": "cas-client-core/src/main/java/org/jasig/cas/client/session/SingleSignOutHandler.java",
+          "start_line": 255
+        },
+        {
+          "end_line": 102,
+          "path": "cas-client-core/src/main/java/org/jasig/cas/client/session/SingleSignOutFilter.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 149,
+          "path": "cas-client-core/src/main/java/org/jasig/cas/client/validation/Cas20ServiceTicketValidator.java",
+          "start_line": 134
+        }
+      ],
+      "prerequisites": "Application deploys SingleSignOutFilter or a SingleSignOutValve with defaults (documented SLO setup). JAXP/Xerces defaults leave external general entity resolution and DTD processing enabled; the attacker needs network reachability to the app and (for the strongest impact) the app server must be able to make outbound connections, or the attacker runs a listener to confirm the OOB request. No special privileges required.",
+      "root_cause": "XmlUtils.getXmlReader() (cas-client-core/.../util/XmlUtils.java:53-63) enables namespaces and disables external-DTD loading (`http://apache.org/xml/features/nonvalidating/load-external-dtd` = false) but never disables DTD processing (`disallow-doctype-decl`), external general entities (`external-general-entities`) or external parameter entities, and never sets secure-processing/entity-expansion limits on the SAXParserFactory (line 55). Consequently an XML document with an internal DTD subset that declares `<!ENTITY x SYSTEM \"http://...\">` still causes Xerces/JAXP to dereference that URL and to expand entities when the entity is referenced. SingleSignOutHandler.destroySession() (lines 284-295) passes the raw request value straight to XmlUtils.getTextForElement() (parse at XmlUtils.java:158-163) without any validation, signature or source check, and SingleSignOutFilter/SSO valves invoke process() for every request by default (SingleSignOutFilter.java:99; v6/v7 SingleSignOutValve invoke()). Cas20ServiceTicketValidator.extractCustomAttributes() (lines 134-149) contains the same weakness in unmitigated form (plain SAXParserFactory, no feature restrictions) for CAS-server responses.",
+      "title": "XML external entity (XXE) processing of attacker-supplied single-sign-out messages via XmlUtils",
+      "trace": "HTTP request -> SingleSignOutFilter.doFilter (line 99) -> SingleSignOutHandler.process (197) -> isBackChannelLogoutRequest/isFrontChannelLogoutRequest (171-188) read `logoutRequest`/`SAMLRequest` -> destroySession (284-295) -> XmlUtils.getTextForElement(logoutMessage, \"SessionIndex\") -> getXmlReader (53-63) builds reader with only `load-external-dtd=false` -> reader.parse(new InputSource(new StringReader(xmlAsString))) (159) -> internal DTD `<!ENTITY xxe SYSTEM \"http://attacker-or-internal-host/...\">` is resolved when `&xxe;` is expanded, and nested internal entities are expanded (no expansion limits set).",
+      "unverified": "Actual entity-resolution behavior of the specific JDK/Xerces version in the target deployment; whether the deployment maps the SLO filter to all request paths (typical default) and whether external general entities remain enabled after the three setFeature calls; no runtime reproduction or CVE/patch ground truth was consulted.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (also CWE-776 entity expansion / CWE-918 SSRF)"
+    }
+  ],
+  "coverage_summary": "Scope: 125 model-visible files (all main Java sources of cas-client-core plus the atlassian, jboss, tomcat-common, tomcat-v6, tomcat-v7, ehcache and memcached modules, POMs, assembly/licensing/README). The P1 relation index reports itself complete (125/125 source files indexed, 0 missing, 958 symbols, 1810 call rows/1486 edges); index facts were used only for navigation and every cited edge was re-verified against source text. I read the core authentication/validation/session/proxy/util classes in full, both Tomcat integration generations, the JBoss and Atlassian integrations, and the distributed PGT storages. No test sources, no runtime execution, and no dependency (OpenSAML/Xerces) source are present in scope.",
+  "limitations": [
+    "No code was executed and no runtime/parser behavior was observed; the XXE mechanics rely on documented JAXP/Xerces defaults (external general entities enabled when only load-external-dtd is disabled).",
+    "The snapshot contains no test sources, so no project-provided tests could corroborate behavior or reachability.",
+    "Third-party dependency sources (Xerces/JAXP, OpenSAML 2.5.1-1, commons-codec, spymemcached, ehcache) are not in scope; vulnerabilities inside them were not assessed.",
+    "Attacker reachability depends on deployment configuration (filter/valve mapping, proxy receptor use); I assessed default filter behavior from source only.",
+    "Per assignment rules I did not consult CVE/patch ground truth, sibling configurations, or external services; the candidate is a lead, not a confirmed vulnerability.",
+    "The P1 index gives syntactic relations only (no data-flow/taint proof, no reachability proof), so data-flow statements in this review are based on manual source tracing."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XML injection: `ticket`/`SAMLart` concatenated unescaped into the SAML 1.1 SOAP request (Saml11TicketValidator.java:236-244) and into the CAS validation URL (AbstractUrlBasedTicketValidator.java:108-151; Cas20ProxyRetriever.java:89-96).",
+      "reason": "Source evidence of missing encoding is clear, but the sink is a request to the configured CAS server and the response is not attacker-controlled; I could not establish a privilege gain or concrete impact beyond request tampering, so it is not the strongest candidate."
+    },
+    {
+      "lead": "Unauthenticated single-sign-out: any client can POST a logoutRequest to trigger destroySession; an attacker can also plant a session mapping with an arbitrary `ticket` value (SingleSignOutHandler.java:230-247, 284-316).",
+      "reason": "Destroying another user's session requires knowing/planting the SessionIndex; the planting variant only yields a logout DoS of a session whose ID the attacker already influences, giving limited impact and no authentication bypass."
+    },
+    {
+      "lead": "Proxy-granting-ticket handling: unauthenticated writes to the PGT storage via readAndRespondToProxyReceptorRequest (CommonUtils.java:184-206) and weak/plaintext PGT protection in AbstractEncryptedProxyGrantingTicketStorageImpl (lines 45-48, 75-109: DESede, no IV/MAC, String<->byte[] conversion, silently returns plaintext when no key is set).",
+      "reason": "Requires a configured proxy receptor/storage and access to the backing store; the cryptographic weaknesses are real but configuration-dependent and not directly remotely exploitable from an untrusted input path."
+    },
+    {
+      "lead": "Host-header-influenced service URL selection in CommonUtils.findMatchingServerName (lines 208-238, incl. `host == \"localhost\"` reference comparison).",
+      "reason": "The returned value is always one of the configured serverNames, so an attacker cannot inject an arbitrary host; only selection among deployer-configured names is influenced, which does not meet the evidence threshold."
+    },
+    {
+      "lead": "Session fixation: assertion is stored into the pre-existing session without rotating the session id after CAS login (AbstractTicketValidationFilter.java:206-221; AuthenticationFilter.java:148-162).",
+      "reason": "Plausible deployment-level weakness, but it is an absence of hardening rather than a traceable dangerous operation in this source, and exploitability depends on the container and attacker's ability to preset the session cookie; left as an unconfirmed lead."
+    },
+    {
+      "lead": "AnyHostnameVerifier / RegexHostnameVerifier / WhitelistHostnameVerifier (ssl package).",
+      "reason": "Hostname-verification bypass is opt-in via configuration; HttpsURLConnectionFactory defaults to HttpsURLConnection.getDefaultHostnameVerifier() (line 50), so the defaults are safe."
+    }
+  ],
+  "summary": "Review of the java-cas-client 3.3.2-SNAPSHOT tree (125 files: 115 Java sources + POM/assembly/licensing docs; no test sources in scope, no binaries). I traced request-controlled input into the auth/SLO/proxy/ticket-validation paths and picked the single strongest source-evidenced issue: attacker-controlled XML from the CAS single-sign-out protocol is parsed by a SAX reader that is only partially hardened against XML external entities (CWE-611). SingleSignOutFilter/valves feed raw request parameters (`logoutRequest` POST, base64+deflated `SAMLRequest` GET) into XmlUtils.getXmlReader()/getTextForElement() with no authentication of the sender. The reader disables external DTD loading but leaves DTD processing, external general/parameter entity resolution and entity expansion enabled, so a crafted internal DTD subset can still cause the app server to dereference attacker-chosen URLs (blind SSRF / OOB requests) and expand entities (resource-exhaustion DoS); the same parser weaknesses (with no hardening at all) exist in Cas20ServiceTicketValidator.extractCustomAttributes. Other plausible leads (unescaped ticket in SAML SOAP body and in the validation URL, unauthenticated SLO session destruction, weak/absent PGT storage encryption, Host-header selection of service URL, session fixation) were checked and rejected or kept as unconfirmed leads because attacker control, reachability or concrete impact was weaker or not demonstrable from source."
+}

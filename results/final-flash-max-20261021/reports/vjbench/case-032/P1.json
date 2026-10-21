@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the XML document that the application passes to XStream.fromXML(String/Reader), XStream.unmarshal(HierarchicalStreamReader) or an equivalent driver entry point. Element names and nesting inside that document select the converter recursion (e.g. repeated built-in 'list'/Map-converter elements). No privileged position is needed: this is the documented threat model of the library ('The provided XML data ... can be manipulated by injecting the XML representation of other objects', security.html lines 27-31).",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) Searched xstream/src/java for any depth/size guard (maxDepth, SizeLimit, TooMany, explicit limit constants, '100000', 'huge') - none exist in the unmarshalling path; the only hit is StringConverter's unrelated cache length limit. (2) Verified the default security framework does NOT block the attack: setupSecurity() allows Collection, Map and Map.Entry hierarchies (XStream.java 638-650) and default aliases 'list'/'map'/'set'/'entry' exist (772-777), so recursion-capable types are permitted out of the box. (3) Checked readers: AbstractPullReader.moveDown is stack-based/iterative, so the overflow is in converter dispatch, not the parser (no parser-level depth guard either). (4) Checked TreeMarshaller's circular-reference exception: it applies to marshalling by id; AbstractReferenceUnmarshaller only guards against invalid refs, not against depth or counts. (5) Checked the security-framework RCE leads I could reach (SecurityMapper, CachingMapper, HierarchicalStreams, DynamicProxyConverter, SerializableConverter class attributes) - all inspected type-resolution paths go through mapper.realClass with SecurityMapper in the chain, so no competing RCE candidate was substantiated.",
+      "id": "xstream-unbounded-unmarshal-recursion-dos",
+      "impact": "Denial of service against any component that unmarshals untrusted XML with this XStream version: unhandled StackOverflowError or OutOfMemoryError during fromXML()/unmarshal(). StackOverflowError is an Error rather than an Exception; it escapes XStream's XStreamException/ConversionException handling and can kill the request thread or the JVM (depending on container handling). The same unbounded loops mean a large but well-formed document is fully materialised in memory. Background knowledge (not verifiable in the snapshot): XStream published resource-exhaustion advisories in its next maintenance releases for exactly this kind of crafted XML; I label the exact advisory/CVE mapping as unverified.",
+      "locations": [
+        {
+          "end_line": 84,
+          "path": "xstream/src/java/com/thoughtworks/xstream/core/TreeUnmarshaller.java",
+          "start_line": 50
+        },
+        {
+          "end_line": 104,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/collections/CollectionConverter.java",
+          "start_line": 78
+        },
+        {
+          "end_line": 150,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/collections/AbstractCollectionConverter.java",
+          "start_line": 111
+        },
+        {
+          "end_line": 113,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/collections/MapConverter.java",
+          "start_line": 85
+        },
+        {
+          "end_line": 660,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 633
+        },
+        {
+          "end_line": 777,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 772
+        },
+        {
+          "end_line": 1253,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 1251
+        }
+      ],
+      "prerequisites": "Application unmarshals untrusted XML with an XStream instance whose security framework permits collections/maps. The default configuration suffices: XStream() -> XppDriver, setupSecurity() adds InterfaceTypePermission, allowTypeHierarchy(Collection.class) and allowTypeHierarchy(Map.class) (XStream.java 638-650), and setupAliases() registers 'list'->List, 'set'->Set, 'map'->Map, 'entry'->Map.Entry (XStream.java 772-777), which the mapper resolves to the default implementations (ArrayList/HashMap) that CollectionConverter/MapConverter unmarshal. Only a request/deserialization thread and a document of modest size (deep nesting) or a large document (many entries) are needed; no other bug is required.",
+      "root_cause": "The unmarshalling pipeline imposes no bound on attacker-controlled structure depth or size. TreeUnmarshaller.convertAnother()/convert() (lines 50-84) dispatch recursively for each nested element, and the collection/map/array converters (CollectionConverter.populateCollection, MapConverter.populateMap, ArrayConverter.unmarshal) loop over children without any counter or depth limit. The reader layer (AbstractPullReader) is iterative, but converter dispatch recurses per XML level, so nesting depth translates directly into JVM stack frames; equally, the per-collection loops admit an unbounded number of child elements. No guard of the form maxDepth/maxDepth/size-limit exists anywhere in the unmarshalling path (searched the whole xstream/src/java tree: no depth cap, no collection/map size cap; the only 'depth' fields are FieldKey.depth and PathTracker/ReaderDepthState which are unrelated to unmarshalling recursion).",
+      "title": "Remote DoS via unbounded attacker-controlled unmarshalling (nested collections/maps cause StackOverflowError; unbounded element counts cause memory exhaustion)",
+      "trace": "XStream.fromXML(String) (XStream.java:1251) -> fromXML(Reader) -> unmarshal(reader) (1364) -> marshallingStrategy.unmarshal(...) (1391) -> AbstractTreeMarshallingStrategy.unmarshal -> TreeUnmarshaller.start (TreeUnmarshaller.java:130) -> convertAnother()/convert() (50-84: types.push, then converter.unmarshal(reader, this)). For a nested collection element: CollectionConverter.unmarshal (78-82) -> populateCollection (88-94) loops over reader.hasMoreChildren(), moveDown() -> addCurrentElementToCollection (96-100) -> AbstractCollectionConverter.readItem/readBareItem (115-133) resolves the child element name via HierarchicalStreams.readClassType -> mapper.realClass (SecurityMapper passes Collection/Map types by default) -> context.convertAnother(current, type) -> TreeUnmarshaller.convertAnother (50-68) -> convert() (70-84) -> the child converter's unmarshal, i.e. one full recursion cycle per nesting level with no depth check. MapConverter.populateMap/putCurrentEntryIntoMap (91-108) and ArrayConverter.unmarshal (50-66) follow the same unbounded loop shape. Because the JVM call stack is consumed proportionally to XML nesting and the heap proportionally to the number of child elements, a crafted document can terminate unmarshalling with StackOverflowError, or exhaust the heap; both abort the unmarshalling thread and, for typical server usage, the request/process.",
+      "unverified": "Not runtime-confirmed: no code was executed, so stack/heap thresholds and exact payload shapes were not measured, and the review only shows the missing bound and the recursive call path from source. The exact upstream advisory/CVE that fixed this (background recollection points to XStream 1.4.19/1.4.20 maintenance releases) cannot be checked from the snapshot and is therefore a lead, not a fact. Whether every alternative driver/converter combination is similarly unbounded was not exhaustively traced, though the default XppDriver/Collection/Map path was verified line-by-line.",
+      "weakness_type": "Uncontrolled Resource Consumption (CWE-400) / Uncontrolled Recursion (CWE-674); StackOverflow / memory exhaustion DoS"
+    }
+  ],
+  "coverage_summary": "Model-visible scope was 516 files (518 with filters; binary-like files refused and 4 index-omitted files): the XStream core library (xstream/src/java, 362 files), xstream-hibernate, xstream-benchmark/xstream-jmh sources, xstream-distribution content/poms, and build files. No test sources are present in the snapshot, so findings could not be corroborated by tests. The P1 relation index parsed 418 Java files (1 parse error, 4989 unresolved calls, control/data-flow not implemented), so cross-file call/index facts were used only for navigation and every cited edge was re-checked in source text. Reviewed: unmarshalling core (TreeUnmarshaller, reference unmarshallers, marshalling strategies), collection/map/array converters plus AbstractCollectionConverter, reflection/serialization converters, security framework (type permissions, SecurityMapper, default setup in XStream), mapper chain (CachingMapper, MapperWrapper, HierarchicalStreams), XML/JSON/binary readers and drivers at a survey level, and the security/change documentation that identifies the snapshot's release line. Not reviewed line-by-line: most basic/extended/time/JavaBean converters, persistence package, Swing/AWT converters, JMH/benchmark tool code, xstream-distribution HTML assets, and all Maven plugin configuration; those are outside the strongest evidence path and remain uninspected in detail.",
+  "limitations": [
+    "No execution, tests, or runtime probing: the finding is a source-level lead, not a confirmed vulnerability; stack/heap thresholds and end-to-end exploitability were not measured.",
+    "The snapshot contains only main sources (no xstream/src/test), so upstream regression tests that would pin the exact fixed behaviour could not be inspected.",
+    "The P1 index provides only syntactic candidates (no control/data flow, no semantic resolution, 4989 unresolved calls, 1 parse error); index labels were treated as navigation hints only.",
+    "The exact advisory/CVE mapping and the corresponding upstream fix (limit on nesting depth vs. element count) could not be verified offline against ground truth; the mechanisms described are derived from the snapshot source text.",
+    "Audit was depth-first on the strongest unmarshalling path; other converters and drivers were only surveyed and could contain additional or mitigating behaviour."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "RCE / type-whitelist bypass during unmarshalling (default security framework)",
+      "reason": "Sampled SecurityMapper.realClass, CachingMapper.realClass, MapperWrapper, HierarchicalStreams.readClassType, DynamicProxyConverter.unmarshal, SerializableConverter class-attribute handling and CustomObjectInputStream.resolveClass; all inspected element-name/class-name resolution used by the XML-driven flow goes through mapper.realClass with SecurityMapper still evaluating TypePermissions, and no concrete attacker-controlled instantiation of a non-whitelisted type was established. Not exhaustively audited (single candidate limit), so this is unconfirmed rather than disproven."
+    },
+    {
+      "lead": "DTD/entity-expansion (XML bomb) denial of service through the default parser",
+      "reason": "Default XStream() uses XppDriver -> XmlPullParserFactory (mxparser 1.2.2); XStream's own code does not enable DTD/entity processing and no entity-handling code exists in the snapshot's driver classes. Parser defaults were not exercised at runtime, so this remains an unverified lead, weaker than the directly code-evident recursion/resource issue."
+    },
+    {
+      "lead": "CustomObjectInputStream.resolveClass uses Class.forName() with the configured ClassLoader instead of mapper.realClass() (potential filter bypass)",
+      "reason": "The XML-driven SerializableConverter flow reads object types through the mapper-checked callback (SerializableConverter.java around 321-445), and resolveClass is only used for stream-internal class descriptors; no attacker-reachable path that bypasses SecurityMapper was demonstrated. Not confirmed."
+    },
+    {
+      "lead": "CachingMapper caches ForbiddenClassException results, so permission additions after a failed unmarshal may not take effect until flushCache()",
+      "reason": "Behaviour matches the snapshot's upstream design and requires a specific host application sequence (addPermission after a denied unmarshal); no attacker-controlled path that turns this into a security violation was demonstrated, and no CVE-level impact was established."
+    }
+  ],
+  "summary": "Snapshot is XStream 1.4.19-SNAPSHOT (all poms; changes.html still shows the upcoming 1.4.x release with only GHI:#233 listed), i.e. the maintenance line that preceded the next published security release. The strongest source-verifiable issue is the complete absence of any bound on the depth/size of attacker-controlled structures while unmarshalling XML: TreeUnmarshaller recurses converter-by-converter for every nesting level, and the collection/map/array converters iterate children without any count limit, so an XML document supplied to XStream.fromXML()/unmarshal() controls both JVM call-stack depth (StackOverflowError) and object count (heap exhaustion). Default configuration is affected: the built-in whitelist (XStream.setupSecurity) explicitly allows the Collection/Map/Map.Entry hierarchies and the built-in aliases expose \"list\"/\"map\"/\"set\", so deeply nested elements are resolvable without any custom setup. This is reported as a single root cause (missing resource bounds in the unmarshalling pipeline) with the recursion path as the concrete trace; the sibling heap-exhaustion behaviour of the same unbounded loops is noted rather than filed separately. No other distinct, adequately evidenced vulnerability candidate was found; the security-framework RCE-bypass leads I sampled all route class resolution through mapper.realClass() with SecurityMapper still in the chain."
+}

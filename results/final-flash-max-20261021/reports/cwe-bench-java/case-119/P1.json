@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A network peer that can reach the worker port controls the framed command type, opaque value, and JSON command body. Within `TaskExecuteRequestCommand` it controls the nested `TaskExecutionContext`, including `taskType`, `taskParams` (for example, a SHELL payload with `rawScript`), tenant code, project/process/task identifiers, and timing fields. No token, session, password, or client certificate is required by the visible protocol or worker handler.",
+      "confidence": "high",
+      "counterevidence_checked": "The worker listener is not completely unvalidated: `TaskExecuteProcessor` checks that the requested OS tenant exists, and the worker may be placed on an internal network not reachable from the Internet. However, the default application configuration binds the listener without an address restriction, tenant auto-creation is enabled, and there is no authentication or task-instance/database-origin check before a queued task is executed. The deployment manifests also expose worker port 1234 through a headless Kubernetes service. The protocol does not use Java native deserialization; the risk is not deserialization but missing authentication plus direct execution of the accepted task definition. No runtime test or packet-level reproduction was performed.",
+      "id": "worker-rpc-unauth-task-execution",
+      "impact": "Unauthenticated remote arbitrary OS command execution on a worker node, potentially as the configured deployment user or as a selected tenant user. With the default sudo-oriented deployment model, an attacker able to submit a task under a privileged existing tenant such as `root` can obtain root-level execution on the worker. This can expose worker-local credentials, task data, logs, mounted storage, and network access available to the worker, and can be used as a foothold for lateral movement.",
+      "locations": [
+        {
+          "end_line": 66,
+          "path": "dolphinscheduler-worker/src/main/resources/application.yaml",
+          "start_line": 56
+        },
+        {
+          "end_line": 156,
+          "path": "dolphinscheduler-worker/src/main/java/org/apache/dolphinscheduler/server/worker/WorkerServer.java",
+          "start_line": 138
+        },
+        {
+          "end_line": 151,
+          "path": "dolphinscheduler-remote/src/main/java/org/apache/dolphinscheduler/remote/NettyRemotingServer.java",
+          "start_line": 119
+        },
+        {
+          "end_line": 170,
+          "path": "dolphinscheduler-worker/src/main/java/org/apache/dolphinscheduler/server/worker/processor/TaskExecuteProcessor.java",
+          "start_line": 88
+        },
+        {
+          "end_line": 180,
+          "path": "dolphinscheduler-worker/src/main/java/org/apache/dolphinscheduler/server/worker/runner/TaskExecuteThread.java",
+          "start_line": 157
+        },
+        {
+          "end_line": 155,
+          "path": "dolphinscheduler-task-plugin/dolphinscheduler-task-shell/src/main/java/org/apache/dolphinscheduler/plugin/task/shell/ShellTask.java",
+          "start_line": 121
+        },
+        {
+          "end_line": 140,
+          "path": "dolphinscheduler-task-plugin/dolphinscheduler-task-api/src/main/java/org/apache/dolphinscheduler/plugin/task/api/AbstractCommandExecutor.java",
+          "start_line": 117
+        }
+      ],
+      "prerequisites": "Network reachability to the worker listener (default port 1234), which is normally reachable from the internal network or Kubernetes pod network. The `dolphinscheduler-task-all` dependency places the SHELL plugin on the worker classpath; the worker installs plugins at startup. The caller must select an existing OS tenant code, or rely on the default `tenant-auto-create: true` plus sudo permission. A working tenant/deploy-user sudo configuration expands execution to that tenant, including `root` if selected and permitted.",
+      "root_cause": "The worker Netty RPC listener is started on the configured listen port without any authentication, authorization, source validation, or task-origin validation. `TASK_EXECUTE_REQUEST` bodies are deserialized into a `TaskExecutionContext` and submitted directly to the task plugin manager. A `SHELL` task constructed by the caller reaches `ShellTask`, which writes the caller-controlled `rawScript` to a command file and executes it through `ProcessBuilder`. The worker configuration defaults to listening on all interfaces on port 1234, with tenant auto-creation and sudo execution enabled.",
+      "title": "Unauthenticated worker RPC permits attacker-supplied shell task execution",
+      "trace": "Worker startup creates `NettyServerConfig` with `worker.listen-port` (default 1234), constructs `NettyRemotingServer`, registers `TaskExecuteProcessor` for `TASK_EXECUTE_REQUEST`, and calls `start()`; `serverBootstrap.bind(port)` binds the listener without an address restriction or authentication handler. An incoming framed `Command` is dispatched by `NettyServerHandler` to `TaskExecuteProcessor.process()`. That method parses the body as `TaskExecuteRequestCommand`, parses its `taskExecutionContext` string as `TaskExecutionContext`, caches it, and offers a `TaskExecuteThread`. The thread selects the task plugin by the caller-controlled `taskType`; for `SHELL`, `ShellTask.init()` parses the caller-controlled task parameters, and `buildCommand()` writes the `rawScript` to a command file. `ShellCommandExecutor`/`AbstractCommandExecutor` then builds a `ProcessBuilder` command and starts it, with `sudo -u <tenantCode>` when sudo execution is enabled.",
+      "unverified": "Runtime reachability from an actual external or neighboring network position was not verified. The exact passwordless sudo policy and availability of the SHELL plugin and a usable tenant are deployment-dependent. The finding is a source-evidence candidate, not a runtime-confirmed exploit.",
+      "weakness_type": "Missing authentication for critical function (CWE-306) leading to OS command execution (CWE-78)"
+    }
+  ],
+  "coverage_summary": "Source scope reported 2,110 visible files; the P1 index covers 2,074 files and parsed 1,035 Java files, with 36 files missing from the index and no semantic resolution, control-flow, or data-flow analysis. I reviewed authentication configuration, API interceptors/controllers, resource services, Python gateway, master/worker Netty RPC, task plugin loading, shell execution, and relevant application/deployment configuration. The relation index was used only for navigation; all candidate edges cited here were checked against source text. No tests, scanners, or code execution were performed.",
+  "limitations": [
+    "The source-relation index is syntactic and incomplete: 36 files are not indexed, 16,725 calls are unresolved, and control-flow/data-flow/reachability are not modeled.",
+    "No runtime or packet-level testing was performed, so network exposure, worker sudo policy, tenant availability, and plugin loading at runtime remain unverified.",
+    "The Python files for the pydolphinscheduler client are not visible in this source scope, limiting verification of Py4J client behavior and the Python gateway call path.",
+    "The repository contains other separate authorization concerns, so this is a single strongest-candidate review rather than a complete vulnerability inventory."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "PythonGateway/Py4J is enabled by default and listens on 0.0.0.0:25333 with methods that accept a caller-supplied user name and task JSON.",
+      "reason": "This is a second strong unauthenticated RPC/management surface and may permit project creation, workflow creation, and execution. It was not selected because proving the exact remote invocation semantics depends on Py4J library behavior not present in the repository, and the selected worker path has a direct in-repository source trace to ProcessBuilder."
+    },
+    {
+      "lead": "Resource content APIs ignore the authenticated login user; `updateResourceContent`, `readResource`, and `downloadResource` are keyed only by sequential resource ID.",
+      "reason": "This appears to be a separate authorization/IDOR issue: the controller passes no user into those service methods, while the normal resource-update path checks `canOperator`. It requires an authenticated account and storage-backed resources to reach its strongest impact, so it was not chosen over the unauthenticated worker path."
+    },
+    {
+      "lead": "Switch task conditions are evaluated by a Nashorn `ScriptEngine` in the master process.",
+      "reason": "This could allow code execution by a workflow author and may bypass worker tenant isolation, but it requires an authenticated workflow-editing capability and the intended trust model for switch expressions was not established from source alone."
+    },
+    {
+      "lead": "Kubernetes namespace/resource YAML is built by string replacement from namespace and limit values before SnakeYAML loads it.",
+      "reason": "The relevant API requires administrator privileges and the source shows no clear path to arbitrary class instantiation or unauthenticated access, so it is a lower-confidence separate hardening issue."
+    }
+  ],
+  "summary": "Reviewed the visible snapshot (2,110 files; 2,074 indexed; 1,035 Java files parsed) with emphasis on authentication boundaries, RPC ingress, task execution, resource APIs, Python gateway exposure, and configuration defaults. The strongest source-evidenced candidate is the worker Netty task channel: it accepts unauthenticated `TASK_EXECUTE_REQUEST` messages and forwards attacker-supplied task JSON to task plugins, including the shell plugin, which ultimately starts an OS process. Other apparent weaknesses are listed as rejected/separate leads rather than being merged into this candidate."
+}

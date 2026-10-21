@@ -1,0 +1,103 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker controls HTTP request parameters (and thus any request-bound action property or `#parameters` entry referenced by an application's tag attribute expression). Typical precondition seen in affected applications: a JSP/FreeMarker/Velocity UI tag uses `%{...}` in an attribute that resolves to request-influenced data, e.g. `<s:textfield id=\"%{someActionProperty}\" .../>` (property set by ParametersInterceptor) or an attribute resolving `#parameters.x`. The attacker supplies a value shaped like `%{...OGNL...}`; the first framework evaluation returns it as a plain string, the second executes it.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the surrounding design and defenses: (a) SecurityMemberAccess (core/.../ognl/SecurityMemberAccess.java) plus default exclusions (core/src/main/resources/struts-default.xml:39-76) block Runtime/System/ProcessBuilder/Class/ClassLoader/Unsafe and ognl./java.io./java.net./javax. packages, and ReflectionContextState.setDenyMethodExecution is enabled during parameter binding, which constrains naive payloads; (b) `ComponentUtils.containsExpression` returns the string untouched when no `%{` is present, so plain data cannot be evaluated; (c) `AbstractUITag.setDynamicAttribute` deliberately uses `isExpression` and single evaluation, showing that single evaluation is the intended design and making the later re-evaluation of stored attribute values inconsistent with it; (d) ParametersInterceptor inspects parameter names, not values, so `%{...}` values reach the stack as data. These reduce but do not remove the flaw: the second evaluation of attacker-influenced data is visible in the source and is the documented S2-061/CVE-2020-17530 behavior for Struts 2.5.25.",
+      "id": "forced-double-ognl-eval-uibean-tag-attrs",
+      "impact": "Server-side execution of attacker-supplied text as an OGNL expression against the Struts value stack/action context. This is expression injection that permits access to server-side objects reachable from the value stack and, where the OGNL sandbox can be bypassed (the known exploit technique for this defect class), remote code execution. The review did not execute anything, so RCE is asserted only as the advisory-documented consequence of this defect class, not as a runtime-confirmed result.",
+      "locations": [
+        {
+          "end_line": 1027,
+          "path": "core/src/main/java/org/apache/struts2/components/UIBean.java",
+          "start_line": 1022
+        },
+        {
+          "end_line": 1011,
+          "path": "core/src/main/java/org/apache/struts2/components/UIBean.java",
+          "start_line": 991
+        },
+        {
+          "end_line": 666,
+          "path": "core/src/main/java/org/apache/struts2/components/UIBean.java",
+          "start_line": 663
+        },
+        {
+          "end_line": 809,
+          "path": "core/src/main/java/org/apache/struts2/components/UIBean.java",
+          "start_line": 786
+        },
+        {
+          "end_line": 320,
+          "path": "core/src/main/java/org/apache/struts2/components/Component.java",
+          "start_line": 302
+        },
+        {
+          "end_line": 383,
+          "path": "core/src/main/java/org/apache/struts2/components/Component.java",
+          "start_line": 371
+        },
+        {
+          "end_line": 130,
+          "path": "core/src/main/java/org/apache/struts2/views/jsp/ui/AbstractUITag.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 58,
+          "path": "core/src/main/java/org/apache/struts2/views/jsp/ComponentTagSupport.java",
+          "start_line": 44
+        },
+        {
+          "end_line": 170,
+          "path": "core/src/main/java/com/opensymphony/xwork2/util/TextParseUtil.java",
+          "start_line": 155
+        },
+        {
+          "end_line": 100,
+          "path": "core/src/main/java/com/opensymphony/xwork2/util/OgnlTextParser.java",
+          "start_line": 28
+        }
+      ],
+      "prerequisites": "`struts.tag.altSyntax=true` (default, core/src/main/resources/org/apache/struts2/default.properties:126); a deployed application renders a Struts UI tag whose evaluated attribute (id/name and similar) contains `%{...}` that resolves to attacker-influenced data; the page/action must be reachable by the attacker (no authentication needed by itself). Full code execution additionally depends on OGNL SecurityMemberAccess restrictions (default `struts.excludedClasses`/`struts.excludedPackageNames` in struts-default.xml exclude e.g. Runtime, System, ProcessBuilder, ognl., java.io.), so an exploit would need a sandbox-disabling chain.",
+      "root_cause": "UIBean prematurely resolves tag attributes and later re-treats the resolved strings as OGNL expressions. (1) `UIBean.setId` evaluates the `id` attribute (`findString(id)`) and stores the resolved value in the component field `id`; `populateComponentHtmlId` later evaluates that same field again via `findStringIfAltSyntax(id)`. (2) `UIBean.evaluateParams` resolves `this.name` into the local `name` (`name = findString(this.name)`), then evaluates it again in `populateComponentHtmlId` (`findString(name)`) and in the nameValue block (`completeExpressionIfAltSyntax(name)` -> `findValue(..., valueClazz)`, and `findValue(name)` when valueClazz is null). `Component.findValue(String, String.class)` interprets any string containing `%{...}` as an expression and executes it through `TextParseUtil.translateVariables` -> `OgnlValueStack.findValue`, so data that merely came out of the first evaluation is executed as an OGNL expression in the second.",
+      "title": "Forced double OGNL evaluation of already-resolved UI tag attributes (`id`/`name`) in UIBean",
+      "trace": "1) JSP lifecycle: `ComponentTagSupport.doStartTag` calls `populateParams()` before `component.start()`; `AbstractUITag.populateParams()` calls `uiBean.setId(id)` (AbstractUITag.java:127). 2) First evaluation: `UIBean.setId` executes `this.id = findString(id)` (UIBean.java:1024-1026); `Component.findString` -> `findValue(expr, String.class)`; because altSyntax is on and `ComponentUtils.containsExpression(expr)` is true, `TextParseUtil.translateVariables('%', expr, stack)` resolves each `%{...}` segment via `OgnlValueStack.findValue` (Component.java:371-377; TextParseUtil.java:157-169). If the expression resolves to attacker data such as `%{payload}`, it is stored verbatim in the `id` field. 3) Second evaluation: at tag end `UIBean.end()` calls `evaluateParams()` (UIBean.java:532-533) which calls `populateComponentHtmlId(form)`; for a non-null `id` the code executes `tryId = findStringIfAltSyntax(id)` (UIBean.java:994-996) -> `findString(id)` (Component.java:315-320) -> `findValue(id, String.class)`, which again sees a string containing `%{...}` and calls `translateVariables`, this time evaluating the attacker text `payload` as OGNL (OgnlTextParser extracts the substring inside `%{`/`}` and invokes the evaluator at OgnlTextParser.java:65-67). The same pattern occurs for `name`: local `name = findString(this.name)` (UIBean.java:663-666) then `findString(name)` (UIBean.java:997) and `findValue(completeExpressionIfAltSyntax(name), valueClazz)` (UIBean.java:796-799), where completeExpressionIfAltSyntax wraps the resolved attacker string back into `%{...}` (Component.java:302-307) and findValue executes it.",
+      "unverified": "No code was executed and no exploit was built. The exact upstream fix location for the corresponding tag-attribute double-evaluation advisory could not be diffed (no repository history/network), so the cited ranges identify the vulnerable behavior rather than a verified patch site. Whether a specific deployment is exploitable depends on its JSP/FreeMarker attribute usage, and full RCE depends on a working OGNL sandbox bypass, which was not established here. Only the core was reviewed in depth; plugins/bundles/views were sampled.",
+      "weakness_type": "CWE-917 Expression Language Injection / forced double OGNL evaluation (leads to CWE-94)"
+    }
+  ],
+  "coverage_summary": "Coverage per get_source_scope: 1824 model-visible files, 0 excluded for size/symlinks/sensitive names; binary-like files are refused/skipped automatically (none of the reviewed files were binary). I focused on the request-processing and view-rendering paths of the framework: core component/tag evaluation (UIBean, Component, ComponentUtils, Label, Param/URL, AbstractUITag, ComponentTagSupport, template rendering), OGNL handling (OgnlUtil, OgnlValueStack, SecurityMemberAccess, TextParseUtil, OgnlTextParser) and its defaults (struts-default.xml, default.properties), parameter/pattern security (ParametersInterceptor, DefaultAccepted/ExcludedPatternsChecker), dispatcher/static content, multipart upload handling and CookieInterceptor, then sampled the shipped showcase/rest-showcase apps and several plugins. I did not read every one of the ~1800 files (large parts of plugins/, bundles/, site docs, view engines and configuration providers were only sampled), so absence of a finding elsewhere is not proof of absence.",
+  "limitations": [
+    "No repository history, patches, tests, or network access are available, so the snapshot could not be diffed against the fixed upstream release; the correspondence to a specific published advisory (tag-attribute forced double evaluation fixed after 2.5.25) is inferred from source behavior, not verified against a patch.",
+    "No code was executed, no build was run, and no payloads were constructed or sent; exploitability and RCE impact are reasoned from source, not runtime-confirmed.",
+    "Reachability depends on application JSP/Freemarker/Velocity attribute usage (the `%{...}` reference to request-influenced data) and on the default OGNL sandbox; these deployment conditions were not evaluated.",
+    "Large portions of the repository (most plugins, bundles, view engines, configuration and doc files) were sampled rather than fully read; other issues may exist there."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "apps/showcase ViewSourceAction.execute trusts request parameters when reading resources (apps/showcase/src/main/java/org/apache/struts2/showcase/source/ViewSourceAction.java:57-98): `servletContext.getResourceAsStream(page)` for a request-controlled path and `new URL(config).openStream()` when `rootPath == null`.",
+      "reason": "Demo application code, not the framework; `config` is partially constrained by `config.startsWith(rootPath)` when a real path exists, and exploitability depends on deployment of the sample WAR. Weaker evidence and impact than the framework-level double evaluation."
+    },
+    {
+      "lead": "apps/showcase JSPEvalAction writes the request parameter `jsp` into `/interactive/demo.jsp` (apps/showcase/src/main/java/org/apache/struts2/showcase/action/JSPEvalAction.java:35-49), which is effectively an intentional JSP-webshell demo.",
+      "reason": "Deliberately insecure interactive showcase feature; documented as such in the class/README context and not a framework defect."
+    },
+    {
+      "lead": "DefaultStaticContentLoader.findStaticResource path handling (core/src/main/java/org/apache/struts2/dispatcher/DefaultStaticContentLoader.java:196-219) with the `resourceUrl.getFile().endsWith(pathEnding)` containment check.",
+      "reason": "The containment check is present and no concrete bypass (e.g. path normalization/encoding trick reachable from this code) was demonstrated within the review; no candidate-level evidence."
+    },
+    {
+      "lead": "SecurityMemberAccess.isClassExcluded uses `clazz.isAssignableFrom(excludedClass)` (core/src/main/java/com/opensymphony/xwork2/ognl/SecurityMemberAccess.java:166-176), which does not block subclasses of excluded classes such as ClassLoader subclasses.",
+      "reason": "The direction is required in this version because `java.lang.Object` is itself in the default excludedClasses set (struts-default.xml:41) — the reverse direction would block every class — so this appears intentional rather than an injected regression."
+    },
+    {
+      "lead": "plugins/sitegraph SiteGraph.render invokes `Runtime.getRuntime().exec(\"dot -o\" + output ...)` (plugins/sitegraph/src/main/java/org/apache/struts2/sitegraph/SiteGraph.java:130-134).",
+      "reason": "Developer/build-time plugin; the output path is plugin configuration, not request-controlled data in the reviewed code."
+    },
+    {
+      "lead": "Other re-evaluation sites sharing the same root cause, e.g. Label.evaluateExtraParams nameValue (core/src/main/java/org/apache/struts2/components/Label.java:90-93), ActionChainResult expression translation, and parameterized URL rendering.",
+      "reason": "Same root cause or not reachable with already-resolved attacker data (Label uses the raw field, not the resolved local `name`); keeping the submission to one distinct candidate per the review cap."
+    }
+  ],
+  "summary": "Reviewed the assigned Apache Struts 2.5.25 snapshot (1824 readable files, safety filters reported by get_source_scope: no excluded/over-size/symlink files; binaries skipped only on NUL detection). The strongest source-evidenced issue is a forced double OGNL evaluation of UI tag attributes in UIBean: the `id` attribute is evaluated once in `UIBean.setId` and the `name` attribute once in `UIBean.evaluateParams`, and both already-resolved strings are then evaluated a second time as OGNL expressions (`populateComponentHtmlId` -> `findStringIfAltSyntax(id)` / `findString(name)`; `evaluateParams` -> `completeExpressionIfAltSyntax(name)` + `findValue`). `Component.findValue(..., String.class)` runs every string containing `%{...}` through `TextParseUtil.translateVariables` / `OgnlValueStack.findValue`, so attacker data that was inert after the first evaluation becomes executable OGNL on the second pass (the defect class fixed after 2.5.25 in the Struts tag-attribute double-evaluation advisory). This is a single root cause with several manifestations; only one candidate is submitted. No other inspected issue met the same evidence threshold; notable rejected leads are listed below."
+}

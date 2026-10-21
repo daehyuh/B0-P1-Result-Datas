@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker controls the HTTP request path (victim user id in `/user/<id>/descriptorByName/jenkins.security.ApiTokenProperty/changeToken`), the HTTP method (GET suffices), and can read the full response including the `script` header carrying the newly generated token.",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched for any authorization in the call path: `Descriptor`, `UserProperty`, `UserPropertyDescriptor` and `ApiTokenProperty.DescriptorImpl` contain no checkPermission or Stapler interceptor for this method; the target's self-ACL (`User.getACL()`, User.java:603-612) only matters if `u.checkPermission` were called, which it is not (contrast `User.doConfigSubmit`/`doDoDelete`, `PluginManager.doUploadPlugin`, `UpdateSite.Plugin.deploy`, `Jenkins.doSecured` etc., which do check). Confirmed the credential is usable: BasicAuthenticationFilter.java:136-148 and ApiTokenFilter.java:46-55 authenticate a user when the supplied password matches `ApiTokenProperty.matchesPassword()`. Confirmed the URL form is framework-generated, not invented, via `Descriptor.getCurrentDescriptorByNameUrl()`/`getDescriptorUrl()` and the JS `checkUrl` mechanism (war/src/main/webapp/scripts/hudson-behavior.js:409-419). Checked that `Jenkins.getUser`, `Jenkins.READ` and the servlet security-constraint (war/src/main/webapp/WEB-INF/web.xml) do not add a user-specific check.",
+      "id": "case-172-1",
+      "impact": "Credential disclosure plus integrity impact on an arbitrary account: the attacker obtains a valid, current API token for the victim and can impersonate that user on HTTP and CLI. Targeting an administrator yields full Jenkins control (job configuration, credential stores, `/script` Groovy console => code execution on the master). The victim's previous token is also invalidated. Because `doChangeToken` is not `@RequirePOST` and `CrumbFilter` only validates POST requests (hudson/security/csrf/CrumbFilter.java:55-92), an attacker can additionally trigger token rotation cross-site (denial of service for the victim's scripts/CLI).",
+      "locations": [
+        {
+          "end_line": 128,
+          "path": "core/src/main/java/jenkins/security/ApiTokenProperty.java",
+          "start_line": 118
+        },
+        {
+          "end_line": 81,
+          "path": "core/src/main/java/jenkins/security/ApiTokenProperty.java",
+          "start_line": 69
+        },
+        {
+          "end_line": 612,
+          "path": "core/src/main/java/hudson/model/User.java",
+          "start_line": 603
+        },
+        {
+          "end_line": 656,
+          "path": "core/src/main/java/hudson/model/User.java",
+          "start_line": 654
+        },
+        {
+          "end_line": 148,
+          "path": "core/src/main/java/hudson/security/BasicAuthenticationFilter.java",
+          "start_line": 136
+        },
+        {
+          "end_line": 3616,
+          "path": "core/src/main/java/jenkins/model/Jenkins.java",
+          "start_line": 3590
+        },
+        {
+          "end_line": 347,
+          "path": "core/src/main/java/hudson/model/Descriptor.java",
+          "start_line": 323
+        }
+      ],
+      "prerequisites": "Security enabled with an authorization strategy in which the attacker holds Jenkins.READ (any authenticated user, or anonymous when anonymous read is granted — `Jenkins.getTarget()` at jenkins/model/Jenkins.java:3590-3592 is the only global gate for `/user/...`). The target account must exist (`Jenkins.getUser(String)` returns existing users to non-admins; real users including administrators generally have a `users/<id>/config.xml`). No crumb, token, or POST body is required.",
+      "root_cause": "`ApiTokenProperty.DescriptorImpl.doChangeToken` (core/src/main/java/jenkins/security/ApiTokenProperty.java:118-128) is a Stapler web method exposed through `DescriptorByNameOwner.getDescriptorByName` (core/src/main/java/hudson/model/User.java:654-656) and resolves the target user from the URL via `@AncestorInPath User u`. Unlike sibling user-configuration endpoints (`User.doConfigSubmit` line 505-507 and `User.doDoDelete` line 542-544 call `checkPermission(Jenkins.ADMINISTER)`; `User.getACL` lines 603-612 enforces checks only when invoked), `doChangeToken` never performs any permission check on `u`. It rotates/creates the token and returns the new credential in the `script` response header (line 126). The method is additionally not annotated `@RequirePOST`.",
+      "title": "Missing authorization in ApiTokenProperty.doChangeToken: any reader can rotate and read arbitrary users' API tokens (account takeover)",
+      "trace": "1) Request GET `/user/<victim>/descriptorByName/jenkins.security.ApiTokenProperty/changeToken`. 2) Root `Jenkins.getTarget()` only checks global READ (Jenkins.java:3590-3616). 3) Stapler resolves the User, then `User.getDescriptorByName(\"jenkins.security.ApiTokenProperty\")` (User.java:654-656) returns the singleton `DescriptorImpl`; the framework builds exactly this URL shape (Descriptor.getDescriptorUrl() = `descriptorByName/<getId()>`, Descriptor.java:323-347; `Descriptor.getId()` = `clazz.getName()` = `jenkins.security.ApiTokenProperty` via the no-arg UserPropertyDescriptor constructor, Descriptor.java:250-253). 4) `@AncestorInPath User u` binds u to the victim. 5) `doChangeToken` rotates or creates the victim's `ApiTokenProperty` with no permission check, then does `rsp.setHeader(\"script\", \"...\"+p.getApiToken()+\"'\")` (ApiTokenProperty.java:126). 6) The attacker reads the token from the response header and authenticates as the victim: HTTP Basic accepts an API token in place of the password (`t.matchesPassword(password)` -> `u.impersonate()`, BasicAuthenticationFilter.java:136-148; also ApiTokenFilter.java:46-55).",
+      "unverified": "Not runtime-confirmed. I could not execute requests, and the Stapler dependency is not in the snapshot, so dispatch details (`descriptorByName` routing to `doChangeToken`, `@AncestorInPath User` injection, and whether Stapler passes a null `User` when no user is in the path) are inferred from in-repo framework contracts (DescriptorByNameOwner javadoc, Descriptor URL construction, existing form-validation usage). The exact upstream fix/advisory identifier (e.g., which SECURITY-nnn/CVE item) is not established without external data. Exposure requires the attacker to pass Jenkins.READ, which is the normal case for authenticated users but may not hold in locked-down anonymous configurations.",
+      "weakness_type": "Missing authorization on a credential-changing endpoint (CWE-862/CWE-863); secondary: missing POST/CSRF protection (CWE-352)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reported 7649 model-visible files (0 binary/sensitive/symlink exclusions; same filters for B0/P1). The exposed snapshot contains Java sources and resources for core/cli/war/maven-plugin/ui-samples, but no test sources and no *.jelly view templates (verified by glob), so view-layer XSS/permission-rendering checks and test-based evidence could not be inspected. I focused on authentication/authorization, credential handling, CSRF, CLI transports, path handling, and permission checks in the model layer: jenkins/model/Jenkins.java (auth gates, script/config/restart endpoints), hudson/model/{User,AbstractItem,Job,Run,AbstractProject,Computer,Queue,View,ListView,ItemGroupMixIn,DownloadService}.java, hudson/security/* (ACL, filters, realms, CSRF, remember-me), jenkins/security/* (ApiTokenProperty/ApiTokenFilter/Confidential*), hudson/cli/* (CLICommand, CliProtocol, Groovy*, InstallPlugin), hudson/model/DirectoryBrowserSupport.java, hudson/model/FileParameterValue.java, hudson/PluginManager.java, hudson/model/UpdateSite.java, plus war/web.xml. Remaining areas (large files such as FilePath.java, Launcher.java, hudson/tasks/**, maven-plugin internals, static JS) were only spot-checked.",
+  "limitations": [
+    "No runtime execution or HTTP probing was performed; all conclusions are from static source reading, so framework dispatch behavior (Stapler descriptor routing, @AncestorInPath injection, crumb filter behavior) is inferred, not observed.",
+    "No .git metadata, patches, tests, or Jelly views are present in the exposed snapshot, so Git-history diffing, regression tests, and view-level permission/XSS analysis were impossible.",
+    "External CVE/advisory data and sibling-case information were deliberately not consulted, so the finding could not be mapped to a specific advisory identifier.",
+    "The repository is large (7649 files); several security-relevant areas (e.g., FilePath, Launcher, remoting-adjacent code, maven-plugin, static JavaScript) were not exhaustively read."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Queue.doCancelItem (core/src/main/java/hudson/model/Queue.java:616-623) cancels queue items without any explicit ABORT/CANCEL permission check; any user with READ can cancel other users' queued builds (denial of service).",
+      "reason": "Plausible missing-authorization issue, but impact is limited to cancelling queued builds and I could not confirm the intended permission model/version for this endpoint in this snapshot; weaker than the API-token account takeover."
+    },
+    {
+      "lead": "ItemGroupMixIn.createTopLevelItem/copy (core/src/main/java/hudson/model/ItemGroupMixIn.java:122-219) resolves `from` and copies a job's config.xml after checking only Job.CREATE, without checking READ on the source item, potentially disclosing source-job configuration/credentials to a CREATE-but-not-READ user.",
+      "reason": "Requires the unusual permission combination CREATE-without-READ; copy still requires CREATE, and I found no in-snapshot evidence that READ-on-source is a required part of this API contract. Unconfirmed."
+    },
+    {
+      "lead": "Many state-changing endpoints lack @RequirePOST (e.g., Jenkins.doConfigSubmit jenkins/model/Jenkins.java:2717-2747, doConfigExecutorsSubmit 2777-2794, doScript/doScriptText 3361-3370), giving a CSRF surface consistent with the 2013 CSRF hardening era.",
+      "reason": "Diffuse across many methods, requires victim interaction, and CrumbFilter only protects POSTs; none of these individually matches the source evidence strength or impact of the API-token endpoint, which combines both the missing POST and the missing authorization in one method."
+    },
+    {
+      "lead": "Public legacy getter Jenkins.getSecretKey() (jenkins/model/Jenkins.java:1007-1009) may be Stapler-reachable and is not guarded by an explicit permission check.",
+      "reason": "Post-SECURITY-49 the value is explicitly documented as no longer the confidentiality boundary (`secret.key.not-so-secret` / ConfidentialStore replace it per the code comments at Jenkins.java:779 and Secret.java:99-104), so the security impact is substantially reduced and not clearly a defect of this snapshot."
+    },
+    {
+      "lead": "DownloadService.Downloadable.doPostBack (hudson/model/DownloadService.java:251-272) writes client-posted JSON into $JENKINS_HOME/updates/<id> without an explicit permission check.",
+      "reason": "The default configuration verifies the payload signature (`signatureCheck` true, lines 258-264, 302); without an alternate data source this is not exploitable by an unprivileged user."
+    }
+  ],
+  "summary": "Reviewed the exposed Jenkins snapshot (jenkinsci/jenkins, version 1.510-SNAPSHOT, 7649 files across core, cli, war, maven-plugin, ui-samples). The strongest source-supported candidate is a missing-authorization issue in the API-token change endpoint: `jenkins/security/ApiTokenProperty.java` `DescriptorImpl.doChangeToken(@AncestorInPath User u, …)` (lines 118–128) performs a sensitive mutation (rotating/creating user u's API token) and writes the fresh token into an HTTP response header, but never calls `checkPermission` on the target user and is not `@RequirePOST`. Because the descriptor is bound under every `DescriptorByNameOwner` (including `User`) and `@AncestorInPath` takes the target user from the URL path, any principal that passes the single global `Jenkins.READ` gate (any authenticated user, or anonymous when anonymous read is granted) can request `/user/<victim>/descriptorByName/jenkins.security.ApiTokenProperty/changeToken` with GET, read the new token from the `script` response header, and then authenticate as the victim via HTTP Basic (API tokens are accepted as passwords), escalating to that victim's rights — including administrators. A secondary facet of the same root cause is the missing POST requirement, which also permits CSRF-style token rotation. This is a lead, not a runtime-confirmed vulnerability."
+}

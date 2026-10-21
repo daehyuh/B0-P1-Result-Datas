@@ -1,0 +1,63 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Content rendered to Markdown (XWiki documents/elements and their text, formatting markers, link labels, code content) is author-controlled; text containing '*', '_' or '`' reaches MarkdownEscapeWikiPrinter.flush() and then escape(). Any user able to store such content (e.g., a page converted/exported to Markdown) supplies the input that selects the crashing/mis-indexed branch.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the exception path is reachable: flush() is called from many renderer methods (getMarkdownPrinter().flush(), popPrinter(), endHeader/endTableCell/endLink) and escape() is unconditional for non-empty buffers, so no block-state gate prevents the single-char branch. Checked XXE hardening in MarkdownChainingRenderer.handleAbbreviations (disallow-doctype-decl, external-general/parameter-entities false, setExpandEntities(false)) so that lead was discarded. Checked that raw HTML and XWiki macros from Markdown content are emitted by design (HTMLNodeVisitor, MacroNodeVisitor, DEFAULT_EXTENSIONS includes MacroExtension) so those are not incremental vulnerabilities. Could not diff against upstream source to prove which line is a modification; the defect is nevertheless self-consistent within the snapshot.",
+      "id": "markdown-reserved-char-escape-index-bug",
+      "impact": "Denial of the Markdown rendering/conversion path (RuntimeException aborts rendering of any content containing reserved characters) and incorrect escaping of reserved characters in produced Markdown (characters that should be backslash-escaped can be left active or corrupted), i.e. output-integrity/availability impact rather than demonstrated code execution. Not demonstrated to be remotely triggerable in a default deployment: it depends on which XWiki feature invokes the Markdown renderer.",
+      "locations": [
+        {
+          "end_line": 103,
+          "path": "syntax-markdown-commonmark12/src/main/java/org/xwiki/contrib/rendering/markdown/commonmark12/internal/renderer/MarkdownEscapeHandler.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 82,
+          "path": "syntax-markdown-commonmark12/src/main/java/org/xwiki/contrib/rendering/markdown/commonmark12/internal/renderer/MarkdownEscapeWikiPrinter.java",
+          "start_line": 75
+        }
+      ],
+      "prerequisites": "The Markdown (markdown/1.2 or markdown+github/1.0) renderer must be invoked for content containing a reserved character; MarkdownEscapeWikiPrinter must flush a non-empty buffer (normal case). No special privileges are required for the content itself.",
+      "root_cause": "In MarkdownEscapeHandler, RESERVED_CHARS_PATTERN lists single-character alternatives before the two-character ones (\"(?<!\\\\\\\\)\\\\*|(?<!\\\\\\\\)\\\\*\\\\*|(?<!\\\\\\\\)__|(?<!\\\\\\\\)_|(?<!\\\\\\\\)`\"), and Java regex alternation is leftmost-first, so a '*', '_' or '`' match has length 1; the replacement expression however unconditionally uses matcher.group().charAt(0) AND matcher.group().charAt(1), which throws StringIndexOutOfBoundsException for any length-1 match. Independently, the loop offset 'i' is advanced by (matcher.end()-matcher.start()+1) while the buffer grows by only (replacementLength-matchLength) per replacement, so for more than one match the start/end indexes used by StringBuffer.replace drift into the wrong positions (corrupt/missed escaping, further exceptions). MarkdownEscapeWikiPrinter.flush() invokes escape() on every non-empty buffer, so all renderer output text (bold '**', monospace '`', code-macro backticks, list/quote/table cell text, link labels) flows through this code.",
+      "title": "Markdown output escaping crashes / mis-escapes on reserved characters (one-char regex match indexed as two, mismatched output offsets)",
+      "trace": "Renderer prints text/format markers (MarkdownChainingRenderer.beginFormat prints '**'/'`', handleCodeMacro prints backticks, onWord/print for text) → MarkdownEscapeWikiPrinter.printInternal/printlnInternal accumulate into the buffer → flush() (MarkdownEscapeWikiPrinter.java:76-82) calls MarkdownEscapeHandler.escape(buffer, chain) → replaceAll doubles '\\' → RESERVED_CHARS_PATTERN.matcher(buffer.toString()) → matcher.find() returns a length-1 match for '*', '_' or '`' (first alternative) → accumulatedBuffer.replace(start+i, end+i, ESCAPE_CHAR + group.charAt(0) + ESCAPE_CHAR + group.charAt(1)) → charAt(1) on a 1-char group throws StringIndexOutOfBoundsException; if matches are length 2, the '+1' offset drift makes later replacements target wrong buffer positions.",
+      "unverified": "Not runtime-confirmed (no execution allowed); the exact Java regex/alternation behavior and StringBuffer index drift were reasoned from the source, not executed. The upstream-intended form of the pattern/replacement and the precise deployment feature that calls the Markdown renderer were not verifiable offline. Impact was not demonstrated to escalate beyond exception/corrupted escaping.",
+      "weakness_type": "Improper neutralization / incorrect computation in escaping routine (CWE-116, CWE-20) leading to renderer exception (availability) and escaping corruption"
+    }
+  ],
+  "coverage_summary": "All 56 source files visible in the snapshot were read (10 commonmark12 parser visitors + supporting listener/parser classes, 12 renderer classes, configuration/syntax-provider components, 7 GitHub-flavored module classes, both module pom.xml files, root pom.xml, META-INF/components.txt files, README.md, .gitignore). No file was excluded by the scope filters (0 symlinks, 0 sensitive-name exclusions, 0 over-size exclusions), and the snapshot contains no test sources, so reviewer-visible coverage is 100% of the assigned text files. Dependency sources (flexmark-java 0.64.8, xwiki-rendering API) are not in scope.",
+  "limitations": [
+    "No execution, tests, or scanners were permitted, so the regex/alternation and StringBuffer index behavior were reasoned statically and the exception was not runtime-confirmed.",
+    "No upstream repository, patch history, tests, or CVE metadata were available, so it cannot be proven which lines differ from the original project or which defect is a deliberate injection.",
+    "Library internals (flexmark AST semantics, xwiki-rendering listener chain, XWiki's macro/HTML/script rights enforcement and HTML sanitization) could not be inspected, which limits certainty about the end-to-end impact and about which XWiki feature invokes the Markdown renderer.",
+    "The parser-side trust decisions (raw HTML, macro passthrough, URL/mailto/dangerous-scheme handling of link and image references with setTyped(false)) were assessed as design behavior without being able to validate XWiki's downstream XHTML link output handling."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Raw HTML passed through from Markdown via HTMLNodeVisitor.onRawText(..., Syntax.HTML_4_01) (HTMLNodeVisitor.java:60-90)",
+      "reason": "This is CommonMark's documented inline/block HTML support and the module's intended behavior; it is not an added weakness of the snapshot. Same reasoning for TableNodeVisitor.visit(TableCaption) (TableNodeVisitor.java:147-154)."
+    },
+    {
+      "lead": "AbbreviationNodeVisitor builds '<abbr title=\"%s\">%s</abbr>' with unescaped attacker-controlled abbreviation text/title and emits it as raw HTML (AbbreviationNodeVisitor.java:52-62)",
+      "reason": "Attribute/HTML injection is real, but it grants no capability beyond the by-design raw HTML path (HtmlInline/HtmlBlock are forwarded verbatim), so it is a redundant escaping gap rather than an incremental vulnerability."
+    },
+    {
+      "lead": "MacroNodeVisitor forwards arbitrary '{{macro}}' constructs from Markdown to onMacro with attacker-controlled name/parameters/content (MacroNodeVisitor.java:51-73)",
+      "reason": "Emission of XWiki macros is the explicit purpose of the flexmark-ext-xwiki-macros extension declared in AbstractMarkdownConfiguration/pom; macro execution rights are enforced by XWiki outside this module. No repository-side neutralization is expected here."
+    },
+    {
+      "lead": "Possible XXE in MarkdownChainingRenderer.handleAbbreviations (SAXBuilder on '<abbr ...>' text, MarkdownChainingRenderer.java:604-629)",
+      "reason": "Explicit hardening is present: disallow-doctype-decl=true, external-general-entities=false, external-parameter-entities=false, setExpandEntities(false); the broad catch only falls back to printing the HTML. No XXE found."
+    },
+    {
+      "lead": "Markdown12ChainingRenderer.onImage prints alt/reference without escaping, and handleCodeMacro inserts unescaped backticks/content (Markdown12ChainingRenderer.java:154-171, MarkdownChainingRenderer.java:673-708)",
+      "reason": "Output-format correctness issues in the XWiki→Markdown direction; no clear attacker-controlled trust boundary or exploitable sink identified, and they overlap the escaping candidate's root area."
+    },
+    {
+      "lead": "Unused private MarkdownChainingRenderer.isExternalReference (MarkdownChainingRenderer.java:399-403) and AbstractMarkdownConfiguration setting Parser.EXTENSIONS inside the extension loop (AbstractMarkdownConfiguration.java:78-89)",
+      "reason": "Dead code/inefficiency only; no security impact identified."
+    }
+  ],
+  "summary": "Reviewed all 56 files of the assigned snapshot (xwiki-contrib/syntax-markdown: CommonMark 1.2 + GitHub-Flavored Markdown syntax modules). I traced the untrusted-input paths: flexmark AST visitors that emit XWiki rendering events (parser side) and the XWiki-event → Markdown chaining renderer (output side). The parser side deliberately mirrors CommonMark semantics (raw HTML pass-through, XWiki macro pass-through, URL/mailto link typing) and I found no check-removal there that adds capability beyond the documented syntax behavior. The single strongest source-evidenced defect is in the Markdown output escaping logic (MarkdownEscapeHandler.escape): the reserved-character pattern can match a one-character group while the replacement blindly indexes charAt(1), so any flushed text containing '*', '_' or '`' raises StringIndexOutOfBoundsException in the renderer; the same loop also advances its output-offset counter by match length + 1 while the buffer only grows by match length, so multi-match inputs are replaced at wrong offsets (corrupted escaping / possible further exceptions). This is submitted as a lead, not a confirmed vulnerability."
+}

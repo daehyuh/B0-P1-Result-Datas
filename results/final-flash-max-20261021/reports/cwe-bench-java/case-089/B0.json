@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The OAuth2 'scope' request parameter is attacker-controlled and is split into individual scope tokens by OAuth2Utils.parseParameterList (spring-security-oauth2/.../common/util/OAuth2Utils.java lines 81-89, whitespace-delimited). The tokens flow through DefaultOAuth2RequestFactory.createAuthorizationRequest/extractScopes into AuthorizationRequest.getScope(), and ApprovalStoreUserApprovalHandler.getUserApprovalRequest builds the 'scopes' model map keyed by 'scope.' + scopeName, which is what createScopes renders. The attacker does not need to know SpelView's random prefix: the template.replace(\"${\", prefix) masking inside SpelView deterministically converts the attacker's own \"${\" into the placeholder prefix, so the injected expression is parsed and evaluated.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked for escaping/sanitization: no HtmlUtils/htmlEscape use in WhitelabelApprovalEndpoint or SpelView (only OAuth2Exception serializers and WhitelabelErrorEndpoint escape). Checked the masking logic in SpelView: it protects model values (resolved values are re-parsed but cannot contain the unpredictable random prefix) but does not protect template text spliced before rendering, because the replacement itself inserts the prefix in front of attacker-supplied \"${\". Checked scope validation (DefaultOAuth2RequestValidator.validateScope, AuthorizationEndpoint lines 154-156): scopes must be a subset of client-registered scopes unless the client's scope set is null/empty, and empty requested scope is rejected; this narrows but does not eliminate the attack (client registered without scopes, or attacker-influenced client registration/scopes). Checked that the whitelabel page is the default (AuthorizationServerEndpointsConfiguration whitelabelApprovalEndpoint bean, XML parser registers oauth2ApprovalEndpoint) and that ApprovalStoreUserApprovalHandler supplies the 'scopes' map; alternative handlers (TokenStoreUserApprovalHandler, DefaultUserApprovalHandler) do not populate 'scopes', which limits the sink. No runtime confirmation was performed.",
+      "id": "case-089-c1",
+      "impact": "Server-side arbitrary code/expression execution in the authorization server process when a malicious scope name is rendered on the default approval page, plus script injection against the consenting user's browser (session/authorization-code theft, CSRF-free approval) for non-SpEL payloads. Both are reachable from an unauthenticated attacker's crafted authorization request once a suitable scope name is accepted for a client.",
+      "locations": [
+        {
+          "end_line": 60,
+          "path": "spring-security-oauth2/src/main/java/org/springframework/security/oauth2/provider/endpoint/WhitelabelApprovalEndpoint.java",
+          "start_line": 29
+        },
+        {
+          "end_line": 77,
+          "path": "spring-security-oauth2/src/main/java/org/springframework/security/oauth2/provider/endpoint/SpelView.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 255,
+          "path": "spring-security-oauth2/src/main/java/org/springframework/security/oauth2/provider/approval/ApprovalStoreUserApprovalHandler.java",
+          "start_line": 238
+        },
+        {
+          "end_line": 88,
+          "path": "spring-security-oauth2/src/main/java/org/springframework/security/oauth2/provider/request/DefaultOAuth2RequestFactory.java",
+          "start_line": 69
+        },
+        {
+          "end_line": 183,
+          "path": "spring-security-oauth2/src/main/java/org/springframework/security/oauth2/provider/endpoint/AuthorizationEndpoint.java",
+          "start_line": 116
+        }
+      ],
+      "prerequisites": "Authorization server uses the default whitelabel approval UI (WhitelabelApprovalEndpoint is registered by default in both AuthorizationServerEndpointsConfiguration and the XML namespace parser) and a UserApprovalHandler that populates the 'scopes' model (the annotation config's default when an ApprovalStore/TokenStore is present is ApprovalStoreUserApprovalHandler, which sets it). The malicious scope token must survive DefaultOAuth2RequestValidator.validateScope: that check is bypassed when the client's registered scope set is null/empty (the validator only rejects scopes when clientScopes is non-empty), and is satisfied when the scope is a registered scope of the client (e.g., an attacker-registered/self-service client whose scope string contains the payload). The victim user must be authenticated and load the authorization approval page for that request.",
+      "root_cause": "WhitelabelApprovalEndpoint.createScopes() builds the approval page by string-replacing the raw scope name into an HTML fragment (SCOPE.replace(\"%scope%\", scope).replace(\"%key%\", scope)) with no escaping, and createTemplate() splices that fragment into the page template before it is handed to SpelView. SpelView.render() then takes the template and re-masks every \"${\" occurrence with its random placeholder prefix and resolves the text between the prefix and \"}\" through SpelExpressionParser with an unrestricted StandardEvaluationContext. A scope name containing \"${ ... }\" is therefore turned back into a live placeholder whose body is evaluated as SpEL (including T(...) type access), so attacker-influenced scope names are executed server-side rather than rendered as inert text.",
+      "title": "SpEL/HTML template injection in whitelabel approval page via unescaped OAuth2 scope names",
+      "trace": "1) Attacker submits a request such as /oauth/authorize?response_type=code&client_id=<client>&redirect_uri=<registered>&scope=${T(java.lang.Runtime).getRuntime().exec(\"...\")} (URL-encoded, no spaces to survive the whitespace split). 2) DefaultOAuth2RequestFactory.extractScopes/parseParameterList place the payload in AuthorizationRequest.scope; validateScope passes for a client with an empty scope set or one whose registered scopes contain the payload. 3) AuthorizationEndpoint.authorize() shows the approval page via userApprovalHandler.getUserApprovalRequest(), which for ApprovalStoreUserApprovalHandler puts the 'scopes' map (keys = \"scope.\" + payload) into the model, and stores the AuthorizationRequest in the session. 4) WhitelabelApprovalEndpoint.createTemplate()/createScopes() splice the payload into the HTML template with no escaping and hand it to new SpelView(template). 5) SpelView.render() executes template.replace(\"${\", randomPrefix) and PropertyPlaceholderHelper.replacePlaceholders(..., resolver); the injected text is now a valid placeholder, the resolver parses its body as SpEL via SpelExpressionParser.parseExpression and evaluates it with the model as root object, so an expression using T(...) (e.g., Runtime.exec) is executed in the authorization-server JVM. Payloads without SpEL syntax still render as raw HTML/attributes, yielding reflected XSS in the approval page.",
+      "unverified": "Not runtime-confirmed and no exploit payload executed. The exact upstream fix/CVE mapping for this snapshot (version 2.3.2.RELEASE) could not be verified offline. Exploitability depends on the deployed client registrations/scopes and on applications keeping the default whitelabel approval page and ApprovalStore-based approval handler; the JVM-side effect of the SpEL expression was reasoned from SpelView/PropertyPlaceholderHelper semantics in the source, not observed. Whether HtmlUtils escaping (a likely upstream hardening) would fully neutralize SpEL payloads was not verifiable from this snapshot.",
+      "weakness_type": "CWE-94/CWE-79: code injection (SpEL) / XSS through unescaped data inserted into an evaluated template"
+    }
+  ],
+  "coverage_summary": "The snapshot contains 487 readable files (no excluded/symlinked/binary-skipped files reported; source root only). No test sources are present, so only main sources, samples, docs, and build files were reviewable. I inventoried all files, then read in depth: spring-security-oauth2 provider/endpoint (AuthorizationEndpoint, TokenEndpoint, CheckTokenEndpoint, WhitelabelApproval/Error endpoints, SpelView, FrameworkEndpointHandlerMapping, DefaultRedirectResolver, TokenEndpointAuthenticationFilter), approval (ApprovalStore/Default/TokenStore user approval handlers), request/token services (DefaultOAuth2RequestFactory/Validator, AbstractTokenGranter and all granters, DefaultTokenServices, JwtAccessTokenConverter, JwtTokenStore, JWK classes, remote token services, JDBC/Redis/InMemory token stores), authentication filters/manager, client-side token providers and filters, common exceptions/serializers, config annotation and XML classes, spring-security-jwt crypto (JwtHelper, Rsa/Mac/EC signers/verifiers), parts of the OAuth1 provider module, docs, and the sample apps. Samples and some OAuth1/client-discovery classes were only skimmed.",
+  "limitations": [
+    "No test sources exist in the snapshot; verification relied on reading main sources only.",
+    "No git history/metadata is available, so the exact upstream commit, release position, and CVE mapping for the 2.3.2.RELEASE snapshot could not be confirmed.",
+    "No code was executed and no payloads, scanners, or runtime probes were used; all impact statements are source-reasoned, not runtime-confirmed.",
+    "Exploitability of the selected candidate depends on deployment choices (client scope registrations, whether the default whitelabel approval page and ApprovalStore-based approval handler are used), which cannot be verified from the library source alone.",
+    "Some areas were reviewed only shallowly: OAuth1 consumer/provider token flows, client discovery/ProviderDiscoveryClient, Redis token store, XML namespace parsers beyond their approval/authorization wiring, and sample applications."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Privilege escalation via the approval endpoint (SECOAUTH/CVE-2018-15758-style: crafted approval request modifies the stored AuthorizationRequest).",
+      "reason": "Could not locate a concrete exploitable defect. AuthorizationEndpoint.approveOrDeny reads the AuthorizationRequest from the session model (lines 202-216) and ApprovalStoreUserApprovalHandler.updateAfterApproval intersects requested with per-scope approved values (lines 198-235); DefaultUserApprovalHandler/TokenStoreUserApprovalHandler do not widen scope. No path was found by which approval request parameters change scope/redirect/client of the stored request, so this remains an unconfirmed lead."
+    },
+    {
+      "lead": "Open redirect / authorization-code leak in DefaultRedirectResolver or AuthorizationEndpoint error handling (CVE-2019-3778/CVE-2019-11269-style).",
+      "reason": "DefaultRedirectResolver.redirectMatches compares scheme, host, port and cleanPath-equal paths against registered URIs, and AuthorizationEndpoint.getUnsuccessfulRedirect/append resolve through the same resolver before redirecting; no concrete way to redirect to an unregistered host was identified. Residual behaviors (matchSubdomains default true, requested query/fragment preserved, userinfo allowed) look inherent/by-design rather than a proven open redirect."
+    },
+    {
+      "lead": "JwkDefinitionSource.getDefinitionLoadIfNecessary performs a remote JWK-set fetch and clears the cache for any unknown attacker-supplied 'kid' (lines 89-101), enabling request amplification/DoS and locking (synchronized block).",
+      "reason": "Genuine robustness/DoS weakness, but the fetch target URL is operator-configured and the client still verifies signature plus alg/kid against the JWK; no confidentiality/integrity impact demonstrated, so it was not selected as the single strongest candidate."
+    },
+    {
+      "lead": "ClientCredentialsTokenEndpointFilter returns an already-present Authentication (including user or anonymous tokens) instead of authenticating the client (lines 104-109).",
+      "reason": "Exploitation would require the principal name to resolve as a registered client id in the subsequent TokenEndpoint client lookup; no realistic path to authenticate as an arbitrary client was established, so this is an unconfirmed hardening concern."
+    },
+    {
+      "lead": "Client-side redirect_uri selection in AbstractRedirectResourceDetails.getRedirectUri honors a user-supplied 'redirect_uri' parameter and the current request URI (lines 82-97).",
+      "reason": "Could enable open-redirect/authorization-code leak only if the authorization server accepts unregistered redirect URIs or the app relies on useCurrentUri; this depends on server-side configuration outside the snapshot and was not demonstrated, so it was not selected."
+    }
+  ],
+  "summary": "Reviewed the spring-security-oauth 2.3.2.RELEASE snapshot (487 readable files) with emphasis on the OAuth2 authorization-server request/approval/token flow, the whitelabel UI views, redirect handling, JWK/JWT verification, JDBC token/client stores, client-side grant providers, the annotation/XML configuration, and the OAuth1 provider filter. The single strongest source-evidenced issue is a template-injection sink in the default approval page: scope names are concatenated into an HTML template that is later evaluated by SpEL in SpelView, giving server-side expression evaluation (code execution) or script injection when a malicious scope name reaches the page. Other suspected CVE-class leads (approval privilege escalation, open redirect, JWK reload DoS) could not be tied to a concrete exploitable defect in this snapshot and are listed as rejected/unconfirmed."
+}

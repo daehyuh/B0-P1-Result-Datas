@@ -1,0 +1,95 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker is the Snowflake endpoint the client is talking to (malicious/compromised server, DNS/route hijack, or TLS MITM whose revocation check is fail-open by default). That endpoint fully controls the JSON returned for a `GET` command: `data.src_locations[]` (the file names used to build `destFileName`), `data.localLocation` (echoed to match the client's own path so verifyLocalFilePath passes), `data.stageInfo`/presigned URLs and encryption material (so it also controls the bytes that are fetched and written). A client on Windows is not required to be tricked into an unusual command - a normal `GET @stage/file file:///local/dir` is enough; the malicious response supplies the traversal name.",
+      "confidence": "medium",
+      "counterevidence_checked": "On Unix the `lastIndexOf(\"/\")` basename extraction does prevent `../` traversal, so the write primitive is Windows-specific; I did not find any canonical/containment check anywhere (`normalize()`, `getCanonicalPath`-based containment, `startsWith`) on the download side - getCanonicalPath is only used for upload wildcard expansion. The user-supplied directory is itself validated (verifyLocalFilePath) and an existing *file* at localLocation is rejected (1041), so the base directory is not attacker-chosen. Normal (non-malicious) GS responses are expected to contain only stage file names; TLS + OCSP is intended to block MITM, although OCSP fail-open is the default. No code was executed; this is source-level analysis only.",
+      "id": "case-210-c1",
+      "impact": "Arbitrary file write with attacker-chosen content under the client process's privileges, outside the directory the user requested: overwriting startup scripts, shell/IDE profiles or application configuration can lead to code execution, and existing user files can be corrupted/destroyed. Directory-listing style disclosure of the traversal is also possible via the log messages (the resolved path is logged).",
+      "locations": [
+        {
+          "end_line": 3016,
+          "path": "src/main/java/net/snowflake/client/jdbc/SnowflakeFileTransferAgent.java",
+          "start_line": 3008
+        },
+        {
+          "end_line": 1252,
+          "path": "src/main/java/net/snowflake/client/jdbc/SnowflakeFileTransferAgent.java",
+          "start_line": 1234
+        },
+        {
+          "end_line": 886,
+          "path": "src/main/java/net/snowflake/client/jdbc/SnowflakeFileTransferAgent.java",
+          "start_line": 860
+        },
+        {
+          "end_line": 1013,
+          "path": "src/main/java/net/snowflake/client/jdbc/SnowflakeFileTransferAgent.java",
+          "start_line": 1005
+        },
+        {
+          "end_line": 379,
+          "path": "src/main/java/net/snowflake/client/jdbc/cloud/storage/SnowflakeS3Client.java",
+          "start_line": 354
+        },
+        {
+          "end_line": 345,
+          "path": "src/main/java/net/snowflake/client/jdbc/cloud/storage/SnowflakeAzureClient.java",
+          "start_line": 332
+        },
+        {
+          "end_line": 267,
+          "path": "src/main/java/net/snowflake/client/jdbc/cloud/storage/SnowflakeGCSClient.java",
+          "start_line": 261
+        }
+      ],
+      "prerequisites": "(1) Victim executes a GET-style download into a directory (JDBC `GET` statement / SnowflakeStatementV1 path reaching SnowflakeFileTransferAgent.execute). (2) Windows client host, because on Linux/macOS the `lastIndexOf(\"/\")` basename extraction removes `/` and prevents `../` traversal; a `\\`-containing server-supplied name survives the extraction and is a separator only on Windows. (3) Server response (or MITM) under attacker control; TLS+OCSP normally raises the bar, but OCSP failure defaults to FAIL_OPEN per HttpUtil/SFTrustManager comments. (4) Target path must be writable by the client process.",
+      "root_cause": "For GET downloads, SnowflakeFileTransferAgent takes the destination file name from the server response: `src_locations` (JsonNode data.src_locations) is read in parseCommand (lines 929-946) and turned into `sourceFiles` (line 1005); initFileMetadata then computes `fileMetadata.destFileName = sourceFile.substring(sourceFile.lastIndexOf(\"/\") + 1)` (lines 3008-3016). The driver only strips everything up to the last `/`; it does not reject `..`, `\\`, drive/ADS colons, or otherwise verify that the resolved path stays inside the user-specified directory. The only server-path guard, verifyLocalFilePath (lines 1234-1252, called at 1051-1052), compares `localLocation` with the path parsed from the client's own command and never inspects the file name(s). The destination is then assembled as `localLocation + File.separator + destFileName` and written by getDownloadFileCallable (line 874) and by each storage client (S3 line 354, Azure line 332, GCS line 261) via Download / blob.downloadToFile / FileOutputStream.",
+      "title": "Server-supplied download file name is used to build the local write path without validation (path traversal / arbitrary file write) in SnowflakeFileTransferAgent",
+      "trace": "parseCommandInGS -> parseCommand (929-946) loads `src_locations` from the untrusted response; DOWNLOAD branch (1005) sets `sourceFiles`; verifyLocalFilePath (1052/1234-1252) checks only `localLocation`, so the file names are unchecked; initFileMetadata (3008-3016) reduces each server name to the substring after the last `/`, leaving `..\\..\\...` intact; downloadFiles -> getDownloadFileCallable (830, 874) builds `new File(localLocation + localFSFileSep + destFileName)`; pullFileFromRemoteStore (2471-2505) calls storageClient.download, and SnowflakeS3Client.download (354-379, TransferManager/FileOutputStream), SnowflakeAzureClient.download (332-345, blob.downloadToFile) and SnowflakeGCSClient.download (261-315, FileOutputStream) write the server-supplied content to that path. Example: server returns src_locations=[\"..\\\\..\\\\..\\\\Users\\\\victim\\\\AppData\\\\Roaming\\\\Microsoft\\\\Windows\\\\Start Menu\\\\Programs\\\\Startup\\\\x.bat\"]; the driver writes the stage object's contents there, outside the requested download directory.",
+      "unverified": "Runtime exploitability on a Windows client and the exact server response shape were not verified; I could not confirm whether real GS responses can carry `\\` in src_locations (a malicious server controls this regardless). I could not inspect test files (absent from the snapshot) or any upstream fix, so I cannot exclude that this behavior was intentionally documented. An alternative, related manifestation in the same file (PUT side: only `src_locations[0]` is verified while all entries are uploaded; LOCAL_FS upload writes to the server-chosen stage location) may be the same-trust-boundary issue the dataset expects; it is listed under rejected/competing leads because multi-entry PUT responses have uncertain legitimate semantics.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-73 External Control of File Name or Path (server-controlled path component used for a local write)"
+    }
+  ],
+  "coverage_summary": "Scope: 345 source files reported by get_source_scope (src/main/java ~283 files plus build/CI/config files; no test sources, no binaries). P1 index is partial: 319/345 files indexed (26 files missing, mostly non-Java/config), 18,413 call sites with 11,361 unresolved, no control-flow/data-flow or semantic resolution, so index edges were used only for navigation and every cited edge was verified in source text. I reviewed most deeply the file-transfer path (SnowflakeFileTransferAgent, S3/Azure/GCS storage clients, StorageClientFactory/StageInfo), plus session/login (SessionUtil, SFSession, SFLoginInput/Output, external browser, key pair), TLS/OCSP (SFTrustManager, SFSSLConnectionSocketFactory, HttpUtil, PrivateLinkDetector), result/chunk handling (SnowflakeChunkDownloader, ResultJsonParserV2, SnowflakeResultSetSerializableV1, SFArrowResultSet), connection/driver/metadata classes, logging/secret masking (SecretDetector, SFLoggerUtil), telemetry, loader, and the new structured-type classes. Large classes (SnowflakeDatabaseMetaData 137 KB, SFTrustManager 67 KB, SFSession 56 KB, SFBaseSession 45 KB, SnowflakeStatementV1 42 KB) were inspected selectively rather than line-by-line.",
+  "limitations": [
+    "No tests, fixtures, or upstream history are present in the snapshot, so the intended vulnerable/fixed boundary could not be confirmed against a fix commit.",
+    "No code was executed and no scanner was run; all conclusions are source-level and runtime exploitability (especially Windows path semantics and server response shape) is unverified.",
+    "The P1 relation index is syntactic only: 11,361 unresolved calls, no data-flow/control-flow, no semantic resolution; 26 files absent from the index - areas without index records were not assumed reviewed.",
+    "Several very large files were only partially read (SnowflakeDatabaseMetaData, SFTrustManager, SFSession, SFBaseSession, SnowflakeStatementV1, SnowflakePreparedStatementV1, ArrowResultChunk, SFArrowResultSet), so additional issues there are possible.",
+    "Version/date context (3.21.1-SNAPSHOT, ~late 2024) was inferred from pom files and SnowflakeDriver.implementVersion; it was not independently verified.",
+    "The candidate requires a malicious/compromised Snowflake endpoint or MITM and (for the write primitive) a Windows client; I could not verify that real servers ever emit backslash-containing src_locations.",
+    "Selection between the download-path traversal, the PUT src_locations verification gap, and the LOCAL_FS write path was based on source evidence and impact; the other two are documented as unselected competing leads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "PUT-side server path verification covers only the first element: parseCommand sets `localFilePathFromGS = src_locations[0]` (SnowflakeFileTransferAgent.java 973-978) and verifyLocalFilePath (1234-1252) compares that one string, while `expandFileNames(src_locations,...)` (1943-2049) processes every entry and uploadFiles (1833-1884) reads each one with new FileInputStream (556-575) and uploads it, so a malicious server could add extra readable local files (e.g., ~/.ssh/id_rsa) for exfiltration.",
+      "reason": "Competing lead within the same trust boundary, not selected for the single-candidate slot: it requires the same malicious-server precondition, and legitimate multi-entry `src_locations` (pattern expansion) semantics are unclear, so the 'extra entries' bypass could not be distinguished from intended behavior from source alone. Worth a dedicated follow-up."
+    },
+    {
+      "lead": "LOCAL_FS upload path: pushFileToLocal (SnowflakeFileTransferAgent.java 2051-2088) writes uploaded content to `stageLocation + destFileName`, both taken from the server response (getStageInfo 1091-1166 accepts locationType/location), with no containment check.",
+      "reason": "Unselected related lead: it is a plausible cross-platform arbitrary-file-write variant, but it requires a malicious endpoint to claim the niche LOCAL_FS stage type, and the written content is the client's own upload data, so attacker content control depends on the application; deferred in favor of the direct download path traversal."
+    },
+    {
+      "lead": "UUIDUtils.getUUID (src/main/java/net/snowflake/client/core/UUIDUtils.java 17-34) uses ThreadLocalRandom instead of SecureRandom for request IDs / telemetry UUIDs (also SnowflakeUtil.randomAlphaNumeric uses new Random).",
+      "reason": "Use of a non-cryptographic PRNG, but the values feed tracing/request-id and telemetry fields, not authentication material; no concrete security impact identified."
+    },
+    {
+      "lead": "SnowflakeBasicDataSource custom readObject (src/main/java/net/snowflake/client/jdbc/SnowflakeBasicDataSource.java 70-86) reads arbitrary objects from an ObjectInputStream.",
+      "reason": "CWE-502-shaped but no attacker-controlled deserialization entry point was identified in this codebase, and the fields read are String/int/Properties; the class only executes DataSource logic on getConnection(), so it does not by itself create a gadget chain. Not selected."
+    },
+    {
+      "lead": "Runtime.exec(\"open \" + ssoUrl) / Runtime.exec(\"xdg-open \" + ssoUrl) in SessionUtilExternalBrowser.openBrowser (src/main/java/net/snowflake/client/core/SessionUtilExternalBrowser.java 71-94).",
+      "reason": "Looked like command injection, but Runtime.exec(String) does not invoke a shell and URLUtil.isValidURL requires an http(s):// prefix and forbids whitespace and shell metacharacters, so no argument/command injection could be demonstrated from source."
+    },
+    {
+      "lead": "SnowflakeUtil.checkErrorAndThrowExceptionSub writes the server error JSON to the relative path `output.json` (src/main/java/net/snowflake/client/jdbc/SnowflakeUtil.java 155-162).",
+      "reason": "Unexpected write of untrusted data to a predictable relative path, but the path is not attacker-controlled and the content is only diagnostic output; low impact."
+    },
+    {
+      "lead": "Outdated runtime dependency versions (e.g., tika-core 2.4.1, joda-time 2.8.1, httpclient 4.5.14; commons-compress 1.21 and avro 1.8.1 in parent-pom.xml).",
+      "reason": "Avro and commons-compress are test-scoped; tika-core is used only via Tika.detect(File) for local PUT compression detection, and no concrete exploitable path for the pinned versions was established from source. Dependency-version findings alone are not a source-verified vulnerability here."
+    }
+  ],
+  "summary": "Repository is the Snowflake JDBC driver at 3.21.1-SNAPSHOT (main sources + build/config only; no tests in the snapshot). After tracing the server→client trust boundary, the strongest source-backed issue is in the file-transfer agent's download path: the local destination file name is taken from the server's GET response (`data.src_locations[]`) and concatenated onto the user-requested directory without any containment/canonicalization check, and the existing SNOW-15153 guard validates only the directory (`localLocation`), not the per-file name. On Windows (where `\\` is a separator and is not stripped by the basename logic), a malicious/compromised endpoint or MITM can cause the driver to write attacker-chosen bytes to an arbitrary path writable by the client process. Related but unselected leads (PUT-side `src_locations` verification covering only element 0; LOCAL_FS `pushFileToLocal` writing to a server-chosen path; weak UUID randomness; custom readObject in the DataSource; Runtime.exec in the external-browser authenticator; relative `output.json` write) are listed with reasons."
+}

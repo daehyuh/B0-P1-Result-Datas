@@ -1,0 +1,104 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The string argument to the public LIKE APIs: `OnGoingStringCondition.like(String likeValue)` / `notLike(String)`, and `OnGoingLikeCondition.any/startsWith/endsWith(String toMatch)`, obtained in typical use from HTTP request parameters (search/filter boxes). The pattern is passed unchanged through ConditionBuilder.like/notLike/any/startsWith/endsWith (ConditionBuilder.java:237-278) and createLike (254-260) into `new LikeCondition(type, selector, toMatch)`.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked that the flaw is real and not mitigated elsewhere: (a) `LikeCondition.getParameters()` really returns an empty list and is the method used by `Condition.getValueParameters()`; (b) `DefaultQueryBuilder.getParameters()`/`createJPAQuery` bind only ValueParameter entries, so the LIKE text is never parameterised; (c) searched the whole snapshot for 'escape' and 'replace(' — no escaping/sanitisation/validation of LIKE input exists anywhere; (d) `Type.wrap` only concatenates '%' and cannot neutralise quotes; (e) comparison with sibling conditions (EqualCondition -> SingleParameterCondition -> ValueParameter ':name' -> setParameter) shows parameter binding is the library's normal, expected handling of values, so the LIKE path is an inconsistent, unsafe outlier rather than the general design; (f) the public API argument names ('likeValue', 'toMatch') and lack of any javadoc warning suggest callers are meant to pass a value, not a raw query fragment. Uncertainty: some upstream TorpedoQuery versions historically interpolated LIKE patterns, so this may be a long-standing design defect rather than a recent regression; either way the source shows data-to-code without binding. Provider-side acceptance of injected HQL was not runtime-tested.",
+      "id": "cand-1",
+      "impact": "Predicate/query-text manipulation in every generated query that uses a LIKE condition: an attacker can alter or terminate the LIKE predicate and add boolean/other JPQL expressions, potentially bypassing application-enforced filters (e.g. tenancy, ownership or state restrictions built from other conditions in the same WHERE clause), changing which rows are returned, and — depending on the query shape and JPA provider behaviour (boolean/error-based oracles) — disclosing data the caller should not see, or causing query-parse/execution failures (denial of service). This is a library-side injection sink: impact in a given application depends on how the generated query is composed and executed.",
+      "locations": [
+        {
+          "end_line": 89,
+          "path": "src/main/java/org/torpedoquery/jpa/internal/conditions/LikeCondition.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 106,
+          "path": "src/main/java/org/torpedoquery/jpa/internal/conditions/LikeCondition.java",
+          "start_line": 103
+        },
+        {
+          "end_line": 278,
+          "path": "src/main/java/org/torpedoquery/jpa/internal/conditions/ConditionBuilder.java",
+          "start_line": 236
+        },
+        {
+          "end_line": 40,
+          "path": "src/main/java/org/torpedoquery/jpa/internal/conditions/NotLikeCondition.java",
+          "start_line": 23
+        },
+        {
+          "end_line": 49,
+          "path": "src/main/java/org/torpedoquery/jpa/OnGoingStringCondition.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 45,
+          "path": "src/main/java/org/torpedoquery/jpa/OnGoingLikeCondition.java",
+          "start_line": 29
+        },
+        {
+          "end_line": 626,
+          "path": "src/main/java/org/torpedoquery/jpa/Torpedo.java",
+          "start_line": 624
+        },
+        {
+          "end_line": 113,
+          "path": "src/main/java/org/torpedoquery/jpa/internal/query/DefaultQueryBuilder.java",
+          "start_line": 91
+        },
+        {
+          "end_line": 319,
+          "path": "src/main/java/org/torpedoquery/jpa/internal/query/DefaultQueryBuilder.java",
+          "start_line": 309
+        },
+        {
+          "end_line": 439,
+          "path": "src/main/java/org/torpedoquery/jpa/internal/query/DefaultQueryBuilder.java",
+          "start_line": 415
+        }
+      ],
+      "prerequisites": "The application builds a query with TorpedoQuery using a LIKE condition whose pattern contains attacker-controlled data, then executes it through `Query.list(EntityManager)`, `get(EntityManager)` or `map(EntityManager, fn)` (DefaultQueryBuilder.java:388-413). No other precondition (no special privilege, no configuration) is required; the pattern is interpolated unconditionally.",
+      "root_cause": "LikeCondition stores the caller's pattern in `toMatch` and builds the predicate as `selector.createQueryFragment(incrementor) + \" \" + getLike() + \" '\" + type.wrap(toMatch) + \"' \"` (LikeCondition.java:86-89). `Type.wrap` only prepends/appends '%' (lines 34/40/46/52) and performs no escaping or validation of single quotes or JPQL keywords. `LikeCondition.getParameters()` returns `Collections.emptyList()` (lines 103-106), so the value is never added to `QueryBuilder.getValueParameters()`; `Condition.getValueParameters()` only collects `ValueParameter`/`SubqueryValueParameters` instances (Condition.java:50-60). Consequently the pattern exists only as query text and is compiled by the JPA provider, i.e. attacker data becomes code. Every other condition type in the library binds its value via `selector.generateParameter(...)` -> `ValueParameter.generate()` -> ':name' (e.g. EqualCondition/SingleParameterCondition, InCondition, BetweenCondition) and is bound in DefaultQueryBuilder.createJPAQuery (line 433), which makes the LIKE path the clear outlier.",
+      "title": "JPQL/HQL injection via unescaped LIKE pattern in LikeCondition",
+      "trace": "1) Public entry: Torpedo.where(String) (Torpedo.java:624-626) or condition(String) (821-824) returns a ConditionBuilder for a String property. 2) `.like(userInput)` -> ConditionBuilder.like(String) (ConditionBuilder.java:237-239) -> createLike(Type.UNKNOW, toMatch) (254-260) -> `new LikeCondition(type, selector, toMatch)`. 3) Query text generation: DefaultQueryBuilder.freezeQuery/appendWhereClause (91-113, 180-197) calls `whereClauseCondition.createQueryFragment(...)`, which resolves to LikeCondition.createQueryFragment (86-89): `... like '<userInput>' ` embedded verbatim in the query string (no placeholder). 4) Parameter collection: `DefaultQueryBuilder.getParameters()` (309-319) only binds `getValueParameters()`; the where condition's `getValueParameters()` is the default in Condition.java:50-60, and LikeCondition.getParameters() returns an empty list (103-106), so no value is bound for the LIKE. 5) Execution: `createJPAQuery` (415-439) passes the concatenated string to `entityManager.createQuery(getQuery(new AtomicInteger()))` at line 416 and binds only the collected parameters at line 433 — the LIKE text is parsed as JPQL/HQL.",
+      "unverified": "Not runtime-confirmed: no query was built or executed, and no JPA/Hibernate provider was run to confirm which injected expressions parse or what data is exposed. The exact exploitability therefore depends on the consuming application's query composition, provider and error handling, which are outside this snapshot.",
+      "weakness_type": "CWE-89 / CWE-943: Improper Neutralization of Special Elements used in a Query ('Query Injection') — JPQL/HQL predicate injection"
+    }
+  ],
+  "coverage_summary": "Assigned tree: 122 files (118 Java sources under src/main/java, plus pom.xml, README.md, .travis.yml, .gitignore); no test sources are present in the snapshot. Source-scope filters: no files excluded for size (>5 MiB), sensitive name/path, or symlinks; binary-like files would be refused/skipped, but none were encountered (0 skipped binary files). P1 relation index: 118/118 Java files parsed, 0 omitted, 854 symbols, 975 call sites, 1529 edges, 1 config fact (pom.xml); capabilities explicitly include only syntax containment and name/type/arity call/inheritance candidates — no control flow, no data flow, no semantic resolution, Spring annotations unverified. I read the full contents of the core query-building path (DefaultQueryBuilder, GroupBy/OrderBy, Torpedo/TorpedoFunction entry points), all condition classes (LikeCondition/NotLikeCondition, ConditionBuilder, LogicalElement/And/Or, Equal/In/Between/MemberOf/Polymorphic/IsNull-family, GroupingCondition), all selector classes, the handler layer (WhereClauseHandler, ParameterQueryHandler, BaseFunctionHandler/CustomFunctionHandler/Constant-function handlers, MathOperationHandler, JoinHandler family, GroupingConditionHandler, Array/AbstractCallHandler), the join classes/builders, and the proxy/utils layer (TorpedoMagic, TorpedoMethodHandler, ProxyFactoryFactory, ClassLoaderProvidedProxyFactory, MultiClassLoaderProvider, SerializableMethod/SimpleMethodCall/LinkedMethodCall), plus pom.xml/README. Remaining files are trivial interfaces, enum wrappers and small builders (e.g. OnGoing* interfaces, Inner/Left/RightJoinBuilder, Avg/Max/Min/Sum/Index handlers) skimmed or read via search; no additional data-to-query concatenation sinks were found beyond those listed, and a repository-wide search for escaping/sanitisation ('escape', 'replace(') returned no matches.",
+  "limitations": [
+    "Static review only: no code was compiled or executed, no query was generated or run, and no JPA/Hibernate provider behaviour was observed, so exploitability is not runtime-confirmed.",
+    "The snapshot contains no tests, so there is no repository test evidence for intended LIKE semantics or for the vulnerability.",
+    "The P1 index is navigation-only (syntax-level call/containment/inheritance candidates; 617 unresolved calls) and provides no complete data flow, control flow, reachability or Spring/DI enforcement, so reachability of the LIKE sink from a real request path in a consuming application cannot be proven here.",
+    "The consuming application's query composition (which other conditions guard the query) and error handling determine the real-world impact; that code is outside this snapshot.",
+    "No network access, so upstream version history/CVE corroboration and dependency vulnerability checks were not possible; the finding is based solely on the source text in the assigned tree."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ConstantFunctionHandler.createQueryFragment / ComparableConstantFunctionHandler.createQueryFragment return `constant.toString()` verbatim into the query (files lines 46-48).",
+      "reason": "This is an intentionally raw-fragment API (`Torpedo.constant(x)`, javadoc 'constant'): the whole purpose is to emit a literal fragment, so inlining is by design and attacker control would require the application to deliberately pass untrusted data into `constant()`. Same root idea as the like sink but weaker evidence that it is an unintended vulnerability; not selected."
+    },
+    {
+      "lead": "CustomFunctionHandler.getFunctionFormat() interpolates the caller-supplied function name into '%1$s' format (lines 42-44).",
+      "reason": "`Torpedo.function(name, returnType, value)` is explicitly documented as a way to call functions not natively supported, i.e. a raw-name API; the name is normally a developer-provided constant, and no application-controlled path to it is present in the snapshot. Not selected."
+    },
+    {
+      "lead": "DynamicInstantiationFunction.createQueryFragment calls `iterator.next()` on an empty selector list (lines 52-53) -> NoSuchElementException.",
+      "reason": "Robustness/DoS-on-misuse bug in a developer-facing API, not attacker-controlled input crossing a trust boundary; no security impact identified. Not selected."
+    },
+    {
+      "lead": "MultiClassLoaderProvider/ProxyFactoryFactory build Javassist proxies and custom class loaders (MultiClassLoaderProvider.java:34-92, ProxyFactoryFactory.java:62-101).",
+      "reason": "Class arguments come from compile-time API usage (entity classes / interfaces), not from request data; no untrusted class-name loading path in the snapshot. Not selected."
+    },
+    {
+      "lead": "DefaultQueryBuilder.freeze() uses SerializationUtils.clone (line 526).",
+      "reason": "It serializes/clones the library's own builder state; no deserialization of externally supplied bytes is exposed. Not selected."
+    },
+    {
+      "lead": "LIKE wildcard characters ('%', '_') in the pattern are not escaped, allowing unintended wildcard matching.",
+      "reason": "Same root cause and same code location as the selected candidate (missing neutralisation of the LIKE argument); folded into the selected candidate rather than reported separately."
+    }
+  ],
+  "summary": "TorpedoQuery is a JPA/HQL query-builder library. The strongest source-evidenced issue is a query-language (JPQL/HQL) injection in the `like()` family: the caller-supplied LIKE pattern is concatenated directly into the generated JPQL inside single quotes instead of being bound as a named parameter, and `LikeCondition.getParameters()` deliberately returns an empty list, so no binding ever happens. A search-string value therefore becomes executable JPQL syntax when the query is run (`EntityManager.createQuery(...)`). Secondary inlining sinks (`constant()`, custom `function()` names) look more like intentional raw-fragment APIs and were not selected; no other attacker-controlled sink of comparable evidence was found. Static review only — no code was executed and exploitability against a specific JPA provider was not runtime-confirmed."
+}

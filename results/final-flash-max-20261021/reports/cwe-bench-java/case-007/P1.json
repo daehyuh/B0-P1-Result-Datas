@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote SOAP/HTTP client invoking Web Service endpoint operations. The attacker chooses the endpoint, operation and credentials (or none, if anonymous access is permitted to the HTTP layer). No management or deployment privileges are required for this leg; the deployment itself (a WS endpoint using role-restricted methods and an Elytron-backed security domain) is the prerequisite.",
+      "confidence": "medium",
+      "counterevidence_checked": "Looked for an override that would supersede the method: `JbossAuthorizationManager`/`JACCAuthorizationManager` path (used when `enable-jacc`/legacy JAAS is configured) does enforce roles, so the weakness applies to the non-JACC elytron path. Verified the class is actually instantiated and attached to endpoints (EndpointService). Checked that `isValid`/`authenticate` in the same class is correctly implemented (verifyEvidence -> authorize -> succeed), so the class is not a wholesale stub - only the role-check members are unconditional/inert. Checked for a later-applied check in this repo (EJB container `RolesAllowedInterceptor`/`AuthorizationInterceptor` exist for EJB endpoints, but no WS-layer role decision is implemented here). The `//TODO:deprecate this after elytron` comments indicate the members may be an intentional upstream stub whose real enforcement was expected elsewhere, which is the main reason this is submitted as a lead.",
+      "id": "ws-elytron-role-check-true",
+      "impact": "Potential authorization bypass on role-restricted Web Service endpoint methods for any caller able to authenticate (or access anonymously) to the HTTP listener: operations intended for specific roles could be invoked by users holding none of the required roles. Impact scope is limited to WS endpoints backed by an Elytron security domain whose authorization is delegated to this API; read/write impact depends on the exposed operations.",
+      "locations": [
+        {
+          "end_line": 62,
+          "path": "webservices/server-integration/src/main/java/org/jboss/as/webservices/security/ElytronSecurityDomainContextImpl.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 137,
+          "path": "webservices/server-integration/src/main/java/org/jboss/as/webservices/service/EndpointService.java",
+          "start_line": 121
+        },
+        {
+          "end_line": 268,
+          "path": "webservices/server-integration/src/main/java/org/jboss/as/webservices/service/EndpointService.java",
+          "start_line": 241
+        },
+        {
+          "end_line": 59,
+          "path": "webservices/server-integration/src/main/java/org/jboss/as/webservices/security/SecurityDomainContextImpl.java",
+          "start_line": 56
+        }
+      ],
+      "prerequisites": "1) A deployed JAX-WS endpoint (POJO or EJB3) whose security domain name resolves to an Elytron SecurityDomain / EJB application-security-domain capability, so `EndpointService.isElytronSecurityDomain(...)` selects `ElytronSecurityDomainContextImpl`; 2) the endpoint (or its methods) declares role restrictions (`@RolesAllowed`/method-permission roles) that the JBossWS stack resolves through `SecurityDomainContext.doesUserHaveRole(...)` rather than only through container JACC; 3) the caller is able to reach the endpoint over HTTP/SOAP. EJB3 endpoints still get container-side EJB authorization in addition, so the clear-cut bypass is for POJO endpoints; deployments with `enable-jacc=true` on the application-security-domain partially mitigate.",
+      "root_cause": "`ElytronSecurityDomainContextImpl.doesUserHaveRole(Principal, Set<Principal>)` ignores both arguments and always returns `true` (lines 48-52); `getUserRoles(...)` similarly returns `null` (lines 58-62). This class is the `org.jboss.wsf.spi.security.SecurityDomainContext` attached to JAX-WS endpoints by `EndpointService.start(...)` whenever an Elytron `SecurityDomain`/`application-security-domain` backs the endpoint (lines 124-133, wired at 250-262), so it is intended to be the endpoint's authorization decision point. The legacy counterpart `SecurityDomainContextImpl.doesUserHaveRole(...)` (lines 56-59) correctly delegates to `AuthorizationManager.doesUserHaveRole(...)`, making the Elytron stub the outlier.",
+      "title": "Web Services Elytron authorization hook unconditionally grants every role (doesUserHaveRole returns true)",
+      "trace": "Deployment with elytron security domain -> EndpointService.install()/start() detects the elytron domain (EndpointService lines 250-262/328-335) -> endpoint.setSecurityDomainContext(new ElytronSecurityDomainContextImpl(...)) (lines 124-133) -> JBossWS SPI invokes the context's `doesUserHaveRole(principal, roles)` for role decisions -> implementation returns true unconditionally (ElytronSecurityDomainContextImpl lines 48-52) -> invocation proceeds despite missing roles. Contrast: the picketbox path uses `SecurityDomainContextImpl.doesUserHaveRole` which calls `context.getAuthorizationManager().doesUserHaveRole(principal, roles)`.",
+      "unverified": "The JBossWS/jboss-ws-common code that consumes `org.jboss.wsf.spi.security.SecurityDomainContext` is an external dependency not present in this snapshot, so I could not read the actual call site that uses `doesUserHaveRole` and therefore cannot prove that role checks reach this method in the configured runtime path. No build, test, or runtime execution was performed; exploitability was not validated. It is also possible this is a pre-existing upstream gap rather than the specific defect targeted by this snapshot.",
+      "weakness_type": "CWE-863 Incorrect Authorization / missing role enforcement in an authentication integration"
+    }
+  ],
+  "coverage_summary": "Reviewed the model-visible snapshot via source tools: 4,552 files (3,885 Java, no src/test sources present; 25 files absent from the P1 index, 28 omitted). I surveyed the module layout and read/spot-checked security-relevant code across webservices (security, invocation, service, injection, parser), undertow (security, JACC, deployment, handlers), security/subsystem (elytron integration, remoting, SimpleSecurityManager, vault), messaging-activemq (security manager, journal import/export), ejb3 (security interceptors, application security domains, timers), clustering (JGroups auth/encrypt, web session/SSO), batch/jberet, jdr, mail, connector, jaxrs, jpa, jsf, weld, naming, iiop-openjdk, mod_cluster, appclient and the build/feature-pack configuration. Search sweeps covered process execution, deserialization, XML parsing, path/file operations, crypto/algorithms, reflection, randomness, role/permission checks and impossible-condition / boolean-logic patterns. The P1 index is syntax-only (no control/data flow, no semantic resolution, 88,745 unresolved calls), so no reachability or data-flow claim is made. The leading weakness sits at the boundary with an external library (JBossWS SPI), which this snapshot cannot fully resolve - that is the principal coverage gap.",
+  "limitations": [
+    "No src/test sources are present, so fix-verifying tests could not be inspected to identify the intended security behavior.",
+    "The JBossWS/jboss-ws-common classes that call org.jboss.wsf.spi.security.SecurityDomainContext (including doesUserHaveRole) are external dependencies, not in this snapshot; the role-check call path could only be inferred from interface design and in-repo integration code.",
+    "The P1 relation index provides syntax-level navigation only (no control flow, data flow, semantic resolution, or runtime reachability); index labels/edges were treated as hints and every cited edge was verified in source text.",
+    "No code was executed, no tests/scanners were run, and no target was contacted; all impact statements are source-based hypotheses, not runtime-confirmed findings.",
+    "25 source files are absent from the P1 index (and 28 omitted overall); those files were not navigated via index edges, though text search could still surface them.",
+    "Coverage was broad but not exhaustive per line: very large services (e.g., UndertowDeploymentInfoService ~76 KB, UndertowDeploymentProcessor ~42 KB, WarMetaDataProcessor ~33 KB) and many per-version XML readers/writers were only partially reviewed.",
+    "It remains possible that this snapshot contains an injected defect elsewhere that my heuristics (sink greps, logic-impossibility checks, authz-decision review) did not surface."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "security/subsystem VaultSession.validateIterationCount uses `iterationCount < 1 && iterationCount > Integer.MAX_VALUE` (impossible conjunction), so iteration counts are never validated",
+      "reason": "Real logic defect, but local CLI vault tooling with no attacker-controlled path and only a weakened/invalid KDF parameter as impact; no concrete security boundary crossed."
+    },
+    {
+      "lead": "messaging-activemq ImportJournalOperation reads an arbitrary filesystem path from the `file` operation parameter (`new FileInputStream(new File(file))`) and feeds it to the Artemis XML importer",
+      "reason": "Runtime-only management operation that additionally requires admin/management credentials and NORMAL mode; arbitrary host file access is effectively by design for this admin operation, and no privilege boundary is crossed beyond the intended one."
+    },
+    {
+      "lead": "webservices WSHandlerChainAnnotationProcessor fetches `@HandlerChain(file=...)` values starting with `http://` or `file://` via `new URL(...).openStream()`",
+      "reason": "Deployment-time SSRF/local-file fetch, but the input comes from the application being deployed (deployer is already highly privileged) and the behavior matches long-standing upstream design; not a strong end-user attack path."
+    },
+    {
+      "lead": "mail SessionProviderFactory.setServerProps decides whether a custom property already exists with `props.contains(key)` (Hashtable.contains checks values, not keys), so custom mail properties can override previously computed settings",
+      "reason": "Misconfiguration-only effect reachable solely through administrator-defined properties; no external attacker control and no evidence of security-relevant override (e.g., TLS off) beyond admin intent."
+    },
+    {
+      "lead": "jdr XMLSanitizer uses DocumentBuilderFactory without disabling DTD/external entities",
+      "reason": "Parses already-trusted local server configuration files that the JDR tool is explicitly collecting; not attacker-controlled input."
+    },
+    {
+      "lead": "security/subsystem SecurityDomainContextRealm.PicketBoxBasedIdentity.exists() returns `authenticatedSubject != null` (pre-auth identities report non-existent)",
+      "reason": "If anything this is restrictive (may deny/break authentication); no permissive effect found, and upstream-identical code could not be ruled out."
+    },
+    {
+      "lead": "Suspected known-vulnerable pinned dependencies (picketlink 2.5.5.SP8, opensaml 3.1.1, dom4j 1.6.1, snakeyaml 1.17, jackson 2.8.9, netty 4.1.9)",
+      "reason": "Dependency-version concerns only; no first-party source-level data flow could be established within this snapshot and the task scope is source-code review."
+    }
+  ],
+  "summary": "WildFly (wildfly-parent 11.0.0.Final, WildFly Core 3.0.8.Final) main-source snapshot. I reviewed the modules present (appclient, batch/jberet, bean-validation, clustering (JGroups/Infinispan/web/ejb), connector, ee, ejb3, iiop-openjdk, jaxrs, jdr, jpa, jsf, jsr77, legacy/*, mail, messaging-activemq, mod_cluster, naming, picketlink, pojo, sar, security/subsystem, system-jmx, transactions, undertow, webservices, weld, xts) with emphasis on remote/ semi-trusted input paths and authn/authz logic. The strongest source-verifiable lead is an unconditionally permissive authorization hook in the Web Services Elytron integration: `ElytronSecurityDomainContextImpl.doesUserHaveRole(...)` returns `true` for every caller/role set, while the legacy implementation delegates to the configured `AuthorizationManager`, and this object is installed as the endpoint's `SecurityDomainContext` whenever an Elytron security domain is used. If the JBossWS invocation path consults this API for `@RolesAllowed`/method-role checks (the reason the SPI method exists), role restrictions on Web Service endpoint methods are bypassed. Because the JBossWS caller classes are external dependencies not present in the snapshot, reachability is inferred, not proven; the candidate is submitted as a lead, not a confirmed vulnerability. Several other plausible issues were examined and rejected (listed below)."
+}

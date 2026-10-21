@@ -1,0 +1,73 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The request path mapped to the CGI servlet (servletPath + pathInfo, e.g. /cgi-bin/<anything>) drives pathInContext and therefore the execCmd search. The attacker chooses the path that makes the search terminate on a rejected target; the environment written to the child process also includes request headers (HTTP_*) and the query string.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the neighbouring guard at CGI.java:174-178 (uses sendError followed by return, showing the intended pattern), the pathInfo/exec argument flow, and the Runtime.exec call site at line 352. Verified that Jetty canonicalizes request paths before servlet mapping (HttpChannel.startRequest uses URIUtil.canonicalPath), so literal '..' cannot normally reach pathInContext — which limits this to the empty-path, isDirectory and symlink/alias branches. Verified the harness-visible tree contains no other copy of this class and no tests that might indicate intended behaviour. I could not consult the upstream reference version (no network), so it is possible this omission is a long-standing upstream quirk rather than an injected change; the code-level inconsistency stands either way.",
+      "id": "cgi-missing-return-exec",
+      "impact": "Bypass of the CGI servlet's own protection against executing aliased/symlinked or otherwise rejected executables: a script reached through a symlinked path component (which the canonical/absolute comparison exists to reject) is executed with the servlet's permissions and an attacker-influenced environment/body, and requests that should yield a clean 404 instead attempt to execute the CGI docroot directory (failing with IOException/500). Because sendError has already committed the response, child-process output is normally not returned to the attacker, so the primary effect is unwanted process execution/side effects rather than response disclosure.",
+      "locations": [
+        {
+          "end_line": 218,
+          "path": "jetty-servlets/src/main/java/org/eclipse/jetty/servlets/CGI.java",
+          "start_line": 197
+        },
+        {
+          "end_line": 214,
+          "path": "jetty-servlets/src/main/java/org/eclipse/jetty/servlets/CGI.java",
+          "start_line": 211
+        },
+        {
+          "end_line": 352,
+          "path": "jetty-servlets/src/main/java/org/eclipse/jetty/servlets/CGI.java",
+          "start_line": 339
+        }
+      ],
+      "prerequisites": "The (non-default) CGI servlet from jetty-servlets must be deployed and mapped (e.g. /cgi-bin/*), with useFullPath=false (the default) so the docroot-search branch is used. The most security-relevant trigger — getCanonicalPath() != getAbsolutePath() — additionally requires the selected executable path to traverse a symlink/alias under the CGI resource base (a local precondition, e.g. a writable CGI directory). The empty-path case only requires a request whose search trims to the docroot itself.",
+      "root_cause": "In CGI.service(), when the docroot search fails its validation (empty path => execCmd is the CGI docroot directory itself; execCmd exists but is a directory; or execCmd.getCanonicalPath() differs from getAbsolutePath(), i.e. the path is an alias/symlink), the code calls res.sendError(404) but has no return/else. Control therefore falls through to pathInfo=info and exec(execCmd, pathInfo, req, res), which invokes Runtime.getRuntime().exec(execCmd, env.getEnvArray(), _docRoot) on the exact file the check just rejected.",
+      "title": "CGI servlet continues into command execution after failing its executable-path validation (missing return after 404)",
+      "trace": "CGI.init() sets _docRoot from cgibinResourceBase/resourceBase (CGI.java:88-168). service() builds pathInContext from servletPath+pathInfo (line 193), searches the docroot for a matching execCmd (lines 203-209), then validates: path.length()==0 || !exists() || isDirectory() || canonicalPath != absolutePath (line 211). On failure it calls res.sendError(404) (line 213) but does not return; execution reaches pathInfo=info (line 216) and exec(execCmd, …) (line 218) → Runtime.getRuntime().exec(execCmd, env.getEnvArray(), _docRoot) (line 352), i.e. the file rejected by the alias/symlink or empty-path check is still spawned as a CGI process. Note the contrast with the earlier guard at lines 174-178, which correctly does 'sendError; return'.",
+      "unverified": "No code was executed and no CGI servlet was deployed; the exact reachability of the canonical!=absolute branch depends on the filesystem layout under the configured CGI resource base (symlink/alias present), and the empty-path branch's practical effect is limited to a failed exec/500 rather than command execution. The child process's output is not returned because the 404 response is committed first. Whether upstream Jetty 9.2.28 contains a return at line 213 could not be verified offline.",
+      "weakness_type": "CWE-20/CWE-284: improper validation followed by execution of a rejected command (missing return / always-incorrect control flow)"
+    }
+  ],
+  "coverage_summary": "Model-visible tree: 1580 files (main Java sources plus poms/config/scripts); the harness excludes src/test trees, so no tests or fixtures were inspected, and binary files are refused. I traced the strongest lead across jetty-servlets (CGI, PutFilter, ConcatServlet, CrossOriginFilter, DoSFilter), jetty-servlet (DefaultServlet, ServletHandler/ServletHolder, Invoker, ErrorPageErrorHandler), jetty-server (HttpChannel, HttpConnection, HttpParser callers, Request/Response, ContextHandler, ResourceHandler, ErrorHandler, DefaultHandler, session managers), jetty-http (HttpParser, HttpFields/HttpField, HttpURI call sites), jetty-util (URIUtil, UrlEncoded, Resource/FileResource/PathResource, MultiPartInputStreamParser, IPAddressMap), jetty-security (SecurityHandler, ConstraintSecurityHandler, SessionAuthentication, Basic/Digest/Form/ClientCert authenticators), jetty-jaas/jetty-plus SQL login modules, jetty-fcgi/SPDY transports, and jetty-xml XmlParser. The P1 relation index reports complete coverage of the 1580 files (21,395 symbols / 43,674 edges) but is syntactic/navigational only; it does not prove data flow, reachability, or exploitability, and I did not use index labels as vulnerability verdicts. No code, tests, or scanners were executed; no runtime confirmation is claimed. Areas sampled rather than exhaustively audited include the WebSocket, client, Maven/Ant plugin, OSGi, rewrite, proxy, JNDI, and distribution/script modules, plus the large unexercised remainder of jetty-server/jetty-util session and IO internals.",
+  "limitations": [
+    "Test sources, fixtures and any duplicate/upstream reference copies are not present in the model-visible tree, so I could not confirm whether the missing return in CGI.java:211-214 is an injected mutation or a long-standing upstream omission.",
+    "No compilation, test execution, deployment, or dynamic tracing was performed; the CGI reachability analysis is source-based reasoning only.",
+    "The relation index provides syntactic navigation edges without data-flow or runtime reachability proof; it was used only to locate code, not to validate exploitability.",
+    "Large parts of the repository (WebSocket client/server, jetty-client, plugins, OSGi, proxy, rewrite, session/IO internals) were only sampled, so additional issues may exist outside the inspected paths.",
+    "One-candidate output cap: other hardening gaps noted above were not investigated to the same depth and are recorded only as rejected/unconfirmed leads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ErrorHandler.badMessageError(int,String,HttpFields) concatenates the 'reason' into an HTML body without StringUtil.sanitizeXmlString (jetty-server/.../handler/ErrorHandler.java:212-218), unlike writeErrorPageMessage which escapes via write()/sanitizeXmlString.",
+      "reason": "Traced every caller: HttpChannel.badMessage is invoked from HttpParser (messages are fixed literals such as 'Bad EOL', 'No Host', 'Bad chunking', plus 'Illegal character 0x%X'), from HttpConnection/HttpChannel with null reason, and from the FCGI/SPDY transports. In this 9.2 tree the FCGI onFailure path appears unused and its exceptions carry null/generic messages, so no attacker-controlled reason reaching the unescaped sink could be demonstrated. Kept as an unconfirmed hardening gap, not a candidate."
+    },
+    {
+      "lead": "PathResource.getFollowLinks() returns the inverse of setFollowLinks() (jetty-util/.../resource/PathResource.java:187-190).",
+      "reason": "Search shows the getter has no callers in the visible tree; it is dead code with no reachable security effect."
+    },
+    {
+      "lead": "DefaultHandler's 404 context listing writes context paths, virtual hosts and context.toString() into HTML unescaped (jetty-server/.../handler/DefaultHandler.java:120-176).",
+      "reason": "The injected values come from deployment configuration (context path/virtual hosts) and the handler only lists them when _showContexts is enabled; not remotely attacker-controlled input."
+    },
+    {
+      "lead": "DefaultServlet/ResourceHandler directory redirects append the raw query string and decoded path to the Location header without encoding (jetty-servlet/.../DefaultServlet.java:510-517, 541-558).",
+      "reason": "The query string is returned as received (percent-encoded) and the redirect target stays within the context path, so no header injection or off-site redirect is demonstrated; no source evidence of a concrete exploit path."
+    },
+    {
+      "lead": "XmlParser does not disable external general entities / DOCTYPE (jetty-xml/.../XmlParser.java:100-125), suggesting possible XXE in XmlConfiguration.",
+      "reason": "Jetty XML configuration and WEB-INF/jetty-web.xml are supplied by the deployer, not by an untrusted remote client; external DTD loading is set from the 'validating' flag (false by default). No attacker-controlled entry point identified."
+    },
+    {
+      "lead": "SessionAuthentication.readObject re-logs in the serialized user during deserialization (jetty-security/.../authentication/SessionAuthentication.java:62-76).",
+      "reason": "Session store contents are server-controlled in the default Hash/JDBC session managers; no untrusted serialized-data source was identified in this tree. Appears to match upstream behaviour."
+    },
+    {
+      "lead": "Directory listing / ConcatServlet XSS and traversal surfaces (Resource.getListHTML, ConcatServlet, WelcomeFilter).",
+      "reason": "The 9.2.27-era escaping and the decode+canonicalPath+case-insensitive /WEB-INF//META-INF rejection are present in this snapshot; no bypass found within the review budget."
+    }
+  ],
+  "summary": "Reviewed the Eclipse Jetty 9.2.28-SNAPSHOT source tree (1580 model-visible files; test sources and binaries are filtered out by the harness). The snapshot is the 9.2.x maintenance branch right after the 9.2.27 release (VERSION.txt), so I focused on security-critical request-processing, path/resource handling, auth, session, multipart, and error-reporting code across jetty-server, jetty-http, jetty-util, jetty-servlet(s), jetty-security, jetty-webapp, jetty-jaas/plus, jetty-fcgi and jetty-xml.\n\nMost historically vulnerable surfaces I checked already contain their hardening: directory listing escapes names/URIs (Resource.getListHTML/deTag/hrefEncodeURI, the 9.2.27 “avoid XSS” refactor), ConcatServlet decodes+canonicalizes and rejects /WEB-INF//META-INF (case-insensitively), ErrorHandler and Response.sendError escape message/URI via StringUtil.sanitizeXmlString, ContextHandler.isProtectedTarget and checkAlias match the expected logic, and JDBC/session/DB login code uses parameterized SQL.\n\nThe strongest concrete defect I found is a fail-open control-flow error in the CGI servlet: the docroot-search validation block calls res.sendError(404) but does not stop execution, so the very operation the check guards — exec(execCmd, …, Runtime.getRuntime().exec(...)) — is still performed. The same method does use “sendError + return” for its other guard, which makes the omission internally inconsistent. Impact is constrained (the 404 response is already committed, and one failure branch requires the file to be reachable through a symlink under the CGI bin), so this is submitted as a lead, not a confirmed exploit."
+}

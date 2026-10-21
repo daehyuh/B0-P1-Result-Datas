@@ -1,0 +1,72 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated network client controls the HTTP request method (GET) and path/query of requests reaching the embedded OpenEJB HTTP server, and can simply omit the Authorization header. No credentials or prior authentication are required.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the exemption is scoped to WSDL/metadata: it is not — it matches any GET regardless of path or query (no `?wsdl` filtering). Checked the Tomcat-side equivalent (TomcatWsRegistry) which enforces auth for GET and POST, showing the embedded behavior is inconsistent with the container's own security model. Checked that the listener is only wrapped when BASIC auth is explicitly configured (auth default NONE), so default deployments are not affected. Checked the failure branch: it contains only a comment (`// login failed,  return 401`) and never writes 401, so the GET path is not an accidental fall-through to an error response. No runtime/test confirmation was possible; I could not consult history to determine whether the GET clause was intentional.",
+      "id": "basicauth-get-auth-bypass",
+      "impact": "Authentication bypass on services whose only configured protection is BASIC authentication in the embedded HTTP stack: any unauthenticated GET can read/invoke protected JAX-RS GET resources, retrieve protected JAX-WS/WSDL metadata, or otherwise reach the wrapped listener (e.g., Hessian endpoints wrapped with BASIC auth), causing confidentiality/integrity exposure of data that BASIC auth was configured to protect. Because the else branch does not emit 401/WWW-Authenticate, the bypass is also silent to operators.",
+      "locations": [
+        {
+          "end_line": 73,
+          "path": "server/openejb-http/src/main/java/org/apache/openejb/server/httpd/BasicAuthHttpListenerWrapper.java",
+          "start_line": 38
+        },
+        {
+          "end_line": 68,
+          "path": "server/openejb-http/src/main/java/org/apache/openejb/server/httpd/BasicAuthHttpListenerWrapper.java",
+          "start_line": 64
+        }
+      ],
+      "prerequisites": "The wrapper is only created when an operator enabled BASIC auth for the deployed listener: server/openejb-rest/.../RsRegistryImpl.createRsHttpListener wraps the JAX-RS listener when the `openejb.rest` service property `auth` equals BASIC (RESTService line 1013, default NONE), and server/openejb-webservices/.../OpenEJBHttpWsRegistry.addWsContainer wraps JAX-WS listeners when `webservice.security.authMethod` equals BASIC (AppInfoBuilder lines 1077-1081, default NONE). The bypass applies to listeners reached through the embedded openejb-http server, i.e., exactly the deployments that rely on this wrapper for access control.",
+      "root_cause": "In BasicAuthHttpListenerWrapper.onMessage the authorization decision is `if (token != null || HttpRequest.Method.GET.name().equals(request.getMethod()))` (line 64). `token` is only set after a successful `securityService.login(...)` from a parsed `Authorization: Basic` header (lines 41-62). Therefore, when an unauthenticated client sends a GET, the left operand is false but the right operand is true and the protected listener is invoked without authentication. The failure branch (`else`) is empty, so no 401/WWW-Authenticate challenge is returned either, confirming that the GET case is not an error path but an explicit bypass of the credential check.",
+      "title": "Unauthenticated GET requests bypass BasicAuthHttpListenerWrapper (embedded REST/JAX-WS/Hessian listeners configured with BASIC auth)",
+      "trace": "HTTP request → openejb-http listener routing (HttpListenerRegistry) → BasicAuthHttpListenerWrapper.onMessage (line 38): no/absent Authorization header ⇒ token remains null (lines 41-62) ⇒ condition at line 64 true for GET ⇒ httpListener.onMessage(request, response) (line 65) executes the protected REST/JAX-WS listener with no authenticated identity. HttpRequestImpl.isUserInRole even delegates to the SecurityService unchecked, so role checks inside the target see an anonymous caller. Compare with the Tomcat-side implementation (tomee/tomee-webservices/.../TomcatWsRegistry.createNewContext lines 307-343), which adds SecurityCollection methods GET and POST plus setAuthConstraint(true) and the BasicAuthenticator — i.e., the container itself treats GET as protected.",
+      "unverified": "Not runtime-confirmed. Whether upstream deliberately allowed anonymous GET for WSDL/service discovery cannot be determined from the snapshot alone; however, the exemption is unscoped (all GET paths, including REST reads), contradicts the class comment/purpose, and differs from the Tomcat-side registry. Exploitability assumes a deployment that enables BASIC auth on a listener registered through the embedded openejb-http server.",
+      "weakness_type": "Authentication Bypass / Missing Authorization (CWE-306/CWE-862)"
+    }
+  ],
+  "coverage_summary": "Source scope reported 4,278 readable files (binary-like files skipped by the harness; no sensitive-name/symlink exclusions). I searched the whole tree by text for high-risk sinks and idioms (ObjectInputStream/new ObjectInputStream, readObject, XMLDecoder, Runtime.exec/ProcessBuilder, SQL Statement/executeQuery, DocumentBuilderFactory/SAXParserFactory, ZipEntry/ZipInputStream, getParameter/getRequestURI/getPathInfo, Base64/password handling, isCallerInRole/authenticate, BlacklistClassResolver/whitelist, Authorization/WWW-Authenticate, URL/lookup) and read the relevant code in container/openejb-core (security, rmi, ivm, config, timer, util, classloader), container/openejb-loader, server/openejb-client, openejb-ejbd, openejb-http, openejb-rest, openejb-webservices, openejb-cxf and cxf-rs, openejb-hessian, openejb-ssh, openejb-common-cli, openejb-server, tomee/tomee-catalina, tomee/tomee-common, tomee/tomee-webapp, tomee/tomee-webaccess, tomee/tomee-embedded, and the maven/arquillian tooling. Examples/itests/TCK trees and generated JAXB accessor classes were only spot-checked rather than exhaustively read.",
+  "limitations": [
+    "No build, test execution, decompilation, or runtime probing was performed; findings are static-source leads only and are not runtime-confirmed.",
+    "No git history, patch, advisory, or external data was available, so I could not verify whether the GET clause or other suspicious conditions are upstream code versus modified code; intent had to be inferred from internal consistency (sibling Tomcat-side implementation and comments).",
+    "The repository is very large (4,278 files); although the security-relevant modules were reviewed and repo-wide text searches were used, examples, itests, TCK, generated JAXB accessor sources, and some large Tomcat-integration files (e.g., TomcatWebAppBuilder, TomcatJndiBuilder) were not read line-by-line, so an additional issue in those areas cannot be excluded.",
+    "Exploitability of the submitted candidate depends on a deployment enabling BASIC auth for an embedded-stack listener (auth/REST/WS settings default to NONE); no deployment in the snapshot was traced end-to-end to a live request path.",
+    "Multi-module build behavior (classpath/provider differences) was not validated, so the set of gadget classes present at runtime for the rejected deserialization lead is inferred from pom dependencies only."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "EJB remoting deserialization with a blacklist-only filter (server/openejb-client/.../EjbObjectInputStream.java:28-134, container/openejb-core/.../core/rmi/BlacklistClassResolver.java:21-66, core/ivm/EjbObjectInputStream.java, ObjectInputStreamFiltered, QuartzObjectInputStream). Network clients of the ejbd service control serialized data.",
+      "reason": "The deserialization-filtering infrastructure is present and applied to every ObjectInputStream use I found (no `new ObjectInputStream(` remains in readable sources), and the default blacklist is the one shipped by the project as the mitigation for this area. The residual gaps (e.g., JDK-internal `com.sun.org.apache.xalan.*`/commons-collections4 gadget families) are a known-mitigation completeness problem rather than a clearly unintended code path, so I treated it as a secondary/hardening lead, not the primary candidate."
+    },
+    {
+      "lead": "InstallerServlet inverted parameter checks (`if (req.getParameter(\"catalinaBaseDir\") != null && \"\".equals(...trim()))`, tomee/tomee-webapp/.../InstallerServlet.java:69-77) that make the web installer ignore non-empty catalinaHome/catalinaBaseDir/serverXmlFile input.",
+      "reason": "The condition ignores attacker-supplied non-empty values, so it reduces rather than expands the attack surface for the installer's file operations; no concrete security impact was established."
+    },
+    {
+      "lead": "Zip-slip in Zips.unzip (container/openejb-loader/.../Zips.java:49-83; arquillian/.../Zips.java:34-78) — entry names are joined with `new File(destination, path)` without rejecting `../`.",
+      "reason": "Call sites unpack distributions/jars obtained from trusted local or Maven-resolved sources (Setup/ProvisioningUtil/JarExtractor/tomee-maven-plugin); I found no path where a remote attacker supplies the archive, so attacker control is not established."
+    },
+    {
+      "lead": "Path handling for static resources in HttpListenerRegistry (`new File(f, pathWithoutSlash)` for `openejb.embedded.http.resources`, server/openejb-http/.../HttpListenerRegistry.java:193-214) and CxfRsHttpListener.findStaticContent (server/openejb-cxf-rs/.../CxfRsHttpListener.java:260-278) without explicit traversal checks.",
+      "reason": "Requires non-default configuration (`openejb.embedded.http.resources`) and depends on the upstream ServletContext/classloader normalizing `..` (Tomcat's WebResourceRoot rejects traversal; EmbeddedServletContext delegates to classloader resource lookup), so exploitability could not be established from source alone."
+    },
+    {
+      "lead": "ConfigurationInfoEjb.getOpenEjbConfiguration authorizes remote callers only by `tmpFile.exists()` on a client-supplied File (container/openejb-core/.../cmd/ConfigurationInfoEjb.java:38-44), potentially leaking the server configuration (including resource credentials) to any EJB client that passes an existing server path.",
+      "reason": "Legacy design (comment references OPENEJB-621); in non-default profiles the system singleton is bound to InternalSecurityInterceptor requiring openejb-admin/tomee-admin, and default-profile OpenEJB is already documented as an unsecured development mode. Kept as an unconfirmed lead rather than the primary candidate."
+    },
+    {
+      "lead": "HttpRequestImpl.authenticate(HttpServletResponse) returns true unconditionally (server/openejb-http/.../HttpRequestImpl.java:800-805, marked 'TODO?').",
+      "reason": "The embedded ServletRequest.authenticate API appears to be a stub; I found no server-side path that relies on it for enforcement, so no concrete impact could be traced."
+    },
+    {
+      "lead": "JndiRequestHandler returns DataSourceMetaData including datasource username/password to remote clients (server/openejb-ejbd/.../JndiRequestHandler.java:272-279).",
+      "reason": "This is the documented remoting behavior for client-side datasource proxies; whether it is a vulnerability depends on trust assumed for ejbd clients, and no explicit authorization check is bypassed by the code itself."
+    },
+    {
+      "lead": "AdminDaemon stop/restart service (server/openejb-server/.../admin/AdminDaemon.java) has no authentication and ServiceAccessController defaults to PermitAllPermission when `only_from` is unset.",
+      "reason": "This is the documented standalone-service security model (IP allow-list configured by operators); no injection or broken check relative to that model was identified."
+    }
+  ],
+  "summary": "Reviewed the TomEE/OpenEJB 7.0.0-SNAPSHOT tree (4,278 files) with emphasis on network-facing, security-relevant code: EJB remoting/deserialization (openejb-client, openejb-ejbd), embedded HTTP/registry stack (openejb-http, openejb-rest, openejb-webservices, openejb-cxf-rs), JAAS/realm services, Tomcat integration, and the distributable webapps. The strongest source-evidenced issue found is an authentication bypass in the embedded HTTP Basic-auth wrapper: `BasicAuthHttpListenerWrapper.onMessage` lets every GET request through without a valid/any credential because of `token != null || HttpRequest.Method.GET.name().equals(request.getMethod())` (server/openejb-http/.../BasicAuthHttpListenerWrapper.java:64). This defeats the BASIC auth that callers explicitly configured (RsRegistryImpl when auth=BASIC, OpenEJBHttpWsRegistry when webservice.security.authMethod=BASIC) and is inconsistent with the Tomcat-side equivalent (tomee-webservices/TomcatWsRegistry.createNewContext requires auth for both GET and POST). Other plausible leads (incomplete deserialization blacklist, zip-slip utilities, legacy configuration-info authorization, static-resource path handling) were examined and are listed below as rejected/unconfirmed rather than additional candidates."
+}

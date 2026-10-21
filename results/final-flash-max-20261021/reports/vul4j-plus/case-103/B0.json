@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The @Remote interface DataSetLookupServices (dashbuilder-shared/dashbuilder-services-api) exposes lookupDataSet(DataSetDef def, DataSetLookup lookup). The DataSetDef parameter is a shared portable object graph (CSVDataSetDef with setFileURL/setFilePath, CSVDataSetDef.java lines 55-69); a malicious client can serialize an arbitrary instance over the Errai bus instead of using the UI's generated one. No server-side code checks that the def is registered, that the UUID is known, or that fileURL/filePath stay within an allowed base directory or URL scheme.",
+      "confidence": "medium",
+      "counterevidence_checked": "The app restricts all URLs, including the Errai bus, to the admin role, so the attacker must be an authenticated user; there is no unauthenticated path. The CSV filePath attribute is a documented way to point a data set at a server-local file (dashbuilder-webapp/README.md line 37, dashbuilder-backend/dashbuilder-dataset-core/README.md lines 50-57), which partially legitimizes local file access for administrators. However, there is no allowlisted base directory, no URL scheme restriction, and crucially the lookupDataSet(DataSetDef, DataSetLookup) overload lets a client query a def that was never registered, so the local-path support is not confined to an administrator-configured definition. CSVDataSetDef validation only enforces non-null/non-empty values and is not called from the lookup path (CSVDataSetDefValidator.java lines 22-40). The maxCsvLength check exists only in saveCSVFile, not in the direct-URL path.",
+      "id": "case-103-candidate-1",
+      "impact": "Disclosure of arbitrary server-side files readable by the application process (configuration, credentials, keystores, source), and SSRF against internal networks/services (HTTP/S, FTP; jar: URLs can also be abused for remote jar reads). The registration path additionally stores the exfiltrated contents inside the application's VFS/cache. This crosses the intended boundary that a dashboards/data-set client should only query data sources pre-configured by an administrator.",
+      "locations": [
+        {
+          "end_line": 128,
+          "path": "dashbuilder-backend/dashbuilder-dataset-csv/src/main/java/org/dashbuilder/dataprovider/csv/CSVParser.java",
+          "start_line": 109
+        },
+        {
+          "end_line": 92,
+          "path": "dashbuilder-backend/dashbuilder-dataset-csv/src/main/java/org/dashbuilder/dataprovider/csv/CSVDataSetProvider.java",
+          "start_line": 78
+        },
+        {
+          "end_line": 99,
+          "path": "dashbuilder-backend/dashbuilder-services/src/main/java/org/dashbuilder/dataset/service/DataSetLookupServicesImpl.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 42,
+          "path": "dashbuilder-shared/dashbuilder-services-api/src/main/java/org/dashbuilder/dataset/service/DataSetLookupServices.java",
+          "start_line": 27
+        },
+        {
+          "end_line": 437,
+          "path": "dashbuilder-backend/dashbuilder-dataset-cdi/src/main/java/org/dashbuilder/dataset/DataSetDefRegistryCDI.java",
+          "start_line": 403
+        }
+      ],
+      "prerequisites": "An authenticated session able to reach the Errai bus (*.erraiBus is protected by the admin role in dashbuilder-webapp/src/main/webapp/WEB-INF/web.xml lines 157-169 and dashbuilder-distros/src/main/tomcat7/WEB-INF/web.xml); the sample deployment documents admin/admin (README.md line 156). No pre-existing data set is required for the direct lookupDataSet(DataSetDef, ...) overload: a random UUID is generated server-side when def.getUUID() is null (DataSetLookupServicesImpl lines 89-92).",
+      "root_cause": "The remote data-set lookup API accepts a caller-supplied DataSetDef and resolves/executes it server-side without verifying that the definition was registered or that its data source is within an allowed location/scheme. For CSV data sets the provider passes the definition straight to CSVParser, which opens dataSetDef.getFileURL() with new URL(url).openStream() (no scheme restriction, so file:, http:, ftp:, jar: are all attempted) or falls back to new FileInputStream(new File(dataSetDef.getFilePath())) for any absolute server path. The only CSV validation constraints are @NotNull/@Size (CSVDataSetDef.java lines 29-34) and they are not invoked on the lookup path.",
+      "title": "SSRF and arbitrary local file read through client-supplied CSVDataSetDef (fileURL/filePath)",
+      "trace": "1) Remote call DataSetLookupServices.lookupDataSet(attackerDef, lookup) → DataSetLookupServicesImpl.lookupDataSet ensures a UUID and calls dataSetManager.resolveProvider(def).lookupDataSet(def, lookup) (lines 86-99); DataSetManagerImpl.resolveProvider selects the provider from def.getProvider() with no registration check (DataSetManagerImpl.java lines 186-199). 2) CSVDataSetProvider.lookupDataSet casts to CSVDataSetDef and, because no cached data set exists, builds new CSVParser(csvDef, csvStorage).load() (lines 78-92). 3) CSVParser.load() calls getCSVInputStream() (line 67), which returns new URL(dataSetDef.getFileURL()).openStream() when fileURL is non-blank (line 112) or new FileInputStream(new File(dataSetDef.getFilePath())) when the path exists (lines 116-118). 4) The stream is parsed into a DataSet and streamed back to the caller. Alternatives: (a) fileURL=file:///etc/passwd yields the file's lines as rows; (b) fileURL=http://internal-host/... performs SSRF; (c) registerDataSetDef with filePath=/etc/passwd makes DataSetDefRegistryCDI.saveCSVFile read that file (FileUtils.readFileToString, line 430) and persist it into the VFS under datasets/<uuid>.csv, after which an ordinary lookup exfiltrates it (only a 10 MB cap applies, lines 423-426).",
+      "unverified": "Not runtime-confirmed: I did not execute the app or craft an Errai call. Errai's ability to deserialize the crafted CSVDataSetDef graph in a real deployment is inferred from the in-repo client that calls the same API (DataSetClientServices.java lines 279-298, DataSetEditHandler.java lines 24-30). Java URL handler availability for file:/http:/ftp: is standard JRE behavior but was not executed here; deployment security policies could further restrict outbound connections. The registration path additionally depends on the deployment's write permissions for the VFS.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery / CWE-22 arbitrary file read (remote data-set provider trusts client-controlled data source)"
+    }
+  ],
+  "coverage_summary": "Scope: 1340 readable source files (no sensitive-name/path exclusions, no symlink exclusions, no files over 5 MiB; binary-like files are skipped by the NUL-byte policy). I reviewed all four @Remote service interfaces and their implementations (DataSetLookupServicesImpl, DataSetDefServicesImpl, DataSetDefVfsServicesImpl, DataSetExportServicesImpl), the dataset manager/registry/deployer, all four providers (CSV, SQL, Elasticsearch, Bean) including the dialect and JDBC execution layer, the displayer client eval/settings/JSON marshalling paths, the JSON definition/lookup marshallers, the web.xml security constraints in both the webapp and the Tomcat distribution, and I browsed the client/renderer code for DOM/HTML sinks. The strongest trace (remote DataSetDef -> CSV provider -> URL/file stream) was verified end-to-end at source level.",
+  "limitations": [
+    "No code execution, build, test, or runtime verification was performed; all conclusions are static source analysis.",
+    "Errai/UberFire framework sources are outside the snapshot, so method exposure, role enforcement beyond web.xml, and object-graph deserialization behavior are inferred from in-repo usage and configuration.",
+    "Not every one of the 678 client files was read line-by-line; client-side renderer/DOM areas were sampled via targeted searches (setHTML/setText/setHref/HTML/SafeHtml).",
+    "Database/JNDI/URL-handler behavior and VFS path normalization are deployment-dependent and could not be confirmed locally.",
+    "Application-wide admin-role protection (web.xml) means the described attacks require an authenticated account; the sample deployment ships documented default credentials (admin/admin), but that was treated as configuration context, not as a separate finding."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SQL injection in the SQL data-set provider: filter values from the client DataSetLookup are concatenated unescaped into SQL (DefaultDialect.getParameterSQL/getStringParameterSQL lines 519-549, used by getCoreConditionSQL lines 374-418) and executed with Statement.executeQuery (JDBCUtils.java lines 72-82).",
+      "reason": "Real and reachable via the same remote lookup service, but it requires a deployed SQL data set (or an attacker-supplied SQL def whose dbSQL/table attributes already let an administrator express arbitrary SQL), making it a plausibly intended admin capability. Kept as an unconfirmed alternative rather than the candidate."
+    },
+    {
+      "lead": "JNDI injection: SQLDataSourceLocatorImpl.lookup passes the client-controlled SQLDataSetDef.getDataSource() directly to InitialContext.lookup (lines 25-28).",
+      "reason": "Impact depends on the container naming configuration and JDK version (remote codebase trust); could not verify from source that an attacker-controlled JNDI URL is honored in the shipped WildFly/Tomcat distributions."
+    },
+    {
+      "lead": "Client-side JavaScript injection via DisplayerGwtExprEval: native eval(expr) with a five-keyword denylist ('document.', 'window.', 'alert(', 'eval(', '.innerHTML') that is trivially bypassable (e.g., self['document']['cookie'], top['location'], fetch), with the expression coming from displayer settings JSON supplied through the 'json' place parameter (DisplayerScreenPresenter.java lines 122-127) or dashboard component properties (DisplayerDragComponent.java lines 99-105 through DisplayerSettingsJSONMarshaller line 225).",
+      "reason": "Plausible XSS, but exploitation needs a victim to open a crafted URL/dashboard and I could not confirm the GWT place-parameter/JSON round-trip and denylist bypass without running a browser; also arguably an intended power-user expression feature."
+    },
+    {
+      "lead": "DOM XSS via JsonSourceViewer.setContent, which renders serialized JSON with FlexTable.setHTML after only whitespace substitution (JsonSourceViewer.java lines 36-58).",
+      "reason": "Unescaped HTML sink, but its only user (DisplayerSettingsJSONSourceViewer) has no callers in this snapshot, and attacker-controlled reachability could not be established."
+    },
+    {
+      "lead": "Path traversal through client-supplied data-set UUID: resolveNioPath/resolveCsvPath concatenate def.getUUID() + '.dset'/'.csv' (DataSetDefRegistryCDI.java lines 158-160, 439-445) and UUIDs are client-provided and only defaulted when null (DataSetDefServicesImpl.java lines 90-100; DataSetDefJSONMarshaller.java lines 102-104).",
+      "reason": "Depends on UberFire Path.resolve semantics (whether '..' segments are normalized/rejected), which I could not verify from the files in scope; impact is a restricted-content write."
+    }
+  ],
+  "summary": "Dashbuilder (0.5.0-SNAPSHOT) exposes a remote Errai service, DataSetLookupServices#lookupDataSet(DataSetDef, DataSetLookup), that accepts a fully client-constructed DataSetDef and immediately resolves it to a server-side provider without registering or validating it. The CSV provider then opens whatever URL or local path the definition contains, so a remote authenticated caller can make the server read arbitrary local files (file:// URLs or absolute filePath) and perform SSRF to internal HTTP/FTP endpoints, returning the fetched content to the caller as data-set rows. A second path (registerDataSetDef → DataSetDefRegistryCDI.saveCSVFile) copies an attacker-specified server-side file into the VFS, where it can subsequently be retrieved through a data-set lookup. Source evidence for the sink, the provider path, and the remote entry point is complete and in-repo; the main residual uncertainty is my inability to execute or inspect the UberFire/Errai runtime and the application's admin-role constraint."
+}

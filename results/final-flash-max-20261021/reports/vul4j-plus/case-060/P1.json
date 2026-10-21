@@ -1,0 +1,78 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Untrusted HTML/CSS submitted for sanitization. A `<style>` block (or `style` attribute on the SAX path) containing `@import url(http://169.254.169.254/latest/meta-data/)` (or any http/ftp URL, including loopback/private hosts) is parsed by the Batik CSS parser; the URI text is fully attacker-chosen. The fetched remote stylesheet body is itself attacker-controlled when the URL points at an attacker server.",
+      "confidence": "medium",
+      "counterevidence_checked": "The feature is disabled by default (`embedStyleSheets` value=\"false\" in antisamy.xml and all other shipped policies), so it is not exploitable in a default configuration; it exists deliberately to embed remote stylesheets. CssHandler does validate the URI against policy regexes and rejects relative URIs, and import count (maxStyleSheetImports, default 1 policy constant / 3 in antisamy.xml), connection/read timeouts, and a cumulative size limit are enforced in ExternalCssScanner. These reduce volume but do not restrict the destination host, scheme, or IP range, which is the core of the SSRF.",
+      "id": "cand-ssrf-external-css-import",
+      "impact": "Blind SSRF: internal port scanning and HTTP GET requests to loopback/private/link-local services and cloud metadata endpoints from the application server; potential interaction with internal state-changing GET endpoints; bounded DoS via slow/large imports (default 1s or policy timeout per request, import count and cumulative size limits). Response content is not returned to the attacker, but error messages/timing can disclose host reachability.",
+      "locations": [
+        {
+          "end_line": 281,
+          "path": "src/main/java/org/owasp/validator/css/CssHandler.java",
+          "start_line": 214
+        },
+        {
+          "end_line": 171,
+          "path": "src/main/java/org/owasp/validator/css/ExternalCssScanner.java",
+          "start_line": 108
+        },
+        {
+          "end_line": 410,
+          "path": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+          "start_line": 391
+        },
+        {
+          "end_line": 208,
+          "path": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+          "start_line": 203
+        },
+        {
+          "end_line": 28,
+          "path": "src/main/resources/antisamy.xml",
+          "start_line": 22
+        }
+      ],
+      "prerequisites": "Policy directive `embedStyleSheets` set to true (false in all shipped policies, so this is a deployment configuration). Attacker-controlled HTML reaches AntiSamy.scan. Network egress from the AntiSamy host. `maxStyleSheetImports`/`connectionTimeout` bound volume/time but do not restrict destinations.",
+      "root_cause": "CssHandler.importStyle accepts any URI matching the generic offsiteURL/onsiteURL regexes (http(s), ftp, mailto; any host, including loopback/link-local/private addresses) when the `embedStyleSheets` directive is true, and enqueues it. ExternalCssScanner.parseImportedStylesheets then constructs GetMethod from that attacker-chosen URI and executes it with no allow-list of hosts/IP ranges/schemes and no redirect restriction, so a scan of untrusted HTML can make the server issue HTTP requests to internal services.",
+      "title": "Blind SSRF via untrusted CSS @import in ExternalCssScanner when embedStyleSheets is enabled",
+      "trace": "AntiSamy.scan -> AntiSamyDOMScanner.processStyleTag / MagicSAXFilter.endElement (Ops.CSS) -> CssScanner.scanStyleSheet|scanInlineStyle -> CssHandler.importStyle: `if (!policy.isEmbedStyleSheets()) return;` else `new URI(uri)`, then only `offsiteURL`/`onsiteURL` regex checks (accepting e.g. `http://127.0.0.1:8080/`, `http://169.254.169.254/...`, `ftp://host/`, `mailto:...`) and an absolute-URI check, then `importedStyleSheets.add(uri)`. Back in CssScanner.parseImportedStylesheets (overridden in ExternalCssScanner), each queued URI becomes `new GetMethod(stylesheetUri.toString())` and `httpClient.executeMethod(stylesheetRequest)`; the response body is read under `sizeLimit` and even parsed/validated as CSS, i.e., server-side request with attacker-selected destination.",
+      "unverified": "No runtime execution or network test was performed. The exact policy in use at the call site (embedStyleSheets true/false) is deployment-dependent. Redirect-following behavior of commons-httpclient 3.1 and behaviour for non-http schemes (ftp/mailto passed to GetMethod) were not executed, and the dependency jar is not in the snapshot; the analysis of executeMethod/GetMethod is from the repository source plus library API semantics.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery"
+    }
+  ],
+  "coverage_summary": "All 48 model-visible files were enumerated; Java sources under src/main/java/org/owasp/validator/{css,html,html/model,html/scan,html/util} and the XML policies/ResourceBundles were read (AntiSamy.java, AntiSamyDOMScanner.java, AntiSamySAXScanner.java, MagicSAXFilter.java, ASHTML/ASXHTMLSerializer, AbstractAntiSamyScanner, CleanResults, Policy, InternalPolicy, Tag/Attribute/Property/AntiSamyPattern/TagMatcher, CssScanner/CssHandler/CssValidator/ExternalCssScanner, URIUtils/XMLUtil/HTMLEntityEncoder/ErrorMessageUtil, Constants, and the css-rules/common-attributes/tag-rules/directives of antisamy.xml plus shipped policy variants). P1 relation index reported complete index coverage of the 48 files (460 symbols, 1352 call rows, 929 edges); index facts were used only for navigation, and every cited behavior was verified in source text. Dependencies (Batik 1.8 CSS parser, NekoHTML, commons-httpclient 3.1, Xerces serializer) are not in the snapshot, so their internal behavior could only be reasoned about from call sites.",
+  "limitations": [
+    "No build, test, scanner, or runtime execution was performed; all findings are static source leads, not confirmed vulnerabilities.",
+    "Third-party dependency sources (Batik CSS parser escape/URI handling, NekoHTML CDATA/processing-instruction emission, commons-httpclient GetMethod/redirect behavior, Apache XML serializer CDATA/entity handling) are not present in the snapshot, so some reachability and data-flow questions remain unverified.",
+    "Policy configuration is caller-controlled; the SSRF lead requires embedStyleSheets=true, which is not the default in any shipped policy. Other deployments may use different directives.",
+    "ResourceBundles for non-English locales and the full text of the largest policy files (antisamy.xml sections outside directives/common attributes/tag rules/css rules, and most locale properties) were only partially inspected; they contain no executable code and no additional security controls were assumed from them."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "MagicSAXFilter.startElement uses direction-reversed check `boolean isStyle = \"style\".endsWith(element.localpart)` (src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java:272), so tags named \"e\", \"le\", \"yle\", \"tyle\" would be treated as style tags with unvalidated attributes.",
+      "reason": "Latent, not demonstrable with repository data: reaching the branch requires a policy <tag> whose lowercased name is a suffix of \"style\" with action validate, and no such tag exists in any shipped policy (antisamy.xml, -anythinggoes, -ebay, -myspace, -slashdot, -tinymce). No exploit path within the reviewed configuration; kept as hardening note, not the primary candidate."
+    },
+    {
+      "lead": "SAX path passes the original, unvalidated <style> attributes through (`cssAttributes = attributes`, MagicSAXFilter.java:274-277 and endElement 178), whereas the DOM path validates them via processAttributes.",
+      "reason": "No shipped style-tag attribute shown to be script-executable in browsers (policy allows type/media; arbitrary attributes such as onload/onerror are not demonstrated to fire on <style>), so impact could not be established from source. Unconfirmed."
+    },
+    {
+      "lead": "AntiSamyDOMScanner.removePI double-removes the node (removeNode(node) followed by node.getParentNode().removeChild(node), lines 686-690), giving a possible NullPointerException on processing-instruction input.",
+      "reason": "At most a DoS/fail-closed crash of the scan; also depends on NekoHTML emitting ProcessingInstruction nodes for HTML input, which was not verifiable from this snapshot. Low impact relative to the SSRF candidate."
+    },
+    {
+      "lead": "stripNonValidXMLCharacters uses matcher.matches() rather than find() (AntiSamyDOMScanner.java:786-793), so invalid XML characters in multi-character input are not stripped.",
+      "reason": "Control/NUL characters are unlikely to yield filter bypass; effect is parser rejection (fail closed) or functional corruption, not a demonstrated XSS. Rejected as weaker than the SSRF lead."
+    },
+    {
+      "lead": "CSS url()/font-family value handling (lexicalValueToString does not quote strings without spaces; escape handling delegated to Batik) might allow constructing a URL/function after browser re-parsing.",
+      "reason": "Would require proving Batik 1.8's escape decoding behavior, which is not present in the snapshot; policy char-sets for cssOnsiteUri/cssOffsiteUri and font-family exclude '<', '>', ':', '(', ')', ';', so no concrete breakout string could be shown from source. Unverified speculation."
+    },
+    {
+      "lead": "XXE during policy loading in Policy.getTopLevelElement/getPolicy.",
+      "reason": "Counterevidence in source: DocumentBuilderFactory features disallow-doctype-decl, external-general-entities, external-parameter-entities and load-external-dtd are all disabled (Policy.java:282-291, 367-376). Rejected."
+    }
+  ],
+  "summary": "Reviewed the AntiSamy 1.5.5-SNAPSHOT tree (48 files: Java scanners/CSS validator/policy model under src/main/java, plus 17 resource policies/ResourceBundles and pom.xml). Strongest source-supported issue: the opt-in external stylesheet feature lets untrusted HTML/CSS drive server-side HTTP requests to arbitrary hosts (blind SSRF) with no host/private-IP/scheme allow-list, only generic URL regexes plus count/time limits. No single XSS root cause could be verified from this snapshot alone: CSS property/selector char-sets block the obvious `<`, `>`, quote break-outs, and policy parsing disables external entities. Several lower-impact leads (latent `endsWith` tag-name check, unvalidated `<style>` attributes in the SAX path, a DOM-scanner NPE on PIs, a broken invalid-XML-char filter) are recorded as rejected/unconfirmed."
+}

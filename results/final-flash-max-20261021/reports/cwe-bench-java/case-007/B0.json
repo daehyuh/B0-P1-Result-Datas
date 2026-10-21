@@ -1,0 +1,67 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any HTTP client controls header names and their casing as parsed by the container, and controls the credentials presented. The code path is triggered on every successful and failed authentication (EventType.AUTHENTICATED / FAILED_AUTHENTICATION) once the receiver is registered. The person who benefits is not the sender but anyone who can read the resulting audit trail (server.log, centralized log/SIEM, or JDR/SOS bundles that ship log files); the comment shows the value was meant to be excluded, so its presence is unintended.",
+      "confidence": "medium",
+      "counterevidence_checked": "The check does exist and would work only if the container returned a lower-case header name; the canonical HTTP spelling and typical client behavior is `Authorization`, and Undertow generally preserves the wire casing, so the guard fails in practice (I could not execute code to confirm the exact casing Undertow 1.4.x returns, so this is not runtime-confirmed). Audit must be enabled (legacy security domain + audit provider) for the receiver to be registered, so default/Elytron deployments are unaffected. Logging request parameters/cookies appears intentional for audit, which reduces the novelty of that part; the Authorization filter is the clear intent/behavior mismatch. Digest values are not the cleartext password.",
+      "id": "audit-log-authorization-header-exposure",
+      "impact": "Disclosure of reusable credentials (HTTP Basic base64 decodes trivially; Digest responses are replayable while the nonce is valid) to anyone with access to the audit trail or to exported diagnostic bundles. Confidentiality-only, but it affects administrator and application users alike and the audit comment proves the exposure was not intended.",
+      "locations": [
+        {
+          "end_line": 119,
+          "path": "undertow/src/main/java/org/wildfly/extension/undertow/security/AuditNotificationReceiver.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 518,
+          "path": "undertow/src/main/java/org/wildfly/extension/undertow/deployment/UndertowDeploymentInfoService.java",
+          "start_line": 511
+        }
+      ],
+      "prerequisites": "Deployment uses a legacy (PicketBox) `security-domain` in jboss-web.xml whose SecurityDomain has an `audit` provider configured (so `sdc.getAuditManager() != null`), the app has not set `disable-audit`, and the audit provider persists the event context (e.g. the default log-based provider). Elytron (`application-security-domain`) deployments do not register this receiver. Undertow must return the wire casing (canonical `Authorization`) from the servlet API.",
+      "root_cause": "AuditNotificationReceiver.deriveUsefulInfo() builds an audit string from the servlet request. Its guard for sensitive data is the case-sensitive expression `!headerName.contains(\"authorization\")` (line 96), with the comment `// Ensure HTTP Basic Password is not logged`. HTTP header names are case-insensitive and the canonical spelling clients send is `Authorization`, which does not contain the lowercase substring `authorization`. The guard therefore fails open and the full header value (e.g. `Basic <base64(user:password)>`, or a Digest `response` value) is appended to the audit event. The method also appends all cookies (line 89) and all request parameters (lines 100-108, including form passwords) and attributes to the same event.",
+      "title": "Legacy security audit log records the Authorization header due to case-sensitive filter (credential disclosure)",
+      "trace": "HTTP request with `Authorization: Basic ...` -> Undertow authentication -> SecurityNotification delivered to NotificationReceiver -> AuditNotificationReceiver.handleNotification (undetow/.../security/AuditNotificationReceiver.java:55) -> deriveUsefulInfo (line 86) -> enumeration of `httpRequest.getHeaderNames()`; for the header named `Authorization`, `headerName.contains(\"authorization\")` is false so `httpRequest.getHeader(headerName)` is appended (line 96) -> AuditEvent context map -> `auditManager.audit(auditEvent)` (line 75) -> configured audit provider writes the event (and thus the credential material) to logs. Receiver registration: UndertowDeploymentInfoService.handleIdentityManager (lines 511-518) when a legacy security domain with an audit manager is used.",
+      "unverified": "Exact header-name casing returned by Undertow's servlet HttpServletRequest wrapper in this snapshot; whether the configured audit provider serializes the context map verbatim; precise set of deployments that enable audit; whether upstream later changed this line (no git history or upstream copy is available in this run).",
+      "weakness_type": "Sensitive information exposure via log file (CWE-532) caused by case-sensitive header-name comparison (CWE-178)"
+    }
+  ],
+  "coverage_summary": "Scope was the 4,552-file main-source snapshot (per get_source_scope; tests and binary files excluded, no symlinks/sensitive-path exclusions). I searched and read across appclient, batch, clustering, connector, ee, ejb3, iiop-openjdk, jaxrs, jdr, jpa, jsf, jsr77, legacy/*, logging, mail, messaging-activemq, mod_cluster, naming, picketlink, pojo, sar, security/subsystem, transactions, undertow, web-common, webservices, weld and xts, concentrating on attacker-reachable sinks (auth/authz code, path/file handling, XML parsing, URL fetching, deserialization, management operations). This was a broad sample, not an exhaustive line-by-line audit of all 4,552 files; large parsers and some clustering/legacy internals were only searched.",
+  "limitations": [
+    "No git history, diff or upstream copy was available, so I could not confirm which code differs from the fixed upstream state or identify the intended CVE.",
+    "No build, test or runtime execution was performed; the header-name casing returned by Undertow's servlet facade and the audit provider's serialization behaviour are inferred, not confirmed.",
+    "Third-party dependencies that implement part of the control flow (Undertow core, Elytron, PicketBox, JBeret, Artemis, JBossWS, Remoting) are not in the snapshot and could only be referenced by their in-repo call sites.",
+    "Findings are limited to what is visible in main sources; deployment configuration (standalone.xml/domain.xml, audit providers) affects exploitability and was not fully enumerable."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DigestAuthenticationMechanism.handleDigestHeader does not validate the `uri` token against the request URI (explicit `// TODO - Validate the URI`), and identityManager.verify() runs before nonce validation (undertow/.../security/digest/DigestAuthenticationMechanism.java:231, 281, 292).",
+      "reason": "The TODO is upstream design debt; the response is still verified against a valid username/password, so no authentication/authorization bypass is demonstrated. The stray `e.printStackTrace()` in authenticate() swallows exceptions into NOT_AUTHENTICATED rather than granting access."
+    },
+    {
+      "lead": "ElytronSecurityDomainContextImpl.doesUserHaveRole() returns true unconditionally for web-service endpoints (webservices/.../security/ElytronSecurityDomainContextImpl.java:48-52).",
+      "reason": "No caller in this repository makes an access-control decision from this method; the only in-repo users are authentication/runAs paths, and the TODO suggests a legacy stub. Impact could not be traced."
+    },
+    {
+      "lead": "HTTPUpgradeService.selectServer() chooses an ActiveMQ server from the client-supplied `activemqServerName` HTTP-upgrade header (messaging-activemq/.../HTTPUpgradeService.java:151-173, 196-206).",
+      "reason": "Selection is limited to the root server and configured HA backups and the acceptor name must still match; no evidence of a concrete security-setting bypass. A null acceptor would at most cause a per-connection error."
+    },
+    {
+      "lead": "CNCtx.getStringifiedIor() opens arbitrary `file://`/`http://` URLs during JNDI lookup, and WSHandlerChainAnnotationProcessor reads `file://`/`http://` handler-chain files (iiop-openjdk/.../CNCtx.java:395-428; webservices/.../WSHandlerChainAnnotationProcessor.java:186-189).",
+      "reason": "Application/deployment-initiated SSRF-style access; returned content must parse as an IOR/handler chain, so exfiltration of arbitrary files is not demonstrated and the actor already has deployment code execution."
+    },
+    {
+      "lead": "JDR sanitization can fail open: XMLSanitizer returns the original bytes when parsing fails and uses a DTD-enabled DocumentBuilderFactory, and JdrZipFile entry names are partly derived from collected file paths (jdr/.../XMLSanitizer.java:61-90; JdrZipFile.java:85-126).",
+      "reason": "Requires administrator-triggered JDR generation and plantable XML under JBOSS_HOME; the information is then disclosed to the same/administrative consumer, so the concrete attack value is limited."
+    },
+    {
+      "lead": "Batch read-only attributes call jobOperator.getJobXmlNames()/getJobXmlNames(jobName) without the `read` BatchPermission check that checkState() applies (batch/.../BatchDeploymentResourceDefinition.java:142-150; BatchJobResourceDefinition.java:81-88; JobOperatorService.java:330-343).",
+      "reason": "Only leaks job XML/job names; no state change, credential or privilege impact, and it is unclear whether this was later considered a defect."
+    },
+    {
+      "lead": "Several deployment-descriptor parsers create XMLInputFactory.newInstance() without the usual NoopXMLResolver (e.g. clustering/singleton/.../SingletonDeploymentParsingProcessor.java:50-82; pojo/.../KernelDeploymentParsingProcessor.java:61,150; sar/.../ServiceDeploymentParsingProcessor.java:54).",
+      "reason": "The parsed XML is supplied by the deployer, who already controls deployment code; no unprivileged-remote input path to these parsers was found."
+    }
+  ],
+  "summary": "Reviewed the WildFly 11.0.0.Final main-source snapshot (4,552 visible files; test sources stripped) with targeted source searches and manual tracing of externally reachable paths (servlet/HTTP security, EJB/IIOP/remoting, messaging, web services, batch, JDR, clustering, deployment parsers). One candidate met the evidence bar: the legacy-security audit receiver copies request details into audit events and its sensitive-header filter is a case-sensitive substring test, so the canonical `Authorization` header (HTTP Basic base64 user:password, or a Digest response) is written into audit events/logs despite the comment stating it must not be. The remaining leads I found are weaker or lack a traceable in-repo impact and are listed as rejected."
+}

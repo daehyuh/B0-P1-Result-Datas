@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The characters being filtered come from the wrapped Reader (e.g. a file/buffer/content that a caller filters before further processing). Whoever supplies that content controls the characters that are supposed to be stripped but are instead delivered verbatim on the bulk-read path. The caller only chooses the skip characters and reads via the public Reader API.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked the single-character read() override (correct, so the bypass is specific to the bulk-read path); checked the compaction bounds (pos < readPos) so the defect is confined to filter/count semantics, not a buffer overrun; checked both subclasses' filter() implementations to confirm the argument semantics (a character, not a count); checked that the classes are public and reachable from ordinary callers; verified via repository search that this is the only occurrence of a predicate being passed a read count in this style (search for \"(read)\" matches only line 64), which argues against it being a deliberate design.",
+      "id": "case-014-001",
+      "impact": "Sanitization/validation bypass: characters the caller asked to be removed (control characters, quotes, separators, CR/LF or any configured junk characters) are delivered unfiltered whenever the data is read in blocks, which is the usual path (BufferedReader, IOUtils/FileUtils). If the filter is used as a security control before writing CSV, logs or passing data to another component, it is ineffective on that path, enabling downstream injection or parsing/corruption issues; conversely, blocks whose length equals a skip code point are silently dropped, causing unexpected data loss. There is no memory-safety impact (the pos < readPos guard keeps writes in bounds).",
+      "locations": [
+        {
+          "end_line": 73,
+          "path": "src/main/java/org/apache/commons/io/input/AbstractCharacterFilterReader.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 46,
+          "path": "src/main/java/org/apache/commons/io/input/CharacterFilterReader.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 53,
+          "path": "src/main/java/org/apache/commons/io/input/CharacterSetFilterReader.java",
+          "start_line": 49
+        }
+      ],
+      "prerequisites": "A consumer uses CharacterFilterReader/CharacterSetFilterReader (or a subclass) as a sanitization step and consumes the data through read(char[]), read(char[],int,int), BufferedReader.readLine/fill, IOUtils.copy(Reader,...), FileUtils.readLines/readFileToString or any other bulk-read based path, and relies on the removed characters being gone. Consumers that only call the single-character read() are unaffected. No special JVM, privilege or configuration conditions are needed; the classes are public API in a widely used library.",
+      "root_cause": "In AbstractCharacterFilterReader.read(char[] cbuf, int off, int len) the compaction loop tests `filter(read)`, i.e. it passes the number of characters returned by the delegate read instead of the character at the current position (`filter(cbuf[readPos])`). Because `read` is constant for the whole call, the outcome no longer depends on the data: when `read` is not one of the configured skip code points (the normal case) no character is ever filtered and every skip character survives into the caller's buffer; when `read` happens to equal a skip code point, the entire just-read block is silently discarded and the method returns 0. The single-character read() override (lines 39-44) correctly tests `filter(ch)`, so the class behaves correctly or not depending on which read API the consumer uses. Subclasses CharacterFilterReader and CharacterSetFilterReader inherit the broken override.",
+      "title": "Character filter readers bypass character filtering on the bulk read(char[], int, int) path",
+      "trace": "Consumer calls read(cbuf, off, len) (line 57) -> super.read(...) fills the buffer and returns `read` (line 58) -> loop iterates readPos = off .. off+read-1 (line 63) -> predicate evaluated as filter(read) (line 64), always the same boolean for the block -> if false, `continue` is never taken, pos advances in lock-step with readPos (line 67-70 does not compact anything), and the method returns `read`, so all characters including configured skip characters remain in cbuf; if true, `continue` is taken for every position, pos stays off-1, and the method returns 0 while the underlying data has already been consumed (silent data loss). The intended per-character check is visible in read() (line 43: while (filter(ch))) and in the subclasses' filter implementations (CharacterFilterReader line 45 compares ch to the configured skip character; CharacterSetFilterReader line 52 looks the character up in the skip set), confirming that the argument to filter() must be a character, not a count.",
+      "unverified": "Not runtime-confirmed: no tests or code were executed, and no test sources are exposed in this snapshot. The defect itself is derived directly from the source; the severity depends on whether a particular consumer treats the filter as a security control. I could not compare this file against upstream history, so I cannot say whether the line is a historical upstream bug or a deliberately introduced mutation; either way the current source behavior is as described.",
+      "weakness_type": "Protection mechanism failure / improper input validation (sanitization filter bypass) — CWE-693/CWE-20"
+    }
+  ],
+  "coverage_summary": "All 168 files reported by get_source_scope were accounted for: root build/config/docs files plus src/main/java sources and src/site xdoc files (no src/test files are exposed by the scope filter). I read the security-relevant input/output stream readers and wrappers, the filefilter package family, the serialization package, the core FilenameUtils/FileUtils/FileDeleteStrategy/FileCleaningTracker/LockableFileWriter/FileSystemUtils classes, and the monitor/DirectoryWalker classes, and ran targeted searches for exec/Runtime, reflection/forName, MessageDigest, URL handling, canonical/exists/startsWith checks, null-byte validation, and wrong-argument predicate patterns. The strongest, most localizable defect found is the AbstractCharacterFilterReader bulk-read filter bypass described in the candidate; other areas examined matched expected behavior (bounds checks, null-byte checks, exec via fixed argument arrays, delete/symlink handling).",
+  "limitations": [
+    "No test sources, build execution, dependency resolution or runtime verification were available; all conclusions are static source readings.",
+    "No upstream/diff baseline is available, so I cannot distinguish a deliberately introduced mutation from a historical upstream defect in AbstractCharacterFilterReader.",
+    "Large files (FileUtils, IOUtils, FilenameUtils, XmlStreamReader, Tailer, ReversedLinesFileReader, WriterOutputStream, ReaderInputStream) were reviewed selectively rather than line-by-line; additional defects cannot be excluded.",
+    "The one-candidate cap means only the single strongest lead is reported; the normalize() path-traversal behavior is real in this version but was not submitted.",
+    "Severity of the selected candidate depends on how downstream applications use the filter readers (security control vs. cosmetic cleanup)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "FilenameUtils.normalize/getPrefixLength limited path traversal (input such as \"//../foo\" is returned unchanged because getPrefixLength treats the leading \"//..\" segment as a UNC server/share prefix; known upstream issue CVE-2021-29425 affecting this version).",
+      "reason": "Real but limited: the advisory impact is a one-level traversal and only materialises if a caller uses normalize() as a security boundary when building filesystem paths; the code is long-standing across releases rather than a localizable anomaly, so it is weaker than the filter bypass as a single candidate for this snapshot."
+    },
+    {
+      "lead": "XmlStreamReader.getXmlProlog (lines 701-746) loops on is.read(...) and does not detect a delegate stream that repeatedly returns 0 for a positive-length read, allowing a CPU spin (later addressed upstream as CVE-2024-47554).",
+      "reason": "Requires a non-conforming/pathological InputStream and yields at most a DoS; the loop is otherwise bounded to a 4096-byte buffer, so the source evidence for a concrete exploitable impact is weaker than the selected candidate."
+    },
+    {
+      "lead": "ValidatingObjectInputStream (serialization package) overrides resolveClass but not resolveProxyClass, so proxy class names are not validated against the accept/reject matchers.",
+      "reason": "Design limitation of the whitelist mechanism rather than a demonstrated bypass in this snapshot; exploitability depends on the consumer's proxy usage and is not verifiable from the source alone."
+    },
+    {
+      "lead": "FileSystem.isReservedFileName uses Arrays.binarySearch against a case-sensitive reserved-name list (WINDOWS enum), potentially allowing reserved names with different casing.",
+      "reason": "Functional/compatibility gap with no clear attacker-controlled confidentiality or integrity impact in this library context, and the list/lookup semantics are otherwise consistent."
+    }
+  ],
+  "summary": "Scope: the 168-file Apache Commons IO snapshot (2.7-SNAPSHOT, mid-2018 state per changes.xml ending at IO-577), main Java sources plus site/build files; no test sources are exposed. I reviewed the stream/reader composites, file filters, serialization package, and the core FilenameUtils/FileUtils/FileSystemUtils path, copy, delete and process logic, and searched for dangerous sinks (exec, deserialization/reflection, XML parsing, URL handling, crypto, path normalization). The single strongest source-evidenced defect is in the newly added character-filter readers (IO-577): the bulk-read override in AbstractCharacterFilterReader applies the per-character filter predicate to the number of characters read instead of to each character, so the filtering control is effectively disabled (or over-applied) on the standard read(char[]/int,int) path. I selected that as the one candidate; a genuine but limited upstream path-normalization issue in FilenameUtils and a pathological-stream read loop in XmlStreamReader were evaluated and left as rejected leads."
+}

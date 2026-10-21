@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Rule text is delivered as `ConfigChangedEvent.getContent()` / `GovernanceRuleRepository.getRule(...)`, i.e. data read from the configured dynamic configuration (Nacos/Apollo/ZooKeeper/etcd/Consul config center) and pushed asynchronously to every listener. Anyone able to create/update governance entries (e.g. `*.tag-router`, `*.condition-router`, app/service configurator rules), a malicious/compromised config center, or any component with write access to that configuration store controls the YAML document. The three parsers run on the node that consumes the rule, so the payload executes in the Dubbo process that parses it.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the JSON fast path: `ConfigParser.isJsonArray` only diverts JSON arrays to `JSON.parseArray(rawConfig, String.class)`, so a YAML mapping still reaches the unsafe SnakeYAML path. Checked whether a safer parser is used elsewhere in these classes: all three parsers use `constructor.Constructor` with plain `Yaml.load`, and no `SafeConstructor`, `LoaderOptions`/`TagInspector`, or class allow-list is applied. Checked whether parsed rules are validated before use: `TagRouterRule`/`ConditionRouterRule`/`ConfiguratorConfig` only validate their own fields (tags/conditions/parameters), which happens after `yaml.load` has already instantiated attacker-named types. Checked mitigation flags: `serialization.security.check` and QoS `accept-foreign-ip` are unrelated to this parser path. The main mitigating assumption is that writing config-center governance data is a privileged operation in many deployments; however, the code path treats that data as usable without any class-level restriction, which is exactly the trust assumption this finding flags.",
+      "id": "yaml-unsafe-constructor-config-rules",
+      "impact": "Remote code execution (or at minimum arbitrary class loading/instantiation and object-graph manipulation) in the JVM of any Dubbo provider/consumer that parses a crafted governance/configurator rule; a single malicious rule can compromise all nodes subscribed to that key. Because the affected parsers are also used for tag/condition routing rules, the issue affects both service governance and routing data.",
+      "locations": [
+        {
+          "end_line": 83,
+          "path": "dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/configurator/parser/ConfigParser.java",
+          "start_line": 75
+        },
+        {
+          "end_line": 44,
+          "path": "dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/router/tag/model/TagRuleParser.java",
+          "start_line": 29
+        },
+        {
+          "end_line": 51,
+          "path": "dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/router/condition/config/model/ConditionRuleParser.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 86,
+          "path": "dubbo-registry/dubbo-registry-api/src/main/java/org/apache/dubbo/registry/integration/AbstractConfiguratorListener.java",
+          "start_line": 44
+        },
+        {
+          "end_line": 79,
+          "path": "dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/router/tag/TagRouter.java",
+          "start_line": 63
+        },
+        {
+          "end_line": 77,
+          "path": "dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/router/condition/config/ListenableRouter.java",
+          "start_line": 58
+        }
+      ],
+      "prerequisites": "A dynamic configuration (config center) is configured and rule listeners are active (default for tag/condition routers and for app/service configurators), and the attacker can write the relevant rule key/group or control the config-center data stream. SnakeYAML must be present at the version managed by the BOM (`snakeyaml_version=1.20` in dubbo-dependencies-bom/pom.xml, declared for dubbo-cluster in dubbo-cluster/pom.xml), whose `Constructor` resolves arbitrary global tags. The doc must be non-JSON (YAML mapping) so it does not take the `isJsonArray` fast path.",
+      "root_cause": "The rule parsers build a SnakeYAML `org.yaml.snakeyaml.constructor.Constructor` (the class-instantiation-capable constructor, not `SafeConstructor`) and call `Yaml.load(rawConfig)` on rule text that originates outside the process. SnakeYAML `Constructor` resolves global YAML tags (`!!<fully.qualified.Class>`) by loading and instantiating the named class, so a crafted rule document can instantiate arbitrary classes (classic SnakeYAML gadget chains, e.g. URLClassLoader/ScriptEngine-manager style payloads) during rule parsing. No allow-list, tag inspection, or SafeConstructor is applied in any of the three parsers.",
+      "title": "Unsafe SnakeYAML `Constructor` deserialization of config-center/route rules allows arbitrary object instantiation (CWE-502)",
+      "trace": "Config center data -> `TagRouter.process(ConfigChangedEvent)` -> `TagRuleParser.parse(event.getContent())` -> `new Constructor(TagRouterRule.class)` + `new Yaml(constructor).load(rawRule)`; and `ListenableRouter.process(...)` -> `ConditionRuleParser.parse(...)` -> `new Constructor(ConditionRouterRule.class)` + `yaml.load(rawRule)`; and `AbstractConfiguratorListener.initWith/process` -> `genConfiguratorsFromRawRule` -> `ConfigParser.parseConfigurators(rawConfig)` -> (non-JSON branch) -> `ConfigParser.parseObject(rawConfig)` -> `new Constructor(ConfiguratorConfig.class)` + `yaml.load(rawConfig)`. In `ConfigParser.parseObject` the unsafe constructor is explicitly `org.yaml.snakeyaml.constructor.Constructor`, whose global-tag handling resolves arbitrary classes; the parsed object graph can contain attacker-chosen instances, i.e. code/class-instantiation side effects at parse time.",
+      "unverified": "No runtime exploitation or SnakeYAML behavior test was executed (read-only review). The exact transitively resolved SnakeYAML artifact/version was not resolved beyond the BOM declaration (`snakeyaml_version=1.20`, dubbo-dependencies-bom/pom.xml line 125), since binaries/dependency trees are not visible. It was not verified which config-center backend is enabled in a given deployment (the rule repositories are pluggable: Nacos/Apollo/ZooKeeper/etcd/Consul; a `NopDynamicConfiguration` exists in dubbo-common), so the concrete attack surface depends on deployment configuration. Resource files (SPI registrations, dubbo.properties) are outside the visible scope, so extension wiring was not verified.",
+      "weakness_type": "Deserialization of Untrusted Data (CWE-502) via unsafe SnakeYAML Constructor"
+    }
+  ],
+  "coverage_summary": "Reviewed the visible main-source tree (1468 files) across core modules: dubbo-common (URL, StringUtils/NetUtils/ConfigUtils, PojoUtils, JavaBeanSerializeUtil, ExtensionLoader), dubbo-cluster (configurator/tag/condition/script routers), dubbo-rpc-api and dubbo-rpc-dubbo (codec, DecodeableRpcInvocation/Result, DubboCodecSupport, filters, CallbackServiceCodec), dubbo-remoting (ExchangeCodec/CodecSupport, http/servlet, netty SSL contexts), dubbo-serialization (hessian2, jdk, kryo, fastjson, protostuff, gson), dubbo-registry/configcenter/metadata providers, dubbo-plugin (qos, auth) and dubbo-config(-spring). Searched for common sink/source patterns (Runtime.exec/ProcessBuilder: none; JNDI/XXE/JAXP/ScriptEngine/ObjectInputStream/Class.forName/YAML/fastjson parsing; file writes/path construction; QoS localhost gate; token/auth filters; SSL trust configuration). Tests are excluded from the snapshot, and non-Java resources such as `META-INF/dubbo/internal` SPI registration files, dubbo.properties and most XML/properties configuration are not visible, so extension wiring/default wiring could not be confirmed.",
+  "limitations": [
+    "No code execution, build, dependency resolution, or exploit payloads were run; all conclusions are static source reading.",
+    "Test sources are not present in the snapshot, so intended behavior, fix tests, and regression expectations could not be inspected.",
+    "Resource files (SPI registrations under META-INF, dubbo.properties, most XML/properties resources) are outside the visible file set, so registered serializations/protocols and runtime defaults for a given assembly could not be verified in-source.",
+    "Binary/jar contents are refused by the tooling, so the exact hessian-lite/SnakeYAML runtime behavior and versions beyond the BOM declarations were not verified.",
+    "Threat models (who can write config-center rules; whether consumers are considered untrusted) are deployment-dependent; the finding assumes the config-center governance data can be influenced by an attacker, which is the standard assertion for this class of issue but is not provable from this snapshot alone.",
+    "Only one candidate may be submitted, so the provider-side client-chosen-serialization deserialization path was not submitted even though it is separately plausible."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Provider deserializes with a client-chosen serialization id: `DecodeableRpcInvocation.decode` uses the wire `serializationType` (`CodecSupport.getSerialization(url, id)`) and the only consistency check is gated by `serialization.security.check` defaulting to false; `JavaObjectInput`/`NativeJavaObjectInput` then call `ObjectInputStream.readObject()` with no class restriction (dubbo-serialization-jdk), giving an unauthenticated network path to JDK-deserialization RCE (CWE-502).",
+      "reason": "Plausible and high impact, but not submitted because only one candidate is allowed and the YAML issue was chosen. It is a different root cause (protocol serialization-type negotiation/opt-in check), reachability depends on the `nativejava`/`java` serialization extension being registered in a given assembly (SPI resource files are outside the visible scope), and the client-selected serializer is part of Dubbo's documented request header handling, making intent harder to establish purely from this snapshot."
+    },
+    {
+      "lead": "`ScriptRouter` compiles and evaluates routing-rule JavaScript with a `ScriptEngineManager`-obtained engine (Nashorn on JDK 8-14) with no sandbox (`ScriptRouter` lines 96-106 and 109-121), so rule authors can execute arbitrary code in the consumer/provider JVM.",
+      "reason": "This is the router's intended function rather than a hidden validation defect; it requires the same rule-publishing access as the submitted finding and is not a more specific root cause. Left as an unconfirmed lead."
+    },
+    {
+      "lead": "Empty private stub `checkSerializationTypeFromRemote()` in `DecodeableRpcInvocation` (lines 101-103).",
+      "reason": "It is dead code: the method is never called, so its empty body has no runtime effect. This is a hardening/dead-code observation, not a vulnerability by itself."
+    },
+    {
+      "lead": "Opt-in/absent deserialization hardening for hessian2 (default `Hessian2SerializerFactory` with no allow/deny list unless `dubbo.application.hessian2.*` properties are set), Kryo (`setRegistrationRequired(false)`, `KryoObjectInput.readClassAndObject`) and Protostuff (`Class.forName` on a wire-supplied class name).",
+      "reason": "Same CWE-502 family, but the effective blocklists live in external libraries (hessian-lite) that are not visible in the snapshot, and these serializers being available/selected is again a configuration-dependent negotiation issue; evidence is weaker than the two leads above."
+    },
+    {
+      "lead": "`dubbo-config/dubbo-config-api/.../ConfigValidationUtils.java` and other validation helpers were reviewed for an injected bypass of name/path/parameter checks.",
+      "reason": "Patterns matched upstream-style validation and no concrete attacker-controlled bypass was established from source."
+    }
+  ],
+  "summary": "Dubbo 2.7.9 snapshot (~1468 visible main-source files). The single strongest source-supported candidate is the unsafe SnakeYAML deserialization used to parse governance/route/configurator rules coming from the dynamic configuration (config center): `org.yaml.snakeyaml.constructor.Constructor` (the non-safe constructor) is combined with `Yaml.load(rawConfig)` in three rule parsers, so YAML documents containing global tags (`!!<class>`) can cause arbitrary class resolution/instantiation on whichever Dubbo node consumes the rule. This is a distinct, single root cause reused in three locations. I considered but did not submit the client-selected serialization id on the provider decode path and the Nashorn-based ScriptRouter; details are in rejected_leads. No runtime testing was performed; all statements are source-level."
+}

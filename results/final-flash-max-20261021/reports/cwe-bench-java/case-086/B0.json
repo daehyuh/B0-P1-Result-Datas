@@ -1,0 +1,73 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker must be able to influence the `types` (or catalog/schema/table) argument that an application passes to `DatabaseMetaData.getTables`/`getImportedKeys`/`getExportedKeys`/`getCrossReference`; this is plausible for tools/ORMs that surface a user-supplied table-type or schema filter. The injected text is uppercased by `t.toUpperCase()`, but SQL keywords and quoted identifiers still survive, so the constraint does not prevent injection.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that `tblNamePattern` itself is escaped (1680-1683), so only `types` is injectable in `getTables`. Checked `CoreDatabaseMetaData.escape()` (172-185) — it correctly doubles single quotes, and it IS used inside `getColumns` for `colName`/`colType`/patterns (1094-1109) and in `getIndexInfo`/`getPrimaryKeys` (1223, 1527, 1560) — confirming an escape facility exists and was omitted for the `types` list and for `quote()`-wrapped parameters. Checked that `Statement.executeQuery` goes through `DB.prepare` -> `NativeDB.prepare_utf8` (single-statement prepare), so multi-statement stacking is not available. Checked `t.toUpperCase()` truncation/case effects; not a mitigation. No repository tests cover metadata escaping, and no fix/commit metadata is available in-scope.",
+      "id": "case-086-candidate-1",
+      "impact": "Arbitrary single-statement SQL injection through a JDBC metadata call: confidentiality breach (UNION/expression-based reads of tables and attached schemas available to the connection), metadata/result tampering, and denial of service via expensive injected SELECTs. Because the driver's `executeQuery` compiles only the first statement (`sqlite3_prepare`), stacked statements such as `; DROP ...` are not executed through this path, which limits but does not remove the impact.",
+      "locations": [
+        {
+          "end_line": 1738,
+          "path": "src/main/java/org/sqlite/jdbc3/JDBC3DatabaseMetaData.java",
+          "start_line": 1732
+        },
+        {
+          "end_line": 1415,
+          "path": "src/main/java/org/sqlite/jdbc3/JDBC3DatabaseMetaData.java",
+          "start_line": 1404
+        },
+        {
+          "end_line": 164,
+          "path": "src/main/java/org/sqlite/core/CoreDatabaseMetaData.java",
+          "start_line": 158
+        }
+      ],
+      "prerequisites": "Application code passes untrusted text into the JDBC metadata API on an open connection. For `getImportedKeys`/`getExportedKeys`/`getCrossReference`, untrusted catalog/schema/table arguments. The query executes with the privileges of that connection.",
+      "root_cause": "In `org.sqlite.jdbc3.JDBC3DatabaseMetaData#getTables`, the caller-supplied `types` array is mapped into the query text as `\"'\" + t.toUpperCase() + \"'\"` (lines 1732-1738) without escaping single quotes, unlike the `tblNamePattern` path which is passed through `escape()` (lines 1680-1683). A value containing a single quote terminates the intended string literal and lets the entry change the query, so attacker-influenced `types` input is concatenated into SQL that the driver prepares and executes against the connection's database. The sibling helper `CoreDatabaseMetaData.quote()` (lines 158-164) has the same defect and is used to embed caller-supplied `catalog`/`schema`/`table` strings in `getImportedKeys`/`getExportedKeys`/`getCrossReference` (e.g. lines 1404-1415, 1151-1168), indicating a systematic missing-escape pattern in metadata SQL construction.",
+      "title": "SQL injection via unescaped `types` parameter in `DatabaseMetaData.getTables`",
+      "trace": "getTables builds `... WHERE TABLE_NAME LIKE '<escaped-pattern>' ESCAPE '\\'` then, when `types` is non-empty, appends ` AND TABLE_TYPE IN ('<types[0].toUpperCase()>',...)` (lines 1726-1739) and executes it via `((CoreStatement) conn.createStatement()).executeQuery(sql.toString(), true)` (line 1743). A single quote in a `types` element closes the literal; a UNION-style tail is appended after the closing `)` and the remaining original text (`') ORDER BY ...`) can be neutralized with a SQL comment, producing an attacker-shaped single SELECT that the driver prepares and returns as the metadata ResultSet. The same mechanism applies to `quote()`-wrapped parameters, e.g. `getImportedKeys` at lines 1404-1415 executes `quote(catalog)`/`quote(schema)`/`quote(table)`/`quote(ft)`-style literals via `executeQuery` at line 1511.",
+      "unverified": "Not runtime-confirmed; no build or execution was performed. The exact upstream advisory/CVE mapping was not consulted (out of scope). Exploitability depends on an application passing attacker-influenced values into the metadata API, which was not demonstrated from this repository alone. The relative contribution of the `types` sink versus the `quote()` sink to any historical fix is inferred from source only.",
+      "weakness_type": "CWE-89 Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+    }
+  ],
+  "coverage_summary": "Scope: 77 model-visible files (binary-like files skipped by the tool policy; no symlinks/sensitive-name exclusions). All files were enumerated and searched (SQL construction, `String.format`, `escape`, `System.getProperty`, `exec`, `openConnection`, `Pattern.compile`, `forName`, `readObject`). Deep reads: SQLiteJDBCLoader, SQLiteConnection, SQLiteConfig, CoreDatabaseMetaData, DB, NativeDB, JDBC3Connection/Statement/PreparedStatement, JDBC3DatabaseMetaData (majority), ExtendedCommand, QueryUtils/StringUtils, OSInfo/ProcessRunner, SafeStmtPtr, Function, SQLiteDataSource, SQLiteConnectionConfig/OpenMode. Partial/skim-only: the copied org.sqlite.date package (FastDateFormat/FastDateParser/FastDatePrinter/FormatCache), JDBC3ResultSet/JDBC4ResultSet, JDBC4* classes, SQLitePooledConnection, SQLiteErrorCode/Exception, and build/CI/config files. No test sources or native C/JNI sources are present in the snapshot, so native-layer memory-safety questions (JNI string/pointer handling) could not be inspected.",
+  "limitations": [
+    "Static source review only: no compilation, tests, scanners, or payload execution were performed, so runtime exploitability is not confirmed.",
+    "No CVE/advisory/commit metadata was consulted (explicitly out of scope), so the candidate is not mapped to a specific CVE and the exact upstream fix location is inferred from source asymmetries.",
+    "The date/time package, JDBC result-set classes, JDBC4 classes and pooled-connection classes were only skimmed; latent issues there are not ruled out.",
+    "Native JNI implementation and generated resources are absent from the snapshot, so behavior of `_exec`/`prepare_utf8` (e.g., confirmed single-statement semantics) is inferred from Java call sites and public SQLite API behavior, not from the extension source.",
+    "Reachability of the `types` sink depends on the consuming application; no in-repo caller passes untrusted data, so this remains a lead rather than a confirmed end-to-end vulnerability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "`quote()` does not escape single quotes; used with caller-supplied catalog/schema/table in `getImportedKeys` (1404-1415), `getExportedKeys` (1340-1366) and `getCrossReference` (1151-1168), plus schema-derived `fkName`/`pkName` (1498-1500).",
+      "reason": "Plausible and same weakness class, but kept inside the single submitted candidate's root cause rather than reported as a second candidate; impact requires untrusted metadata arguments and single-statement-only execution."
+    },
+    {
+      "lead": "`getColumns` inserts schema-derived `tableName` into generated SQL unescaped (line 1090-1092) and `getPrimaryKeys` wraps a schema-parsed `pkName` in literal quotes (1213-1216).",
+      "reason": "Second-order injection requiring a crafted database whose table/index/constraint name contains a quote; the resulting statement is a single SELECT executed on the same connection the attacker already controls, so security impact is weaker and the trust boundary is less direct."
+    },
+    {
+      "lead": "`SQLiteConfig.apply` concatenates pragma values into SQL: `stat.execute(String.format(\"pragma %s=%s\", key, value))` (line 219); `setTempStoreDirectory` also quote-wraps without escaping (1055-1056) and the SQLCipher password path only escapes single quotes (206).",
+      "reason": "Values originate from JDBC URL/properties, but keys are filtered to a fixed pragma whitelist and `Statement.execute` compiles only the first statement, so the classic arbitrary-SQL impact is not supported by the source; kept as an unconfirmed lead."
+    },
+    {
+      "lead": "`SQLiteConnection.extractResource` (297-341) writes `:resource:` databases to `<tmp>/sqlite-jdbc-tmp-<URL.hashCode>.db`, returns a pre-existing file when its mtime is newer than the resource, and `new URL(resourceName)` (line 240) permits remote protocols.",
+      "reason": "Insecure-temp-file/SSRF-like pattern, but exploitation needs local temp-directory placement or an application that accepts untrusted `:resource:` URLs; the documented feature makes intended-behavior vs. vulnerability ambiguous."
+    },
+    {
+      "lead": "`OSInfo.resolveArmArchType` builds a `/bin/sh -c` command from the `java.home` system property (lines 204-217); `StringUtils`/`ProcessRunner` also execute fixed shell commands.",
+      "reason": "Requires the attacker to already control JVM system properties (code-execution capability); no in-repo path supplies attacker input to `java.home`."
+    },
+    {
+      "lead": "`SQLiteJDBCLoader.cleanup()` deletes temp files whose names start with `sqlite-<version>` when no `.lck` sibling exists (80-106); native extraction uses UUID names plus a contents-equality check (193-236).",
+      "reason": "Deletion is limited to the driver's own naming pattern and protected by lock files/temp-directory permissions; UUID-based extraction and the content check defeat the predictable-temp-file concern for the native library."
+    },
+    {
+      "lead": "`ExtendedCommand` exposes `backup ... to <file>` / `restore ... from <file>` with arbitrary destination/source paths, and `DB.backup`/`restore` take raw filenames.",
+      "reason": "Reachable only after the attacker can already influence SQL text sent to `Statement.execute`, i.e., it is not an independent vulnerability."
+    }
+  ],
+  "summary": "Reviewed the 77-file sqlite-jdbc (3.41.2.1) Java source snapshot. Broad search plus focused reads of the native-library loader, connection/config handling, DB/NativeDB, JDBC metadata implementations, and utility/date code. The strongest source-evidenced issue is SQL injection in the JDBC metadata layer: `JDBC3DatabaseMetaData.getTables` concatenates caller-supplied `types[]` entries into the metadata query with no single-quote neutralization (line 1736). Related metadata methods share the same escaping gap through `CoreDatabaseMetaData.quote()` (lines 158-164 used at 1151-1168, 1340-1366, 1404-1415). No runtime verification was performed and no tests/native C sources are present in scope; other leads (pragma-value concatenation in `SQLiteConfig.apply`, predictable temp file in `SQLiteConnection.extractResource`, `java.home` shell invocation in `OSInfo`, native-library cleanup/deletion) were inspected and are listed as unconfirmed/rejected."
+}

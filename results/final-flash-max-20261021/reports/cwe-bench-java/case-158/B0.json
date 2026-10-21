@@ -1,0 +1,87 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Unauthenticated attacker controls (a) the access key/appid supplied as `Authorization: Anonymous <appid>` or `?accessKey=<appid>` (RestUtils.extractAccessKey / isAnonymousRequest), (b) the request path segment `{subjectid}` (and, on the check route, the base64-encoded resource path and HTTP method). The appid is a public identifier (it is the access key embedded in browser/JS clients and sent as the Credential scope of every signed request), so it is not a secret barrier. No credential, signature, JWT or configured guest permission is required.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked (a) that guest requests normally require an explicit guest grant: app.isAllowedTo() with a blank subjectid requires a \"?\" (GUEST) entry for subject \"*\" (App.java lines 750-786, 788-826) — the bypass skips exactly this check; (b) that AppAuthentication marks itself authenticated so getPrincipalApp() in the handlers yields the app (AppAuthentication lines 42-46/76-78); (c) that only read-only handlers are registered under `_permissions/*` (Api1 620-656 routes: GET read + GET check, PUT/DELETE grant/revoke are not covered by the GET-only bypass); (d) that the appid is not a secret (access key) and is exposed in client code and in the Credential field of signed requests; (e) that the inline comment (\"allow permission checks, i.e. pc.isAllowed(), to go through\") shows the author intended only the boolean check endpoint, which explains the over-broad regex but does not remove the exposure of the read endpoint.",
+      "id": "cand-1",
+      "impact": "Unauthenticated disclosure of an application's authorization table (subject ids, resource paths and allowed methods, including the wildcard \"*\" subject and guest \"?\" grants) and a permission-check oracle for arbitrary subject/resource/method combinations. It also breaks the guest trust boundary in the security model: a self-declared \"Anonymous\" request is upgraded to the application principal, and any other GET handler reachable under `_permissions/*` (including ones added by custom plugins/handlers) would inherit that identity. The subject-id entries also aid account/resource enumeration for follow-up attacks. Data modification is not reachable through this bypass because it requires the GET method.",
+      "locations": [
+        {
+          "end_line": 217,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/RestAuthFilter.java",
+          "start_line": 202
+        },
+        {
+          "end_line": 128,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/RestAuthFilter.java",
+          "start_line": 110
+        },
+        {
+          "end_line": 656,
+          "path": "para-server/src/main/java/com/erudika/para/server/rest/Api1.java",
+          "start_line": 620
+        },
+        {
+          "end_line": 165,
+          "path": "para-server/src/main/java/com/erudika/para/server/rest/RestUtils.java",
+          "start_line": 151
+        }
+      ],
+      "prerequisites": "The targeted application exists and is active; its access key/appid is known to the attacker; apiSecurityEnabled is true (default). For the read route the attacker uses GET /v1/_permissions/{subjectid}; for the oracle route GET /v1/_permissions/{subjectid}/{base64(resourcePath)}/{method}.",
+      "root_cause": "RestAuthFilter.hasPermission() returns true unconditionally when the extracted resource path matches \"^_permissions/.+\" and the method is GET, *before* the subject (guest) permission check `parentApp.isAllowedTo(subjectid, resourcePath, method)` is performed. For guest requests, guestAuthRequestHandler() then installs `new AppAuthentication(parentApp)` in the security context, so an unauthenticated caller that merely presents a known access key (appid) is treated as the application itself for every GET route under `_permissions/`. The bypass was apparently intended only for the permission *check* call used by clients (`pc.isAllowed()`, i.e. GET /v1/_permissions/{subjectid}/{base64path}/{method}), but the regex also covers the permission *read* route (GET /v1/_permissions/{subjectid}), which returns the stored ACL for a subject.",
+      "title": "Guest (unauthenticated) requests are elevated to the application identity for GET /v1/_permissions/* and can read the app's resource-permission table",
+      "trace": "1) GET /v1/_permissions/app%3Avictim with header `Authorization: Anonymous app:victim` (no signature/JWT). 2) RestAuthFilter.doFilter (lines 79-108): appid = \"app:victim\", isApp = true, isGuest = true -> guestAuthRequestHandler(appid, ...). 3) guestAuthRequestHandler (110-128) loads the app object via Para.getDAO().read(App.id(appid)) and calls hasPermission(parentApp, null, request) with user == null. 4) hasPermission (202-217): extractResourcePath() -> \"_permissions/app:victim\", which matches ^_permissions/.+ for method GET, so it returns true (line 211-213) without ever consulting app.isAllowedTo(\"\" , ...) — i.e. the guest ACL is bypassed. 5) guestAuthRequestHandler sets SecurityContextHolder authentication = new AppAuthentication(parentApp) and returns true, so the request proceeds. 6) Jersey routes to Api1.getPermitHandler (620-634): `App app = getPrincipalApp()` now returns the victim app (principal is an App) and the handler returns `Response.ok(app.getAllResourcePermissions(subjectid))` — the app's ACL map — to the unauthenticated caller (200). 7) The sibling route checkPermitHandler (642-656) similarly answers `app.isAllowedTo(subjectid, base64dec(pathParam(type)), pathParam(method))` for arbitrary subject/resource/method, giving an unauthenticated permission oracle.",
+      "unverified": "Not runtime-confirmed (no code execution performed). Whether this bypass is upstream-but-unintended versus deliberately introduced could not be determined because the snapshot cannot be diffed against the upstream project in this environment. I also could not verify Jersey/Jetty path normalization edge cases (e.g. encoded slashes/dot segments) that might further widen the set of reachable GET handlers.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-306 Missing Authentication for Critical Function (with CWE-200 information exposure)"
+    }
+  ],
+  "coverage_summary": "All 199 snapshot files were listed and the security-relevant ones were read in full or in substantial part: para-server security stack (SecurityConfig, SecurityModule, JwtConfigurer, RestAuthFilter, JWTRestfulAuthFilter, JWTAuthenticationProvider, JWTAuthentication, User/App/LDAP authentication providers, SimpleUserService, SimpleAuthenticationEntryPoint/AccessDeniedHandler/Success/Failure handlers, SimpleRequestCache, Rest/Ignored/Csrf/Ajax matchers, Password/Passwordless/OAuth2/LDAP/SAML/SAMLMetadata filters), REST layer (Api1 full, RestUtils full, CustomResourceHandler, GenericExceptionMapper), core model and utilities (App, User, Sysprop, Linker, Webhook, Vote/Votable, Tag/Translation/Address, ParaObjectUtils, CoreUtils, Utils, Config, ParaConfig, ValidationUtils, Constraint, Para, RateLimiter, Pager, RegistryUtils, Search/DAO/Queue/Cache/FileStore interfaces and mocks), server infrastructure (IndexAndCacheAspect, SearchQueryAspect, AOPUtils, CaffeineCache, AWSDynamoDAO/Utils, River/LocalQueue/AWSQueue, AWSFileStore/LocalFileStore/StorageModule, HealthUtils, MetricsUtils, HttpUtils, GZip/Error/Field/Caching/CORS filters, BufferedRequestWrapper), build/CI/config (all poms, workflows, reference.conf, application.properties, Dockerfile, shell scripts, SECURITY/README/CONTRIBUTING). Tools used: file listing, literal text search and bounded file reads only; no execution, no diffing against upstream, no external lookups.",
+  "limitations": [
+    "Static review only: nothing was compiled, executed, scanned or fuzzed, and no runtime behaviour was confirmed; all findings are source-level leads.",
+    "The snapshot cannot be compared with the upstream Para project or any patch/fix history in this environment, so I could not distinguish deliberately introduced flaws from long-standing upstream design decisions (this materially lowers confidence in attributing any single issue to this case).",
+    "Plugin implementations that back the core interfaces are absent (H2/JDBC DAO, Lucene/Elasticsearch search, Hazelcast/Redis caches, SQS/SNS queues): cross-tenant isolation in those layers, query construction and any path where `search.isValidQueryString` is relied upon could not be audited.",
+    "Third-party library semantics assumed but not verified from source: nimbus-jose-jwt verifier algorithm checks, onelogin java-saml strict-mode signature requirements, flexmark/jsoup rendering guarantees, Spring Security firewall/matcher normalisation (whether unusual paths can bypass RestRequestMatcher's regex and rely on the filter's fail-open behaviour).",
+    "No unit/integration tests are present in the snapshot, so intended security invariants could not be cross-checked against test expectations.",
+    "Parts of large files were skimmed rather than read line-by-line (para-client/ParaClient.java, AWSDynamoDAO/AWSDynamoUtils, MetricsUtils, native-image resource JSON, HumanTime, CurrencyUtils), so a subtle defect in those areas could have been missed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CORS misconfiguration: CORSFilter defaults are anyOriginAllowed=true + supportsCredentials=true and ParaServer registers `cors.support.credentials=true`, so the filter reflects an arbitrary Origin together with Access-Control-Allow-Credentials: true (CORSFilter lines 254-276, 1017, 1033; ParaServer lines 274-289).",
+      "reason": "Looked like a serious cross-origin weakness, but in this codebase the API is authenticated via Authorization-header signatures/JWTs, remember-me is disabled and sessions are never created (SecurityConfig lines 122-130; no auth-cookie consumer in-repo), so I could not establish a concrete cross-site data-theft path; likely long-standing upstream configuration rather than the case's defect."
+    },
+    {
+      "lead": "SAMLAuthFilter defaults SECURITY_WANT_ASSERTIONS_SIGNED and SECURITY_WANT_MESSAGES_SIGNED to false (SAMLAuthFilter lines 331-340), which would allow forged assertion acceptance if unsigned responses were accepted.",
+      "reason": "The same settings force STRICT_PROPERTY_KEY=true, and the onelogin toolkit's strict mode is expected to reject responses that are neither signed nor carry a signed assertion; I could not verify the vendor library's behaviour from the snapshot, so the impact chain is unproven."
+    },
+    {
+      "lead": "LocalFileStore performs no path normalization (folder + path; default `localstorage.folder` is empty so the root is \"/\") enabling read/write outside the intended folder if a path containing \"..\" reaches it (LocalFileStore lines 56-146; ParaConfig lines 991-996).",
+      "reason": "Searched all callers: paths come from server configuration (HealthUtils config file), or are built from server-generated ids (appid + user id + content-type extension) in the OAuth2/Microsoft avatar downloaders; no HTTP-reachable attacker-controlled path was found, so impact is speculative."
+    },
+    {
+      "lead": "Api1.meHandler returns an app's credentials when a root-app request carries a Bearer JWT with a \"getCredentials\" claim (Api1 lines 475-494).",
+      "reason": "The claim-bearing token must first pass JWTRestfulAuthFilter/JWTAuthenticationProvider signature verification with the root app's secret, and the caller must already be authenticated as the root app; no privilege gain demonstrated."
+    },
+    {
+      "lead": "Sensitive user fields are serialized without @JsonIgnore (twoFAkey, twoFAbackupKeyHash, idpIdToken, idpAccessToken, idpRefreshToken — User.java lines 73-82, 182-207, 587-629) while password/tokenSecret/settings are annotated.",
+      "reason": "Real exposure only to principals already authorized to read the user object (the user itself, an app, or an admin/OWN-granted reader), so it is a defence-in-depth/data-minimisation gap rather than a clear cross-boundary vulnerability."
+    },
+    {
+      "lead": "SSRF-capable outbound requests driven by app settings/webhook records (GenericOAuth2Filter token_url/profile_url and avatar fetch, SAMLAuthFilter idp.metadata_url parseRemoteXML, River.processWebhookPayload HttpPost(targetUrl)).",
+      "reason": "All targets are configured by the app owner (settings require app-secret or explicit `_settings` permission), and webhook targetUrl is @URL-validated; I found no path letting an unprivileged attacker choose the URL."
+    },
+    {
+      "lead": "RestAuthFilter fails open on exceptions (proceed initialised true; catch logs and continues, lines 87-107) and SecurityUtils.isValidSignature can NPE on a malformed Authorization header (sigHeaders.split on null, lines 404-411).",
+      "reason": "The resulting unauthenticated request reaches handlers that require an app/user principal and return 404/401, so I could not show a data- or privilege-impact."
+    },
+    {
+      "lead": "Signature/token comparisons use non-constant-time StringUtils.equals (SecurityUtils.isValidSignature line 439, User.isValidToken line 893) and the password-lock period mixes nanos with currentTimeMillis (User lines 740-742).",
+      "reason": "Practical timing-based forgery of HMAC/random tokens is not credibly exploitable over the network, and the lock-period unit mismatch causes a longer lockout (availability wrinkle) rather than an access-control weakness."
+    },
+    {
+      "lead": "Client-side library observations (ParaClient TLS/truststore handling, endpoint/JWT plumbing).",
+      "reason": "No missing certificate/hostname validation was found (SSLFactory + DefaultClientTlsStrategy with hostname verifier), and client-side issues would not be the strongest repository-level vulnerability."
+    }
+  ],
+  "summary": "Reviewed the Para (Erudika) multi-tenant backend snapshot (199 files; para-core, para-server, para-client, para-jar, build/CI/scripts), tracing the authentication/authorization stack end-to-end: SecurityConfig/SecurityModule/JwtConfigurer, RestAuthFilter, JWTRestfulAuthFilter + JWTAuthenticationProvider, SecurityUtils, the API surface (Api1 + RestUtils), the permission model (App.isAllowedTo / isAllowed / permissionsContainOwnKeyword), User credential/JWT handling, ValidationUtils/Constraint, the filter chain (CORS, CSRF, GZip, Error, FieldFilter), storage/DAO/queue/cache/AOP layers, config defaults (ParaConfig, reference.conf, application.properties), poms, workflows and shell scripts.\n\nThe snapshot shows several deliberate hardening measures already in place (HOCON `include` disabled via NoopConfigIncluder, app `settings`/secrets JSON-ignored, `@Locked` on tenant/identity fields, sanitized app/type ids, constant-ish signature/JWT verification, bcrypt, SecureRandom, CSRF matcher, restricted admin bootstrap, TLS hostname verification in the client). I did not find a single unambiguous injected flaw; the strongest source-evidenced authorization defect is a guest (unauthenticated) path that elevates the request to the application identity and exposes the application's ACL data, because the permission check `hasPermission()` short-circuits to `true` for any GET whose resource path starts with `_permissions/` — including for guests (`user == null`), before the guest-permission evaluation runs. Other plausible-but-unconfirmed leads are listed as rejected."
+}

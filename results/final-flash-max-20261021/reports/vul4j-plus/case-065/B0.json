@@ -1,0 +1,77 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The complete XML document, including any <!DOCTYPE ... [ <!ENTITY xxe SYSTEM 'file:///etc/passwd'> ]> declarations and &xxe; references, is attacker-controlled data supplied through the unauthenticated import endpoints (/command/core/importing-controller with subCommand=initialize-parser-ui or create-project, /command/core/create-project-from-upload) as an uploaded file, pasted clipboard content, or content fetched from an attacker URL. There are no CSRF/origin checks on these POST commands, so a malicious page can also trigger imports against a running instance.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the factory settings around the call really are the only ones applied (no DTD/entity hardening elsewhere in the file or repo: searches for IS_SUPPORTING_EXTERNAL_ENTITIES, SUPPORT_DTD, disallow-doctype, external-general-entities, DocumentBuilderFactory and SAXReader returned no matches). Confirmed the reader is used in both preview and full import paths. Considered that GREL parseXml() uses Jsoup (not vulnerable in the same way) and that RDF/XML uses Apache Jena, so the vulnerable surface is specifically the built-in XML importer. Acknowledged mitigating factors: default localhost binding, need to get an XML file imported/previewed, and JDK-version-dependent StAX defaults; this was not runtime-confirmed.",
+      "id": "xml-importer-xxe",
+      "impact": "Confidentiality breach: arbitrary files readable by the OpenRefine process (project data, saved connection/credential files, OS files) can be pulled into the imported project/preview and exfiltrated, and the server can be induced to make requests to internal/attacker-controlled endpoints (SSRF, including cloud metadata). Content can persist in project data. Denial of service via entity expansion is also possible (bounded by JVM entity-expansion limits).",
+      "locations": [
+        {
+          "end_line": 328,
+          "path": "main/src/com/google/refine/importers/XmlImporter.java",
+          "start_line": 322
+        },
+        {
+          "end_line": 111,
+          "path": "main/src/com/google/refine/importers/XmlImporter.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 219,
+          "path": "main/src/com/google/refine/importers/XmlImporter.java",
+          "start_line": 214
+        }
+      ],
+      "prerequisites": "The server must process an attacker-supplied XML file with the XML importer (user importing/previewing an untrusted XML file, an attacker on a shared/exposed instance posting it directly, or a cross-site POST against localhost). Exploitability relies on the JVM's default StAX behavior (JDK 8 default: DTD and external entities enabled); OpenRefine binds to 127.0.0.1 by default, which limits who can submit the request but not what the parser does with the file.",
+      "root_cause": "XmlImporter.createXMLStreamReader (main/src/com/google/refine/importers/XmlImporter.java:322-328) builds the parser with XMLInputFactory.newInstance() and sets only XMLInputFactory.IS_COALESCING=true and XMLInputFactory.IS_REPLACING_ENTITY_REFERENCES=true. It never disables DTD support (XMLInputFactory.SUPPORT_DTD=false), never disables external entity resolution (XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES=false), and sets no accessExternalDTD/accessExternalSchema restriction. In the default JDK (the app targets JDK 8) supportDTD and isSupportingExternalEntities default to true, so attacker-supplied DOCTYPE/ENTITY declarations are processed and external general entities are fetched and substituted (entity replacement is explicitly enabled). The same factory is used both for parser-UI preview (createParserUIInitializationData, line 91) and for full import via the XmlParser TreeReader (lines 214-219, parseOneFile lines 196-212), so merely previewing an uploaded XML file triggers resolution server-side.",
+      "title": "XXE in XML importer: StAX parser resolves external entities during import/preview",
+      "trace": "HTTP POST /command/core/importing-controller?subCommand=initialize-parser-ui (or create-project) -> ImportingControllerCommand.doPost -> DefaultImportingController.doPost -> ImportingUtilities.retrieveContentFromPostRequest stores the uploaded file under the job raw-data dir -> XmlImporter.createParserUIInitializationData (line 87) / ImportingUtilities.getFile + new FileInputStream, or XmlImporter.parseOneFile -> new XmlParser(inputStream) -> createXMLStreamReader (line 322) -> XMLInputFactory.newInstance() with DTD/external entities left enabled -> parser.next() resolves DOCTYPE/ENTITY declarations; with IS_REPLACING_ENTITY_REFERENCES=true the external entity text (e.g., file:///... content or fetched URL body) is returned as CHARACTERS and stored into the preview DOM (lines 176-181) or imported project cells. An external DTD reference (SYSTEM 'http://attacker/...') additionally makes the OpenRefine process issue the HTTP request (SSRF).",
+      "unverified": "No runtime/JVM test was performed, so the exact entity-resolution behavior was not confirmed on a specific JDK build. It was not verified whether the benchmark's intended issue is this XXE rather than the archive-extraction traversal (see rejected leads). The writable/readable file scope depends on the OS user running OpenRefine.",
+      "weakness_type": "CWE-611: Improper Restriction of XML External Entity Reference ('XXE')"
+    }
+  ],
+  "coverage_summary": "Read the scope report (952 files, no name/symlink/size exclusions; binary files skipped; tests not present in the snapshot) and inspected the Java server core (commands, importing/importers, io/file persistence, history, model/operations, exporters, expr/GREL, util, oauth) plus extensions database, gdata, jython, and portions of wikidata. Frontend JS/HTML/langs and large parts of the wikidata schema/QA and third-party minified assets were reviewed only selectively (searches plus targeted reads). The snapshot's stale CHANGES.txt and absence of CHANGES.md/tests meant release-note/test corroboration was unavailable.",
+  "limitations": [
+    "No code was executed and no dependency/classpath behavior was tested; JDK-default StAX entity-resolution behavior is assumed from the source and Java/JAXP defaults, not runtime-confirmed.",
+    "I could not diff against upstream or access patches/CVE data, so identification of the single 'intended' vulnerability is uncertain; the tar/zip extraction traversal and multipart filename traversal are equally source-visible arbitrary-file-write issues that could instead be the ground truth.",
+    "OpenRefine binds to 127.0.0.1 by default and the reviewed flow requires an attacker-supplied file to be imported/previewed (or a cross-site POST), which reduces remote exploitability of the XXE candidate.",
+    "Large areas were not read line-by-line: all frontend JavaScript/HTML/CSS, translation files, most wikidata schema/QA classes, the Metaphone/CalendarParser utility bulk, and build/packaging files; dependency-level vulnerabilities (e.g., old POI, commons-fileupload 1.2.1, Jena 3.6.0) were out of scope for source-level tracing.",
+    "The XXE candidate is a lead based on source evidence only; it has not been reproduced or confirmed at runtime."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal (Zip Slip) in project import: FileProjectManager.untar (main/src/com/google/refine/io/FileProjectManager.java:162-187) writes tar entries with new File(destDir, tarEntry.getName()) and no canonical-path containment check; ImportingUtilities.explodeArchive (ImportingUtilities.java:610-679) applies the same pattern to tar/zip entries via allocateFile (lines 437-456), and the multipart upload filename at ImportingUtilities.java:361-372 flows into allocateFile unsanitized. Reachable via /command/core/import-project (multipart) and the create-project upload flow, enabling arbitrary file writes as the OpenRefine user. Rejected only to keep a single candidate: evidence is strong, but this class of fix is commonly associated with much later upstream security releases, and the XXE candidate matches the snapshot-era parser hardening gap more directly.",
+      "reason": "Strong but deprioritized in favor of a single candidate; cannot be confirmed as the intended issue without ground-truth access."
+    },
+    {
+      "lead": "Systemic absence of CSRF protection: no CSRF token/origin checks exist anywhere (search for 'csrf' returns nothing; RefineServlet.service and Command do not validate Origin/Referer/tokens), so any website can POST to commands such as preview-expression/log-expression with language=jython (extensions/jython is built by default) or create-project-from-upload, giving drive-by code execution/file write on the machine running OpenRefine. Rejected because it is a design-wide missing control with diffuse locations rather than a single root cause, and it requires the victim to visit a malicious page while OpenRefine runs.",
+      "reason": "Real but systemic; not a single distinct code defect for a one-candidate submission."
+    },
+    {
+      "lead": "Reflected XSS / JSONP injection in GetRowsCommand: request parameter 'callback' is written raw into the response body (main/src/com/google/refine/commands/row/GetRowsCommand.java:145-163 and 219-221) with Content-Type text/javascript, so a crafted URL executes script in the OpenRefine origin when visited.",
+      "reason": "Plausible, but impact is bounded to script execution in the user's browser and the endpoint requires a valid project id."
+    },
+    {
+      "lead": "Path traversal / reflected content in LoadLanguageCommand: 'lang' is concatenated into a file path (main/src/com/google/refine/commands/lang/LoadLanguageCommand.java:89-92) and echoed in the JSON response; traversal is limited because the target must parse as a JSON object.",
+      "reason": "Limited impact (JSON-only file read/reflection) compared with the selected candidate."
+    },
+    {
+      "lead": "Weak credential protection in the database extension: hardcoded Jasypt passphrase (DatabaseUtils.java:56) and saved-connection passwords returned decrypted by SavedConnectionCommand (lines 140-144, 197-202); Wikidata credentials are stored in plaintext in preferences (ConnectionManager.java:73-89).",
+      "reason": "CWE-321/522-style weakness with lower exploit impact; not remotely reachable without existing local access or CSRF."
+    },
+    {
+      "lead": "OpenWorkspaceDirCommand local-only check uses request.getServerName() (lines 52-55), which is derived from the client-supplied Host header and can be spoofed; the executed command string is constant, so impact is minimal.",
+      "reason": "Host-header bypass exists but the sensitive operation is not injectable (fixed 'open .' command and server-side workspace path)."
+    },
+    {
+      "lead": "SQL exporter does not quote/escape DATE/TIMESTAMP cell values (SqlInsertBuilder.java:158, unlike the VARCHAR branch at line 121), allowing crafted cell content to break out of the generated INSERT statement.",
+      "reason": "Affects a generated .sql file consumed later by the user, not the server itself; lower confidence of being the benchmark target."
+    },
+    {
+      "lead": "SSRF-by-design surfaces: URL-based import (ImportingUtilities.java:257-351, ImportProjectCommand.java:134-163) and reconciliation/extend-data service URLs; arbitrary URL fetching is an intentional feature of the tool.",
+      "reason": "By-design functionality rather than a defect with a clear validation gap."
+    }
+  ],
+  "summary": "Reviewed the OpenRefine 3.2-SNAPSHOT snapshot (952 files; Java server in main/, server/, extensions/{database,gdata,jython,pc-axis,wikidata}, plus webapp JS/HTML). I traced attacker-controlled input through the import pipeline, command dispatch, file/archive handling, expression evaluation, and the database/wikidata extensions. The strongest single evidence-backed issue is an XML External Entity (XXE) vulnerability in the XML importer: the StAX XMLInputFactory used for XML import preview and parsing leaves DTD processing and external entity resolution enabled (only coalescing and entity replacement are configured), so a crafted XML file causes the server to resolve external entities (local files / URL fetches) with the content surfaced in the import preview/project. Several other real weaknesses were found (archive/extraction path traversal, upload filename traversal, no CSRF protection, JSONP callback XSS, hardcoded credential-encryption key), but they are listed as rejected leads rather than extra candidates because only one candidate may be submitted and the tar/JSONP/CSRF fixes are commonly associated with much later upstream fixes."
+}

@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote unauthenticated peer controls the raw bytes of the first TLS record on a connection to any server using an OpenSSL/netty-tcnative-backed SslContext (ReferenceCountedOpenSslContext -> SslHandler with jdkCompatibilityMode=false). Five attacker bytes of the form 0x80 0x00 0x00 0x02 0x00 (or 0x00 0x01 0x00 0x02 0x00) are sufficient to drive the helper into its SSLv2 branch and return NOT_ENOUGH_DATA.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the `len < SSL_RECORD_HEADER_LENGTH` guard precedes the helper call and that the helper's fast path requires the first ByteBuffer's remaining() >= 5, so the crafted 5-byte input reaches the SSLv2 branch with >=5 bytes total. Verified NOT_ENOUGH_DATA = -1 and NOT_ENCRYPTED = -2 in SslUtils (L104, L109) so `packetLength == NOT_ENCRYPTED` cannot accidentally catch -1. Verified SslHandler's JDK-compatible decode path does handle NOT_ENOUGH_DATA (SslHandler L1363-1365), so the gap is specific to the native-engine branch; this is consistent with the native-engine focus of the 4.1.118 SslHandler fix. Considered but could not confirm: whether the JNI `SSL.bioSetByteBuffer` implementation rejects/sanitizes a negative length (tcnative is an external dependency not present in this snapshot), and whether the upstream fix instead hardened SslUtils itself; native crash behavior is therefore unverified. Also checked that the SSLv2 major-version offset (offset + headerLength + 1) is consistent with both SSLv2 header layouts and is not itself a defect.",
+      "id": "netty-openssl-unwrap-not-enough-data-negative-packet-length",
+      "impact": "Remote, low-effort trigger on a TLS endpoint: unhandled negative length is passed into the native OpenSSL BIO binding (undefined behavior risk/crash) or throws an unhandled IllegalArgumentException on heap-backed input, terminating the affected connection with a fatal error; repetition across connections yields a denial of service. The misclassification also defeats the intended NotSslRecordException handling for non-TLS input.",
+      "locations": [
+        {
+          "end_line": 1234,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 1196
+        },
+        {
+          "end_line": 1273,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 1264
+        },
+        {
+          "end_line": 651,
+          "path": "handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java",
+          "start_line": 629
+        },
+        {
+          "end_line": 377,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslUtils.java",
+          "start_line": 316
+        },
+        {
+          "end_line": 488,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslUtils.java",
+          "start_line": 438
+        },
+        {
+          "end_line": 1431,
+          "path": "handler/src/main/java/io/netty/handler/ssl/SslHandler.java",
+          "start_line": 1421
+        }
+      ],
+      "prerequisites": "Server uses the native OpenSSL engine (netty-tcnative available), so SslHandler.jdkCompatibilityMode is false and decodeNonJdkCompatible feeds all readable bytes to the engine; handshake not finished (normal for a fresh connection, the branch at lines 1191-1195 also applies whenever oldHandshakeState != FINISHED); at least 5 readable bytes in the inbound cumulation buffer (heap or direct).",
+      "root_cause": "`SslUtils.getEncryptedPacketLength(ByteBuffer[], int)` (and its private `getEncryptedPacketLength(ByteBuffer)` helper) can return the sentinel `SslUtils.NOT_ENOUGH_DATA` (-1) for data that is >= SSL_RECORD_HEADER_LENGTH (5) bytes: the SSLv2 heuristic path computes `packetLength = (shortBE & 0x7FFF) + 2` (2-byte header) or `(shortBE & 0x3FFF) + 3` (3-byte header) and returns NOT_ENOUGH_DATA when the computed length is <= headerLength, e.g. bytes 80 00 00 02 00 or 00 01 00 02 00. `ReferenceCountedOpenSslEngine.unwrap` handles `NOT_ENCRYPTED` (-2) but not `NOT_ENOUGH_DATA` (-1), so `packetLength` stays -1; the `packetLengthDataOnly > capacity` and `len < packetLength` guards both evaluate false, and the negative length is used as `pendingEncryptedBytes` for `writeEncryptedData`.",
+      "title": "OpenSSL engine unwrap ignores SslUtils.NOT_ENOUGH_DATA, feeding a negative record length into BIO writes",
+      "trace": "decode (SslHandler L1421-1430) -> decodeNonJdkCompatible -> unwrap -> engineType.unwrap (L1485) -> ReferenceCountedOpenSslEngine.unwrap: len=5 >= SSL_RECORD_HEADER_LENGTH (L1196), getEncryptedPacketLength(srcs, srcsOffset) (L1200) returns -1 (NOT_ENOUGH_DATA) for the crafted 5 bytes, only NOT_ENCRYPTED is checked (L1201-1203), packetLengthDataOnly = -1-5 = -6 (L1205) fails both the capacity and `len < packetLength` checks (L1206, L1223), packetLength remains -1, then srcLoop sets pendingEncryptedBytes = min(-1, remaining) = -1 (L1267) and calls writeEncryptedData(src, -1) (L1269). For a direct source buffer this is SSL.bioSetByteBuffer(networkBIO, address+pos, -1, false) (L632); for a heap source buffer it is alloc.directBuffer(-1) (L634), which throws IllegalArgumentException and escapes unwrap/decode, surfacing as a channel error.",
+      "unverified": "No runtime execution, no native (netty-tcnative) sources in scope, and no upstream diff available: the exact consequence of a -1 BIO length in `SSL.bioSetByteBuffer` is not proven, and the precise upstream fix location (engine check vs. SslUtils sentinel handling vs. SslHandler) is inferred from version/date and code shape, not confirmed. `SslUtils.getEncryptedPacketLength(ByteBuffer[], int)` also returns NOT_ENOUGH_DATA only through the SSLv2 branch; the DTLS and TLS branches return non-negative lengths, so triggerability depends on the SSLv2 heuristic.",
+      "weakness_type": "Missing validation / improper input validation (CWE-20) leading to denial of service in TLS record parsing"
+    }
+  ],
+  "coverage_summary": "Reviewed the SSL handler area (SslHandler, SslUtils, ReferenceCountedOpenSslEngine unwrap/writeEncryptedData, SslClientHelloHandler), HTTP codec hot spots (HttpObjectDecoder content-length/TE handling, HttpUtil, encoders, multipart and CORS classes spot-checked), and scanned broadly for classic injection sinks (Runtime.exec, ProcessBuilder, ObjectInputStream, Class.forName-adjacent patterns, MessageDigest/Random use). Only main sources are present (no tests), 2,231 files total with 13 files omitted from the P1 index; the P1 relation index provides syntax-level containment/call candidates only (no control/data flow, no semantic resolution, unresolved calls: 32,461). Large modules (buffer, transport-native-*, resolver-dns, codec-* protocols other than HTTP) were not exhaustively reviewed. No code was executed and no native dependency sources (netty-tcnative) are in scope.",
+  "limitations": [
+    "No execution, fuzzing, unit tests, or native dependency sources: the negative-length BIO path is a source-level lead, not a confirmed crash; `SSL.bioSetByteBuffer` behavior with len=-1 is unverified.",
+    "P1 index is partial: 2,218 of 2,231 files indexed, 13 omitted, no control-flow/data-flow/semantic resolution and 32,461 unresolved calls, so reachability is argued from source reading only.",
+    "No tests are included in the snapshot, so upstream regression tests that would identify the intended fix location could not be consulted.",
+    "The identification of the release window (4.1.118.Final-SNAPSHOT) as the pre-fix state for the SslHandler packet-validation fix is inferred from the pom version and code shape; the exact upstream fix commit could not be compared (no git history, no network).",
+    "The rest of the repository (buffer, transports, other codecs, DNS resolver) was only sampled, so other latent issues may exist that this single-candidate review does not report."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SslUtils SSLv2 version-offset logic (majorVersion read at offset + headerLength + 1)",
+      "reason": "Checked against both SSLv2 header layouts (2-byte and 3-byte header, version following the message type): the offset is correct, and caller-side 5-byte guarantees prevent out-of-bounds reads."
+    },
+    {
+      "lead": "DTLS record-length branch in SslUtils.getEncryptedPacketLength (buffer.readableBytes() < offset + DTLS_RECORD_HEADER_LENGTH)",
+      "reason": "The guard prevents out-of-bounds reads of the 13-byte DTLS header; behavior is conservative (may report NOT_ENOUGH_DATA early), not memory-unsafe."
+    },
+    {
+      "lead": "HttpObjectDecoder / HttpUtil content-length and Transfer-Encoding handling (request smuggling)",
+      "reason": "The duplicate/conflicting Content-Length normalization (HttpUtil.normalizeAndGetContentLength), TE-vs-CL handling, and chunked decoding checks appear present and consistent with hardened upstream behavior; no source-level defect identified."
+    },
+    {
+      "lead": "CorsHandler / cookie decoders / multipart upload handling",
+      "reason": "No concrete attacker-controlled input reaching an unsafe sink was established in the time available; these areas were only spot-checked."
+    },
+    {
+      "lead": "NativeLibraryLoader.tryExec / ProcessBuilder usage",
+      "reason": "No attacker-controlled argument reaches these calls; they are configuration/startup-time helpers."
+    }
+  ],
+  "summary": "Snapshot is Netty 4.1.118.Final-SNAPSHOT (main sources only, no tests): ~2,231 files, 2,058 Java files indexed. The strongest source-supported lead is in the OpenSSL/native SSLEngine unwrap path: `ReferenceCountedOpenSslEngine.unwrap` validates `SslUtils.getEncryptedPacketLength(...)` against `NOT_ENCRYPTED` but not against `NOT_ENOUGH_DATA` (-1), and the ByteBuffer[] variant of that helper can return `NOT_ENOUGH_DATA` for attacker-supplied 5-byte inputs that pass the `len >= SSL_RECORD_HEADER_LENGTH` guard. The negative value then flows into `pendingEncryptedBytes = min(packetLength, remaining)` and `writeEncryptedData(src, -1)`, producing either a native BIO call with length -1 (direct buffers) or `alloc.directBuffer(-1)` (heap buffers, immediate IllegalArgumentException). This matches the \"SslHandler does not correctly validate packets\" class of issue fixed in the 4.1.118 line; the snapshot is the pre-release of that version, but I could not statically confirm the upstream fix location, and native behavior with a negative BIO length is unverified. Confidence: medium, lead only — not runtime confirmed."
+}

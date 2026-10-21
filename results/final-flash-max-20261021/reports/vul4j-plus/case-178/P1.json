@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An attacker supplies a crafted .xlsx file. Within the OOXML zip, the attacker fully controls xl/worksheets/sheetN.xml (and comments/drawing parts referenced by the sheet). The sheet part is read via XSSFReader.SheetIterator (raw XML) and parsed by the pooled Tika SAX parser. Server-side, a remote unauthenticated client can trigger this through tika-server endpoints that invoke the AutoDetectParser on uploaded content (/tika, /meta, /rmeta, /unpack), because TikaResource.createParser() registers OOXMLParser (with ExtractorFactory.setAllThreadsPreferEventExtractors(true)) and OOXMLExtractorFactory routes XLSX to XSSFExcelExtractorDecorator. Any application using Tika to parse untrusted spreadsheets is equally affected.",
+      "confidence": "medium",
+      "counterevidence_checked": "(a) Checked all 21 XMLReaderUtils.parseSAX call sites in the tree: only XSSFExcelExtractorDecorator:342 lacks an outermost OfflineContentHandler (NetworkParser:131 nests it under TeeContentHandler). (b) Confirmed XSSFSheetInterestingPartsCapturer extends DefaultHandler with no resolveEntity override (lines 491-550) and that ContentHandlerDecorator/TeeContentHandler also do not override resolveEntity. (c) Confirmed XMLReaderUtils.getSAXParserFactory sets FEATURE_SECURE_PROCESSING but no entity resolver and no disallow-doctype-decl, so the guard is handler-based. (d) Confirmed the sheet stream is raw attacker-controlled XML (XSSFReader.SheetIterator) and that OfficeParserConfig/PDFParserConfig settings cannot remediate this path. (e) Weaker/mitigating facts: FEATURE_SECURE_PROCESSING on the JDK's built-in Xerces may restrict external DTD/entity access on modern JDKs, so exploitability is implementation-dependent; no test resources or runtime confirmation exist in this snapshot; this is not verified against a CVE/fix commit.",
+      "id": "cand-1-xssf-sheet-xxe",
+      "impact": "XXE in the XLSX parsing path: server-side request forgery from the Tika host to internal/loopback HTTP endpoints, and local file disclosure if expanded entity content is included in extracted cell text/response (or used by other handlers). In library deployments it is an untrusted-document-to-XML-parser trust-boundary violation. Impact is bounded by whether the underlying XML implementation blocks external access under FEATURE_SECURE_PROCESSING; where it does not, this is a classic remote XXE with Confidentiality/Integrity impact on the parsing host.",
+      "locations": [
+        {
+          "end_line": 351,
+          "path": "tika-parsers/src/main/java/org/apache/tika/parser/microsoft/ooxml/XSSFExcelExtractorDecorator.java",
+          "start_line": 330
+        },
+        {
+          "end_line": 203,
+          "path": "tika-parsers/src/main/java/org/apache/tika/parser/microsoft/ooxml/XSSFExcelExtractorDecorator.java",
+          "start_line": 196
+        },
+        {
+          "end_line": 550,
+          "path": "tika-parsers/src/main/java/org/apache/tika/parser/microsoft/ooxml/XSSFExcelExtractorDecorator.java",
+          "start_line": 491
+        },
+        {
+          "end_line": 337,
+          "path": "tika-core/src/main/java/org/apache/tika/utils/XMLReaderUtils.java",
+          "start_line": 326
+        },
+        {
+          "end_line": 181,
+          "path": "tika-core/src/main/java/org/apache/tika/utils/XMLReaderUtils.java",
+          "start_line": 163
+        },
+        {
+          "end_line": 45,
+          "path": "tika-core/src/main/java/org/apache/tika/sax/OfflineContentHandler.java",
+          "start_line": 30
+        }
+      ],
+      "prerequisites": "(1) Target parses attacker-supplied XLSX content (server or library usage). (2) The XML implementation/JDK does not, by itself, block external entity access when FEATURE_SECURE_PROCESSING=true is set in XMLReaderUtils.getSAXParserFactory() (line 168-169); Tika's own history shows FSP was not considered sufficient, which is why OfflineContentHandler is used at all other sites. (3) No user-supplied SAXParser/EntityResolver can be injected via ParseContext (the server does not set one).",
+      "root_cause": "XMLReaderUtils.parseSAX(InputStream, DefaultHandler, ParseContext) relies on the top-level DefaultHandler passed by the caller to act as the SAX EntityResolver (SAXParser.parse(InputStream, DefaultHandler) registers that handler as ContentHandler/EntityResolver). Tika's XXE guard is OfflineContentHandler, whose resolveEntity() returns an empty stream and which must therefore be the outermost handler. In XSSFExcelExtractorDecorator.processSheet (line 342) the handler object XSSFSheetInterestingPartsCapturer (extends org.xml.sax.helpers.DefaultHandler, which inherits DefaultHandler.resolveEntity returning null) is passed directly, so Xerces falls back to default (external) entity resolution for the worksheet XML. Every comparable call site in the tree wraps the handler, e.g. the same class wraps workbook data at line 200 ('new OfflineContentHandler(new AbsPathExtractorHandler())'), and other OOXML/ODF/XML/EPUB/DIF/XPS/iWork/HTML parsers use 'parseSAX(..., new OfflineContentHandler(...), context)'. The only other occurrence without an outermost OfflineContentHandler is NetworkParser (line 131), where the guard is nested under TeeContentHandler and the parsed data is a configured remote endpoint response, so the XLSX case is the stronger, client-reachable one.",
+      "title": "Missing OfflineContentHandler when SAX-parsing XLSX worksheet XML enables XML External Entity (XXE) processing of attacker-supplied spreadsheets",
+      "trace": "OOXMLParser.parse -> OOXMLExtractorFactory -> XSSFExcelExtractorDecorator.getXHTML (line 113) -> AbstractOOXMLExtractor.getXHTML (line 135-150) -> buildXHTML (line 128) -> iterates sheets (line 148-168) -> processSheet (line 330) -> XMLReaderUtils.parseSAX(sheetInputStream, handler, parseContext) (line 342) -> XMLReaderUtils.acquireSAXParser() -> SAXParser.parse(InputStream, DefaultHandler) registers the unwrapped XSSFSheetInterestingPartsCapturer (extends DefaultHandler, no resolveEntity override) as the EntityResolver; DefaultHandler.resolveEntity returns null, so external entity/DTD resolution falls through to the parser default. With a DOCTYPE internal subset declaring e.g. an entity whose SYSTEM id is file:///... or http://internal-host/..., the parser may fetch it, and expansion referenced inside a cell can surface in the extracted text returned to the caller. Sibling sites avoid this by making OfflineContentHandler the outermost handler (its resolveEntity returns an empty stream).",
+      "unverified": "Runtime exploitability was not tested (no code execution allowed). Whether the JDK/Xerces implementation used in a given deployment blocks the external entity despite FEATURE_SECURE_PROCESSING is unverified. Also unverified: exact upstream revision and whether a later Tika commit added OfflineContentHandler at this exact line. No test fixtures for XXE exist in this snapshot to confirm the intended behavior.",
+      "weakness_type": "XML External Entity (XXE) / improper restriction of XML external entity references (CWE-611)"
+    }
+  ],
+  "coverage_summary": "Source scope: 807 files, all main sources/resources (no test sources present) across tika-core, tika-parsers, tika-server, tika-app, tika-batch, tika-translate, tika-eval, tika-dl and examples. Read/traced the tika-server resources (TikaResource, UnpackerResource, Metadata/RecursiveMetadata, writers, CLI), tika-core XML/IO/detector/sax utilities (XMLReaderUtils, ParseContext, OfflineContentHandler, ContentHandlerDecorator, SecureContentHandler, FilenameUtils, TikaInputStream), and the main tika-parsers XML entry points (OOXML decorators, ODF, EPUB, iWork, XPS, XML/WordML, DIF, Tesseract OCR) plus command-execution and file-write sites (TesseractOCRParser, ExternalParser/Embedder, GDAL, tika-app, tika-batch, tika-translate). Relation index reported complete: 807/807 files indexed, 10,111 symbols, 26,853 calls; no missing files or hash mismatches; index is syntactic/navigational only (no data flow, reachability or exploitability proof). Searches likewise covered XML factories, deserialization, SQL/reflection sinks and path handling; unexamined in depth: most binary-format parsers (CHM/LZX, RTF, MP3/MP4, DBF, MAT, images, fonts, executables, PST, Jackcess, NetCDF/HDF/GRIB) beyond entry-point pattern checks.",
+  "limitations": [
+    "No code execution, fuzzing, scanner, or exploit testing was performed; the candidate is a static lead, not a runtime-confirmed vulnerability.",
+    "No git history/upstream diff is available, so I could not verify whether the missing OfflineContentHandler at XSSFExcelExtractorDecorator:342 is an upstream state or a deliberate modification; the finding rests on the inconsistency with ~20 sibling call sites and Tika's documented XXE-hardening pattern.",
+    "Exploitability depends on the XML implementation/JDK: FEATURE_SECURE_PROCESSING=true is set in XMLReaderUtils.getSAXParserFactory (lines 167-169), and on some JDK/Xerces versions this may itself restrict external DTD/entity access; that behavior could not be verified statically.",
+    "The relation index and searches are text/syntax level; no complete data-flow or reachability proof. Some sinks may be reachable only through code paths I did not exhaustively read (e.g., text/CHM/RTF/binary parsers, third-party libraries such as ROME, POI/XmlBeans, XMPCore, Apache SIS).",
+    "No test sources or fixtures were in scope, so intended behavior and regression coverage for XXE could not be checked."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "NetworkParser (tika-core, line 131) passes TeeContentHandler as the outermost SAX handler while the OfflineContentHandler guard is nested inside TaggedContentHandler, so entity resolution again falls to the default resolver.",
+      "reason": "The parsed XML is the response from a network endpoint configured by the administrator (a 'network parser' URI), not client-uploaded content, so attacker control is weak/configuration-dependent. Same root cause as the submitted candidate but much weaker reachability."
+    },
+    {
+      "lead": "TikaCLI extraction writes embedded file names to disk using new File(extractDir, FilenameUtils.normalize(name)) without FilenameUtils.getName (line 1065); Tika's normalize only escapes reserved characters and does not strip '..' or path separators, while PackageParser puts raw archive entry names into Metadata.RESOURCE_NAME_KEY and OLE labels are attacker-controlled.",
+      "reason": "Plausible Zip-Slip-style arbitrary file write, but it requires a victim to run tika-app in extraction mode on a malicious file (local CLI, user interaction). Could not confirm whether upstream intended getName() here; kept as a secondary lead, not the primary candidate."
+    },
+    {
+      "lead": "tika-server /rmeta passes -1 (unlimited) for maxEmbeddedResources and max chars to RecursiveParserWrapperHandler/BasicContentHandlerFactory (RecursiveMetadataResource lines 131-143), while the handler API supports a cap; a document with very many embedded resources can exhaust server memory.",
+      "reason": "Acknowledged in-code by a TODO; impact is DoS/OOM only and no explicit numeric bound is provably required. Weaker source evidence than the XXE candidate."
+    },
+    {
+      "lead": "tika-server header reflection lets a client set X-Tika-PDFSetKCMS=true, causing PDFParser (line 137) to set the JVM-global property sun.java2d.cmm=sun.java2d.cmm.kcms.KcmsServiceProvider, whose own Javadoc warns of security/stability risks (PDFParserConfig lines 694-698).",
+      "reason": "Configuration/privilege effect is real but the concrete impact requires a separate bug in the legacy KCMS native provider; no such flaw is evident in this source. Treated as a hardening/config-injection concern, not a demonstrated vulnerability."
+    },
+    {
+      "lead": "URLEnabledInputStreamFactory reads arbitrary URLs from the fileUrl header (SSRF/local file read).",
+      "reason": "Gated behind --enableFileUrl plus --enableUnsecureFeatures with an explicit warning (TikaServerCli lines 184-197); it is a documented, deliberately opt-in risk (CVE-2015-3271), not a default-exposed vulnerability."
+    },
+    {
+      "lead": "Reflection-driven X-Tika-OCR/X-Tika-PDF setter invocation in TikaResource.processHeaderConfig (lines 206-285).",
+      "reason": "The CVE-2018-1335 hardening (character allow-list plus 'trusted'-setter block) is present; reviewed setters of TesseractOCRConfig/PDFParserConfig and found no command/path-injection primitive reachable through the allow-listed argument set."
+    }
+  ],
+  "summary": "Review of Apache Tika 1.19-SNAPSHOT (807 main-source files across tika-core, tika-parsers, tika-server, tika-app, tika-batch, tika-translate, tika-eval, etc.; no test sources in scope). I traced attacker-controlled document input through the parser/server surface (XML/SAX/DOM/StAX handling, command execution, file writes, reflection-driven header config, archive extraction) and compared every XML entry point against Tika's own XXE guard (OfflineContentHandler + XMLReaderUtils). One clear outlier stands out: XSSFExcelExtractorDecorator.processSheet passes the raw XLSX sheet XML to XMLReaderUtils.parseSAX with a DefaultHandler (XSSFSheetInterestingPartsCapturer) that does not override resolveEntity, unlike ~20 sibling call sites that wrap the handler in OfflineContentHandler. This is submitted as the single candidate (a lead, not a confirmed exploit). Other plausible-but-weaker leads are listed as rejected."
+}

@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The runtime value supplied by the application to a @Path-annotated service-method parameter (e.g. a user name, id, or filename taken from untrusted input). The library itself cannot know the value's origin; it performs the substitution and URL construction with no dot-segment validation or warning.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified there is exactly one substitution site (search for 'relativeUrl.replace' returns only RequestBuilder.java:94) and one caller (ParameterHandler.java:99). Checked the encoding logic: with encoded=false the characters '/' and '%' are percent-encoded (lines 103/127), so a raw multi-segment '../..' payload cannot cross segments; the default-mode exploit is limited to a bare '.'/'..' value removing one segment. OkHttp does not reject dot segments, it normalizes them, so it does not mitigate the escape. The @Path Javadoc (http/Path.java:40-49) documents encoded=true only as 'already URL encoded' and gives no traversal warning. Searches for 'traversal' / 'PATH_TRAVERSAL' return no matches, i.e. no mitigation exists in the snapshot. No tests are included to check intended behavior, and the code was not executed.",
+      "id": "retrofit-path-param-traversal",
+      "impact": "Attacker-influenced outbound requests leave the intended base-path prefix on the same origin and can reach sibling endpoints such as /admin, /internal, or other API versions that the call site was not supposed to address, defeating path-prefix-based routing or authorization assumptions and expanding the reachable server surface (an SSRF-like request-forgery primitive within the target origin). Dot-segment traversal alone cannot change scheme/host, so this is not arbitrary-host SSRF.",
+      "locations": [
+        {
+          "end_line": 95,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 144,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 202,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 189
+        },
+        {
+          "end_line": 100,
+          "path": "retrofit/src/main/java/retrofit2/ParameterHandler.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 405,
+          "path": "retrofit/src/main/java/retrofit2/ServiceMethod.java",
+          "start_line": 388
+        }
+      ],
+      "prerequisites": "1) The interface method's relative URL contains a {name} placeholder inside a path segment with a matching @Path parameter. 2) The application passes attacker-influenced data as that parameter. 3) For multi-level traversal, the annotation must use encoded=true (a documented supported mode) so '/' and '%' are left intact; with default encoding only a bare '.'/'..' value can shift one segment. 4) The base URL has a path prefix that the target server treats as a routing/authorization boundary.",
+      "root_cause": "RequestBuilder.addPathParam (lines 89-95) replaces the \"{name}\" placeholder with canonicalizeForPath(value, encoded) and never rejects '.'/'..' (or percent-encoded '%2e') path segments. canonicalizeForPath deliberately leaves '/', '%' and '.' untouched when alreadyEncoded is true (line 103 and mirrored line 127; '.' is not in PATH_SEGMENT_ALWAYS_ENCODE_SET at line 33), so values such as \"../admin\" or \"%2e%2e/admin\" survive substitution. The substituted relative URL is then resolved against baseUrl via HttpUrl (baseUrl.resolve at line 197, or baseUrl.newBuilder at line 149), and OkHttp's canonicalization resolves '.'/'..'/'%2e' segments by popping path segments, producing a request path outside the intended base prefix. A single-segment escape also exists with default encoding because '.' is never percent-encoded, so a bare \"..\" value removes the preceding path segment.",
+      "title": "Path traversal via unsanitized @Path parameter substitution in RequestBuilder.addPathParam",
+      "trace": "ServiceMethod.Builder.parseParameterAnnotation builds ParameterHandler.Path with path.encoded() (ServiceMethod.java:405) -> ParameterHandler.Path.apply calls builder.addPathParam(name, value, encoded) (ParameterHandler.java:99) -> RequestBuilder.addPathParam does relativeUrl.replace(\"{\"+name+\"}\", canonicalizeForPath(value, encoded)) with no dot-segment check (RequestBuilder.java:94) -> with encoded=true, canonicalizeForPath copies '/', '%' and '.' verbatim (RequestBuilder.java:103, 127, 139-141) -> RequestBuilder.build (or addQueryParam) resolves the substituted relative URL against baseUrl (RequestBuilder.java:197 / 149) -> OkHttp HttpUrl normalization resolves '.'/'..'/'%2e' segments by popping them. Example shape: base https://api.example.com/v1/ with @GET(\"users/{id}\") and id=\"../admin\" yields https://api.example.com/admin (no runtime execution performed; based on source semantics of OkHttp HttpUrl.resolve used at the call site).",
+      "unverified": "Runtime behavior was not executed and no tests exist in the snapshot; the reachable traversal depth depends on OkHttp 3.10.0's dot-segment handling of raw '..' versus '%2e' variants. Whether a concrete deployment feeds untrusted data into such a @Path parameter is application-dependent and cannot be determined from library sources alone. The exact server-side impact depends on how the target maps paths.",
+      "weakness_type": "Path traversal / improper neutralization of dot-segments in URL path (CWE-22-like)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 182-file source snapshot (get_source_scope reported no sensitive-name/path, symlink, or size exclusions; only binary-like files are skipped by tooling). Core library files were read in full or substantially: RequestBuilder, ParameterHandler, ServiceMethod, Utils, OkHttpCall, Platform, Response, Converter, Call, CallAdapter, DefaultCallAdapterFactory, ExecutorCallAdapterFactory, BuiltInConverters, HttpException, and the http annotations. Adapters (rxjava/rxjava2 slots read around cancellation/error delivery), converters (Gson/Moshi/SimpleXML/Scalars response paths), retrofit-mock (NetworkBehavior, BehaviorCall, Calls) and the samples were skimmed and searched. Notable coverage gaps: no test sources, and retrofit/src/main/java/retrofit2/Retrofit.java is absent although referenced by ServiceMethod/Converter/CallAdapter, so builder-side validation (baseUrl/create) could not be inspected. Static website assets were not security-relevant.",
+  "limitations": [
+    "No tests in the snapshot; behavior could not be validated against expected unit-test semantics.",
+    "Retrofit.java is missing from the snapshot even though it is referenced by other sources, so create()/Builder validation logic is uninspected and the module would not compile as included.",
+    "No execution, compilation, or runtime probing was performed (read-only review); the traversal is inferred from source semantics of OkHttp HttpUrl.resolve.",
+    "Many adapter/converter files were only skimmed or search-inspected, not read line by line; a subtle issue there cannot be fully excluded.",
+    "The snapshot's commit history/patch state is unavailable, so whether the missing dot-segment check is a deliberately reverted fix versus the historical vulnerable state cannot be determined from the tree alone."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "@Url parameter accepts arbitrary absolute URLs (SSRF-shaped behavior)",
+      "reason": "Documented API semantics: @Url is meant to be the full URL supplied by the caller; the library intentionally performs no allow-listing. No source evidence of a library-level trust-boundary violation beyond intended use."
+    },
+    {
+      "lead": "encoded=true call sites can cause a protocol-relative value to change the request host (e.g. whole-path placeholder with value '//evil.com/')",
+      "reason": "Plausible adjacent behavior but a distinct root cause, requires the unusual whole-placeholder URL plus encoded=true, and could not be verified against OkHttp 3.10.0 semantics from this snapshot; left unconfirmed."
+    },
+    {
+      "lead": "Full buffering of error response bodies in OkHttpCall.parseResponse/Utils.buffer allows memory pressure from a hostile server",
+      "reason": "Upstream intended behavior; impact is bounded by the response the server sends and the client's own read path, with no evidence of unbounded amplification or missing validation."
+    },
+    {
+      "lead": "Reflective trusted MethodHandles.Lookup construction in Platform.Java8.invokeDefaultMethod",
+      "reason": "Standard upstream implementation for calling interface default methods; inputs are library-internal (service interface metadata), not attacker-controlled."
+    },
+    {
+      "lead": "@Header/@HeaderMap/@Part names and values could inject headers",
+      "reason": "OkHttp Headers.Builder rejects CR/LF in names and values, and these values originate from application code, not the remote peer; no evidence of a reachable injection in this snapshot."
+    }
+  ],
+  "summary": "Snapshot is Retrofit 2.4.1-SNAPSHOT (182 source files; tests and the central Retrofit.java are not present). The strongest source-evidenced issue is that @Path parameter values are substituted into the method's relative URL without any rejection of dot-segments, so an attacker-influenced path value can escape the intended base-URL path prefix when OkHttp normalizes the resulting URL. This matches the known Retrofit path-traversal weakness (RequestBuilder.addPathParam); a dot-segment check (e.g. rejecting '.'/'..'/%2e) is absent everywhere in the snapshot. Other inspected areas (adapters, converters, mock module, samples, platform/reflection code) showed no stronger candidate."
+}

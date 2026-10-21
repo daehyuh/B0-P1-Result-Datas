@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated client fully controls the request bytes: it chooses the Transfer-Encoding value (e.g. `gzip, chunked`), whether a Content-Length is also present, whether Content-Length is duplicated with different values, and the body bytes that follow. No credentials or special configuration are needed; only a plain HTTP connection to the Netty server (or, in the CL.TE direction, to the proxy).",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified in source: (a) the earlier whitespace-vs-colon and header-name/value validation fixes are present (`HttpObjectDecoder.splitHeader` lines 716-766 with the RFC 7230 §3.2.4 comment; `DefaultHttpHeaders.validateHeaderNameElement` lines 362-409 rejects space/tab/CR/LF/colon in names; value converter rejects CR/LF), so the 2019 whitespace smuggling vectors are closed; (b) Netty's 'Transfer-Encoding overrides Content-Length' preference is itself allowed by RFC 7230 §3.3.3 in isolation, so this is a disagreement/desync weakness rather than a standalone parser bug and requires a differing intermediary; (c) `HttpUtil.setTransferEncodingChunked(m, true)` removes Content-Length (lines 315-318), but the decoder never calls it when it selects READ_CHUNK_SIZE, so the conflicting Content-Length survives on decoded messages; (d) an explicit look for the later hardening (`contentLengthFields`, `normalizeAndGetContentLength`, `handleTransferEncodingChunkedWithContentLength`, duplicate-Content-Length rejection) found none in this snapshot; (e) no test sources are present in the snapshot to document intended behavior, and no web/CVE/patch lookups were permitted, so the exact upstream advisory/patch mapping could not be confirmed.",
+      "id": "netty-http1-framing-desync",
+      "impact": "HTTP request smuggling / desynchronization: a request (or prefix of another user's request) that the front-end intermediary considered part of an earlier body can be executed by the Netty back end as an independent request, enabling bypass of front-end ACLs, path-based routing and rate limits, cache poisoning, hijacking of other users' pipelined requests, and request/response desync denial of service. Netty later hardened exactly this area (rejecting messages whose Content-Length and Transfer-Encoding conflict, validating duplicate/multiple Content-Length values, and treating comma-separated Transfer-Encoding values per RFC), which matches the pre-hardening state of this snapshot.",
+      "locations": [
+        {
+          "end_line": 615,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 603
+        },
+        {
+          "end_line": 260,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 241
+        },
+        {
+          "end_line": 305,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 297
+        },
+        {
+          "end_line": 188,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 174
+        },
+        {
+          "end_line": 128,
+          "path": "codec/src/main/java/io/netty/handler/codec/DefaultHeaders.java",
+          "start_line": 111
+        }
+      ],
+      "prerequisites": "The Netty HTTP server (`HttpServerCodec`/`HttpRequestDecoder`, i.e. `HttpObjectDecoder`) must be reachable through a front-end HTTP intermediary (reverse proxy, load balancer, CDN, TLS terminator) whose body framing rules differ from Netty's for ambiguous messages (for example: honors `Content-Length` when both headers are present, or honors `Transfer-Encoding: gzip, chunked` per RFC 7230 §3.3.3). Keep-alive/connection reuse on the back-end hop makes the smuggled bytes appear as the next request. Impact is reduced for deployments with no intermediary or where the intermediary rejects the same ambiguous messages.",
+      "root_cause": "The HTTP/1.1 decoder accepts ambiguous message-framing headers and resolves them locally instead of rejecting them, so it can disagree with an intermediary about where the body ends. (1) `HttpObjectDecoder.readHeaders()` (lines 603-615) picks the body state: if `HttpUtil.isTransferEncodingChunked(message)` is true it reads chunked, else if `contentLength() >= 0` it reads a fixed-length body, and the message is forwarded with BOTH headers still present (nothing removes Content-Length). (2) `HttpUtil.isTransferEncodingChunked()` (lines 303-305) calls `message.headers().contains(TRANSFER_ENCODING, CHUNKED, true)`, which dispatches to `DefaultHttpHeaders.contains(CharSequence,CharSequence,boolean)` -> `DefaultHeaders.contains(name,value,CASE_INSENSITIVE_HASHER)` (DefaultHeaders lines 249-262) comparing the *entire* header value with `AsciiString.contentEqualsIgnoreCase` (AsciiString lines 1359-1370). Only a header line that is exactly `chunked` is recognized; a comma-separated value that per RFC 7230 §3.3.3 establishes chunked framing (`Transfer-Encoding: gzip, chunked`) is treated as NOT chunked, while a proxy decodes the chunked body. Combined with a Content-Length header the decoder then uses the Content-Length boundary (line 610-611), producing a front-end/back-end desync (TE.CL). Conversely, when TE is exactly `chunked` and a Content-Length is also present, Netty reads chunked (line 608-609) while a proxy using the Content-Length frames differently (CL.TE); the conflicting Content-Length is never removed from the decoded message. (3) `HttpUtil.getContentLength(HttpMessage, long)` (lines 174-179) reads only the last `Content-Length` value (`DefaultHeaders.get()` loops and overwrites, lines 111-128) and never checks for duplicates or conflicting values, so `Content-Length: 6` + `Content-Length: 0` is resolved silently in Netty's favor.",
+      "title": "HTTP/1 request smuggling via inconsistent Transfer-Encoding/Content-Length framing in HttpObjectDecoder",
+      "trace": "Stored bytes -> `HttpObjectDecoder.decode()` READ_HEADER case (lines 213-265) -> `readHeaders()` (lines 564-616): all `Content-Length` and `Transfer-Encoding` header lines are added to the message (lines 572-601), then the framing decision at lines 605-614. For `Transfer-Encoding: gzip, chunked` + `Content-Length: N`, `isTransferEncodingChunked()` returns false (whole-value compare), so state becomes READ_FIXED_LENGTH_CONTENT and exactly N bytes are consumed as content (lines 275-302); the client's remaining bytes are decoded by the same `ByteToMessageDecoder` loop as a brand-new HTTP message after `resetNow()`. For `Transfer-Encoding: chunked` + `Content-Length: N`, state becomes READ_CHUNK_SIZE (lines 308-355) and the Content-Length header is still on the message handed downstream; a proxy that framed by Content-Length leaves extra bytes that Netty executes as a second request. The decoded request therefore reaches application handlers with attacker-selected framing that the intermediary did not agree to.",
+      "unverified": "Not runtime-confirmed and not patch-confirmed: exploitability depends on the exact framing behavior of the intermediary in front of Netty, which cannot be established from this repository alone. The precise CVE/fix mapping and whether the upstream fix changed `HttpUtil.isTransferEncodingChunked` to a comma-separated-value check, added TE+CL rejection, or all of these, was not verified (no external lookups allowed). The snapshot date was inferred only from in-tree markers (pom dependency versions, Maven wrapper version, highest referenced GitHub issue number, copyright years), so the assumption that this is the immediate pre-fix tree is itself unverified.",
+      "weakness_type": "CWE-444 Inconsistent Interpretation of HTTP Requests ('HTTP Request Smuggling')"
+    }
+  ],
+  "coverage_summary": "Scope: 1,851 repository-relative main-source files of Netty 5.0.0.Final-SNAPSHOT (no test sources were included in the snapshot; binaries/symlinks were excluded by the tool policy; P1 relation index covers all 1,851 files but is navigational only — no data-flow, reachability, or exploitability semantics). Reviewed in depth: HTTP/1 codec (`codec-http`: HttpObjectDecoder/RequestDecoder/ServerCodec, HttpUtil, HttpHeaders/DefaultHttpHeaders/DefaultHeaders value handling, multipart decoders and disk upload storage), TLS/SNI (`handler/ssl`: SniHandler, AbstractSniHandler, SslContextBuilder), HAProxy codec, DNS codec name decompression, compression codecs (Zlib/JdkZlib/JZlib/Bzip2/LZ4/LZF/Snappy bounds checks), and buffer/common utility code. Cross-file tracing used the P1 index (DefaultHttpHeaders->DefaultHeaders->AsciiString hasher; HttpObjectDecoder->HttpUtil) and every indexed edge was re-verified in source text before use. Not exhaustively audited: transport/NIO internals, native transports (epoll/kqueue C code), HTTP/2 framing/HPACK, WebSocket frame codecs, SOCKS/STOMP/MQTT/Redis/SMTP/XML codecs, and TLS engine internals beyond the SNI path.",
+  "limitations": [
+    "No code was executed; no build, tests, scanners, or network interaction were used, and no external CVE/patch/ground-truth lookups were permitted. All findings are source-evidence leads, not runtime-confirmed vulnerabilities.",
+    "The exact snapshot date/commit could not be verified; it was inferred from pom dependency versions (tcnative 2.0.28, Maven wrapper 3.6.3), the highest referenced GitHub issue number (#9663), absent post-2019 code markers, and copyright years. If the snapshot is from a different point in time, the CVE/fix mapping assumed here may be wrong.",
+    "Exploitability of the selected candidate depends on an external intermediary whose framing behavior is not present in this repository; source evidence shows Netty's own framing decision and the absence of strict validation, not a live desync.",
+    "No test sources are present in the snapshot, so intended/expected framing behavior could not be corroborated from tests.",
+    "The P1 index provides syntactic navigation only; untouched areas (transport internals, native C code, HTTP/2, WebSocket, other codecs) were not fully line-by-line audited and could contain the benchmark's target issue."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "`AbstractSniHandler.decode()` buffers an attacker-sized TLS ClientHello: `ctx.alloc().buffer(handshakeLength)` with `handshakeLength` taken from the 3-byte handshake length (up to 16,777,215) and no upper bound or handshake timeout (`handler/src/main/java/io/netty/handler/ssl/AbstractSniHandler.java` lines 105-153; `SniHandler` has no max/hello timeout). A remote client can repeatedly force a multi-megabyte heap allocation per connection, a real memory-exhaustion DoS pattern (matches the later CVE-2023-34462 hardening). Rejected as the single candidate because it is a DoS-only issue and post-dates the apparent era of this snapshot, while the framing issue has higher impact; it remains a plausible independent weakness.",
+      "reason": "Strong evidence but lower severity class (availability only) and likely outside the snapshot's fix window; only one candidate is permitted."
+    },
+    {
+      "lead": "`JdkZlibDecoder.decode()`/`JZlibDecoder.decode()` grow the decompression buffer from attacker-controlled compressed input without any output/allocation cap (`ctx.alloc().heapBuffer(inflater.getRemaining() << 1)`, `ensureWritable(inflater.getRemaining() << 1)`, JdkZlibDecoder lines 172-213, JZlibDecoder lines 90-153). A crafted compressed stream can expand into a very large single allocation (decompression-bomb DoS, CVE-2020-11612 pattern). Rejected because the unbounded-growth effect is partly inherent to streaming decompression and impact is availability-only.",
+      "reason": "Plausible DoS, but weaker distinct root cause than the framing desync and not verified against the upstream fix."
+    },
+    {
+      "lead": "`HttpUtil.getContentLength` accepts duplicates with last-value-wins and no consistency check (lines 174-179 plus DefaultHeaders.get lines 111-128).",
+      "reason": "Covered as part of the selected candidate's root cause (same framing-validation defect), not counted separately."
+    },
+    {
+      "lead": "Multipart disk upload path traversal via the client-supplied `filename`.",
+      "reason": "Checked `DiskFileUpload.getDiskFilename()` (hard-coded \"upload\") and `AbstractDiskHttpData.tempFile()` (File.createTempFile in the configured base directory) — the client filename is not used to build the file path, so no traversal found."
+    },
+    {
+      "lead": "Bzip2 decompression over-allocation/overflow via crafted stream headers.",
+      "reason": "`Bzip2BlockDecompressor` already enforces declared block-size bounds (\"block exceeds declared block size\", lines 203-205, 220-222), so no clear unbounded allocation found."
+    },
+    {
+      "lead": "DNS name-decompression pointer loop / infinite loop in `DnsCodecUtil.decodeDomainName`.",
+      "reason": "Loop guard present (`checked >= end` throws \"name contains a loop.\", lines 90-94); no finding."
+    },
+    {
+      "lead": "HAProxy v1 header unbounded buffering (CVE-2022-41881 pattern).",
+      "reason": "The decoder already enforces `V1_MAX_LENGTH = 108` and discards/limits over-length v1 headers (lines 35, 312-317, 393-433); no unbounded accumulation found in this snapshot."
+    }
+  ],
+  "summary": "Netty 5.0.0.Final-SNAPSHOT (master, appears to be ~Dec 2019/Jan 2020: tcnative 2.0.28, Maven 3.6.3 wrapper, highest referenced issue #9663, no 2020+ copyrights, no zstd/Brotli/HttpHeaderValidationUtil/normalizeAndGetContentLength) HTTP/1.1 code review. The strongest source-evidenced candidate is a request-smuggling weakness (CWE-444) in the HTTP/1.1 message-framing logic: `HttpObjectDecoder.readHeaders()` resolves body framing with `HttpUtil.isTransferEncodingChunked()` and `contentLength()` without ever rejecting messages that carry conflicting or ambiguous framing headers, and `isTransferEncodingChunked()` only recognizes a Transfer-Encoding header whose entire value is exactly \"chunked\" (whole-value hasher comparison), so RFC 7230 forms such as `Transfer-Encoding: gzip, chunked` are treated as *not* chunked; multiple Content-Length values are also accepted with last-value-wins and no consistency check. Netty can therefore compute a different message boundary than a front-end proxy/intermediary for the same bytes, allowing a smuggled request to be executed as a new request (or vice versa). DoS-only issues (unbounded ClientHello buffering in AbstractSniHandler, unbounded zlib output growth) were reviewed but not selected."
+}

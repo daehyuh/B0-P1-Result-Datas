@@ -1,0 +1,99 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any client able to open a TCP connection to the broker listener (default 10911, fast listener 10909) can send a RemotingCommand with code `RequestCode.UPDATE_BROKER_CONFIG` (25) and a fully attacker-controlled properties body; `rocketmqHome` and `filterServerNums` are plain String/int properties that map directly onto setters. The NameServer listener (9876) accepts `UPDATE_NAMESRV_CONFIG` (318) and `PUT_KV_CONFIG` (100) with no ACL facility, letting the attacker set `kvConfigPath` and control the content persisted there; the Controller listener accepts `UPDATE_CONTROLLER_CONFIG` similarly. Values are attacker-controlled strings/ints parsed by `MixAll.string2Properties` with no length/content restriction beyond Java property escaping.",
+      "confidence": "high",
+      "counterevidence_checked": "ACL support exists but does not protect the default deployment: `BrokerController.initialAcl` (929-933) returns early unless `aclEnable` is true (default false), and even then the check is a valid admin credential, not a content guard. No server-side property validation/allow-list was found (searches for forbidden/denyList/checkBrokerConfig; the only `checkBrokerConfig` is a client-side `brokerPermission` value check in client/Validators.java:120-127 that an attacker simply bypasses by hand-crafting the RemotingCommand). `Configuration.update`'s `mergeIfExist` only updates keys already present in the merged allConfigs map, but the subsequent `properties2Object` loop still applies supplied keys to every registered config object, and both `rocketmqHome` and `filterServerNums` are standard BrokerConfig fields normally present there. NameServer registers no ACL RPCHook — `NamesrvController.initiateRpcHooks` only adds `ZoneRouteRPCHook`, whose `doBeforeRequest` is empty; `PUT_KV_CONFIG`/`UPDATE_NAMESRV_CONFIG` are handled directly. `Runtime.exec` does not itself invoke a shell, but the constructed command contains `sh`, so the attacker-controlled token is interpreted as shell arguments (`sh -c ...`), preserving the injection. Also checked that topic-name/path handling elsewhere (TopicValidator, static-topic temp files) is validated, and that the ACL package's decision logic (PlainPermissionManager.validate, PlainPermissionChecker.check, Permission.checkPermission) is intact, before settling on this candidate.",
+      "id": "case-091-cand-1",
+      "impact": "Remote code execution with the privileges of the broker process (the filter-server shell is spawned by the broker JVM), i.e. full host compromise in deployments exposing the broker port without ACL (the default configuration). Secondary impact of the same root cause: attacker-directed file write/overwrite on NameServer and Controller via `kvConfigPath`/`configStorePath`; and remote tampering with any live broker/message-store configuration value (store paths, flow control, permissions), enabling data destruction or denial of service. The fact that `UPDATE_BROKER_CONFIG` is deliberately classified as an admin-only request code (`acl/common/Permission.ADMIN_CODE`) shows the operation is intended to be privileged, but the enforcement is absent in the default configuration.",
+      "locations": [
+        {
+          "end_line": 801,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java",
+          "start_line": 765
+        },
+        {
+          "end_line": 216,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java",
+          "start_line": 215
+        },
+        {
+          "end_line": 97,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/filtersrv/FilterServerManager.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 41,
+          "path": "broker/src/main/java/org/apache/rocketmq/broker/filtersrv/FilterServerUtil.java",
+          "start_line": 24
+        },
+        {
+          "end_line": 203,
+          "path": "remoting/src/main/java/org/apache/rocketmq/remoting/Configuration.java",
+          "start_line": 179
+        },
+        {
+          "end_line": 30,
+          "path": "common/src/main/java/org/apache/rocketmq/common/BrokerConfig.java",
+          "start_line": 30
+        },
+        {
+          "end_line": 115,
+          "path": "common/src/main/java/org/apache/rocketmq/common/BrokerConfig.java",
+          "start_line": 115
+        },
+        {
+          "end_line": 636,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/processor/DefaultRequestProcessor.java",
+          "start_line": 603
+        },
+        {
+          "end_line": 206,
+          "path": "controller/src/main/java/org/apache/rocketmq/controller/processor/ControllerRequestProcessor.java",
+          "start_line": 173
+        }
+      ],
+      "prerequisites": "Network reachability to the service port; broker ACL disabled (the default — `aclEnable=false`) or, for the broker only, a legitimate ACL admin credential, since UPDATE_BROKER_CONFIG is listed in `Permission.ADMIN_CODE`. For the broker command-execution step, the periodic filter-server task must run (it is started unconditionally in `BrokerController.start` and fires every 30 s) and the attacker must set `filterServerNums` above the current filter-server table size; the host must provide `sh`. Impact is bounded by the privilege of the broker/NameServer JVM user.",
+      "root_cause": "Broker `AdminBrokerProcessor.updateBrokerConfig` (dispatched unconditionally from the request switch on `RequestCode.UPDATE_BROKER_CONFIG`) parses an attacker-supplied `key=value` body with `MixAll.string2Properties` and passes the whole `Properties` object to `org.apache.rocketmq.remoting.Configuration.update`, which (a) merges the values and (b) calls `MixAll.properties2Object(properties, configObject)` on every registered config object, reflectively invoking matching setters. There is no authorization check and no key allow-list/validation on the broker side, and Broker ACL is disabled by default (`BrokerConfig.aclEnable = false`; `BrokerController.initialAcl` returns immediately unless enabled). Consequently security-critical live settings are remotely writable: `BrokerConfig.rocketmqHome` (line 30) and `BrokerConfig.filterServerNums` (line 115). `FilterServerManager.buildStartCommand()` builds `String.format(\"sh %s/bin/startfsrv.sh %s\", rocketmqHome, config)`; `FilterServerUtil.splitShellString` splits it on single spaces and `Runtime.getRuntime().exec(cmdArray)` runs it. Because the command line itself contains `sh -c` tokens only if the attacker supplies them, a crafted `rocketmqHome` value injects `sh -c` arguments and the shell executes the attacker's command string (the referenced startfsrv.sh file need not exist). The same unprotected update-config handler pattern exists in the NameServer (`DefaultRequestProcessor.updateConfig`, which has no ACL hook registered at all) and the Controller (`ControllerRequestProcessor.updateControllerConfig`); there, attacker-chosen `kvConfigPath`/`configStorePath` combined with the unauthenticated `PUT_KV_CONFIG` request drives `KVConfigManager.persist()`/`Configuration.persist()` to write attacker-influenced content to attacker-chosen paths.",
+      "title": "Unauthenticated remote configuration update: broker UPDATE_BROKER_CONFIG reaches Runtime.exec via filter-server command, with the same unprotected update-config handler in NameServer/Controller",
+      "trace": "1) Attacker sends UPDATE_BROKER_CONFIG (code 25) with body e.g. `filterServerNums=1` and `rocketmqHome=<injected value>`. 2) `AdminBrokerProcessor.updateBrokerConfig` (lines 765-801) converts the body to Properties and calls `this.brokerController.getConfiguration().update(properties)` without any permission or content check. 3) `Configuration.update` (remoting, lines 179-203) merges the values and calls `MixAll.properties2Object(properties, configObject)` (line 189), which reflectively invokes `setRocketmqHome`/`setFilterServerNums` on the live BrokerConfig (MixAll.properties2Object lines 347-385; BrokerConfig fields at lines 30 and 115). 4) Within 30 s, the scheduled `FilterServerManager.createFilterServer()` (lines 69-76) computes `more = filterServerNums - filterServerTable.size()` and calls `FilterServerUtil.callShell(buildStartCommand())`. 5) `buildStartCommand` (lines 78-97) formats `sh <rocketmqHome>/bin/startfsrv.sh <config>` using the attacker's value; `splitShellString` (FilterServerUtil lines 39-41) splits the whole string on single spaces and `Runtime.getRuntime().exec(cmdArray)` (line 28) launches `sh` with the resulting tokens. A `rocketmqHome` crafted to inject `-c`/`$@|sh`/`. `/`echo` tokens turns the trailing arguments into a shell command string that `sh -c` executes (the echoed script path suffix is neutralized/ignored), yielding command execution without needing any file on disk. 6) Independently, on the NameServer the same property-update primitive sets `kvConfigPath` (NamesrvConfig) and the unauthenticated PUT_KV_CONFIG then persists attacker-controlled JSON to that path (KVConfigManager.persist lines 90-112); `configStorePath` drives `Configuration.persist` (lines 205-221), giving attacker-directed file overwrite. 7) The Container variant (`container/.../BrokerContainerProcessor.updateBrokerConfig` lines 226-256) repeats the same handler.",
+      "unverified": "No code was executed and no build/test/scan was run; the finding is source-level only. The exact form of the `sh -c` argument-injection payload and the 30-second filter-server scheduling were not dynamically validated, and impact assumes `sh` exists on the host and the broker user has meaningful privileges. Line numbers refer to this snapshot. No external diff, patch, CVE metadata, or sibling run was consulted, so I cannot confirm this matches a specific published advisory; the NameServer/Controller instances are reported as the same root cause, with less direct (file-write rather than immediate command-execution) evidence than the broker chain.",
+      "weakness_type": "Missing authorization / missing validation on a privileged configuration operation (CWE-862/CWE-306) chained into OS command injection / argument injection (CWE-78)"
+    }
+  ],
+  "coverage_summary": "Coverage is based on the 1,430 model-visible files returned by `get_source_scope` (all 17 modules of the RocketMQ 5.1.0 snapshot; the filters excluded 0 files, only binary-like files are unreadable). Deep review focused on: broker request dispatch and `AdminBrokerProcessor` (including all update-config-adjacent handlers), the filter-server command execution path, `remoting.Configuration`/`common.MixAll` property reflection, broker/NameServer/Controller startup and ACL initialization, the ACL package (parse/validate/check), remoting RPC hook ordering, proxy authentication interceptors/pipelines, and selected store/static-topic file-path handling. Remaining areas were only grepped/sampled: tieredstore internals, store engine internals (commitlog/consume-queue/timer), client, tools, example, openmessaging, distribution scripts, and the many other admin handlers that are also reachable without ACL (e.g. topic/offset/subscription management), which are the same \"admin API without ACL\" class.",
+  "limitations": [
+    "No code was executed; no tests, builds, scanners, or payloads were run, and no target was contacted. The command-execution chain is a source-level reconstruction, not a runtime-confirmed exploit.",
+    "No external diff, upstream tree, patch, CVE/CWE database, or previous run output was available, so I could not verify which specific historical fix or advisory this snapshot corresponds to.",
+    "Impact of the broker chain depends on deployment specifics I cannot inspect (whether the broker port is reachable from untrusted networks, ACL disabled, `sh` availability, service user privileges).",
+    "The NameServer/Controller arbitrary-file-write consequences depend on which files the process can write and whether any written file is later executed or sourced; this liveness was not verified.",
+    "Coverage of store/tieredstore/client/tools internals was sampling only, so a stronger issue in those areas cannot be excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "NameServer `UPDATE_NAMESRV_CONFIG` / Controller `UPDATE_CONTROLLER_CONFIG` as separate vulnerability candidates",
+      "reason": "Same root cause as the submitted candidate (unprotected remote config update); not counted as a separate candidate, but included as locations/trace because they share the weakness and are part of the same CVE-family issue."
+    },
+    {
+      "lead": "Proxy `AuthenticationPipeline.execute` adds a new `PlainAccessValidator` to the shared list on every request when `enableACL=true` (proxy/.../pipeline/AuthenticationPipeline.java:38-46)",
+      "reason": "Unbounded growth of a shared list is a robustness/resource concern; I found no attacker-controlled authorization bypass or immediate security impact tied to it, and ACL is off by default."
+    },
+    {
+      "lead": "TLS trusts all peers (`InsecureTrustManagerFactory`) in remoting TlsHelper and proxy gRPC/TLS helpers",
+      "reason": "Stock design where client authentication is opt-in via configuration (`tlsClientAuthServer` etc.); it does not by itself grant an unauthenticated attacker a new capability and is not tied to the config-update root cause."
+    },
+    {
+      "lead": "`TopicQueueMappingUtils.writeToTemp` builds a file name from the topic name (remoting/.../TopicQueueMappingUtils.java:397-411)",
+      "reason": "Topic names are validated to `^[%|a-zA-Z0-9_-]+$` by TopicValidator, and the callers are admin-only operations, so no traversal/attacker-controlled path was established."
+    },
+    {
+      "lead": "Potential ACL bypass in `PlainPermissionManager`/`PlainPermissionChecker`/`AclUtils`",
+      "reason": "The signature, white-address and admin-permission logic reviewed appears consistent; no concrete bypass with attacker-controlled input was identified."
+    },
+    {
+      "lead": "Tieredstore/store file handling as a path-traversal candidate",
+      "reason": "Only sampled; no specific attacker-controlled path construction was found before the review budget ended, so it remains an unconfirmed area rather than a candidate."
+    }
+  ],
+  "summary": "Snapshot is Apache RocketMQ 5.1.0 (root pom version/tag, 17 Maven modules, 1,430 readable source files). The strongest source-evidenced candidate is the unauthenticated/unauthorized remote configuration-update surface: broker `UPDATE_BROKER_CONFIG` (RequestCode 25) applies any attacker-supplied properties to the live BrokerConfig/MessageStoreConfig objects, and a NameServer `UPDATE_NAMESRV_CONFIG` (318) / Controller `UPDATE_CONTROLLER_CONFIG` handler does the same with no ACL on the NameServer path at all. On the broker, attacker-set `rocketmqHome` and `filterServerNums` are formatted into a shell string (`sh <rocketmqHome>/bin/startfsrv.sh ...`), space-split, and passed to `Runtime.getRuntime().exec`, giving argument injection into `sh -c` and remote code execution as the broker user. I submit one candidate covering this single root cause (missing authorization/validation of privileged config updates), with the broker command-execution chain as the primary instance and the NameServer/Controller handlers as the same root cause (arbitrary persistence-path writes) rather than as separate candidates. Other leads were reviewed and rejected as weaker/unconfirmed (listed below)."
+}

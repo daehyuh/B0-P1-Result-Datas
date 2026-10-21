@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `dataSource` query parameter of GET /druid/coordinator/v1/compaction/progress and GET /druid/coordinator/v1/compaction/status (Coordinator). Jersey decodes percent-encoded input, so a value such as `x%26max%3D1` becomes `x&max=1` and `x%0d%0aHost:%20y` becomes a value containing CRLF; the raw value is then concatenated into the path sent to the Overlord.",
+      "confidence": "medium",
+      "counterevidence_checked": "- Sibling methods in the same class (taskStatuses, killPendingSegments, taskStatus, taskPayload, cancelTask) do call StringUtils.urlEncode, and integration-tests CompactionResourceTestClient encodes the same `dataSource` parameter for the same coordinator APIs — so the omission is inconsistent with the project's own convention. - RequestBuilder enforces only a leading '/', and ServiceLocation.toURL/NettyHttpClient do not validate CRLF, so no later layer is known to neutralize the injection (I could not run code to confirm Netty/Jetty behavior). - The endpoints themselves require STATE READ via StateResourceFilter, so the attacker cannot read arbitrary datasources directly; the injected request goes to endpoints that also require STATE-level permission on the Overlord, which limits direct data exposure. - Compaction supervisor must be enabled (non-default) for these code paths to execute. - Other candidate issues were rejected as documented behavior (see rejected leads).",
+      "id": "druid-189-overlordclient-datasource-request-injection",
+      "impact": "Injection of attacker-controlled query parameters into a privileged internal Coordinator→Overlord call (parameter tampering/confused-deputy: the Overlord processes parameters the Coordinator did not intend, e.g. a different/first `dataSource` value, or a `#` fragment truncating the request). If the injected control characters are not rejected before the request line is encoded, the same primitive can inject headers or a second HTTP request onto the internal connection, letting the request be processed with the Coordinator's internal (escalated) identity — i.e. potential request smuggling into Overlord task/segment APIs. I did not execute anything; the CRLF/smuggling escalation is a plausible but unverified consequence, while the unencoded-parameter injection itself is directly visible in the source.",
+      "locations": [
+        {
+          "end_line": 323,
+          "path": "server/src/main/java/org/apache/druid/rpc/indexing/OverlordClientImpl.java",
+          "start_line": 318
+        },
+        {
+          "end_line": 341,
+          "path": "server/src/main/java/org/apache/druid/rpc/indexing/OverlordClientImpl.java",
+          "start_line": 339
+        },
+        {
+          "end_line": 93,
+          "path": "server/src/main/java/org/apache/druid/server/http/CoordinatorCompactionResource.java",
+          "start_line": 84
+        },
+        {
+          "end_line": 113,
+          "path": "server/src/main/java/org/apache/druid/server/http/CoordinatorCompactionResource.java",
+          "start_line": 104
+        }
+      ],
+      "prerequisites": "Authenticated user with STATE READ on the Coordinator (StateResourceFilter guards both endpoints), and compaction supervisors enabled on the Overlord (the Coordinator calls these client methods only when overlordClient.isCompactionSupervisorEnabled() returns true, CoordinatorCompactionResource lines 92 and 112). The injected request is then sent by the Coordinator's internal service client to the Overlord, i.e. with the node's internal/escalated identity rather than the requesting user's identity.",
+      "root_cause": "OverlordClientImpl.getCompactionSnapshots (lines 318-323) and getBytesAwaitingCompaction (lines 339-341) build the internal request path by string-concatenating the caller-supplied `dataSource` value without StringUtils.urlEncode, unlike every other method in the same class (e.g. taskStatuses line 149, killPendingSegments lines 279-283, taskStatus line 183, taskPayload line 306, cancelTask line 125). The value originates from an unvalidated JAX-RS @QueryParam that Jersey percent-decodes, and no IdUtils.validateId/name validation is applied on this path, so `&`, `#`, `?` and control characters (e.g. `%0d%0a`) survive into the request URI.",
+      "title": "Unencoded dataSource query parameter injected into internal Overlord HTTP requests (Coordinator compaction APIs)",
+      "trace": "1) User request: GET /druid/coordinator/v1/compaction/progress?dataSource=<percent-encoded payload> (or /status) → CoordinatorCompactionResource.getCompactionProgress/getCompactionSnapshotForDataSource. 2) The decoded string is passed unchanged to OverlordClientImpl.getBytesAwaitingCompaction/getCompactionSnapshots. 3) Those methods concatenate it into `/druid/indexer/v1/compaction/progress?dataSource=` + dataSource (or a StringBuilder in getCompactionSnapshots). 4) RequestBuilder only checks that the path starts with '/' (RequestBuilder line 60) and ServiceLocation.toURL passes the string to `new URL(scheme, host, port, basePath+path)`, which does not reject control characters. 5) NettyHttpClient takes `url.getFile()` (path+query) and creates a DefaultHttpRequest whose URI is written verbatim into the HTTP request line by the Netty encoder (processing/.../NettyHttpClient.java lines 143-148). 6) The Overlord therefore receives a request whose query string (and, if CRLF is preserved, request line/headers) contains attacker-chosen content, while the connection carries the Coordinator's internal identity.",
+      "unverified": "No runtime confirmation: whether the Netty encoder/Jetty parser actually preserve CRLF far enough to allow header/request smuggling, and the exact severity of the Overlord-side effect, are unverified. I also could not diff against upstream Druid (no network/Git history), so it remains possible that this asymmetry exists in the upstream 31.0.1 release rather than being a deliberately introduced defect; either way the code-level omission and its inconsistency with sibling methods are visible in this snapshot.",
+      "weakness_type": "Improper neutralization of special elements in an HTTP request path/query (CWE-74/CWE-644); HTTP parameter / request-line injection into an internal service call"
+    }
+  ],
+  "coverage_summary": "Scope: 6,361 repository files / 5,451 Java files (all under src/main; Java tests are absent from this snapshot) plus web-console TypeScript sources, configuration, build files and docs. Reviewed (read or searched): server security package (AuthConfig, AuthorizationUtils, PreResponseAuthorizationCheckFilter, SecuritySanityCheckFilter, AuthenticationWrappingFilter, TrustedDomainAuthenticator, AllowHttpMethodsResourceFilter, ResourceType, AuthValidator), resource filters (Config/State/Rules/Datasource/Task/Supervisor), druid-basic-security (BasicHTTPAuthenticator, MetadataStore/LDAP credentials validators, PasswordHashGenerator, BasicAuthUtils, BasicRoleBasedAuthorizer, permission entities), query paths (QueryResource/QueryLifecycle, SqlResource/DartSqlResource/AbstractStatement, SqlResourceCollectorShuttle, EXTERN/DruidExternTableMacro resource computation), indexing (OverlordResource, SamplerResource, TaskQueue, TaskResourceFilter, FileTaskLogs, DurableStorageUtils, ForkingTaskRunner), MSQ/Dart task APIs (SqlStatementResource, MSQResourceUtils, DartSqlResource), metadata SQL paths (SQLMetadataStorageActionHandler, IndexerSQLMetadataStorageCoordinator, SQLMetadataConnector), input sources and compression (HttpInputSource/HttpEntity, LocalInputSource, CombiningInputSource, CompressionUtils zip-slip validation), RPC/service clients (OverlordClientImpl, RequestBuilder, ServiceLocation, NettyHttpClient, DruidLeaderClient), and selected contrib/core extensions (protobuf, thrift, kafka, kubernetes, catalog, pac4j/kerberos, JDBC allow-list code). Not exhaustively reviewed: all processing/segment query-engine internals, all contrib extensions, dependency/CVE analysis of poms, and the full web-console.",
+  "limitations": [
+    "No Java test sources exist in the snapshot, so I could not use tests (or run them) to confirm intended behavior or validate a failing security assertion.",
+    "No code execution, scanners, network access, or upstream diff was available: all conclusions are static and cannot confirm runtime behavior of Netty/Jetty (CRLF handling) or the exact upstream-vs-mutated provenance of the flagged code.",
+    "The snapshot is large (6,361 files); coverage was broad but not exhaustive, and the web-console, some extensions, and deep query-engine internals were only sampled.",
+    "Only one candidate may be submitted, so several plausible but weaker leads (listed above) were not investigated to exhaustion; their exclusion is not proof that they are safe.",
+    "Candidate status is a lead: the missing URL-encoding is source-visible, but the security impact (especially request smuggling vs. mere parameter tampering) is unverified."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Arbitrary local-file read / SSRF via the `local` and `http` input sources (HttpInputSource with only protocol allow-listing; sampler/task submission paths), amplified by `druid.auth.enableInputSourceSecurity` defaulting to false in AuthConfig",
+      "reason": "Documented, intended trust model rather than a code defect: docs/operations/security-overview.md lines 53-55 and 271 state that any user allowed to submit ingestion tasks can read/write local files and external resources as the Druid process user, and only DATASOURCE WRITE should be granted to trusted users. The opt-in input source security config is a project-provided gate, so this is a configuration/privilege assumption (hardening opportunity), not an exploitable validation gap."
+    },
+    {
+      "lead": "URL/local-file loading of the Protobuf descriptor in FileBasedProtobufBytesDecoder (`new URL(descriptorFilePath).openConnection()`, lines 62-80) from an ingestion spec / SQL EXTERN input format",
+      "reason": "Documented feature: docs/development/extensions-core/protobuf.md line 76 states the descriptor file must be on the classpath or reachable by URL. Offline I cannot show it was introduced by this snapshot's mutation, and the primitive is bounded by protobuf-descriptor parsing."
+    },
+    {
+      "lead": "String-interpolated UPDATE statements in SQLMetadataStorageActionHandler.updateColumnsTypeAndGroupIdForTasks (type/group_id/id from task payload) and fetchTasksWithTypeColumnNullAndIdGreaterThan",
+      "reason": "Legacy migration path: rows are selected only where the `type` column IS NULL (pre-0.17 rows), so an attacker would need a legacy row carrying a malicious groupId before an upgrade; low reachability and apparently long-standing upstream code, so it does not meet the evidence threshold."
+    },
+    {
+      "lead": "TrustedDomainAuthenticator uses `remoteAddr.endsWith(domain)` and optionally the X-Forwarded-For header (lines 116-128)",
+      "reason": "Upstream design: `useForwardedHeaders` defaults to false, and the endsWith check is the documented mechanism for trusted-domain authentication. No snapshot-specific deviation found."
+    },
+    {
+      "lead": "LookupReferencesManager.fetchLookupsForTier builds a leader URL with an unencoded `tier` (line 631); DruidLeaderClient.makeRequest concatenates paths without encoding (line 120)",
+      "reason": "Same encoding class as the submitted candidate but weaker: `tier` is normally operator configuration and only becomes task-controlled when `druid.lookup.lookupTierIsDatasource=true` is set, and exploiting it requires DATASOURCE WRITE (treated as trusted per the documented trust model). Kept as a related, unconfirmed lead."
+    },
+    {
+      "lead": "Feature/docs inconsistency: `druid.auth.enableInputSourceSecurity` is plumbed through AuthConfig, OverlordResource, SamplerResource, SupervisorResource and SQL planning but is not documented anywhere under docs/",
+      "reason": "Could indicate a stale doc or a feature added after these docs, but documentation drift is at most a hardening signal; it does not by itself demonstrate an exploitable vulnerability."
+    }
+  ],
+  "summary": "Reviewed the Apache Druid 31.0.1 snapshot (5,451 Java files under src/main plus web-console TS; all Java test sources are absent from the snapshot). I traced the main trust boundaries: HTTP auth/authorization filter chain, druid-basic-security (basic/LDAP/Ranger), query lifecycle and SQL resource collection, MSQ/Dart task APIs, indexing Overlord/worker resources, sampler/task-log paths, metadata SQL, and internal RPC/service clients. Most security checks and encodings match the project's conventions; the strongest concrete defect found is that two adjacent OverlordClientImpl methods interpolate the caller-supplied `dataSource` query parameter directly into an internal coordinator→Overlord request path, while every sibling method in the same class URL-encodes user-controlled path/query values (and the integration-test client for the same coordinator APIs also encodes it). That is an HTTP request/parameter injection into a privileged internal channel (with a plausible CRLF request-splitting/header-injection extension), reachable from the Coordinator compaction status/progress endpoints when compaction supervisors are enabled. Other apparent issues were examined and rejected because they are documented design/trust-model behavior or require non-default configuration/trusted callers."
+}

@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the request body of a MTOM/XOP or multipart/related message: the xop:Include href (and equivalent attachment content-id) is read verbatim from the incoming XML (JAXB AttachmentUnmarshaller contract; Aegis AbstractXOPType.readInclude line 127 takes reader.getAttributeReader(XOP_HREF).getValue()). Any value containing \"://\" is accepted, e.g. http://169.254.169.254/..., http://internal-host:port/..., file:///etc/passwd, jar:file:..., with no authentication to CXF beyond the service's own endpoint exposure.",
+      "confidence": "medium",
+      "counterevidence_checked": "Confirmed the cid: branch resolves only against the in-message attachment collection and that values without \"://\" stay local (so the issue is specific to absolute-URL style references); confirmed both JAX-WS and JAX-RS JAXB providers actually install the attachment unmarshaller (DataReaderImpl:137, JAXBElementProvider:532) and that Aegis reads the href from the message; verified there is no scheme/host/port validation, deny-list, or property gate anywhere in the resolution path in this snapshot; checked that XML parsing itself is done through hardened StaxUtils (DTD/external entities disabled), so the finding is the attachment dereference, not generic XXE. Checked that URLDataSource is the JDK javax.activation class (import at AttachmentUtil.java:52), i.e., the fetch is real. Could not run code to confirm the JAXB RI passes the raw href and to demonstrate an end-to-end exploit; no runtime verification was performed.",
+      "id": "cxF-attachment-url-ssrf",
+      "impact": "Server-side request forgery from the CXF process: requests to internal/loopback services and cloud metadata endpoints, internal port probing, and scheme abuse. Use of file:// references turns the same code path into arbitrary server-side file read; because the fetched bytes are handed back as the unmarshalled base64Binary/DataHandler value, services that return or log the field can disclose the content to the attacker, and blind SSRF still permits internal network interaction. The same weak resolution is reachable from two independent data bindings (JAXB and Aegis), increasing exposure.",
+      "locations": [
+        {
+          "end_line": 539,
+          "path": "core/src/main/java/org/apache/cxf/attachment/AttachmentUtil.java",
+          "start_line": 520
+        },
+        {
+          "end_line": 65,
+          "path": "rt/databinding/jaxb/src/main/java/org/apache/cxf/jaxb/attachment/JAXBAttachmentUnmarshaller.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 140,
+          "path": "rt/databinding/jaxb/src/main/java/org/apache/cxf/jaxb/io/DataReaderImpl.java",
+          "start_line": 130
+        },
+        {
+          "end_line": 535,
+          "path": "rt/frontend/jaxrs/src/main/java/org/apache/cxf/jaxrs/provider/JAXBElementProvider.java",
+          "start_line": 528
+        },
+        {
+          "end_line": 78,
+          "path": "rt/databinding/aegis/src/main/java/org/apache/cxf/aegis/type/mtom/AttachmentUtil.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 140,
+          "path": "rt/databinding/aegis/src/main/java/org/apache/cxf/aegis/type/mtom/AbstractXOPType.java",
+          "start_line": 125
+        }
+      ],
+      "prerequisites": "A deployed endpoint that unmarshals JAXB (JAX-WS DataReaderImpl or JAX-RS JAXBElementProvider, including MTOM-enabled services) or Aegis MTOM payloads with attachments so that the attachment unmarshaller is installed; the application (or JAXB data binding) must access the referenced attachment field for the fetch to occur (URLDataSource opens the URL lazily on getInputStream). No special opt-in flag is required for the fetch itself; no allow-list or sandbox exists in the snapshot. For disclosure rather than blind SSRF, the decoded value must be returned/echoed or otherwise observable by the attacker.",
+      "root_cause": "AttachmentUtil.getAttachmentDataSource() (core/src/main/java/org/apache/cxf/attachment/AttachmentUtil.java:520-539) only special-cases references starting with \"cid:\" or containing no \"://\"; every other value is treated as an absolute URL and wrapped in javax.activation.URLDataSource(new URL(contentId)) (line 533) with no allow-list of schemes/hosts. The content-id/href is supplied by the request: DataReaderImpl installs JAXBAttachmentUnmarshaller for JAX-WS (rt/databinding/jaxb/.../io/DataReaderImpl.java:137) and JAXBElementProvider installs it for JAX-RS (rt/frontend/jaxrs/.../JAXBElementProvider.java:529-535) whenever the inbound message has attachments; JAXB then calls getAttachmentAsDataHandler/getAttachmentAsByteArray with the attacker-controlled xop:Include/@href value (rt/databinding/jaxb/.../JAXBAttachmentUnmarshaller.java:47-65). A second implementation repeats the flaw in Aegis MTOM: AbstractXOPType.readInclude() reads the xop:Include href from the message (rt/databinding/aegis/.../mtom/AbstractXOPType.java:125-139) and AttachmentUtil.getAttachment() explicitly falls back to \"Try loading the URL remotely\" with new URLDataSource(new URL(id)) for any URL-shaped id (rt/databinding/aegis/.../mtom/AttachmentUtil.java:51-78).",
+      "title": "Attachment content references are dereferenced as arbitrary URLs (SSRF / local file read) during MTOM/XOP unmarshalling",
+      "trace": "POST multipart/related (MTOM/XOP) request -> CXF attachment handling exposes message attachments -> DataReaderImpl.getUnmarshaller sets JAXBAttachmentUnmarshaller (line 137) / JAXBElementProvider.addAttachmentUnmarshaller (line 532) -> JAXB parses <xop:Include href=\"http://internal-host/...\"/> from the attacker's payload -> JAXBAttachmentUnmarshaller.getAttachmentAsDataHandler/getAttachmentAsByteArray calls AttachmentUtil.getAttachmentDataSource(contentId, attachments) -> because contentId.indexOf(\"://\") != -1 it executes new URLDataSource(new URL(contentId)) (AttachmentUtil.java:533) -> javax.activation.URLDataSource.getInputStream() calls URL.openConnection().getInputStream(), issuing the server-side request (or reading a file:// URL). Aegis MTOM path: AbstractXOPType.readInclude -> AttachmentUtil.getAttachment(href, attachments) -> new URLDataSource(new URL(id)) at rt/databinding/aegis/.../type/mtom/AttachmentUtil.java:71-74.",
+      "unverified": "Runtime reachability and exploitability were not executed: whether the specific JAXB/RI version passes the unmodified href for xop:Include, whether a given deployed service reads and returns the attachment value, and whether file:// reads succeed under the deployment's JVM settings were not verified. The exact set of services in real deployments that expose MTOM/XOP with attachments is application-dependent, and the fetch is lazy (only when the attachment value is consumed).",
+      "weakness_type": "Server-Side Request Forgery (CWE-918) with arbitrary-scheme dereference enabling local file disclosure (CWE-73)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot (4,416 files; root pom.xml indicates Apache CXF 3.1.3-SNAPSHOT). I read the P1 relation scope (complete index of 4,416 files, 107,377 edges; syntactic/navigation only, not SAST) and used it to trace attachment-unmarshalling call chains, then verified every cited edge in source text. I broadly searched core, databindings (JAXB, Aegis), JAX-RS frontend/client, transports (HTTP, JMS, Netty, WebSocket), RS/WS security (JOSE, SAML, OAuth, CORS), and management modules for the classic sink families (URL/URLConnection use, XML parser configuration, deserialization, header/HTML output, path handling, SQL, command execution, TLS/hostname verification). The submitted candidate is the one issue with a complete attacker-input-to-sink chain verified in source.",
+  "limitations": [
+    "No code was executed; no tests, builds, or scanners were run. Findings are source-evidence based and not runtime-confirmed.",
+    "The snapshot contains no src/test sources and no history/patches, so fix lineage and pre/post-fix comparisons could not be checked.",
+    "Binary-like files are skipped by the tools; 4,416 text files were in scope but I did not read all of them exhaustively, so unread areas (e.g., CORBA binding, JavaScript frontend, tooling, samples, OSGi/Karaf paths) are not claimed as reviewed.",
+    "The P1 relation index is syntactic/navigation-only and omits runtime data flow and semantic resolution; its labels are not vulnerability verdicts.",
+    "Reachability of the attachment SSRF depends on deployment (an endpoint with MTOM/XOP or multipart attachments that reads the referenced value) and on JDK/JAXB RI behavior that I could not run to confirm."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected XSS in the default service list page: BaseUrlHelper builds the base path from request.getRequestURL() (Host header, rt/transports/http/.../servlet/BaseUrlHelper.java:37-55) and FormattedServiceListWriter writes basePath/publishedEndpointUrl into HTML without escaping (rt/transports/http/.../servlet/servicelist/FormattedServiceListWriter.java:52-171).",
+      "reason": "Real missing-output-encoding pattern and the page is enabled by default, but practical attacker control is weaker (browsers do not normally place script characters in the Host header; a victim must reach the server under an attacker-influenced authority), and the request URI variant is normally percent-encoded by the container. Different root cause from the submitted candidate."
+    },
+    {
+      "lead": "Unsafe Java deserialization in Aegis: ObjectType.reconstituteJavaObject() deserializes attacker-supplied base64 via new ObjectInputStream(in).readObject() (rt/databinding/aegis/.../type/basic/ObjectType.java:157-166).",
+      "reason": "The dangerous branch requires serializedWhenUnknown to be enabled; the default ObjectType()/DefaultTypeMapping construction sets it to false (ObjectType.java:60-78, DefaultTypeMapping.java:232, TrailingBlocks.java:49-51), so no default reachable path was found in this snapshot. Not submitted."
+    },
+    {
+      "lead": "Unsafe Java deserialization in the JMS transport: JMSMessageConverter.fromMessage() calls ((ObjectMessage)message).getObject() (rt/transports/jms/.../util/JMSMessageConverter.java:69-70 via JMSMessageUtils.retrieveAndSetPayload:85), executing readObject() on broker-delivered objects.",
+      "reason": "Plausible and impactful, but requires the JMS transport plus the ability to publish an ObjectMessage to a queue/topic consumed by the endpoint; the attacker-control conditions and deployment assumptions are less direct than the HTTP-reachable attachment dereference, and I could not verify broker-side access controls in this snapshot."
+    },
+    {
+      "lead": "JWT claim validation: AbstractJoseJwtConsumer.getJwtToken() verifies the signature but leaves validateToken() empty (rt/rs/security/jose/.../jwt/AbstractJoseJwtConsumer.java:44-57), so exp/iat are not enforced by the JWT filters.",
+      "reason": "Missing hardening/hardening gap rather than a clearly exploitable defect in the reviewed code; token claim enforcement can legitimately be left to applications. Not enough source evidence of a concrete security impact."
+    }
+  ],
+  "summary": "Reviewed the Apache CXF 3.1.3-SNAPSHOT tree (4,416 files, root pom.xml:24) with source search plus the P1 relation index. Strongest issue found: attachment content references (xop:Include/@href, MIME content-id) are resolved by AttachmentUtil as arbitrary absolute URLs and dereferenced with javax.activation.URLDataSource, without any scheme/host allow-list. This gives an unauthenticated request-level SSRF and, via file:// URLs, local file read/data disclosure wherever the decoded attachment value is consumed or returned. I verified the full source chain from request processing (JAX-WS DataReaderImpl, JAX-RS JAXBElementProvider) through the JAXB/Aegis attachment unmarshallers to the URL fetch. A separate Aegis MTOM implementation contains the same pattern (\"Try loading the URL remotely\"). Other plausible but weaker leads (service-list XSS via request URL/Host, Aegis serializedJavaObject deserialization, JMS ObjectMessage.getObject() deserialization) are recorded as rejected leads rather than additional candidates."
+}

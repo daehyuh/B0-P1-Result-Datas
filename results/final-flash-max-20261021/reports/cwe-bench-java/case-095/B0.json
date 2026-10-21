@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `logFileName` value in `@QueryParam(\"logFileName\")` (and `instanceName` selecting the per-instance overload) is fully attacker-controlled HTTP query-string input to the management REST endpoint (custom Domain resource path `view-log` / `view-log/details`, i.e. `/management/domain/view-log/details`).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked for any hidden validation between the REST layer and LogFilter (StructuredLogViewerResource.getWithType has none; LogFilter has none) and for a containment/canonicalization check in LogFile (none). Verified `RawLogParser` returns raw lines so arbitrary text content is disclosed, and that default filter values do not drop the records. Confirmed the endpoint path exists via LogViewerResource `@Path(\"details/\")` and the `Domain`/`LogViewerResource` `view-log` custom-resource registration (CommandResourceMetaData line 243). Counterweights: the resource is authenticated (not pre-auth) and the `exists()` check plus file permissions limit which files are reachable; the REST/web layer may require an authorization grant for this resource.",
+      "id": "glassfish-logviewer-path-traversal",
+      "impact": "Arbitrary file disclosure as the application-server OS user from a remote authenticated session: domain configuration (`domain.xml`), `master-password`, `admin-keyfile`/key material, other domains' logs, keystore metadata, and any world/server-readable file. This can expose credentials/keys that enable further compromise, and is a clear read outside the intended log directory.",
+      "locations": [
+        {
+          "end_line": 127,
+          "path": "nucleus/admin/rest/rest-service/src/main/java/org/glassfish/admin/rest/resources/custom/StructuredLogViewerResource.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 95,
+          "path": "nucleus/admin/rest/rest-service/src/main/java/org/glassfish/admin/rest/resources/custom/LogViewerResource.java",
+          "start_line": 91
+        },
+        {
+          "end_line": 163,
+          "path": "nucleus/core/logging/src/main/java/com/sun/enterprise/server/logging/logviewer/backend/LogFilter.java",
+          "start_line": 150
+        },
+        {
+          "end_line": 415,
+          "path": "nucleus/core/logging/src/main/java/com/sun/enterprise/server/logging/logviewer/backend/LogFilter.java",
+          "start_line": 316
+        },
+        {
+          "end_line": 146,
+          "path": "nucleus/core/logging/src/main/java/com/sun/enterprise/server/logging/logviewer/backend/LogFile.java",
+          "start_line": 84
+        }
+      ],
+      "prerequisites": "1) Network access to the administration/REST port and an authenticated principal authorized for the log-viewer REST resource (admin console admin; read-only monitoring users if the resource grants them access); 2) the target file must exist and be readable by the server process; 3) the caller can adjust the number of `../` segments to reach the desired path.",
+      "root_cause": "The REST resources expose a `logFileName` query parameter and pass it unmodified into LogFilter. LogFilter builds the file path with plain string concatenation (`logDir + File.separator + logFileName.trim()`), only checks `new File(path).exists()`, and then opens that path via LogFile/FileInputStream. There is no path canonicalization, normalization, or base-directory containment check (e.g., comparing canonical paths or rejecting `..`/absolute components). The same unsafe concatenation exists in the per-instance overload (`new File(loggingDir + File.separator + logFileName)`), so traversal is possible for both DAS and instance log queries.",
+      "title": "Path traversal in admin REST log viewer (`logFileName`) allows arbitrary file read",
+      "trace": "HTTP GET with `logFileName=../../config/master-password` (plus benign parameters such as `logLevel=INFO`) -> Jersey dispatches to `LogViewerResource.getDomainUptimeResource()` (`@Path(\"details/\")`) -> `StructuredLogViewerResource.getJson/getXML` -> `getWithType()` -> `LogFilter.getLogRecordsUsingQuery(logFileName, ...)` -> line 152 builds `logDir + File.separator + logFileName.trim()` -> line 154 `new File(...).exists()` passes for an existing traversed file -> `getLogFile()`/`LogFile.getLogEntries()` -> `FileInputStream(logFileName)` (LogFile line 224) reads it -> `LogParserFactory.createLogParser()` returns `RawLogParser` for non-log formats, whose `parseLog()` emits each line as a `ParsedLogRecord` with `LOG_MESSAGE` set -> `fetchRecordsUsingQuery()`/`convertQueryResult()` renders those lines in the JSON/XML response. Default query parameters (`onlyLevel=false`, null dates, empty module/search lists) do not filter raw records (`levelCheck` returns true when level parsing fails), so arbitrary text files are returned line-by-line. The per-instance overload is the same at LogFilter line 379.",
+      "unverified": "Not runtime-confirmed: the exact deployed REST URL, required authorization grant/role for `view-log`, and header/format of returned records were not executed. I did not verify whether GlassFish's admin authorization mapping grants the log viewer to non-admin (e.g., monitoring) principals, and binary file contents may be mangled/limited despite RawLogParser returning lines.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal'); CWE-73 External Control of File Name or Path"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot (7,791 readable files; no size/symlink/sensitive-name exclusions reported by get_source_scope; binary files skipped by NUL heuristic). Focused on attacker-reachable input paths in the admin REST service (nucleus/admin/rest), the admin console servlets/handlers (appserver/admingui), logging (nucleus/core/logging), payload/file-transfer utilities, security/auth modules, and web-core (Tomcat fork) command/file/XML sinks. I traced the log viewer flow end-to-end (REST query param -> LogFilter -> LogFile -> RawLogParser -> JSON/XML response). Other modules (persistence/CMP, transaction/JTS, connectors, appclient, embedded/OSGi packaging, large portions of web-core and deployment) were only searched or sampled, not exhaustively line-reviewed.",
+  "limitations": [
+    "No execution, build, or dynamic verification was performed; all conclusions are static source analysis.",
+    "The repository is very large (7,791 files); coverage was risk-targeted rather than exhaustive, so an equally strong vulnerability elsewhere (e.g., in web-core, deployment, or JACC/security internals) cannot be excluded.",
+    "The exact runtime URL, role mapping/authorization for the `view-log/details` resource, and whether the returned record set always includes raw lines were not executed; the finding is a source-evidence-based lead, not a runtime-confirmed vulnerability.",
+    "No patch/CVE metadata was available in the snapshot, so I could not confirm whether this code path corresponds to a published advisory or whether it was later fixed; no external sources were consulted."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CGIServlet command injection on Windows (Runtime.exec of a command string built from decoded query-string tokens; no `enableCmdLineArguments`/Windows argument checks, i.e., the pre-CVE-2019-0232 Tomcat pattern) at appserver/web/web-core/src/main/java/org/apache/catalina/servlets/CGIServlet.java:1615-1684.",
+      "reason": "Real injection pattern, but exploitability is conditional on the CGI servlet being explicitly configured for a web application (not enabled by default), the platform being Windows, and the attack surface being the application web container; weaker and more configuration-dependent than the log-viewer traversal."
+    },
+    {
+      "lead": "SSRF plus REST-token exfiltration: DownloadServlet ContentSources (LogViewerContentSource/LogFilesContentSource/ClientStubsContentSource) build an outbound URL from the request parameter `restUrl` and attach the admin session's `__rTkn__` cookie (RestUtil.getRequestFromServlet, RestUtil.java:800-808), then DownloadServlet writes server-returned headers via raw setHeader (DownloadServlet.java:249-255), bypassing the CRLF validator added at lines 261-274.",
+      "reason": "Strong candidate but requires an authenticated victim to be induced to load a crafted same-origin GET (`/download/...restUrl=http://attacker`) to leak the token; exploitation is interaction-dependent and the primary impact depends on the stolen REST token still being valid, so I kept it as a secondary lead rather than the single submission."
+    },
+    {
+      "lead": "PayloadFilesManager arbitrary file write/replace/delete via payload part names and the `file-xfer-root` part property (nucleus/common/common-util/src/main/java/org/glassfish/admin/payload/PayloadFilesManager.java:380-391, 466-556).",
+      "reason": "No containment check is visible, but absolute/relative part names and transfer roots appear to be an intentional part of the admin file-transfer design (documented behavior), and exploitation requires an authenticated admin payload upload; weaker 'unintended flaw' evidence than the log traversal."
+    },
+    {
+      "lead": "XXE-prone XML parsing without DTD/external-entity hardening in deployment descriptor parsing (appserver/deployment/dol/src/main/java/com/sun/enterprise/deployment/io/DeploymentDescriptorFile.java:93-208) and in other DOM parsers (e.g., nucleus/admin/util/.../RemoteAdminCommand.java:1174, nucleus/admin/util/.../InstanceStateFileProcessor.java:51-54).",
+      "reason": "Textbook hardening gaps, but the parsed documents are largely server-generated/local or the flow requires deploying a malicious application as an admin; no attacker-controlled parse path with clear cross-boundary impact was confirmed."
+    },
+    {
+      "lead": "Admin console REST redirect/session handling (AdminConsoleAuthModule) and secure-admin/localhost checks.",
+      "reason": "Looked for session fixation/auth-bypass/open-redirect issues; the module uses request.changeSessionId() after login, validates CRLF before redirect, and stores `SAVED_SUBJECT` only after a successful REST authentication, so no bypass was substantiated from source."
+    }
+  ],
+  "summary": "Reviewed the GlassFish 6.2.5-era source snapshot (7,791 readable files: nucleus/, appserver/, admin console, REST admin service, web-core, logging/backup modules). The strongest source-evidenced issue I found is an unvalidated path traversal in the admin REST log viewer: the client-supplied `logFileName` query parameter is concatenated onto the configured log directory and opened as a file, with no canonicalization or containment check, allowing an authenticated administration user to read arbitrary server files through the log-viewer JSON/XML response."
+}

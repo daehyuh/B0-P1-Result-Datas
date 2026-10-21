@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client that can reach the proxy's binary service port sends `CommandConnect` with `proxy_to_broker_url` set to an arbitrary `host:port` (directly, or via any Pulsar client that populates this field, e.g. Commands.newConnect). If `authenticationEnabled=true` on the proxy the client must first authenticate with any valid role; if authentication is disabled, no role is needed. The host/port is otherwise unconstrained.",
+      "confidence": "medium",
+      "counterevidence_checked": "Grepped all uses of `proxyToBrokerUrl`/`ProxyToBroker`: only ProxyConnection.java (store/log) and DirectProxyHandler.java (connect) reference it — no allow-list, DNS/IP restriction, or discovery-provider membership check exists; `ProxyConfiguration` exposes no switch limiting it. `ProxyConnection.java:246-249` shows `isForwardAuthorizationCredentials` governs only the client's own auth data, not the proxy's broker authentication. `DirectProxyHandler`'s only rejection is a `URISyntaxException` on `new URI(\"pulsar://\" + targetBrokerUrl)` (125-134). The HTTP `AdminProxyHandler` does call Jetty `validateDestination` (AdminProxyHandler.java:346-350), but that is a different handler and does not protect the binary `DirectProxyHandler` path. Also considered: the feature is used legitimately by clients after lookup (Commands.java:193-196 comment), which explains the design but does not constrain the value.",
+      "id": "C1-proxy-client-controlled-broker-url",
+      "impact": "Disclosure of the proxy's broker-client credentials (e.g. a JWT/token, Athenz role token, SASL/Kerberos material) to an attacker-chosen host; in common deployments the proxy role is highly privileged, so stolen credentials can enable cluster-wide broker/admin access. Additionally, the proxy can be coerced into arbitrary outbound TCP connections from the proxy host (SSRF), enabling internal service reachability/port probing and bypass of network segmentation; a malicious \"broker\" can also complete the handshake and have the proxy relay its traffic.",
+      "locations": [
+        {
+          "end_line": 285,
+          "path": "pulsar-proxy/src/main/java/org/apache/pulsar/proxy/server/ProxyConnection.java",
+          "start_line": 279
+        },
+        {
+          "end_line": 233,
+          "path": "pulsar-proxy/src/main/java/org/apache/pulsar/proxy/server/ProxyConnection.java",
+          "start_line": 224
+        },
+        {
+          "end_line": 136,
+          "path": "pulsar-proxy/src/main/java/org/apache/pulsar/proxy/server/DirectProxyHandler.java",
+          "start_line": 125
+        },
+        {
+          "end_line": 233,
+          "path": "pulsar-proxy/src/main/java/org/apache/pulsar/proxy/server/DirectProxyHandler.java",
+          "start_line": 222
+        },
+        {
+          "end_line": 238,
+          "path": "pulsar-common/src/main/java/org/apache/pulsar/common/protocol/Commands.java",
+          "start_line": 227
+        },
+        {
+          "end_line": 196,
+          "path": "pulsar-common/src/main/java/org/apache/pulsar/common/protocol/Commands.java",
+          "start_line": 193
+        }
+      ],
+      "prerequisites": "Proxy reachable by the attacker; proxy configured with `brokerClientAuthenticationPlugin/Parameters` (the normal secure deployment) so its broker credentials are non-empty; for the CONNECT frame with credentials to actually reach the attacker's server, the backend connection must complete, i.e. `tlsEnabledWithBroker=false`, or TLS-to-broker with `tlsAllowInsecureConnection=true`, or the attacker can present a certificate the proxy trusts. Even without those last conditions, the proxy still performs an arbitrary outbound TCP connect (network reachability/port probing from the proxy host).",
+      "root_cause": "The proxy treats the wire field `CommandConnect.proxy_to_broker_url` (fully client-controlled) as a trusted target-broker address. `ProxyConnection.handleConnect` records it without any validation or allow-list (no comparison against the brokers returned by `BrokerDiscoveryProvider`, no host/port restriction), `completeConnect` passes it straight into `DirectProxyHandler`, and `DirectProxyHandler` opens a TCP (optionally TLS) connection to that host. On connect, `ProxyBackendHandler.channelActive` builds a CONNECT command with the proxy's own broker-client `Authentication` (`ProxyConnection.getClientAuthentication()` / configured `brokerClientAuthenticationPlugin`) and transmits it to the attacker-named host; only the *client's* auth data is gated by `isForwardAuthorizationCredentials` — the proxy's own credentials are always attached.",
+      "title": "Proxy connects to client-supplied broker address and discloses its own broker credentials (SSRF / credential leak)",
+      "trace": "Client CONNECT frame -> `ProxyConnection.handleConnect` sets `hasProxyToBrokerUrl` and stores `connect.getProxyToBrokerUrl()` unchanged (ProxyConnection.java:283-285) -> after authentication `completeConnect` creates `new DirectProxyHandler(service, this, proxyToBrokerUrl, ...)` (224-233) -> handler captures the proxy's broker `Authentication` and client identity (DirectProxyHandler.java:93-103) -> parses `\"pulsar://\" + targetBrokerUrl` and calls `b.connect(targetBroker.getHost(), targetBroker.getPort())` (125-136) -> on channelActive the proxy writes `Commands.newConnect(authentication.getAuthMethodName(), authData, protocolVersion, \"Pulsar proxy\", null, originalPrincipal, clientAuthData, clientAuthMethod)` to that host (222-233) -> `Commands.newConnect` serializes `authData`/`originalPrincipal` into the CONNECT command (Commands.java:227-238).",
+      "unverified": "No runtime execution, traffic capture, or exploit payload was performed; the snapshot does not include the .proto/generated proto classes, so field presence is confirmed only through `Commands.java` and the proxy sources. Exact exploit reachability depends on proxy configuration (client authentication enabled/disabled; TLS-to-broker mode and trust settings) and whether a TLS handshake to the attacker host can complete. It is also not excluded that upstream considered client-chosen broker URLs an accepted design, though no validation or documented warning was found in the snapshot.",
+      "weakness_type": "Server-Side Request Forgery (CWE-918) leading to sensitive credential disclosure (CWE-200/CWE-441)"
+    }
+  ],
+  "coverage_summary": "Tools/scope: `get_source_scope` reports 5,482 source-root files, 5,473 model-visible, 9 excluded for sensitive name/path (the `.conf` files, e.g. broker.conf/proxy.conf/standalone.conf, are absent from visibility), binaries refused on NUL detection; all `src/test` trees are absent from the snapshot, and `.proto`/generated proto classes are not visible (confirmed by listing/searching). `get_relation_scope` reports 2,063 parsed Java files (0 parse errors), 32,829 symbols, 64,370 syntax edges, 99,137 call rows, 75,953 unresolved calls, \"partial\" index status, no control-flow/data-flow/semantic resolution, and Java-only relations. I read and cross-checked source in the authentication providers (token/TLS/basic/SASL), authorization provider/service, broker admin wiring and filters, proxy HTTP/binary handlers, proxy/worker/broker web-server wiring, functions worker REST wiring, NAR unpacking/class-loading, JDBC sink, TLS context construction, and several client/admin TLS paths; I did not exhaustively inspect all 5,473 files (C++/Python/Go clients and most of the ~2,063 Java files were only sampled via targeted searches).",
+  "limitations": [
+    "No code execution, build, tests, scanners, or traffic capture: all conclusions are static source reading; no runtime confirmation.",
+    "P1 relation index is partial and Java-only, with no control-flow, data-flow, semantic resolution, or reachability proof; unresolved calls (75,953) mean absence of an indexed edge is not evidence of absence.",
+    "Snapshot lacks all test sources and `.proto`/generated-protocol classes, so behavior cannot be corroborated by tests and the `proxy_to_broker_url` field definition itself was verified only through `Commands.java`/proxy sources.",
+    "Nine files excluded for sensitive name/path (configuration files) could not be inspected; binaries were skipped.",
+    "No upstream diff, patch, or CVE metadata was consulted (prohibited), so I could not confirm which modification (if any) was introduced for this case.",
+    "Client/server interoperability details (e.g., exact TLS handshake requirements for the attacker's host to receive the CONNECT frame) were reasoned from source, not demonstrated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "pulsar-client-admin AsyncHttpConnector passes `conf.isTlsAllowInsecureConnection() || !conf.isTlsHostnameVerificationEnable()` as `allowInsecureConnection` to SSL-context creation at 4 sites (AsyncHttpConnector.java:130,144,148,153); with the default `tlsHostnameVerificationEnable=false` this effectively trusts any server certificate, contradicting the documented `allowTlsInsecureConnection` default(false).",
+      "reason": "Potentially real CWE-295, but I could not establish that this is not long-standing upstream behavior; the nearby pulsar-client HttpClient.java:104 uses only `isTlsAllowInsecureConnection()`. Retained as unconfirmed rather than submitted."
+    },
+    {
+      "lead": "NarUnpacker.unpack writes `new File(workingDirectory, jarEntry.getName())` with no canonical-path containment (NarUnpacker.java:116-129) — classic zip-slip if a crafted NAR is unpacked.",
+      "reason": "Looks like unmodified upstream pre-hardening code; exploitation requires an actor able to deploy a malicious NAR (functions/sinks/packages), a privileged prerequisite, and no fixed-version evidence exists in the snapshot."
+    },
+    {
+      "lead": "Log4j2 2.14.0 pinned in pom.xml (pom.xml:122) and buildtools/pom.xml:42 (Log4Shell-era version).",
+      "reason": "Dependency-version issue, not traceable to a concrete vulnerable code path with in-repo evidence (message-lookup configuration would need verification); no config files were available for inspection (excluded from scope)."
+    },
+    {
+      "lead": "MultiRolesTokenAuthorizationProvider parses tokens unsigned via `parser.parseClaimsJwt` (MultiRolesTokenAuthorizationProvider.java:108-111).",
+      "reason": "Appears intentional: the token signature is validated earlier by AuthenticationProviderToken; the authorization provider only extracts additional roles from an already-authenticated token."
+    },
+    {
+      "lead": "SecurityUtility.createSslContextFactory calls `sslCtxFactory.setTrustAll(true)` unconditionally (SecurityUtility.java:532; also KeyStoreSSLContext.java:377).",
+      "reason": "Both occurrences mirror each other across the two near-duplicate classes, indicating long-standing upstream behavior rather than a targeted change; Jetty ignores trust-all when an explicit SSLContext is supplied. Hardening concern, not submitted."
+    }
+  ],
+  "summary": "Reviewed the Apache Pulsar 2.9.0-SNAPSHOT Java snapshot (2,063 Java files; other languages/docs sampled). The strongest, source-verifiable issue is in the binary-protocol proxy: the target broker URL supplied by the client in `CommandConnect.proxy_to_broker_url` is stored and used verbatim to open a backend connection, and the proxy then sends its own configured broker-client authentication data in the CONNECT frame to that client-chosen host. This is a client-controlled value crossing a trust boundary into a privileged operation (SSRF + credential disclosure/confused deputy). Other security-relevant areas (token/TLS/SASL authn providers, authorization provider/service, broker admin wiring, proxy HTTP handler, functions worker wiring, NAR unpacking) were sampled against source text; no stronger issue with equal evidence was found, and several plausible-but-unconfirmed leads are listed as rejected."
+}

@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "No direct remote attacker control: the input is the JVM system property 'jdk.tls.namedGroups' read at line 99, normally set by the operator/deployment (a trusted configuration input). An attacker who can influence that property (shared JVM, container env, config injection) or who can get an unsupported group configured would gain the behaviour described.",
+      "confidence": "medium",
+      "counterevidence_checked": "Confirmed the opposing interpretation in the same class: line 91 uses '== 0' to mean 'Not supported, let's remove it', and lines 241 and 251 use '== 0' as failure for the same JNI methods (SSLConext_set1_groups_list / set1_sigalgs_list), so at most one of the two interpretations can be right; BoringSSL's documented SSL_CTX_set1_groups_list returns 1 on success, 0 on failure. Verified the block is live (reachable from the QuicheQuicSslContext constructor path via QuicSslContextBuilder.build()) and not dead code, that the branch is not guarded by any other check, and that the JNI wrapper BoringSSL.SSLContext_set1_groups_list (BoringSSL.java lines 88-103, 121) returns the native int unchanged. Considered that this may be pre-existing upstream behaviour rather than an injected change: I could not verify the upstream revision because external lookups are out of scope and the JNI C sources are not in the snapshot, so this is reported as a lead (medium confidence), not a confirmed vulnerability.",
+      "id": "case-186-1",
+      "impact": "Silent failure to enforce an operator-configured TLS key-exchange group policy: a deployment that uses -Djdk.tls.namedGroups to constrain/select groups (e.g. to disable a group disallowed by policy and allow only a specific one) instead gets the built-in default list, so the intended restriction is not applied. In the converse case (a configured group not supported by the linked BoringSSL, e.g. under FIPS) SSL context construction throws IllegalStateException, preventing the server from starting (availability impact). The bug also misreports supported/unsupported groups in logs (lines 118-130).",
+      "locations": [
+        {
+          "end_line": 113,
+          "path": "codec-classes-quic/src/main/java/io/netty/incubator/codec/quic/QuicheQuicSslContext.java",
+          "start_line": 106
+        },
+        {
+          "end_line": 96,
+          "path": "codec-classes-quic/src/main/java/io/netty/incubator/codec/quic/QuicheQuicSslContext.java",
+          "start_line": 88
+        },
+        {
+          "end_line": 241,
+          "path": "codec-classes-quic/src/main/java/io/netty/incubator/codec/quic/QuicheQuicSslContext.java",
+          "start_line": 241
+        },
+        {
+          "end_line": 251,
+          "path": "codec-classes-quic/src/main/java/io/netty/incubator/codec/quic/QuicheQuicSslContext.java",
+          "start_line": 251
+        }
+      ],
+      "prerequisites": "The application must configure the QUIC TLS context (QuicSslContextBuilder.build() -> new QuicheQuicSslContext(...)) and must have 'jdk.tls.namedGroups' set at JVM start so the static initializer takes the branch at line 99-135. The static block runs once per class loader/JVM.",
+      "root_cause": "In the QuicheQuicSslContext static initializer, the return value of BoringSSL.SSLContext_set1_groups_list(sslCtx, converted) is tested with '== 0' and the group is then added to supportedNamedGroups/supportedConvertedNamedGroups (lines 106-113), i.e. 0 is treated as success. In the very same class the identical API is used with the opposite meaning: line 91 removes a default group when the call returns 0 (comment: 'Not supported, let's remove it') and lines 241 / 251 throw IllegalStateException when the call returns 0 ('failed to set curves / groups list'). BoringSSL's SSL_CTX_set1_groups_list returns 1 on success and 0 on failure, so the branch at line 108 is inverted: groups BoringSSL rejects are recorded as 'supported' and groups it accepts are recorded as 'unsupported'.",
+      "title": "Inverted success check for SSL_CTX_set1_groups_list inverts jdk.tls.namedGroups handling, silently ignoring the configured TLS group policy (or failing SSL context creation)",
+      "trace": "SystemPropertyUtil.get(\"jdk.tls.namedGroups\") at line 99 -> for each configured group, GroupsConverter.toBoringSSL() at 107 -> SSLContext_set1_groups_list() at 108 -> with '== 0' the code adds actually-rejected groups to supportedNamedGroups/supportedConvertedNamedGroups and actually-accepted groups to unsupportedNamedGroups (108-113) -> if all configured groups are really supported, supportedNamedGroups is empty and line 116-120 replaces the configuration with the library defaults (X25519, P-256, P-384, P-521), i.e. the operator's restriction is silently dropped; if an actually-unsupported group is configured it is stored in supportedConvertedNamedGroups (131) and later passed to SSLContext_set1_groups_list in the constructor (line 241), where '== 0' now correctly means failure and an IllegalStateException aborts context creation.",
+      "unverified": "The native JNI implementation and the BoringSSL library source are not part of the snapshot; the 1=success/0=failure contract is inferred from the three other call sites in the same file and BoringSSL documentation knowledge, not from the C code. No build/runtime execution was performed. Whether the inverted test is an injected modification or an upstream defect could not be established from the snapshot alone.",
+      "weakness_type": "CWE-697 Incorrect Comparison - wrong return-value check on native API leads to ineffective TLS group configuration (security-relevant configuration bypass) and possible startup failure"
+    }
+  ],
+  "coverage_summary": "Assigned scope: 143 source files (104 Java, 4 POMs, native-image resource configs, GitHub workflows/scripts). The relation index covers 134 files with 9 unindexed and 3 parse errors; no test sources and no native C/C++ sources are present in the snapshot. I read all primary network-facing and security-relevant Java sources in full: QuicHeaderParser, QuicheQuicCodec/Client/Server, QuicheQuicChannel, QuicheQuicStreamChannel (+config), QuicCodecDispatcher, QuicheQuicConnection, Quiche (JNI wrapper declarations and helpers), SockaddrIn, QuicheRecvInfo, QuicheSendInfo, QuicheQuicTransportParameters, InsecureQuicTokenHandler, NoQuicTokenHandler, Hmac/HmacSign*/SecureRandomQuicConnectionIdGenerator, QuicConnectionAddress, BoringSSL, BoringSSLCertificateCallback, BoringSSLCertificateVerifyCallback, BoringSSL{HandshakeComplete,Session,SessionTicket,TlsextServername,Keylog}Callback, BoringSSLKeylessManagerFactory and private-key task classes, QuicheQuicSslContext, QuicheQuicSslEngine, QuicSslContextBuilder, QuicClientSessionCache, SslSessionTicketKey, QuicCodecBuilder/QuicServer/Client builds, QuicChannelBootstrap/QuicStreamChannelBootstrap, EpollQuicUtils, QuicheConfig, Quic (constants), and the CI workflows/scripts. Remaining unread areas are interface/constant/value classes (e.g. QuicChannelConfig, QuicChannelOption, QuicTransportError, QuicheError, QuicheLogger, QuicPacketType, QuicSslContext/QuicSslEngine interfaces, BoringSSL*NativeStaticallyReferencedJniMethods, event classes) and the large native build POM, which I inspected only selectively; these contain little security logic. The native JNI C implementation and the quiche/BoringSSL libraries are absent, so native-side argument handling could not be verified.",
+  "limitations": [
+    "No code execution, build, tests or scanners were run (per assignment), so the finding is not runtime-confirmed.",
+    "The JNI C/C++ implementation and BoringSSL/quiche sources are not in the snapshot; native return-value contracts and buffer handling are inferred from Java call sites and library knowledge only.",
+    "The source-relation index is syntactic/navigational only (no control- or data-flow, no semantic resolution); call/containment edges were verified against source text, but 'no caller found' conclusions rely on text search plus the index.",
+    "9 of 143 files are not covered by the index and 3 files had parse errors; interface/constant classes and most of the 60 KB native build POM were reviewed only selectively.",
+    "No upstream revision, patch, CVE or fix history was consulted (out of scope); I therefore cannot prove the submitted comparison inversion is a snapshot modification rather than a pre-existing upstream bug.",
+    "The candidate's impact depends on the (trusted) -Djdk.tls.namedGroups system property being configured and is not remotely triggerable, so severity is limited compared with a memory-safety or authentication bypass."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "QuicheSendInfo.getAtNanos (lines 152-158) reads the tv_nsec value from TIMESPEC_OFFSETOF_TV_SEC instead of TIMESPEC_OFFSETOF_TV_NSEC, so the nanoseconds part of quiche_send_info.at is computed from the seconds field.",
+      "reason": "Verified via text search and the call-relation index that getAtNanos has no callers anywhere in the snapshot (dead code), so there is no reachable security impact in this revision. It remains an unconfirmed logic anomaly, not a vulnerability candidate."
+    },
+    {
+      "lead": "QuicCodecDispatcher.channelRead (lines 118-134): getDestinationConnectionId()/sliceCid() can throw QuicException for short-header datagrams that are shorter than 1 + localConnectionIdLength (>= 10) bytes; the exception escapes channelRead before ctx.fireChannelRead and the DatagramPacket is never released, potentially leaking one direct buffer per malformed UDP datagram (remote DoS) for users of QuicCodecDispatcher with SO_REUSEPORT.",
+      "reason": "The code structure matches the upstream opt-in dispatcher design (QuicException declared), the leak only affects deployments that explicitly use QuicCodecDispatcher, and I could not show the Netty pipeline fails to release the message in all cases. Insufficient source evidence for a stronger finding than the submitted candidate."
+    },
+    {
+      "lead": "QuicheQuicChannel.recvDatagram (lines 1858-1907): after quiche_conn_dgram_recv returns an unexpected negative error that is not QUICHE_ERR_DONE, datagramBuffer is released and the method continues to call recvHandle.lastBytesRead(written), writerIndex(writtenIndex + written) and fireChannelRead on the released buffer.",
+      "reason": "Any resulting IllegalReferenceCountException/IndexOutOfBoundsException is caught by the caller (handleQuicPacket's catch in QuicheQuicCodec), the error path is hard to reach (requires an unexpected native error) and the pattern appears present in the upstream implementation; no clear memory-safety or auth impact demonstrable from source alone."
+    },
+    {
+      "lead": "InsecureQuicTokenHandler (lines 48-78) is a non-cryptographic token handler; its token binds only the server name and client address prefix, not the destination connection ID, and it is offered as a public singleton.",
+      "reason": "The class and its use are explicitly documented as insecure and unsuitable for production (class-level warning); the design is intentional, so it is not treated as a vulnerability in this review."
+    },
+    {
+      "lead": "QuicheQuicChannel.attachQuicheConnection (lines 303-324) builds a qlog file name from the peer-controlled connection trace id (Quiche.quiche_conn_trace_id) concatenated into configuration.path(), which could permit path manipulation if the trace id contains separators.",
+      "reason": "Requires the application to explicitly enable qlog via QuicChannelOption.QLOG before registration; it is a debugging feature, and the pattern appears to be upstream behaviour. No attacker-controlled flow without that opt-in configuration."
+    },
+    {
+      "lead": "QuicheQuicStreamChannel.writeWithoutCheckChannelState (lines 791-797) continues after catching UnsupportedOperationException from filterMsg without returning, so an unsupported message type is used again in write0 with a possibly released reference.",
+      "reason": "The subsequent failure is caught by the local catch(Exception) and turned into a promise failure; release() of a non-refcounted message is a no-op, so no use-after-free is demonstrable. Likely a pre-existing quirk rather than a security issue."
+    },
+    {
+      "lead": "GitHub Actions workflows/scripts (ci-release.yml, ci-deploy.yml, release_*.sh, check_*.sh) as a potential supply-chain/script-injection surface.",
+      "reason": "Checked the workflows and scripts: no untrusted event fields (PR titles/branches) are interpolated into run: blocks; release workflows are workflow_dispatch-only and scripts quote their arguments. No source-based evidence of injection."
+    }
+  ],
+  "summary": "Reviewed the assigned snapshot (netty-incubator-codec-quic at 0.0.71.Final-SNAPSHOT / netty 4.1.118.Final, 143 files: 104 Java sources plus POMs, native-image resource configs and GitHub workflows). Coverage focused on attacker-reachable parsing/token/CID code (QuicHeaderParser, QuicheQuicServerCodec, QuicCodecDispatcher, InsecureQuicTokenHandler, Hmac*), TLS paths (QuicheQuicSslContext/Engine, BoringSSLCertificate{Certificate,Verify}Callback, session-ticket/session callbacks), native-memory marshalling (Quiche.java, SockaddrIn, QuicheRecvInfo/SendInfo/Connection), and channel/stream lifecycles (QuicheQuicChannel, QuicheQuicStreamChannel, codecs, builders). Most of the code is consistent with the known Netty QUIC design and I found no remote memory-corruption or TLS-verification bypass with direct source evidence. The one clear internal contradiction is in the QuicheQuicSslContext static initializer, where the return value of BoringSSL.SSLContext_set1_groups_list is interpreted in opposite ways in the same class, inverting the supported/unsupported named-group sets used to honour the operator's -Djdk.tls.namedGroups TLS group policy. I submit that as a lead; several other suspicious but weaker/possibly-upstream items are listed as rejected leads."
+}

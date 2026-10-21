@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Full content of the XML document handed to `XStream.fromXML(...)`/`unmarshal(...)`: element names/aliases, `class` and `resolves-to` attributes, nested objects, collection entries and serialized-data emulation nodes. The application only has to expose an endpoint that deserializes untrusted XML through a default-configured XStream instance.",
+      "confidence": "medium",
+      "counterevidence_checked": "The denials that do exist are enforced correctly: `NoPermission.allows` throws `ForbiddenClassException` rather than returning false (security/NoPermission.java:33-38), so the EventHandler block is effective and the classic DynamicProxy+EventHandler+ProcessBuilder chain is blocked; `CachingMapper` caches denials by name and cannot re-allow a denied name; XXE is separately mitigated (`disallow-doctype-decl` in DomDriver/Dom4JDriver/JDom*; `IS_SUPPORTING_EXTERNAL_ENTITIES=false` in Stax/Sjsxp/Wstx); CVE-2017-7957 void-type DoS is mitigated in BeanProvider/PureJavaReflectionProvider/SunLimitedUnsafeReflectionProvider; `SecurityMapper` is inside the mapper chain used by converters, and `resolves-to`/`class`/interface/`readResolve` names all pass through `mapper.realClass`. The residual issue is breadth of the denylist, not a broken check. The XStream docs themselves state a blacklist gives a 'false sense of security' and that the whitelist helper is opt-in, which supports (rather than refutes) the finding.",
+      "id": "xstream-default-denylist-rce",
+      "impact": "Remote code execution / arbitrary command execution in the JVM processing the XML, with the application's privileges; additionally server-side request forgery, local file deletion and denial of service through the same arbitrary-instantiation primitive. This is the vulnerability class of CVE-2020-26217 (fixed in XStream 1.4.14).",
+      "locations": [
+        {
+          "end_line": 649,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 639
+        },
+        {
+          "end_line": 78,
+          "path": "xstream/src/java/com/thoughtworks/xstream/mapper/SecurityMapper.java",
+          "start_line": 70
+        },
+        {
+          "end_line": 128,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/extended/DynamicProxyConverter.java",
+          "start_line": 94
+        },
+        {
+          "end_line": 102,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/reflection/PureJavaReflectionProvider.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 582,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/reflection/AbstractReflectionConverter.java",
+          "start_line": 569
+        },
+        {
+          "end_line": 132,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/collections/TreeMapConverter.java",
+          "start_line": 103
+        },
+        {
+          "end_line": 95,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/collections/TreeSetConverter.java",
+          "start_line": 56
+        }
+      ],
+      "prerequisites": "Application (a) builds XStream without an explicit whitelist (`new XStream()` or a variant that leaves `setupSecurity()`'s defaults in place) and (b) unmarshals XML from an untrusted source. If the application calls `XStream.setupDefaultSecurity()` or establishes its own `allowTypes*` whitelist, the permissive ANY permission is cleared and the attack surface shrinks. A usable gadget/trigger class must be present on the classpath (the JDK itself provides many candidates when ANY is granted).",
+      "root_cause": "`XStream.setupSecurity()` (XStream.java:639-649) initializes the default security framework with `AnyTypePermission.ANY` and only three denials: `java.beans.EventHandler`, `.*\\$LazyIterator`, `javax.crypto..*`. `SecurityMapper.realClass()` (mapper/SecurityMapper.java:70-78) is the single authorization gate for every type resolved from the stream, so any other class on the classpath is accepted. The engine then instantiates the attacker-named class through `AbstractReflectionConverter.instantiateNewInstance` (AbstractReflectionConverter.java:569-582) and `PureJavaReflectionProvider.newInstance` (65-102, which force-accesses and invokes no-arg constructors), can build `java.lang.reflect.Proxy` instances from attacker-supplied interface lists and handler classes (DynamicProxyConverter.java:94-128), invokes attacker-controlled comparator/key methods while populating sorted collections (TreeMapConverter.java:103-132, TreeSetConverter.java:56-95) and emulates Java serialization by invoking readObject/readResolve on attacker-selected Serializable classes (SerializableConverter.java:312 ff.). A name denylist covering only EventHandler/lazy iterators/javax.crypto cannot cover the gadget space (e.g., `java.lang.ProcessBuilder` and its inner classes, other JDK InvocationHandler/trigger classes are not denied), which is exactly the insufficient-denylist problem fixed in 1.4.14.",
+      "title": "Default XStream security setup allows arbitrary class instantiation from untrusted XML (incomplete default denylist -> RCE; CVE-2020-26217 class of issue)",
+      "trace": "fromXML -> TreeUnmarshaller.start (TreeUnmarshaller.java:131-140) -> HierarchicalStreams.readClassType -> CachingMapper/AnnotationMapper -> SecurityMapper.realClass: only the three default denials throw `ForbiddenClassException`; all other classes pass because ANY is in the permission list (XStream.java:644). The selected converter then materializes the attacker-chosen type: AbstractReflectionConverter.instantiateNewInstance -> reflectionProvider.newInstance (arbitrary no-arg constructor invocation), DynamicProxyConverter creates a Proxy with attacker-chosen interfaces/handler, TreeMap/TreeSet/Collection converters invoke comparator or key `hashCode`/`compareTo` while inserting entries, and SerializableConverter/ExternalizableConverter invoke readObject/readResolve/readExternal. Any of these trigger primitives reaching a gadget class whose effect is `java.lang.ProcessBuilder.start()` (ProcessBuilder is not on the deny list) yields command execution; simpler gadgets yield SSRF, file deletion or DoS.",
+      "unverified": "The exact end-to-end gadget chain and required classpath classes were not established (no execution/scanner run, no tests in the snapshot); I could not read the 1.4.14 fix commit or its regression-test payload, so the precise deny-list entries the maintainers considered missing are unconfirmed. Runtime exploitability therefore remains a lead, not a confirmed result.",
+      "weakness_type": "Insecure deserialization / incomplete denylist (CWE-502, CWE-184)"
+    }
+  ],
+  "coverage_summary": "484 model-visible files (416 Java; remainder POMs/HTML/XML docs). The snapshot contains no unit-test sources, so only main code and distribution/benchmark modules were reviewable. I read the full security framework (SecurityMapper, all TypePermission classes, NoPermission), the mapper chain construction and CachingMapper, the core unmarshalling path (TreeUnmarshaller, AbstractReflectionConverter, SerializableConverter, ExternalizableConverter, DynamicProxyConverter, TreeMap/TreeSet/Collection converters, PureJavaReflectionProvider), XML drivers' XXE hardening, the persistence module, XStreamer and the XStream facade, plus the project security/CVE documentation. P1 index: 416 parsed Java files, 4 omitted files, 1 parse error, syntax-only relations with no control-flow/data-flow; every indexed lead I used was re-verified against source text. Not exhaustively line-reviewed: xstream-jmh/xstream-benchmark modules, most io/xml driver internals, several extended/basic converters, and the xstream-hibernate module (spot-checked only).",
+  "limitations": [
+    "No tests are present in the snapshot, so the upstream security regression test/payload for the 1.4.14 fix could not be inspected.",
+    "No code was executed and no exploit was attempted; all conclusions are static source reading, so the finding is a lead rather than a runtime-confirmed vulnerability.",
+    "The P1 relation index is syntactic only (no control-flow, data-flow, semantic resolution, runtime reachability, or DI/security enforcement), and it reported 4 omitted files and 1 parse error; findings were verified manually in source instead.",
+    "I could not consult the fixed version or CVE patch (external access prohibited), so the exact missing deny-list entries in 1.4.14 are inferred from version/context and source state, not verified.",
+    "Coverage is strongest in the security and unmarshalling paths; other modules (jmh/benchmark, hibernate, some converters/drivers) were only spot-checked."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE in remaining drivers (BEAStaxDriver/XomDriver)",
+      "reason": "The repository FAQ still lists these two drivers as vulnerable because their parser cannot disable parameter entities, but the main drivers explicitly disable DOCTYPE/external entities and using those drivers is an explicit application choice; this is a documented limitation rather than the snapshot's next-fix security defect."
+    },
+    {
+      "lead": "XStreamer.fromXML deserializes an embedded XStream instance via Java serialization",
+      "reason": "It applies `XStream.setupDefaultSecurity` to the outer stream and the embedded-configuration behavior is the documented purpose of the API; exploitation requires the application to route untrusted XML into this specialized helper, and the type whitelist for the outer stream exists. No concrete bypass was traced in source."
+    },
+    {
+      "lead": "Path traversal/file handling in AbstractFilePersistenceStrategy",
+      "reason": "Filenames are built by escaping the key's type/value with '/' '\\' and '%' in the illegal-character set, so no traversal was demonstrated; `unescape` assumes well-formed `%XX` input but only sees names produced by `escape`."
+    },
+    {
+      "lead": "createObjectInputStream/CustomObjectInputStream resolveClass performs raw Class.forName",
+      "reason": "This is the documented Java-serialization integration API; the library warns it is unsafe for untrusted data. The XStream XML path itself passes object types through SecurityMapper, so this alone is not the snapshot's strongest defect."
+    },
+    {
+      "lead": "Doors/DoS via `void` type (CVE-2017-7957)",
+      "reason": "Already mitigated in this snapshot through explicit void/Void rejection in BeanProvider, PureJavaReflectionProvider and SunLimitedUnsafeReflectionProvider, and PrimitiveTypePermission."
+    }
+  ],
+  "summary": "XStream 1.4.14-SNAPSHOT (post-1.4.13) with the default security framework. The strongest issue is the insecure-by-default type denylist used during XML unmarshalling: a plain `new XStream()` grants `AnyTypePermission.ANY` and denies only `java.beans.EventHandler`, `.*\\$LazyIterator` and `javax.crypto.*`, while the unmarshalling engine reflectively instantiates arbitrary classes, builds attacker-specified dynamic proxies, invokes comparator/hashCode methods while populating collections, and emulates readObject/readResolve for Serializable types. This is the blacklist-bypass class of issue addressed by XStream 1.4.14 (CVE-2020-26217) and, per the project's own docs, provides only a \"false sense of security\"; the only robust mitigation (`XStream.setupDefaultSecurity(xstream)` whitelist) is opt-in. I found no stronger, better-evidenced issue."
+}

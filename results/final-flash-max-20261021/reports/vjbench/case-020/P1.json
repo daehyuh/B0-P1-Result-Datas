@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remote attacker controls the JSON request body consumed by ObjectMapper.readValue/readTree when the application registers JavaTimeModule/JSR310Module and binds a java.time type (Instant, OffsetDateTime, ZonedDateTime, Duration, or a bean property of those types). Both a bare numeric token (VALUE_NUMBER_FLOAT path, e.g. 1e1000000000) and a quoted numeric string with a single dot (InstantDeserializer line 193-194 -> new BigDecimal(string)) reach the unvalidated conversion.",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) The string path filters characters via _countPeriods and catches NumberFormatException, but the ID_NUMBER_FLOAT token path does no validation at all, so the guard does not cover the numeric form. (2) Databind commonly wraps RuntimeException thrown while setting bean properties, but Error/OOM and root-value deserialization are not wrapped, and wrapping would not prevent resource exhaustion. (3) Instant/Duration range checks (ofEpochSecond/ofSeconds) can throw before conversion in some cases, but in _fromDecimal the BigDecimal longValue()/intValue() conversions occur before/independently of those checks, and in extractNanosecondDecimal the conversion is unconditional. (4) I verified there is no max-exponent/scale check anywhere in the module text; jackson-core 2.9 has no number-length/scale constraint of this kind. (5) I could not execute code to confirm exact JDK 8 BigDecimal internals or jackson-core getDecimalValue text-exactness; both are asserted from source reasoning/memory and are flagged as unverified.",
+      "id": "jsr310-bigdecimal-unbounded-conversion-dos",
+      "impact": "Denial of service: a very short numeric payload can trigger enormous memory allocation and CPU work inside request handling, exhausting heap/GC and degrading or crashing the JVM. Secondary robustness impact: malformed/out-of-range numerics can raise RuntimeException types (DateTimeException/ArithmeticException) that are not converted to JsonMappingException at least for root-level values.",
+      "locations": [
+        {
+          "end_line": 174,
+          "path": "datetime/src/main/java/com/fasterxml/jackson/datatype/jsr310/deser/InstantDeserializer.java",
+          "start_line": 168
+        },
+        {
+          "end_line": 286,
+          "path": "datetime/src/main/java/com/fasterxml/jackson/datatype/jsr310/deser/InstantDeserializer.java",
+          "start_line": 280
+        },
+        {
+          "end_line": 102,
+          "path": "datetime/src/main/java/com/fasterxml/jackson/datatype/jsr310/DecimalUtils.java",
+          "start_line": 96
+        },
+        {
+          "end_line": 57,
+          "path": "datetime/src/main/java/com/fasterxml/jackson/datatype/jsr310/deser/DurationDeserializer.java",
+          "start_line": 53
+        },
+        {
+          "end_line": 194,
+          "path": "datetime/src/main/java/com/fasterxml/jackson/datatype/jsr310/deser/InstantDeserializer.java",
+          "start_line": 193
+        }
+      ],
+      "prerequisites": "Module registered and a JSR-310 type targeted; default/typical Jackson 2.9 configuration (numeric timestamps path is always enabled for Instant/OffsetDateTime/ZonedDateTime/Duration); attacker can send JSON. Compounding factor: out-of-range numeric values also reach uncaught Instant.ofEpochSecond/ofEpochMilli/OffsetDateTime.ofInstant/Duration.ofSeconds which can throw DateTimeException/ArithmeticException outside the module's try/catch for the numeric-token branches.",
+      "root_cause": "Decimal timestamp handling converts an attacker-supplied BigDecimal to primitive long/int without validating its scale or precision. InstantDeserializer._fromDecimal (line 282) and DurationDeserializer (line 55) call value.longValue(), and DecimalUtils.extractNanosecondDecimal (line 101) calls .multiply(ONE_BILLION).intValue(). In the Java 8 baseline targeted by this repo, BigDecimal.longValue()/intValue() are implemented via toBigInteger() -> setScale(0, ROUND_DOWN), which must materialize 10^|scale|; a JSON number with an extreme negative scale (e.g. 1e1000000000) is parsed into a BigDecimal cheaply (unscaled value 1, scale -1000000000) but then forces a gigantic BigInteger allocation, i.e. OOM/CPU exhaustion. No code in the module bounds the exponent or scale before conversion.",
+      "title": "Unvalidated BigDecimal scale/precision in JSR-310 decimal deserializers permits resource-exhaustion DoS",
+      "trace": "InstantDeserializer.deserialize switch on token id (line 168) -> case ID_NUMBER_FLOAT returns _fromDecimal(context, parser.getDecimalValue()) (lines 170-171) -> _fromDecimal line 282 value.longValue() -> JDK8 BigDecimal.toBigInteger()/setScale(0, ROUND_DOWN) expands scale -1e9 into a ~10^9-digit BigInteger (hundreds of MB) -> OutOfMemoryError/GC thrash. Then DecimalUtils.extractNanosecondDecimal line 101 .multiply(ONE_BILLION).intValue() repeats the same primitive conversion. DurationDeserializer lines 54-56 follows the identical pattern (getDecimalValue -> longValue -> extractNanosecondDecimal -> Duration.ofSeconds). The string fast-path (_countPeriods, lines 187-199) deliberately rejects 'e'/'E' (returns -1) but the numeric-token path has no equivalent restriction, and quoted plain decimals with one period still reach new BigDecimal(string) at line 194.",
+      "unverified": "Runtime exploitability was not confirmed: (a) JDK 8/9+ BigDecimal.longValue()/intValue()/toBigInteger() allocation behavior could not be executed; (b) jackson-core's getDecimalValue() preserving an extreme negative scale from a float token was not run; (c) whether a wrapping framework surfaces this as an availability incident is environment-dependent. No tests exist in the snapshot and the relation index has no data-flow/control-flow analysis, so propagation was verified by source reading only.",
+      "weakness_type": "CWE-400 / CWE-20: Uncontrolled Resource Consumption via unchecked BigDecimal to long/int conversion"
+    }
+  ],
+  "coverage_summary": "Assigned tree: 459 repository files; 71 Java main sources (21 datatypes/jdk8, 47 datetime/jsr310, 3 parameter-names) read in full or in the relevant method bodies, plus parent/module poms, .travis.yml, READMEs, and targeted inspection of the bundled Javadoc (docs/javadoc/... 2.9 and 2.9.pr1). No test sources exist in the snapshot (search for **/src/test/**/*.java returned 0). The P1 relation index covers 458 files/71 Java files with 514 symbols, 1040 call records, 644 edges, only 4 facts (all config_file), 932 unresolved calls, no control-flow/data-flow/semantic resolution, and its own scope reports 'partial'; it exposed no vulnerability-relevant edges, so all conclusions are based on source text. Binary-like files would be skipped, but none were relevant.",
+  "limitations": [
+    "No code was executed and no tests/parsers were run, so exploitability of the BigDecimal/DoS path is not runtime-confirmed; JDK BigDecimal and jackson-core behavior are argued from source/memory only.",
+    "The date of the snapshot (2.9.8-SNAPSHOT) and the bundled 2.9 Javadoc differ (docs are older), so the docs could not be used as a fixed-version reference to diff candidate faults.",
+    "The P1 relation index provides only syntactic candidates with no data flow or reachability; 932 calls are unresolved (including the JDK BigDecimal calls central to the candidate), so propagation past the module boundary could not be index-verified.",
+    "No dependency sources (jackson-core/jackson-databind 2.9.x) are included in the snapshot, so parser behavior feeding getDecimalValue() and framework-level exception wrapping were assessed from memory, not from repository code.",
+    "Only one dir tree was in scope; no sibling modules, CVE databases, patches, or external data were consulted."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ParameterNamesAnnotationIntrospector.findParameterName (lines 39-50) dereferences params[annotatedParameter.getIndex()] with no null/bounds check after catching MalformedParametersException.",
+      "reason": "getParameters(owner) returns null only if the owner is neither AnnotatedConstructor nor AnnotatedMethod, which cannot occur for real AnnotatedParameter instances, and the index is into the same executable's parameter array; no realistic attacker-controlled path found, so impact is speculative."
+    },
+    {
+      "lead": "OffsetTimeDeserializer line 119 calls ZoneOffset.of(parser.getText()) inside the array branch with no try/catch, so a malformed offset string raises an unhandled DateTimeParseException.",
+      "reason": "Real robustness gap, but it is a single invalid-input 500/exception path rather than memory/CPU exhaustion; databind wraps runtime exceptions at property level and the array form is non-default, so security impact is weak."
+    },
+    {
+      "lead": "Array-branch constructors LocalDate.of / LocalTime.of / LocalDateTime.of / Year.of / YearMonth.of / OffsetTime.of perform no catch of DateTimeException for out-of-range numeric input.",
+      "reason": "Same class of unchecked-exception robustness issue; appears consistent with upstream behavior and does not by itself enable resource exhaustion or data compromise."
+    },
+    {
+      "lead": "Jsr310NullKeySerializer.NULL_KEY is the empty string, so a legitimate empty-string map key deserializes as null and null keys serialize as an empty key (collision/ambiguity).",
+      "reason": "Bundled 2.9 Javadoc constant-values.html documents NULL_KEY = \"\" as released behavior; impact is data-integrity/robustness at most, no demonstrated attacker-controlled security impact."
+    },
+    {
+      "lead": "StreamSerializer/IntStreamSerializer/etc. iterate the entire stream with forEachOrdered, so a huge or infinite stream can exhaust serialization resources.",
+      "reason": "Serialization-side resource use with weak attacker control over the in-memory Stream object; no source evidence that remote input can create an unbounded stream in this snapshot."
+    },
+    {
+      "lead": "JavaTimeModule._findFactory inner loop uses continue instead of breaking/returning when a parameter type mismatches.",
+      "reason": "Logic quirk only; with the single (String) argument used here, only the correct of(String) factory can match the parameter-count filter, so no security-relevant misconfiguration results."
+    }
+  ],
+  "summary": "Snapshot is jackson-modules-java8 2.9.8-SNAPSHOT (parameter-names, datatypes/jdk8, datetime/jsr310). I read all 71 main Java sources plus poms/READMEs and spot-checked the bundled Javadoc. The code is largely upstream-shaped; I found no injected command/reflection/path sink. The strongest source-evidenced security issue is in the JSR-310 decimal-timestamp conversion path: attacker-controlled JSON numbers are converted with BigDecimal.longValue()/intValue() without any bound on scale/precision, allowing uncontrolled resource consumption (OOM/CPU) when parsing a short numeric payload such as a huge-exponent decimal into Instant/OffsetDateTime/ZonedDateTime/Duration. Rejected weaker leads are listed below."
+}

@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The objectName path segment of GET/DELETE /api/buckets/{bucketName}/objects/{objectName} (and the objectName used by FileTransferApi.createTransfer). RouteContext.getRouteParam URL-decodes the segment (RouteContext.java:146-156), so encoded slashes (%2F) and dots (%2E) reach the API as '../../<file>' or '/absolute/path'; the BucketsApi comment on deleteObject ('will not parse ending / unless URI encoded') confirms encoded path characters are decoded and used.",
+      "confidence": "medium",
+      "counterevidence_checked": "putObject (145-149) has a traversal guard, showing intent to block escapes on writes, but that guard is absent from the read/delete/find paths and is itself only a prefix check (canonicalPath.startsWith(root) without a separator boundary). uploadObject calls verifyObjectName, but getObject/deleteObject do not, and the regex permits '.' and '/', so it is not a traversal control. RdbBucket (RocksDB storage) is key/value based and unaffected; the issue is specific to FileSystemBucket, which is only selected when the bucket is filesystem-backed (confirmed in FileSystemBucketDatabase.getBucket and the example yamcs.yaml bucket path configurations). I found no later sanitization/normalization in the call chain, and no privilege check that compensates for the missing path containment.",
+      "id": "case-061-cand-1",
+      "impact": "A user with read access to any filesystem-backed bucket (e.g. the bucket backing displays, which UI users normally can read) can read arbitrary files readable by the Yamcs process - /etc/passwd, etc/yamcs.yaml and security configuration, application.properties, truststore/keystore files, other instance data - and can trigger arbitrary file deletion with manage rights (Files.delete on a single file or empty directory). Because Path.resolve with an absolute argument discards the root entirely, plain absolute paths also work, not only '..' sequences.",
+      "locations": [
+        {
+          "end_line": 218,
+          "path": "yamcs-core/src/main/java/org/yamcs/yarch/FileSystemBucket.java",
+          "start_line": 193
+        },
+        {
+          "end_line": 162,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/api/BucketsApi.java",
+          "start_line": 138
+        },
+        {
+          "end_line": 265,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/api/BucketsApi.java",
+          "start_line": 246
+        },
+        {
+          "end_line": 334,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/api/BucketsApi.java",
+          "start_line": 327
+        },
+        {
+          "end_line": 520,
+          "path": "yamcs-core/src/main/java/org/yamcs/yarch/YarchDatabaseInstance.java",
+          "start_line": 513
+        }
+      ],
+      "prerequisites": "The target bucket must be filesystem-backed: created via the 'buckets: - name/path' configuration (examples/cfdp, examples/simulation map 'displays', 'stacks', 'cfdpUp' to disk), or auto-discovered from directories under <dataDir>/<instance>/fsbuckets (FileSystemBucketDatabase.getBucket/listBuckets). The caller needs read or manage rights on that bucket (ReadBucket/ManageBucket on e.g. 'displays', or ManageAnyBucket; in the default security-disabled install the guest user is superuser; FileTransferApi.createTransfer additionally needs ControlFileTransfers). RocksDB-backed buckets (the default for yamcs createBucket) are not affected.",
+      "root_cause": "Object names coming from HTTP requests are resolved directly into filesystem paths without containment validation. FileSystemBucket.putObject guards writes with a canonical-path prefix check (FileSystemBucket.java:145-149), but getObject (193-201), deleteObject (203-207) and findObject (209-218) do root.resolve(objectName) and then Files.readAllBytes / Files.delete / Files.readAttributes, so an object name containing '..' segments (or, because Path.resolve returns an absolute argument unchanged, an absolute path) escapes the bucket root. BucketsApi.getObject (138-162) and deleteObject (246-265) also never call the only name validator present (verifyObjectName, 327-334); only uploadObject does (181). Even verifyObjectName would not stop traversal, since OBJ_NAME_REGEXP (line 52) explicitly allows '.' and '/'.",
+      "title": "Path traversal via unvalidated bucket object names in filesystem-backed storage (FileSystemBucket / BucketsApi)",
+      "trace": "HTTP request -> HttpRequestHandler.route to ApiHandler -> BucketsApi.getObject:141 checkReadBucketPrivilege -> verifyAndGetBucket:144 -> YarchDatabaseInstance.getBucket:513 -> FileSystemBucketDatabase.getBucket:87 (root.resolve(bucketName), isDirectory) -> FileSystemBucket.findObject:211 root.resolve(objName) -> Files.exists/readAttributes -> FileSystemBucket.getObject:195-197 Files.readAllBytes(path). Same for deleteObject -> BucketsApi.deleteObject:255-259 -> FileSystemBucket.deleteObject:205-206 Files.delete(path). A second reachable sink is FileTransferApi.createTransfer (upload direction) -> CfdpService.startUpload:846 bucket.getObject(objectName), which reads the traversed file and pushes its contents over a configured CFDP entity (data exfiltration), with only checkReadBucketPrivilege on the bucket name.",
+      "unverified": "Not runtime-confirmed. Exploitability depends on a deployment having a filesystem-backed bucket reachable with the attacker's privileges; I could not run the server or confirm that the generated route for objectName accepts encoded slashes in every API version (the in-code TODO comment strongly implies it does). The exact upstream fix location (BucketsApi vs FileSystemBucket) is inferred, not observed.",
+      "weakness_type": "CWE-22: Path Traversal (arbitrary file read and deletion)"
+    }
+  ],
+  "coverage_summary": "Coverage was broad but not exhaustive. I searched the whole visible snapshot (2,394 files; no files excluded by the tool scope) for command execution, deserialization, XML/XXE parsing, SQL construction/execution, path/File/Path usage, template rendering, auth checks, privilege checks, and XSS sinks, then read the relevant parts of the HTTP stack (HttpRequestHandler, RouteHandler, RouteContext, ApiHandler, HttpServer, StaticFileHandler, AuthHandler, JwtHelper/TokenStore), the buckets/file-transfer stack (BucketsApi, FileSystemBucket/Database, RdbBucket/Database, FileTransferApi, FileSaveHandler, CfdpService), security code (SecurityStore, DirectoryAuthModule, YamlAuthModule, OpenIDAuthModule, PBKDF2PasswordHasher, SessionManager), IamApi/MdbApi/MdbOverrideApi/RocksDbApi/TableApi/InstancesApi, and the yamcs-web handlers/components (WebPlugin, WebFileDeployer, AngularHandler, Markdown, TimelineTooltip, AuthService). yamcs-xtce, simulator, packet-viewer, examples and large parts of yamcs-web component code were only spot-checked, not read end to end; no tests/CI runtime evidence was available in the snapshot.",
+  "limitations": [
+    "Read-only static review; no server was run, so all exploitability statements are source-derived and unconfirmed.",
+    "The snapshot contains no test sources and only minimal docs, so intended behavior/regression tests could not be used to confirm or refute the candidate.",
+    "Generated protobuf route definitions are absent, so the exact route pattern for the objectName path parameter (single segment vs. catch-all) had to be inferred from client code and the in-file TODO comment.",
+    "Deployment-dependent preconditions (filesystem-backed bucket configured, effective bucket privileges) cannot be observed from source alone.",
+    "Several other plausible-but-weaker issues were rejected (see rejected leads); if the intended defect is one of those, this review would not cover it."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "StaticFileHandler / AngularHandler absolute-path traversal: sanitizePath (StaticFileHandler.java:275-283) rejects '.'-segment forms but not absolute paths, and locateFile (99-107) uses staticRoot.resolve(path), which returns an absolute argument unchanged; a request target such as '/static//etc/passwd' or '//etc/passwd' (handled by the '*' Angular handler registered in WebPlugin.java:150) yields '/etc/passwd' after the prefix chop (getFilePath, 92-97) and would be served unauthenticated (requireAuth() false, 72-74). Source evidence is strong, but exploitability depends on double-slash request targets surviving to the handler and on yamcs-web being deployed; not selected because the bucket traversal has clearer data-flow evidence and a directly analogous guarded sibling method.",
+      "reason": "Strong but unconfirmed; selection preferred for the explicitly missing validation on object names."
+    },
+    {
+      "lead": "Reflected XSS on the login page: authorize.html lines 48-52 render {{ request.client_id }}, {{ request.redirect_uri }} and {{ request.state }} from query/form parameters, while VarStatement.render (VarStatement.java:13-20) appends values with no HTML escaping and HandlerContext.render (HandlerContext.java:288-297) responds with text/html; /auth/authorize is unauthenticated (AuthHandler.requireAuth false).",
+      "reason": "Plausible CWE-79, but the sink is a template resource plus a generic, deliberately non-escaping template engine, making the intended fix location and attacker impact less certain than the path traversal."
+    },
+    {
+      "lead": "Unvalidated OAuth redirect_uri plus reusable authorization codes: AuthHandler.redirectWithCode (191-205) redirects to any request-supplied redirect_uri with the code, and handleTokenRequestWithAuthorizationCode (262-302) never invalidates codes (CODE_CACHE.getIfPresent) and does not authenticate the client, which could allow account takeover via an attacker-chosen redirect target.",
+      "reason": "Real design weakness (open redirect / code interception) but code is short-lived (60s) and the impact chain depends on user interaction; lower confidence that it is the reviewed defect."
+    },
+    {
+      "lead": "Java deserialization of server-provided data in packet-viewer (PacketViewer.java:657 ObjectInputStream over getSerializedJavaDump) and of local cache in XtceDbFactory (XtceDbFactory.java:458).",
+      "reason": "The client trusts the server it connects to and the other path is local/admin-controlled, so the trust-boundary shift is weak."
+    },
+    {
+      "lead": "SQL text injected from request into readRows via SqlBuilder.where(request.getQuery()) (TableApi.java:274-279); executeSql allows arbitrary StreamSQL with ControlArchiving (397-443).",
+      "reason": "readRows requires ReadTables and the custom StreamSQL engine offers little beyond filtered reads; executeSql already requires the archiving admin privilege, so impact/attacker model is weak."
+    },
+    {
+      "lead": "Runtime algorithm text override via MdbOverrideApi.updateAlgorithm (MdbOverrideApi.java:144-189) executing server-side scripts.",
+      "reason": "Requires the ChangeMissionDatabase system privilege, which is explicitly the privilege to define executable MDB content, so it is closer to intended capability than a boundary violation."
+    }
+  ],
+  "summary": "Reviewed the assigned Yamcs 5.8.6 snapshot (2,394 visible files; mostly yamcs-core / yamcs-web / yamcs-xtce Java+TypeScript sources; tests and most docs are absent from the snapshot). I traced the main untrusted-input boundaries: the Netty HTTP stack and route transcoding, authentication (JWT/Basic/cookies, OAuth-ish login handler, sessions), the REST APIs for buckets, file transfers, tables and MDB, the CFDP file-transfer path, the filesystem-backed bucket implementation, the static-file handler, and the Angular web UI. The strongest source-supported issue is the path traversal in filesystem-backed buckets: HTTP-supplied object names reach FileSystemBucket.getObject/deleteObject/findObject, which resolve them against the bucket root (and, because Path.resolve honors absolute arguments, against any absolute path) without containment validation, while the analogous write path (putObject) does have such a check. Other plausible but weaker leads are noted as rejected. No code was executed; findings are source-evidence leads only."
+}

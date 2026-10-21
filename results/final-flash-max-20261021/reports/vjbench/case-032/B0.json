@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker supplies the whole XML stream: the element name / `class` attribute selects the concrete type (e.g. `set`/`linked-hash-set` -> HashSet/LinkedHashSet, `map` -> HashMap, `list` -> ArrayList, all allowed by the default whitelist) and the `reference` attribute selects the target ancestor path. Recursive structures are therefore fully attacker-defined; no server-side configuration is required beyond unmarshalling untrusted XML with an out-of-the-box XStream instance.",
+      "confidence": "medium",
+      "counterevidence_checked": "Confirmed the default setupSecurity() explicitly allows Collection, Map and Map.Entry hierarchies (XStream.java lines 638-650), so the required types pass the 1.4.18+ whitelist; confirmed reference handling is enabled by the default ReferenceByXPath marshalling strategy and that AbstractReferenceUnmarshaller does early registration (lines 43-50) rather than resolving only completed objects; confirmed the converters insert directly into hash-based targets and that TreeUnmarshaller has no StackOverflowError/depth guard; considered that XStream supports circular references by design so the mechanism is intentional but unguarded against the attacker-controlled hash traversal; could not run code, so the exact StackOverflowError/CPU outcome is inferred from JDK hashCode semantics, not observed.",
+      "id": "xstream-recursive-collection-map-dos",
+      "impact": "Denial of service: the unmarshalling thread enters unbounded recursion (StackOverflowError, or sustained CPU consumption while hashing deep/cyclic structures). Depending on container/thread-pool behavior this can crash request threads or exhaust CPU on the affected JVM. Safe impact level: availability only; no code execution or data disclosure is demonstrated.",
+      "locations": [
+        {
+          "end_line": 79,
+          "path": "xstream/src/java/com/thoughtworks/xstream/core/AbstractReferenceUnmarshaller.java",
+          "start_line": 42
+        },
+        {
+          "end_line": 108,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/collections/MapConverter.java",
+          "start_line": 103
+        },
+        {
+          "end_line": 100,
+          "path": "xstream/src/java/com/thoughtworks/xstream/converters/collections/CollectionConverter.java",
+          "start_line": 96
+        },
+        {
+          "end_line": 84,
+          "path": "xstream/src/java/com/thoughtworks/xstream/core/TreeUnmarshaller.java",
+          "start_line": 70
+        }
+      ],
+      "prerequisites": "Application calls XStream.fromXML/unmarshal on attacker-influenced data with an XStream instance using the 1.4.18+ default whitelist (Collection/Map/Map.Entry hierarchies allowed) and default reference-enabled marshalling strategy. A user-initialized, minimal whitelist that excludes java.util collection/map types would avoid the default path.",
+      "root_cause": "XStream's reference support registers an object as a reference target before it is fully unmarshalled (AbstractReferenceUnmarshaller.convert lines 43-50), so a descendant element can resolve `reference` to an ancestor collection/map that is still being populated (getReferenceKey/resolution at lines 52-64). The collection/map converters then immediately insert the attacker-controlled object into a real hash-based container: MapConverter.putCurrentEntryIntoMap calls target.put(key, value) (line 107, HashMap/LinkedHashMap/Hashtable hash the key) and CollectionConverter.addCurrentElementToCollection calls target.add(item) (line 99, HashSet/LinkedHashSet hash the element). There is no cycle/recursion guard anywhere in the chain (TreeUnmarshaller.convert lines 70-84 only handles ConversionException/RuntimeException), so a self- or mutually-referential structure causes `AbstractMap.hashCode`/`AbstractCollection.hashCode` to recurse without bound.",
+      "title": "Unbounded recursion/DoS when unmarshalling recursive collections or maps (cycle used as hash key/element)",
+      "trace": "TreeUnmarshaller.start (line 130-133) -> convertAnother -> convert (70-84) -> CollectionConverter/MapConverter.unmarshal -> populateCollection/populateMap -> readCompleteItem/readItem -> TreeUnmarshaller.convertAnother for the child. When the child carries a `reference` attribute, AbstractReferenceUnmarshaller.convert (52-64) resolves it against `values`; the ancestor was registered early at lines 43-50, so the still-incomplete ancestor instance is returned and then inserted with target.put/target.add (MapConverter:107, CollectionConverter:99). Hashing that object traverses its (now cyclic) contents, re-entering the same object's hashCode and never terminating.",
+      "unverified": "The exact PoC shape and the precise fix location expected by the dataset are not observable from this snapshot; the runtime result (StackOverflowError vs. long CPU-bound recursion) was not executed. Whether the upstream fix for this snapshot targets AbstractReferenceUnmarshaller, MapConverter/CollectionConverter, or adds a central guard in TreeUnmarshaller is inferred, not confirmed.",
+      "weakness_type": "Uncontrolled Recursion / Uncontrolled Resource Consumption (CWE-674/CWE-400)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 516 repository-visible files (source filters reported by get_source_scope; parity with P1). Deep-read: security framework (all com.thoughtworks.xstream.security classes, SecurityMapper, XStream.setupSecurity/setupAliases), core unmarshalling (TreeUnmarshaller, AbstractReferenceUnmarshaller, ReferenceByXPathUnmarshaller, TreeMarshaller), collection/map converters (Map, Collection, Tree, Properties, AbstractCollectionConverter, PresortedMap/Set), String/WeakCache, ObjectIdDictionary, and representative IO drivers (DomDriver, Xpp/MXParser drivers). Searched for error/DoS handling, whitelist/deny logic, reflection, forName/getRuntime/ProcessBuilder, MAX_/depth limits and hashCode usage. Test sources are not present in the snapshot, so no test-based corroboration was possible; no code was executed and no external services were contacted.",
+  "limitations": [
+    "Tests and build outputs are absent from the visible tree; the snapshot's exact commit and the corresponding upstream fix diff cannot be verified locally.",
+    "No execution, decompilation or runtime confirmation was performed; the StackOverflowError/CPU outcome and exact cyclic XML shape are derived from source semantics.",
+    "Only ~main Java sources and distribution content were reviewable; third-party parsers (MXParser/Xpp3/StAX/DOM libraries) and the Hibernate/JMH modules were only skimmed.",
+    "The candidate is a lead, not a confirmed vulnerability; the exact fix site among the reference-unmarshaller/converters/marshaller chain remains uncertain."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "StringConverter string cache: every unmarshalled String <= 38 chars is put into a Collections.synchronizedMap(WeakCache) whose WeakHashMap uses the attacker-controlled string as key (StringConverter.java 87-102, WeakCache.java 44-66).",
+      "reason": "A HashDoS with colliding String.hashCode values is plausible, but the cache is a long-standing design and the cache documentation/default strategy shows no evidence this snapshot is pre-fix for it; kept out because the recursive collection/map path matches the post-1.4.18 media and is more directly evidenced."
+    },
+    {
+      "lead": "Generic deep-nesting stack overflow: TreeUnmarshaller.convert recurses per XML depth with no depth limit, and PropertiesConverter.unmarshal recursively calls itself for nested <defaults> elements (PropertiesConverter.java 86-87).",
+      "reason": "Same availability impact but requires deep (non-cyclic) input; treated as a related, unconfirmed lead rather than a second candidate."
+    },
+    {
+      "lead": "Default whitelist breadth / gadget converters (JavaMethodConverter, DynamicProxyConverter, SerializableConverter with CustomObjectInputStream).",
+      "reason": "The 1.4.18 whitelist plus InterfaceTypePermission/ArrayTypePermission is the project's intended security boundary; no whitelist bypass or attacker-reachable code execution was traced from source, so this remains speculative."
+    }
+  ],
+  "summary": "XStream 1.4.19-SNAPSHOT (post-1.4.18, pre-1.4.19) source review. The strongest source-evidenced issue is an unmarshalling-time denial of service: an attacker can craft XML that builds a self/mutually recursive collection or map, and XStream's map/set population then invokes hashCode/equals on that cyclic graph, producing unbounded recursion (StackOverflowError / 100% CPU). The default 1.4.18+ type whitelist does not mitigate it, because java.util.Collection, Map and Map.Entry hierarchies are deliberately allowed and the cycle is created via the standard `reference` attribute handling."
+}

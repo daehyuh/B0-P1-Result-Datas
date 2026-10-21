@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Fully attacker-controlled: the ZIP archive contents. ZipInputStream.getNextEntry() returns entries whose names are arbitrary strings, including absolute paths, '..' segments, mixed '/' and '\\' separators, and (on Windows) drive-letter paths. Entry type (isDirectory), timestamp and data are also attacker-controlled; overwrite defaults to true (Expand.overwrite = true), so existing files are truncated and replaced.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether FileUtils.resolveFile enforces confinement: it calls getCanonicalFile() (Expand.java:153; FileUtils.java:1322-1335, 1365-1374) but canonicalization only resolves '..' - it returns paths outside baseFile (e.g. new File(base, '../x').getCanonicalFile() = parent/x), and the absolute branch explicitly returns canonical external paths. Checked whether Expand validates entry names elsewhere: expandFile/extractFile contain no name validation, no normalization against dest, and no post-resolution containment check; the only conditional is the 'overwrite' freshness check (lines 156-161), which is true by default. Checked whether the ZIP layer rejects such names: ZipInputStream performs no path sanitization. Also verified similar path helpers (FileUtils.normalize/catPath) are not used as a guard here. Caller-side mitigation (applications that pre-validate archive entries or never extract untrusted archives) was considered and is the main reason confidence is not high.",
+      "id": "expand-zip-slip-path-traversal",
+      "impact": "Arbitrary file write/overwrite outside the intended extraction directory, as the user running the extraction. This can overwrite configuration, scripts, startup files, authorized_keys, Maven/Gradle caches or files in a victim's home directory, and can commonly escalate to code execution (e.g. writing into a directory whose contents are later executed) or corrupt unrelated data; it also allows planting attacker content in a path the consuming application trusts. Absolute entry names make the destination fully attacker-chosen.",
+      "locations": [
+        {
+          "end_line": 118,
+          "path": "src/main/java/org/codehaus/plexus/util/Expand.java",
+          "start_line": 112
+        },
+        {
+          "end_line": 178,
+          "path": "src/main/java/org/codehaus/plexus/util/Expand.java",
+          "start_line": 145
+        },
+        {
+          "end_line": 1377,
+          "path": "src/main/java/org/codehaus/plexus/util/FileUtils.java",
+          "start_line": 1308
+        }
+      ],
+      "prerequisites": "An application or plugin must use org.codehaus.plexus.util.Expand (e.g. setSrc(untrustedArchive); setDest(dir); execute(), or a subclass calling expandFile) to extract an archive that is not otherwise validated. Write scope is limited only by the JVM process's filesystem permissions. No privileges beyond those of the extracting process are required on the attacker's side.",
+      "root_cause": "Expand.expandFile() passes each attacker-controlled ZIP entry name (ze.getName()) directly to Expand.extractFile(), which computes the output file as FileUtils.resolveFile(dir, entryName) and writes to it with new FileOutputStream(f) (and mkdirs() for parent directories). FileUtils.resolveFile() only normalizes/canonicalizes the path: for names starting with a file separator (or containing ':' on Windows) it returns the canonical absolute File unchanged (lines 1322-1336), and for relative names it builds new File(baseFile, filename).getCanonicalFile() (lines 1365-1369) without ever verifying that the result is still inside baseFile. Canonicalization resolves '../' but does not confine the result, so entries such as '../../<file>', '/tmp/<file>' or 'C:\\<file>' escape the extraction root. There is no containment check anywhere in Expand or in resolveFile.",
+      "title": "Expand.extractFile writes archive entries outside the destination directory (Zip Slip path traversal)",
+      "trace": "Expand.execute() -> expandFile(source, dest) [Expand.java:90-119] -> while ((ze = zis.getNextEntry()) != null) extractFile(srcF, dir, zis, ze.getName(), ...) [112-118] -> File f = FileUtils.resolveFile(dir, entryName) [153] -> FileUtils.resolveFile: absolute-entry branch returns canonical absolute file [1322-1336]; relative branch returns canonical File(baseFile, filenm) with '..' fully resolved [1365-1369]; no check that f is under dir -> dirF.mkdirs() [164-165] -> if (!isDirectory) new FileOutputStream(f) [178] writes attacker data over the target file, then f.setLastModified(...) [204].",
+      "unverified": "No code was executed and no archive was built/tested; the finding is a source-level lead, not a runtime-confirmed exploit. I could not verify which real callers extract untrusted archives through Expand (Maven core tends to use plexus-archiver instead), so real-world reachability depends on the consuming application. Symlink handling in the destination directory (FileOutputStream follows pre-existing symlinks) was not tested.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Source scope reported 100 model-visible files, all Java/XML/text under src/main plus pom/NOTICE/site files; no test sources, binaries, or excluded sensitive paths. I read or searched all of them: full/partial reads of Expand, FileUtils (path/delete/copy regions), Commandline, CommandLineUtils, Shell/BourneShell/CmdShell, StringUtils quoting/escape regions, MXParser key regions (doctype/entity handling), EntityReplacementMap, Xpp3DomBuilder, XmlUtil, XmlReader/XmlStreamReader, Base64, ReflectionValueExtractor, PathTool, MatchPattern(s), SelectorUtils, DirectoryScanner/DirectoryWalker regions, ReaderFactory, PropertyUtils, and targeted greps for exec/process, stream writes, getCanonicalFile, setAccessible/reflection, JAXP/SAX/XXE constructs, and path traversal keywords. Large files (MXParser ~3400 lines, StringUtils ~2550, FileUtils ~2385, MXSerializer, DirectoryScanner) were not read line-by-line; non-security utility logic there was sampled rather than exhaustively audited.",
+  "limitations": [
+    "No execution, build, test, or scanner was run; all conclusions are static source reading, and the candidate is a lead rather than a runtime-confirmed vulnerability.",
+    "No test suite, git history, patch diff, or precomputed source-relation index is present, so I could not compare against the upstream fix or verify which revision this snapshot corresponds to.",
+    "Large files were partially inspected (targeted reads/searches); unread regions of MXParser, MXSerializer, FileUtils, DirectoryScanner, StringUtils and reflection classes could contain additional issues.",
+    "Reachability of Expand depends on consuming applications; this repository is a library, so no in-repo call sites demonstrate end-to-end exploitation.",
+    "Behavior on Windows paths (drive letters, UNC) was reasoned from code only and not executed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "OS command injection through incomplete argument quoting in the cli package (StringUtils.quoteAndEscape / Shell.getRawCommandLine / BourneShell.BASH_QUOTING_TRIGGER_CHARS): trigger chars omit '\\n' and '\\\\', and quoteAndEscape returns a string unchanged when it merely starts and ends with the quote char (StringUtils.java:2314-2318), so an argument such as \"'';id;''\" or one containing a newline is passed into the single string given to /bin/sh -c (Shell.java:132-178, BourneShell.java:32-48, Commandline.execute at Commandline.java:636/651).",
+      "reason": "Real quoting weaknesses, but the trust boundary is ambiguous: Commandline's API is explicitly for building shell command lines (addArguments(String line) accepts raw shell syntax), and exploitation requires the caller to feed attacker-controlled values as argument values while relying on best-effort quoting. Source gives no evidence that any caller uses it as a security boundary, so it is weaker than the Expand destination-containment violation; listed as an unconfirmed lead only."
+    },
+    {
+      "lead": "XXE / external-entity expansion in the bundled XML stack (MXParser, Xpp3DomBuilder, XmlUtil, XmlReader/XmlStreamReader).",
+      "reason": "Checked and rejected: MXParser.setFeature(FEATURE_PROCESS_DOCDECL, true) throws (MXParser.java:479-483), getFeature returns false (507-508), parseDocdecl() only scans/skips the DOCTYPE (MXParser.java:2765-2835), and parseEntityRef() resolves only the five predefined entities plus the static EntityReplacementMap (MXParser.java:2190-2326); no external DTD/entity is fetched and no JAXP/SAX parser is used anywhere in the snapshot."
+    },
+    {
+      "lead": "Base64.decodeBase64() unchecked ArrayIndexOutOfBoundsException on crafted padding (e.g. input like \"A===\"): after discardNonBase64 keeps '=', the pad-stripping loop can leave lastData - numberQuadruple == 0 (Base64.java:399-406) while the decode loop still writes decodedData[encodedIndex] for a marker0==PAD case (Base64.java:414-436).",
+      "reason": "Robustness/DoS-only issue on malformed caller input; not an attacker-controlled write or privilege boundary crossing, and not executed/verified. Rejected in favor of the stronger path-traversal candidate."
+    },
+    {
+      "lead": "Path helpers that do not fully normalize traversal sequences (FileUtils.normalize only handles '/' sequences and misses trailing '/..' or '\\\\'; PathTool.getRelativePath uses a naive startsWith prefix check).",
+      "reason": "These are helper-semantics gaps; no in-repo security decision demonstrably relies on them, so they do not by themselves establish attacker-controlled impact."
+    }
+  ],
+  "summary": "Reviewed the 100 model-visible files of the plexus-utils 3.0.15 snapshot (all under src/main; no test sources exist) with targeted reading of the highest-risk areas: archive extraction (Expand, FileUtils), command execution (cli/Commandline, CommandLineUtils, Shell, BourneShell, CmdShell), XML parsing/writing (MXParser, EntityReplacementMap, Xpp3DomBuilder, XmlUtil, XmlReader/XmlStreamReader, writers), reflection/introspection, StringUtils quoting, Base64, and path helpers. No security-relation index was available, so review was by search/reading. One candidate was selected with the strongest source evidence: the ZIP extraction path in Expand trusts archive entry names and writes them anywhere the process can write, because FileUtils.resolveFile canonicalizes the path without confining it to the destination directory (classic \"Zip Slip\", CWE-22)."
+}

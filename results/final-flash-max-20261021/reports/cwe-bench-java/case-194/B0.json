@@ -1,0 +1,57 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the `{member-id}` path parameter and can choose any user id in the target realm; the attacker also controls their own bearer token. Any realm user who can obtain a normal access token (session-bound or stateless, issued for any enabled client) can call the admin API: AdminRoot.authenticateRealmAdminRequest/verifyIdentityToken only validate the token signature, issuer, activity and user session/client-enabled state, and never require an admin role. The endpoint itself supplies no authorization check, so no admin privilege is needed for this specific request.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether a blanket authorization exists upstream of the endpoint: AdminRoot/AppAuthManager only authenticate tokens (no role requirement), and RealmsAdminResource only checks realm equality. Verified that OrganizationMemberResource has no internal auth field or check and that its other callers are reached through the checked OrganizationsResource.get(orgId) path. Confirmed sibling methods in OrganizationsResource (create/search/get) each start with `auth.realm().requireManageRealm()`, showing the expected pattern. Confirmed the endpoint is a documented public admin-client API (OrganizationsMembersResource.getOrganizations) rather than dead code. Searched for tests exercising the endpoint; none were found, so no test contradicts or confirms the behavior. No runtime verification was performed.",
+      "id": "org-membership-missing-authz",
+      "impact": "Unauthorized disclosure of organization membership and organization metadata (name, alias, description, redirect URL, e-mail domains) for arbitrary user ids to any authenticated realm user, bypassing realm-management authorization. This permits cross-user membership enumeration and organization reconnaissance; no data modification was identified, so impact is confidentiality only. Severity depends on organizations being in use, but the access-control defect is concrete.",
+      "locations": [
+        {
+          "end_line": 201,
+          "path": "services/src/main/java/org/keycloak/organization/admin/resource/OrganizationsResource.java",
+          "start_line": 189
+        },
+        {
+          "end_line": 249,
+          "path": "services/src/main/java/org/keycloak/organization/admin/resource/OrganizationMemberResource.java",
+          "start_line": 231
+        },
+        {
+          "end_line": 565,
+          "path": "services/src/main/java/org/keycloak/services/resources/admin/RealmAdminResource.java",
+          "start_line": 562
+        }
+      ],
+      "prerequisites": "Organizations feature enabled (organization REST resources are present and reachable only when the feature is enabled) and the admin API enabled (default). Attacker needs a valid access token for the realm (ordinary low-privileged user token is sufficient) and knowledge/enumeration of a target user id.",
+      "root_cause": "`OrganizationsResource.getOrganizations` (admin REST resource mounted at /admin/realms/{realm}/organizations) delegates directly to `new OrganizationMemberResource(session, null, adminEvent).getOrganizations(memberId)` without first calling `auth.realm().requireManageRealm()` (or any other permission check). `OrganizationMemberResource` performs no authorization itself, and unlike the singled-out `members/{member-id}/organizations` path, all other entry points to that class go through `OrganizationsResource.get(orgId)` -> `OrganizationResource` (line 170-187 of OrganizationsResource), which is gated by `auth.realm().requireManageRealm()`. As a result the standalone member-id -> organizations lookup is the only admin API path to this data with no caller check.",
+      "title": "Missing authorization on admin endpoint returning a user's organizations",
+      "trace": "GET /admin/realms/{realm}/organizations/members/{member-id}/organizations -> AdminRoot.getRealmsAdmin() authenticates the bearer token only (AdminRoot.java 210-232, 164-194) -> RealmsAdminResource.getRealmAdmin() only enforces realm equality, no role check (RealmsAdminResource.java 194-210) -> RealmAdminResource.organizations() returns `new OrganizationsResource(session, auth, adminEvent)` with no check (RealmAdminResource.java 562-565) -> OrganizationsResource.getOrganizations(memberId) performs no `auth.realm().requireManageRealm()` and calls `new OrganizationMemberResource(session, null, adminEvent).getOrganizations(memberId)` (OrganizationsResource.java 199-201) -> OrganizationMemberResource.getOrganizations -> getUser(memberId) -> `session.users().getUserById(realm, id)` -> `provider.getByMember(member).map(ModelToRepresentation::toRepresentation)` (OrganizationMemberResource.java 241-249) -> response body contains organization id, name, alias, enabled flag, redirectUrl, description and domains (ModelToRepresentation.java 1320-1337).",
+      "unverified": "Cannot diff against upstream/fixed Keycloak, so it is unconfirmed whether this missing check is the dataset's intended vulnerability, a real pre-fix CVE state, or a longstanding upstream oversight. Feature-enablement defaults for organizations in this snapshot were not verified, and no execution/test was run to confirm the HTTP behavior end-to-end.",
+      "weakness_type": "CWE-862 Missing Authorization (broken access control / information disclosure)"
+    }
+  ],
+  "coverage_summary": "The snapshot contains 5,924 model-visible files (Keycloak main, 999.0.0-SNAPSHOT, dependencies around Feb 2025). I inspected it via repository-wide literal searches and bounded reads across the Java server code: OIDC authorization/token/userinfo/logout endpoints and RedirectUtils, token verification (TokenVerifier, AuthenticationManager), client authentication/secrets, credential providers (OTP, recovery codes), required actions (UpdateEmail/VerifyEmail), SAML protocol/broker signature paths, client registration policies and client-policy conditions/executors, CORS handling, the newer organizations admin/account API surface (OrganizationsResource, OrganizationResource, OrganizationMemberResource), the organization authenticator, the OIDC/OID4VCI and SD-JWT modules, and parts of the JPA/Infinispan model layer. I did not exhaustively read all 5,924 files; in particular the JS/TS admin and account console code, themes/templates, testsuite, operator, adapters and many storage/provider files were only sampled or searched, not fully audited. No files were executed and no external data was used.",
+  "limitations": [
+    "No git metadata is present in the snapshot, so no diff against upstream or fix commits was possible; intent (planted vs. longstanding upstream code) cannot be established.",
+    "No code execution, tests, scanners or runtime probing were performed; the finding is source-evidence only and not runtime-confirmed.",
+    "Feature defaults for Organizations in this snapshot were not verified; if the feature is disabled, the endpoint is unreachable (the defect would still exist behind the feature flag).",
+    "Coverage is not exhaustive: large areas (JS/TS UI, themes, testsuite, operator, adapters, many storage/provider files) were only searched or sampled, so a more severe vulnerability elsewhere could have been missed.",
+    "An exact permission model nuance (whether deployments could place a gateway/role restriction in front of the admin API) was not verified; the server code itself provides no check on this path."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ClientUpdaterSourceHostsCondition.verifyHostInTrustedDomains uses `hostname.endsWith(confDomain)` without a dot/domain boundary when matching `*.example.com` trusted domains (services/src/main/java/org/keycloak/services/clientpolicy/condition/ClientUpdaterSourceHostsCondition.java 146-163), so a hostname like `fooexample.com` would match.",
+      "reason": "Looks like longstanding upstream behavior rather than an injected/reverted fix; exploitation requires the attacker to control a hostname whose reverse DNS ends with the configured suffix (PTR control) and the impact is limited to a client-policy condition vote, so it is a weaker, less certain candidate than the missing endpoint authorization."
+    },
+    {
+      "lead": "DefaultCors.add echoes the request Origin in Access-Control-Allow-Origin for preflight requests without checking allowedOrigins (services/src/main/java/org/keycloak/services/cors/DefaultCors.java 123-160).",
+      "reason": "Actual (non-preflight) responses still enforce allowedOrigins before emitting CORS headers, the credential header is controlled by the `auth` flag, and the pattern appears intentional/upstream; no concrete cross-origin data exposure was established."
+    },
+    {
+      "lead": "UpdateEmailActionToken uses tabs/irregular indentation versus surrounding Keycloak style (services/src/main/java/org/keycloak/authentication/actiontoken/updateemail/UpdateEmailActionToken.java).",
+      "reason": "Style anomaly only; the related handler verifies oldEmail against the authenticated user and the token flow otherwise matches expected logic, so this is not evidence of a vulnerability."
+    }
+  ],
+  "summary": "Reviewed the Keycloak (999.0.0-SNAPSHOT, ~Feb 2025 main) source snapshot as a defensive code review, tracing attacker-reachable input through authentication, authorization, redirect, token, SAML/OIDC, credential, client-policy and organization code. The strongest concrete issue found is an unguarded admin REST endpoint: `GET /admin/realms/{realm}/organizations/members/{member-id}/organizations` reaches `OrganizationMemberResource.getOrganizations` without any permission check, allowing any user holding a valid realm access token (no admin role needed) to read the organization memberships and organization metadata of an arbitrary user id. Every sibling method in the same `OrganizationsResource` class calls `auth.realm().requireManageRealm()`, and `OrganizationMemberResource` contains no authorization logic of its own; the only other route to it is gated by the parent `OrganizationsResource.get(orgId)` check. This is a Missing Authorization / broken access control (information disclosure) candidate. It is submitted as a lead only; no runtime confirmation was performed."
+}

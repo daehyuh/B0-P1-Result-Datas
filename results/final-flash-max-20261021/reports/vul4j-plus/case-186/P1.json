@@ -1,0 +1,91 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the property names (and values) that an application passes into BeanUtils/PropertyUtils — the classic case being HTTP parameter names bound to a bean via `BeanUtils.populate(bean, params)` or a Struts-style parameter interceptor (`BeanUtilsBean.setProperty`/`copyProperty`). The library itself does not read HTTP input; the names are attacker-controlled at the embedding-application boundary.",
+      "confidence": "high",
+      "counterevidence_checked": "(1) `BeanUtilsBean.copyProperties()` skips the literal property name `\"class\"` when enumerating source descriptors (lines 274-276), but that guard covers only that one enumeration path — it does not apply to `populate`/`setProperty`/`copyProperty` nested traversal or to `PropertyUtils` APIs, and it does not cover nested names such as `class.classLoader`. (2) `SuppressPropertiesBeanIntrospector` exists and `DefaultIntrospectionContext.removePropertyDescriptor()` works (91-93), but text search shows no caller of `SuppressPropertiesBeanIntrospector` and the P1 index shows no `SUPPRESS_CLASS` symbol, i.e., the mechanism is never activated by default. (3) DynaBean property access uses its own `DynaClass` property definitions and is not the traversal path here. (4) The vulnerability requires an embedding application to pass untrusted property names into BeanUtils; the library alone does not parse user input, so impact is conditional on that usage pattern — but this is precisely the usage the default suppression was designed to make safe. (5) No runtime execution or exploit payloads were used; descriptor exposure is inferred from the JDK Introspector contract and the source path above.",
+      "id": "case-186-bu-class-property-suppression-missing",
+      "impact": "Every Java object exposes the readable `class` property, giving attacker-influenced property expressions a path from an application bean to its `java.lang.Class` and `ClassLoader`, and onward through container objects that expose settable configuration/stream/file properties. In web frameworks that bind request parameters through BeanUtils (historically Struts), this class-loader traversal is a remote code execution / runtime-internals manipulation primitive; more generally it discloses and can mutate class-loader/container state. The suppression control that upstream BeanUtils 1.9.2 introduced by default is absent in this snapshot.",
+      "locations": [
+        {
+          "end_line": 191,
+          "path": "src/main/java/org/apache/commons/beanutils/PropertyUtilsBean.java",
+          "start_line": 188
+        },
+        {
+          "end_line": 64,
+          "path": "src/main/java/org/apache/commons/beanutils/SuppressPropertiesBeanIntrospector.java",
+          "start_line": 23
+        },
+        {
+          "end_line": 953,
+          "path": "src/main/java/org/apache/commons/beanutils/PropertyUtilsBean.java",
+          "start_line": 950
+        },
+        {
+          "end_line": 2241,
+          "path": "src/main/java/org/apache/commons/beanutils/PropertyUtilsBean.java",
+          "start_line": 2229
+        },
+        {
+          "end_line": 96,
+          "path": "src/main/java/org/apache/commons/beanutils/DefaultBeanIntrospector.java",
+          "start_line": 76
+        },
+        {
+          "end_line": 900,
+          "path": "src/main/java/org/apache/commons/beanutils/BeanUtilsBean.java",
+          "start_line": 858
+        },
+        {
+          "end_line": 825,
+          "path": "src/main/java/org/apache/commons/beanutils/BeanUtilsBean.java",
+          "start_line": 800
+        },
+        {
+          "end_line": 365,
+          "path": "src/main/java/org/apache/commons/beanutils/BeanUtilsBean.java",
+          "start_line": 355
+        },
+        {
+          "end_line": 276,
+          "path": "src/main/java/org/apache/commons/beanutils/BeanUtilsBean.java",
+          "start_line": 270
+        }
+      ],
+      "prerequisites": "1) A consuming application feeds untrusted property names into BeanUtils/PropertyUtils property access for a target bean (e.g., request-parameter binding). 2) The target object graph exposes `Class`/`ClassLoader`/container objects reachable through readable properties so intermediate segments (e.g., `class.classLoader`, `class.protectionDomain`, container-specific classloader getters) resolve. 3) No Java SecurityManager restricts reflective access (the common modern deployment).",
+      "root_cause": "`PropertyUtilsBean.resetBeanIntrospectors()` (lines 188-191) clears the introspector list and re-adds only `DefaultBeanIntrospector.INSTANCE`. The `SuppressPropertiesBeanIntrospector` class (lines 23-64) that would remove a property from the introspection context has no default `SUPPRESS_CLASS` instance and is never referenced anywhere in the tree, so it is dead code. As a result, the JDK `Introspector.getBeanInfo()` `class` property (getter `Object.getClass()`) added by `DefaultBeanIntrospector.introspect()` (lines 76-95) survives into the descriptor cache and is returned by `PropertyUtilsBean.getPropertyDescriptor()` (lines 950-953), and nested-name resolution (`getNestedProperty`/`setNestedProperty`, `BeanUtilsBean.setProperty` lines 892-898, `BeanUtilsBean.copyProperty` lines 358-365) will traverse it. This is exactly the vulnerable state that the default `class`-property suppression in BeanUtils 1.9.2 was added to eliminate.",
+      "title": "Default bean introspection does not suppress the `class` property, exposing ClassLoader traversal through BeanUtils property APIs",
+      "trace": "`BeanUtils.populate(bean, params)` (BeanUtilsBean.java:800-825) -> `BeanUtilsBean.setProperty(bean, name, value)` (858+), which loops `while (resolver.hasNested(name))` and calls `getPropertyUtils().getProperty(target, resolver.next(name))` (894). For the first segment `\"class\"`, `PropertyUtilsBean.getProperty(bean,\"class\")` -> `getSimpleProperty` (1214-1268) -> `getPropertyDescriptor(bean,\"class\")` (915-980) -> `getIntrospectionData`/`fetchIntrospectionData` (2207-2241), which runs only the registered introspectors (just `DefaultBeanIntrospector`). `DefaultBeanIntrospector.introspect()` calls `Introspector.getBeanInfo()` and adds every descriptor, including `class` with read method `getClass()`; `getReadMethod`/`MethodUtils.getAccessibleMethod` resolves it and the method is invoked, returning the `Class` object. Remaining segments (`classLoader`, `parent`, container-specific properties, etc.) are then resolved the same way, and the final segment can be written via `setSimpleProperty` when a reachable object exposes a matching setter. No source component ever calls `icontext.removePropertyDescriptor(\"class\")` by default — `SuppressPropertiesBeanIntrospector.introspect()` (59-63) implements this but is never registered.",
+      "unverified": "Not runtime-confirmed: the `class` descriptor is expected from standard `java.beans.Introspector` behavior (well-established, but not executed here), and the exact object graph reachable after `class.classLoader` (and therefore the final writable property) depends on the embedding application's container/runtime. No test sources are present in the snapshot, and no build, tests, or scanners were run.",
+      "weakness_type": "Missing security control / unsafe reflection: externally influenced property names can traverse to java.lang.Class.getClassLoader() (class-loader manipulation)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 132-file snapshot (all main Java sources plus XML/site/build files; no test sources are present). P1 relation scope reports the index as complete (132/132 files indexed, 0 hash mismatches, 0 missing), but it is a navigation-only syntactic index with no data/control-flow or reachability proof; it was used only to locate symbols/edges and every cited edge was verified against source text. I inspected in depth the property-access core (PropertyUtilsBean, BeanUtilsBean, PropertyUtils, BeanUtils, DefaultBeanIntrospector, SuppressPropertiesBeanIntrospector, DefaultIntrospectionContext, BeanIntrospectionData, DefaultResolver) and searched the whole tree for `SUPPRESS_CLASS`, suppression usage, `\"class\"`/`classLoader`/`protectionDomain`, `Class.forName`, `readObject`, and `setAccessible`. Converters/locale packages, DynaBean implementations, BeanMap and MethodUtils were reviewed at a sampling level only.",
+  "limitations": [
+    "No code was executed; findings are source-evidence based and not runtime-confirmed.",
+    "The P1 index is syntactic (declarations/calls/containment) and cannot prove runtime reachability, data flow, or exploitability; only source-verified edges were relied upon.",
+    "The end-to-end exploit chain after `class.classLoader` depends on the embedding application and container classes that are outside this snapshot.",
+    "Line-by-line review was concentrated on property/introspection paths; converters, locale classes, DynaBeans, BeanMap, and utility classes were sampled rather than exhaustively audited.",
+    "No test suite or build output is present in the snapshot to cross-check intended behavior."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Index security_call hint at DynaProperty.java:368 (`in.readObject()` inside `readAnyClass`) categorized as deserialization.",
+      "reason": "This is the standard upstream workaround for serializing primitive `Class` values (`readObject`/`readAnyClass` only read a type constant or a Class object); it adds no gadget chain or attacker-controlled deserialization of this class by itself."
+    },
+    {
+      "lead": "`setAccessible(true)` uses in MethodUtils.setMethodAccessible (line 1057-1059) and ConstructorUtils (lines 391, 424).",
+      "reason": "Upstream reflection workarounds that catch and log `SecurityException`; the methods involved come from bean classes selected by application code, not from attacker-controlled strings, and this is pre-existing library behavior rather than a distinct exploitable defect."
+    },
+    {
+      "lead": "`Class.forName(className, false, cl)` in JDBCDynaClass.loadClass (lines 160-161).",
+      "reason": "The class name originates from application configuration/ResultSet metadata, not from an untrusted property name; no source evidence of an attacker-controlled path into this method."
+    },
+    {
+      "lead": "SuppressPropertiesBeanIntrospector being dead code in isolation.",
+      "reason": "Treated as part of the single main finding (missing default registration) rather than a separate candidate; its absence of call sites is the evidence for the mitigation being disabled."
+    }
+  ],
+  "summary": "This is an Apache Commons BeanUtils 1.9.2-SNAPSHOT tree (132 files, main sources only). The strongest issue is a missing default security control: `PropertyUtilsBean.resetBeanIntrospectors()` registers only `DefaultBeanIntrospector`, so JDK introspection's `class` property (`Object.getClass()`) is never suppressed. `SuppressPropertiesBeanIntrospector` exists but is inert dead code (no `SUPPRESS_CLASS` instance, zero call sites), so attacker-influenced property names passed to `PropertyUtils`/`BeanUtils.populate`/`setProperty` can traverse `class.classLoader...` — the class-loader manipulation primitive fixed in BeanUtils 1.9.2. No runtime confirmation was performed."
+}

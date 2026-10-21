@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The redirect_uri query/form parameter of the unauthenticated OIDC authorization endpoint (and of PAR/CIBA request-object validation paths) is fully attacker-controlled; the attacker only needs to send the victim a crafted authorization-endpoint URL for a client that uses a wildcard valid redirect URI (e.g. https://app.example.com/*), which is a documented and commonly used configuration. Encoding must survive the container's one decoding pass (i.e. the separator is double-encoded in the request), which the attacker controls.",
+      "confidence": "medium",
+      "counterevidence_checked": "I traced decodeRedirectUri (lines 175-207), getNormalizedRedirectUri (156-171), lowerCaseHostname (209-216) and matchesRedirects (232-248) in the snapshot; verified that URI.normalize() does not collapse the encoded separator, that URI.create() on the returned encoded authority already resolves the host after the last '@', and that no code path rejects a userinfo component or compares the origins of the decoded and returned forms. Checked that the fallback exact match at lines 139-141 cannot rescue the check because `valid` is already true after the wildcard match, and that callers store and later emit the returned string (AuthorizationEndpoint line 301, OIDCLoginProtocol lines 215-216/248). Checked Java URI/KeycloakUriBuilder parsing (common KeycloakUriBuilder.uriTemplate/buildString, Encode.decode) to confirm the encoded separator is preserved in the returned value. Also reviewed the sibling validators in LogoutEndpoint (lines 235-254), SamlService (line 426), IdentityBrokerService (line 216), UserResource (line 829), and LoginActionsServiceChecks (line 232), which all consume the same method.",
+      "id": "redirect-uri-decoded-vs-returned-mismatch",
+      "impact": "Unauthenticated open redirect from the identity provider's own trusted login endpoint; in standard flow the victim's browser is sent to an attacker-controlled origin with the authorization `code` (and `session_state`/`state`) as query parameters, and in implicit/hybrid flows access/ID tokens are placed in the fragment where attacker JavaScript can read them. This enables authorization-code/token theft where PKCE or client secrets do not protect the redirect leg, plus convincing phishing that originates from the legitimate Keycloak URL. Redirect validation is also reused for post_logout_redirect_uri (LogoutEndpoint), request_uri allow-lists (PAR/CIBA/request-object), action tokens, and the account/identity-broker referrer flows, so the same mismatch affects those callers.",
+      "locations": [
+        {
+          "end_line": 154,
+          "path": "services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java",
+          "start_line": 92
+        },
+        {
+          "end_line": 249,
+          "path": "services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java",
+          "start_line": 232
+        },
+        {
+          "end_line": 134,
+          "path": "services/src/main/java/org/keycloak/protocol/oidc/endpoints/AuthorizationEndpointChecker.java",
+          "start_line": 122
+        },
+        {
+          "end_line": 305,
+          "path": "services/src/main/java/org/keycloak/protocol/oidc/endpoints/AuthorizationEndpoint.java",
+          "start_line": 299
+        },
+        {
+          "end_line": 248,
+          "path": "services/src/main/java/org/keycloak/protocol/oidc/OIDCLoginProtocol.java",
+          "start_line": 215
+        }
+      ],
+      "prerequisites": "1) Target client has a wildcard valid redirect URI (or the installed-app/loopback wildcard path at lines 119-133 is applicable). 2) Attacker can get a victim to open the crafted authorization link and complete authentication (or the victim already has an active SSO session). 3) The decoded form of the supplied authority matches the wildcard prefix, while the returned encoded form is parsed by the browser with a different host. No client secret or authenticated access is required for the redirect itself.",
+      "root_cause": "In RedirectUtils.verifyRedirectUri (services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java:92-154) the value is validated only after decodeRedirectUri() decodes percent-encodings up to 5 times and getNormalizedRedirectUri() normalizes/lowercases it (lines 109-117, using matchesRedirects with allowWildcards=true). Afterwards the method normalizes and returns the ORIGINAL, still-encoded redirectUri (lines 135-146) without ever verifying that the original and the decoded form have the same scheme/host/port (there is no userinfo/origin check anywhere in the flow). The fallback exact comparison at lines 139-141 runs only when the decoded form did not already match (and with wildcards disabled), so a wildcard match on the decoded form is sufficient to make the original encoded value pass. Because matchesRedirects (lines 232-248) treats a configured value ending in '*' as a raw string prefix, an encoded form such as '<valid-host>%2f@<attacker-host>/...' decodes to '<valid-host>/@<attacker-host>/...' (which matches the '<valid-host>/' wildcard prefix) while the unvalidated original is the string handed to the browser, which parses the last '@' in the authority as the userinfo separator and therefore navigates to <attacker-host>.",
+      "title": "redirect_uri is validated in decoded/normalized form but the original encoded form is returned, allowing open redirect and authorization-response leakage (wildcard clients)",
+      "trace": "AuthorizationEndpoint.buildGet() reads the decoded query parameters and AuthorizationEndpointChecker.checkRedirectUri() (line 129) calls RedirectUtils.verifyRedirectUri(session, redirectUriParam, client, isOIDCRequest). Inside verifyRedirectUri the parameter is decoded/normalized (lines 110-112), matched with allowWildcards=true against resolveValidRedirects (line 117), and then the original encoded parameter is normalized and returned as `redirectUri = valid ? redirectUri : null` (lines 135-146). The returned value is stored via AuthorizationEndpoint.updateAuthenticationSession() into authSession.setRedirectUri(redirectUri) (line 301). After a successful login, OIDCLoginProtocol.authenticated() reads authSession.getRedirectUri() (line 215) and builds a 302 Location through OIDCRedirectUriBuilder, adding the authorization code at line 248 (or implicit/hybrid tokens into the fragment). OIDCRedirectUriBuilder.QueryRedirectUriBuilder/FragmentRedirectUriBuilder emit the URI unchanged, so the browser receives the encoded authority and resolves it to the attacker host.",
+      "unverified": "Not runtime-confirmed: the exploit path was established by static tracing, not by executing Keycloak or a browser. The browser-side parsing premise (last '@' in the authority delimits userinfo, so the returned encoded URI navigates to the attacker host) is standard URL parsing semantics but was not executed here. The exact encoding level needed depends on where the servlet/JAX-RS layer performs its single decode pass (AuthorizationEndpoint.buildGet uses decoded query parameters, POST uses decoded form parameters), so an extra encoding layer is required; I did not verify it against a running instance. No test in the snapshot covers this behavior. It is also possible that the intended defect for this snapshot is a different issue in a file type excluded from the visible set (templates/`tsx`), which I could not inspect.",
+      "weakness_type": "CWE-601 URL Redirection to Untrusted Site / improper input validation of redirect_uri"
+    }
+  ],
+  "coverage_summary": "Visible snapshot: 6,546 model-visible files (root has 6,547; one file excluded by the sensitive-name/path filter; no symlinks; no file over 5 MiB). The visible set excludes some asset/source types (e.g. .ftl templates, .tsx, .adoc), so template/UI-layer issues could not be reviewed. I concentrated on Java backend security boundaries: OIDC authorization/PAR/CIBA parameter parsing and redirect_uri validation, token endpoint client authentication, logout/post-logout redirect, action tokens and login actions, account console, admin REST resources and permission evaluators (MgmtPermissions, users/clients/roles/groups), client policies and client secret rotation, SAML broker response parsing and signature handling, SAML signature utilities, LDAP query escaping, JPA named-query usage, map-storage query builders, CORS, theme resource serving/path handling, adapters' token verification, and the Twitter social IdP. The strongest traceable candidate is the redirect_uri decoded-vs-returned mismatch in RedirectUtils; other reviewed areas are recorded as rejected leads. Review was not exhaustive for the whole repository (JS/TS apps, operator, federation, testsuite and several storage modules were sampled rather than fully audited).",
+  "limitations": [
+    "No runtime execution or exploit validation was performed; all conclusions are static source reading. The one-candidate limit means only the strongest lead is reported, not every suspicious area.",
+    "The visible file set excludes .ftl, .tsx and .adoc files, so template-based XSS or front-end issues in those files could not be assessed.",
+    "Whether the reported behavior is the specific defect the review case targets is uncertain; other real issues may exist (e.g. SAML signature-relaxation nuances) but could not be confirmed to the same evidentiary level.",
+    "The exact single-decoding behavior of the HTTP/servlet layer was reasoned about, not observed; the reported open-redirect requires a wildcard-configured redirect URI and a correctly encoded authority, and depends on standard browser URL parsing semantics that were not executed.",
+    "Coverage of the JS/TS apps, operator, map storage, federation and test modules was partial (sampled hotspots rather than exhaustive review)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SAML broker signature relaxation: SAMLEndpoint.PostBinding.verifySignature (services/src/main/java/org/keycloak/broker/saml/SAMLEndpoint.java lines 727-739) skips document signature verification when the response contains assertions, and containsUnencryptedSignature (lines 721-725) only checks for the mere presence of any ds:Signature element; handleLoginResponse (lines 482-492) accepts an unsigned assertion when any signature element exists.",
+      "reason": "When validateSignature is enabled, handleSamlResponse (lines 668-677) still calls verifySignature, which falls through to SamlProtocolUtils.verifyDocumentSignature whenever any Signature element is present, so the naive 'unsigned assertion + dummy signature' path fails; XMLSignatureUtil.validate (saml-core) additionally requires every signature to verify and rejects documents mixing signed and unsigned assertions. I could not construct a concrete XML-signature-wrapping bypass from the source alone, so this remains an unconfirmed hardening concern rather than a demonstrated vulnerability."
+    },
+    {
+      "lead": "Java deserialization of the Twitter request token (services/src/main/java/org/keycloak/social/twitter/TwitterIdentityProvider.java line 213) reads a Base64-serialized object with a plain ObjectInputStream.",
+      "reason": "The serialized value comes from the 'twitter_token' authentication-session note that the provider itself writes in performLogin (line 100) after calling the Twitter API; it is not directly settable from request parameters, and authentication sessions are server-side in this version. No attacker-controlled path to that note was identified."
+    },
+    {
+      "lead": "Theme resource path checks use String.startsWith on URL/canonical paths (ClassLoaderTheme.java lines 120-123, ClasspathThemeResourceProviderFactory.java lines 54-58, FolderTheme.java line 96).",
+      "reason": "FolderTheme uses a canonical-path prefix check with a trailing separator (safe); the classpath variants are prefix checks that could in principle reach a sibling path sharing the prefix, but the path is constrained to theme resource providers and I found no concrete attacker-reachable traversal with a same-prefix target. Treated as hardening, not a finding."
+    },
+    {
+      "lead": "Client secret rotation and CORS handling (ClientSecretRotationExecutor, services Cors.build skipping origin validation for preflight).",
+      "reason": "The rotation logic uses session/config state that is not directly attacker-controlled, and the CORS preflight branch cannot by itself expose a credentialed cross-origin read because the non-preflight response is still validated against allowed origins. No concrete security impact established."
+    },
+    {
+      "lead": "Admin REST permission plumbing (MgmtPermissions and per-resource permission evaluators).",
+      "reason": "Spot-checked role/permission checks and found the expected permission evaluator calls; no missing or inverted authorization decision could be confirmed within the review budget. No candidate submitted."
+    }
+  ],
+  "summary": "This is a Keycloak 21.1.1 source snapshot (root pom version 21.1.1). I reviewed the backend security boundaries most exposed to unauthenticated input: OIDC authorization/PAR/CIBA parameter handling, redirect_uri validation, logout and post-logout redirect handling, account console, admin REST permission evaluators, client authentication and adapter token verification, CORS, SAML broker parsing/signature checks, LDAP query escaping, theme resource path handling, and the Twitter identity-provider deserialization path. The strongest, most concretely traceable issue is in the OIDC redirect_uri validator: validation is performed on a repeatedly percent-decoded and normalized form of the URI, but the original (still-encoded) form is normalized and returned unchanged, with no origin/host comparison between the two forms. Combined with the wildcard branch of matchesRedirects, a redirect_uri whose authority contains an encoded path separator before an '@' validates against the legitimate host (e.g. a client wildcard such as https://app.example.com/*) while resolving in a browser to a different host, so the post-login 302 that carries the authorization code (and, for implicit/hybrid flows, tokens in the fragment) can be pointed at an attacker-controlled origin. I also found several suspicious-looking but non-qualifying areas (SAML broker signature-relaxation logic, Twitter IdP ObjectInputStream deserialization, ClassLoader/Folder theme path checks, admin permission plumbing); those are listed as rejected leads. I did not have .ftl/.tsx/.adoc files in the visible file set, so template/JS-layer XSS ground truth could not be assessed."
+}

@@ -1,0 +1,106 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A messaging client controls the message body (e.g. TextMessage/core text message) and, with CONSUME permission, the consumer filter string. A filter such as `XPATH '/root'` is accepted and created server-side by ServerSessionImpl.createConsumer -> FilterImpl.createFilter -> SelectorParser/XPathExpression. Any text message routed to such a consumer (or to an admin-configured XPATH queue/divert filter) is parsed as XML by the broker. The XML payload, including DOCTYPE/external entity declarations, is fully attacker-controlled. When the selector is used client-side, a malicious producer controls the XML parsed in the consumer JVM.",
+      "confidence": "medium",
+      "counterevidence_checked": "The hardening code itself is present and complete behind `!isXxeEnabled()`; setting `artemis.disableXxe=true` (or setting the property to the empty string with -Dartemis.disableXxe) switches protection ON, so this is an insecure default rather than a missing control. The XMLUtil.readerToElement path substitutes `${...}` system/env values before parsing but does not prevent DOCTYPE/entities. The XPath evaluation returns only a boolean and failures are logged at debug, so file-content reflection is not guaranteed; SSRF/DoS and blind exfiltration remain plausible. I also checked whether the selector builder is ever forced-hardened elsewhere: no other XmlProvider call site or `setXxeEnabled` caller exists in the visible sources (tests are absent from the snapshot), so the property default is the only control. I could not diff against upstream; the property-name/default mismatch and the empty-string special case strongly suggest protection-on is the intended default, but this is inference, not a confirmed regression.",
+      "id": "case-185-xxe-default",
+      "impact": "Broker-side (and client-side for XPath consumers) XML External Entity processing: outbound network requests from the broker to attacker-chosen URLs (SSRF / out-of-band data exfiltration via external DTD), local file access where entity content is reflected/error-leaked, and denial of service via entity expansion (billion laughs). The same default also weakens XML configuration/import parsing done through XMLUtil/XmlProvider, where XXE could be triggered by malicious XML supplied through configuration management paths. Worst case is information disclosure from the broker host and network-level pivoting; no RCE primitive is demonstrated in the source path.",
+      "locations": [
+        {
+          "end_line": 62,
+          "path": "artemis-commons/src/main/java/org/apache/activemq/artemis/utils/XmlProvider.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 109,
+          "path": "artemis-commons/src/main/java/org/apache/activemq/artemis/utils/XmlProvider.java",
+          "start_line": 101
+        },
+        {
+          "end_line": 125,
+          "path": "artemis-commons/src/main/java/org/apache/activemq/artemis/utils/XmlProvider.java",
+          "start_line": 114
+        },
+        {
+          "end_line": 155,
+          "path": "artemis-commons/src/main/java/org/apache/activemq/artemis/utils/XmlProvider.java",
+          "start_line": 140
+        },
+        {
+          "end_line": 93,
+          "path": "artemis-core-client/src/main/java/org/apache/activemq/artemis/utils/XMLUtil.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 58,
+          "path": "artemis-selector/src/main/java/org/apache/activemq/artemis/selector/filter/XPathExpression.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 78,
+          "path": "artemis-selector/src/main/java/org/apache/activemq/artemis/selector/filter/JAXPXPathEvaluator.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 120,
+          "path": "artemis-server/src/main/java/org/apache/activemq/artemis/core/filter/impl/FilterImpl.java",
+          "start_line": 106
+        },
+        {
+          "end_line": 574,
+          "path": "artemis-server/src/main/java/org/apache/activemq/artemis/core/server/impl/ServerSessionImpl.java",
+          "start_line": 574
+        }
+      ],
+      "prerequisites": "`artemis.disableXxe` must be unset (the default) or set to `false` (explicit opt-out). The broker (or a client) must evaluate an XPath selector against message content: either a client creates a consumer with an `XPATH '...'` filter (CONSUME permission) and messages are produced to that address, or an administrator has configured an XPATH filter on a queue/divert. No special privileges beyond ordinary messaging permissions are needed when an XPath filter already exists. Third-party XML parsers on the classpath must behave like the JDK/Xerces default (external DTD/general entities enabled), which is the default in the absence of the skipped `setFeature` calls.",
+      "root_cause": "XmlProvider computes the process-wide flag as: `private static boolean xxeEnabled = !\"\".equals(System.getProperty(ARTEMIS_DISABLE_XXE_PROPERTY)) && !Boolean.parseBoolean(System.getProperty(ARTEMIS_DISABLE_XXE_PROPERTY, Boolean.FALSE.toString()));`. With `artemis.disableXxe` unset, this evaluates to `true && true == true`, i.e. XXE processing is considered enabled and every hardening block guarded by `if (!isXxeEnabled())` is skipped. Because the property is named `disableXxe`, the natural secure default is disabled/true (as with the empty-string form, which evaluates to protection ON); the current `Boolean.FALSE.toString()` default silently leaves all XML parsers in their JDK default, entity-resolving configuration.",
+      "title": "XXE protections disabled by default in XmlProvider (artemis.disableXxe default is permissive)",
+      "trace": "XmlProvider.xxeEnabled (lines 61-62) defaults to true when `artemis.disableXxe` is unset -> XmlProvider.newDocumentBuilder (lines 101-109), createXMLStreamReader (117-122), newSchemaFactory (140-155), newTransformer (163-166) and newValidator (174-177) all skip the XXE hardening -> XPathExpression static initializer (line 48) builds the shared DocumentBuilder through XmlProvider; XMLUtil.readerToElement (lines 86-92) does the same for XML helper parsing -> JAXPXPathEvaluator.evaluate (lines 65-78) feeds attacker-controlled message text to `builder.parse(InputSource)` -> FilterImpl.FilterableServerMessage.getBodyAs(String.class) (lines 250-256) supplies the message body, and ServerConsumerImpl.handle/QueueImpl/ClusterConnectionBridge evaluate the client-supplied or configured filter -> external entities in the message body are resolved by the broker (file:// and http(s):// fetches), enabling blind file read, SSRF and entity-expansion DoS.",
+      "unverified": "Not runtime-confirmed. Upstream intent for the default value could not be verified from this snapshot (no tests, no docs, no git history). The exact exploitability of file disclosure depends on the XML parser and on whether entity-expanded content can be reflected through the boolean XPath result or error handling; SSRF and entity-expansion DoS are the more certain outcomes. Whether generated/supported configs ship with XPath filters by default was not exhaustively audited.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (insecure default)"
+    }
+  ],
+  "coverage_summary": "Snapshot scope as reported by get_source_scope: 2078 model-visible files, all under the repository root; binary-like files are skipped and no files were excluded for size/sensitivity/symlinks. The snapshot contains main sources of the Artemis modules (commons, core-client, jms-client, server, protocols AMQP/OpenWire/MQTT/STOMP, CLI, web, JDBC store, journal, DTO, CDI, boot, RA, lock managers, distribution/scripts) but no test sources, no docs and no git metadata. I read or searched the security store and permission checks, management/RBAC/JMX handlers, web component, protocol permission paths (AMQP/OpenWire), XML/deserialization utilities, CLI/tools path handling, and JDBC shared-state/lock code. Coverage is not exhaustive: the largest management control classes (ActiveMQServerControlImpl, QueueControlImpl, AddressControlImpl) and much of the AMQP federation/mirror and journal code were only sampled via targeted searches; no dynamic analysis was performed.",
+  "limitations": [
+    "No tests, docs, git history or upstream reference are present, so I could not diff this snapshot against a known-good revision to confirm which line(s) changed or what the intended default was.",
+    "No runtime verification, compilation or exploit execution was performed; the XXE finding is a source-evidence-based lead.",
+    "The impact of blind XXE depends on the JDK XML parser behavior and on how parse errors are logged; file-content disclosure was not proven, only SSRF/DoS and out-of-band exfiltration paths.",
+    "Large parts of the codebase (several management control classes, AMQP federation/mirror, journal/paging internals, MQTT/STOMP details, CLI tools) were reviewed by targeted search rather than line-by-line, so a second independent vulnerability could exist elsewhere."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "JsonUtil.fromJsonArray deserializes Base64 data into CompositeDataSupport with ObjectInputStreamWithClassLoader allowlist \"java.util,java.lang,javax.management\" (artemis-core-client/.../api/core/JsonUtil.java:94-105)",
+      "reason": "Used when decoding management responses, and the allowlist is narrow (no known RCE gadget outside those packages is loadable). Suspicious but no demonstrated gadget chain or attacker-controlled server-side input."
+    },
+    {
+      "lead": "Base ActiveMQMessage.getBodyInternal uses a plain ObjectInputStream to deserialize the message body (artemis-jms-client/.../ActiveMQMessage.java:739-747)",
+      "reason": "All concrete JMS message subclasses override getBodyInternal (Text/Bytes/Map/Object), and reaching the base path requires an application to call getBody on a plain Message with a body, which is a spec deviation rather than a clear server-side vulnerability; the ObjectMessage path applies allow/deny lists."
+    },
+    {
+      "lead": "NetworkHealthCheck builds and executes a ping command from configured address strings (artemis-commons/.../core/server/NetworkHealthCheck.java:389-394, 54-60)",
+      "reason": "Inputs come from broker configuration, not remote clients, and ProcessBuilder is used without a shell, so this is an administrative-configuration concern, not an attacker-controlled command injection."
+    },
+    {
+      "lead": "OpenWire anonymous-producer send path calls checkDestinationForSendPermission before conversion (artemis-protocols/.../openwire/amq/AMQSession.java:361-374, 583-601)",
+      "reason": "The permission check (including composite destinations) is present, which looks like the post-fix state; no bypass found in that path."
+    },
+    {
+      "lead": "JGroupsFileBroadcastGroupControlImpl.getFileContents reads a classpath resource named by configuration (artemis-server/.../management/impl/JGroupsFileBroadcastGroupControlImpl.java:48-56)",
+      "reason": "The file name comes from broker configuration and getResource only resolves classpath entries; no remote path traversal was demonstrated."
+    },
+    {
+      "lead": "DefaultSensitiveStringCodec encrypts masked passwords with Blowfish and a fixed internal key (artemis-commons/.../utils/DefaultSensitiveStringCodec.java:167-210)",
+      "reason": "Known, documented obfuscation-only behavior of the default codec; no attacker-controlled key or data path identified."
+    },
+    {
+      "lead": "BasicAuthenticator.authenticate dereferences params without validating credentials type (artemis-server/.../management/BasicAuthenticator.java:37-43)",
+      "reason": "Yields an NPE/denial of the JMX login attempt rather than an authentication bypass."
+    },
+    {
+      "lead": "Default management.xml grants broad access to the configured role (artemis-cli resources .../etc/management.xml:30-49, jolokia-access.xml:23-33)",
+      "reason": "Generated default policy bound to the operator-supplied role; it is an intentional default configuration, not a broken authorization check."
+    }
+  ],
+  "summary": "Repository is Apache ActiveMQ Artemis 2.40.0-SNAPSHOT (main sources only; no test sources in the snapshot). I reviewed protocol, security/authorization, management, web, CLI, and persistence code and traced remote input paths into XML/object parsers. The single strongest candidate is in artemis-commons XmlProvider: the process-wide XXE hardening is switched off by default because the `artemis.disableXxe` property is evaluated with a `false` default, so `isXxeEnabled()` returns true when the property is unset. All call sites that are supposed to apply XXE protections (DocumentBuilder, StAX reader, schema factory, transformer, validator) are gated on `!isXxeEnabled()`, so an unset property leaves JDK default, entity-resolving XML parsing in place. This builder is also the shared parser used by XPath message selectors (artemis-selector), which the broker evaluates against attacker-produced message bodies when a queue/divert/consumer uses an XPATH filter. This is an insecure-default XXE weakness (CWE-611) with broker-side file/SSRF/DoS impact; it is a lead supported by source evidence, not a runtime-confirmed exploit. Other suspicious areas were checked and rejected as weaker (listed below)."
+}

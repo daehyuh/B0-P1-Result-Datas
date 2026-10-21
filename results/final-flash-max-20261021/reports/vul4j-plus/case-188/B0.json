@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote HTTP/2 peer controls the frame stream after the connection preface: it can send arbitrarily many PING frames (without ACK), SETTINGS frames, and can trigger RST_STREAM responses. By default `autoAckPingFrame` and `autoAckSettingsFrame` are true, so each such frame produces an outbound control frame. The peer also controls whether it reads: if it stops reading, TCP backpressure fills the socket send buffer and Netty keeps queueing the writes in the ChannelOutboundBuffer (watermarks only signal writability, they do not bound queued bytes).",
+      "confidence": "medium",
+      "counterevidence_checked": "(a) Repo-wide searches for `Http2ControlFrameLimitEncoder`, `ControlFrameLimit`, `controlFrame`, `outstandingControlFrames`, and `maxOutstandingControlFrames` return matches only inside Http2ControlFrameLimitEncoder.java itself, so there is no alternative wiring (reflection, service loader, other module) I could find. (b) The guard's plumbing works if installed: DecoratingHttp2ConnectionEncoder.lifecycleManager propagates (lines 34-37) and Http2ConnectionHandler calls encoder.lifecycleManager(this) (Http2ConnectionHandler.java:388), so the class is compatible with the current chain - its absence is not explained by an API mismatch. (c) Users can reduce exposure by setting autoAckSettingsFrame(false)/autoAckPingFrame(false) (AbstractHttp2ConnectionHandlerBuilder.java:108-109, 383-405), but these are opt-in and do not bound RST_STREAM responses; the default remains unprotected. (d) This snapshot also lacks the later `decoderEnforceMaxRstFramesPerWindow`/`decoderEnforceMaxConsecutiveEmptyDataFrames` limits, consistent with a pre-fix state for the same DoS family, but I could not prove which specific fix this snapshot precedes. (e) I could not rule out that upstream intentionally committed the class ahead of the wiring commit; even then the shipped default behavior in this snapshot is unprotected. (f) I did not execute code or tests; the memory-growth impact is inferred from the code path and Netty buffering semantics, not runtime-confirmed.",
+      "id": "netty-http2-control-frame-limit-not-applied",
+      "impact": "Remote denial of service against Netty-based HTTP/2 servers/clients: sustained control-frame floods (PING/SETTINGS, plus RST_STREAM responses the same guard would count) accumulate queued outbound buffers and objects, leading to heap exhaustion/long GC or process OOM, or at minimum severe latency and connection stalls. The mitigation that exists in the tree (flush + ENHANCE_YOUR_CALM + close) is inert, so the default configuration has no cap. This matches the Ping/Settings-flood class of HTTP/2 DoS issues disclosed in 2019 (CVE-2019-9512 / CVE-2019-9515 pattern), whose fix is precisely to apply this encoder.",
+      "locations": [
+        {
+          "end_line": 112,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2ControlFrameLimitEncoder.java",
+          "start_line": 25
+        },
+        {
+          "end_line": 487,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/AbstractHttp2ConnectionHandlerBuilder.java",
+          "start_line": 470
+        },
+        {
+          "end_line": 188,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2FrameCodecBuilder.java",
+          "start_line": 179
+        },
+        {
+          "end_line": 212,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2MultiplexCodecBuilder.java",
+          "start_line": 205
+        },
+        {
+          "end_line": 489,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2ConnectionDecoder.java",
+          "start_line": 466
+        }
+      ],
+      "prerequisites": "Application uses the default HTTP/2 builders (Http2ConnectionHandlerBuilder / Http2FrameCodecBuilder / Http2MultiplexCodecBuilder) with autoAckPingFrame/autoAckSettingsFrame left at their defaults, and exposes HTTP/2 to untrusted peers; attacker can open an HTTP/2 connection and withhold reads. The condition is a default configuration, not an opt-in.",
+      "root_cause": "Http2ControlFrameLimitEncoder (codec-http2) is defined but referenced nowhere in the repository: no `new Http2ControlFrameLimitEncoder(...)` exists and the identifier occurs only inside its own file. The HTTP/2 connection builders build the encoder chain as `new DefaultHttp2ConnectionEncoder(connection, writer)` (plus optional StreamBufferingEncoder) without ever decorating it with the limiter, and Http2ConnectionHandler stores/uses that encoder directly. Consequently the counter/limit logic (flush, then connectionError(ENHANCE_YOUR_CALM) and ctx.close() once maxOutstandingControlFrames outstanding control frames are reached) can never execute, while the decoder still auto-acknowledges every PING and SETTINGS frame by default.",
+      "title": "HTTP/2 control-frame flood mitigation is dead code: Http2ControlFrameLimitEncoder is never installed, allowing unbounded queued PING/SETTINGS/RST responses (remote DoS)",
+      "trace": "1) readFrame -> DefaultHttp2FrameReader.readPingFrame/readSettingsFrame (codec-http2/.../DefaultHttp2FrameReader.java:519-544, 577-584) dispatches to Http2FrameListener. 2) DefaultHttp2ConnectionDecoder internal FrameReadListener.onPingRead (line 483-489) calls encoder.writePing(ctx, true, data, ctx.newPromise()); onSettingsRead (lines 466-480) calls encoder.writeSettingsAck(ctx, ctx.newPromise()). 3) Because the builders never wrapped the encoder (AbstractHttp2ConnectionHandlerBuilder.java:470-486; Http2FrameCodecBuilder.java:179-186; Http2MultiplexCodecBuilder.java:205-210), the call lands on DefaultHttp2ConnectionEncoder.writePing/writeSettingsAck (DefaultHttp2ConnectionEncoder.java:310-312, 280-286) and then DefaultHttp2FrameWriter, which allocates and writes one frame per request with no accounting (DefaultHttp2FrameWriter.java:337-339). 4) Http2ControlFrameLimitEncoder.handleOutstandingControlFrames (lines 88-112), the only code that would flush and tear the connection down when a limit is reached, is never in the chain, so the number of outstanding acks/RSTs and the queued outbound bytes grow without bound while the peer never reads.",
+      "unverified": "Runtime confirmation of memory exhaustion and required flood rates; exact CVE mapping and whether the missing wiring is an intentional intermediate upstream state versus a reverted/omitted patch; whether any downstream packaging or user code replaces the builders with a custom encoder that includes the limiter.",
+      "weakness_type": "Uncontrolled resource consumption / missing rate limiting (CWE-770/CWE-400 class)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 1,988 model-visible files, 0 excluded by sensitive-name/path filters, 0 excluded for size, 0 symlink exclusions; binary-like files are refused/skipped by the reader. No test sources are visible in the snapshot and no git history is available. I read in depth: the HTTP/2 codec (HpackDecoder, DefaultHttp2FrameReader, DefaultHttp2ConnectionDecoder, Http2ConnectionHandler, AbstractHttp2ConnectionHandlerBuilder, Http2FrameCodecBuilder, Http2MultiplexCodecBuilder, Http2ControlFrameLimitEncoder, Http2CodecUtil, DefaultHttp2ConnectionEncoder/Decoder), and significant parts of codec-http (HttpObjectDecoder, HttpObjectAggregator, HttpUtil, QueryStringDecoder, WebSocket08FrameDecoder, multipart disk handling, XmlDecoder), codec (JdkZlibDecoder, compression framing, Base64), codec-dns (DefaultDnsRecordDecoder, DnsCodecUtil), codec-haproxy (HAProxyMessageDecoder/Message), codec-mqtt (MqttDecoder), handler/ssl (SslProvider, AbstractSniHandler), plus buffer/common spot checks and the root pom/dependency versions (4.1.39.Final-SNAPSHOT; netty-tcnative 2.0.25.Final). Extensive repo-wide literal searches were used for attacker-controlled size/parse patterns, unused mitigation identifiers, and known-vulnerability signatures.",
+  "limitations": [
+    "No git history, upstream diff, or release tags are available, so I could not prove the snapshot was modified relative to upstream; the selected issue is inferred from the presence of an inert mitigation class and the unprotected default code path, not from a patch diff.",
+    "No build, compilation, tests, or runtime execution was performed; the DoS impact is a source-level inference and is not runtime-confirmed.",
+    "No test sources are visible in the snapshot, so expected-behavior/regression signals could not be used.",
+    "Not all 1,988 files were read; modules such as resolver/resolver-dns internals, codec-socks, codec-smtp, codec-stomp, codec-memcache, transport/native C sources, and examples/microbench were only sampled or searched, so an injected or latent defect there cannot be excluded.",
+    "Exact CVE/issue mapping and which specific security fix this snapshot precedes are uncertain; multiple 2019-2020 Netty issues (HTTP request smuggling, HTTP/2 DoS variants) are consistent with the old version string, and only one candidate could be submitted."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HTTP request smuggling via whitespace before the colon in header names (HttpObjectDecoder.splitHeader, codec-http/.../HttpObjectDecoder.java:720-751) and via bare-LF line terminators / ignored CRs (HeaderParser.process, lines 806-826)",
+      "reason": "The parsing logic does accept 'Transfer-Encoding : chunked' as a TE header and terminates lines on a lone LF, which is the smuggling surface later addressed in Netty's request-smuggling fixes; however the code matches the upstream pre-fix design with no leftover artifact indicating modification, and I could not confirm a desync pair or that this snapshot's target issue is in HTTP/1 parsing, so I did not select it."
+    },
+    {
+      "lead": "No limit on received RST_STREAM frames per time window or on consecutive empty DATA frames (decoderEnforceMaxRstFramesPerWindow / decoderEnforceMaxConsecutiveEmptyDataFrames are absent from all builders and Http2ConnectionHandler)",
+      "reason": "Real DoS exposure for this version range and related to the selected candidate, but it is pure missing hardening with no source artifact (such as an unused mitigation class) proving this is the intended defect; also would be a second root cause, and only one candidate may be submitted."
+    },
+    {
+      "lead": "HpackDecoder.setMaxHeaderListSize error message uses MIN_HEADER_TABLE_SIZE/MAX_HEADER_TABLE_SIZE instead of the header-list-size bounds (codec-http2/.../HpackDecoder.java:333-339)",
+      "reason": "Cosmetic/incorrect diagnostics only; the actual validation comparisons are correct, so there is no security impact."
+    },
+    {
+      "lead": "AbstractSniHandler/ SniHandler client-hello parsing has no explicit upper bound on the TLS handshake record length before the SNI lookup (handler/.../AbstractSniHandler.java:53-205)",
+      "reason": "Hardening gap known to be addressed only in much later releases; no evidence of tampering in this snapshot and the application's byte-buffer limits still apply, so it was not selected."
+    },
+    {
+      "lead": "Various other protocol parsers reviewed without finding a concrete defect (HAProxy v1/v2 header extraction, MQTT remaining-length decode, DNS name decompression loop checks, WebSocket08 frame decoding, query-string HashDOS limit, HTTP/1 aggregator size checks, multipart disk-file temp handling)",
+      "reason": "No missing check, wrong comparison, or injectable sink was identified that rises to the evidence bar used here."
+    }
+  ],
+  "summary": "Netty 4.1.39.Final-SNAPSHOT source tree (1,988 model-visible main-source files; no test sources visible). I reviewed the HTTP/2 codec in depth and sampled HTTP/1, HAProxy, MQTT, DNS, WebSocket, compression, SSL and buffer/common paths. The single strongest source-evidenced issue is in codec-http2: the repo contains a purpose-built mitigation class, Http2ControlFrameLimitEncoder, whose javadoc says it guards \"against a remote peer that will trigger a massive amount of control frames but will not consume our responses\", yet the class is never instantiated anywhere in the tree. All three HTTP/2 builders create a raw DefaultHttp2ConnectionEncoder (optionally wrapped only in StreamBufferingEncoder), so every inbound PING/SETTINGS (and outbound RST_STREAM) gets answered with no cap on outstanding control frames. A remote HTTP/2 peer can therefore cause unbounded growth of the channel outbound buffer by flooding control frames it never reads, i.e., a remote resource-exhaustion/DoS condition of the class the dead code was written to prevent. I selected this over other plausible but less-evidenced leads (HTTP/1 request smuggling via whitespace-before-colon / bare LF; missing RST_STREAM and empty-DATA frame limits)."
+}

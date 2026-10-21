@@ -1,0 +1,94 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The path is built from HttpServletRequest.getServletPath()/getPathInfo() in AbstractResourceHandler.getResource(HttpServletRequest) (lines 40-60), i.e. the container-decoded request path. A remote client controls it byte for byte, including percent-escapes such as %5C (backslash), which servlet containers decode into the path info. No application-level route needs to exist: MatcherFilter calls staticFiles.consume() before any route matching (spark/http/matching/MatcherFilter.java:90-95), and SparkFilter does the same (spark/servlet/SparkFilter.java:166-171).",
+      "confidence": "low",
+      "counterevidence_checked": "Checked whether UriPath.canonical already removes all dot-dot segments: it only handles '/' delimiters, and it does correctly return null for '/../' above the '/'-root — the surviving payload relies exclusively on backslash-encoded dot-dot, not on plain '..' segments. Checked ordering comparison: if the path were canonicalized after prefixing (or if the prefixed string were re-canonicalized with a '/'-aware canonicalizer), the base folder could not be cancelled in the same way; the snapshot canonicalizes before prefixing but normalizes with a different separator set afterwards, which is the mismatch reported. Checked that only reachable-when-configured handlers are involved (configure/configureExternal, StaticFilesConfiguration.java:150-229) and that MatcherFilter/SparkFilter invoke static consumption before route/filter matching, so an attacker does not need a mapped route. Checked that cleanPath alone (without the canonicalizer mismatch) would not be exploitable, because UriPath.canonical removes plain '..' segments first. Checked handler error paths: exceptions are swallowed and return null (ExternalResourceHandler.java:81-86), so a failed traversal attempt produces a 404 rather than a crash. Did not (and cannot, in this run) confirm the exact container behaviour for a %5C-encoded path, which is why confidence is stated as low rather than high.",
+      "id": "spark-static-file-path-traversal",
+      "impact": "Disclosure of files that the application did not intend to serve: application configuration, WEB-INF resources, deployment descriptors and (with enough traversed segments) arbitrary readable files relative to the file-system root or classpath roots, limited by the privileges of the JVM process. Read-only; no code execution demonstrated. In the classpath mode the traversal reaches resources above the configured classpath folder (URL resolution of '../' entries), which is a classic protected-resource disclosure.",
+      "locations": [
+        {
+          "end_line": 87,
+          "path": "src/main/java/spark/resource/ExternalResourceHandler.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 41,
+          "path": "src/main/java/spark/resource/ExternalResource.java",
+          "start_line": 39
+        },
+        {
+          "end_line": 88,
+          "path": "src/main/java/spark/resource/ClassPathResourceHandler.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 83,
+          "path": "src/main/java/spark/resource/ClassPathResource.java",
+          "start_line": 75
+        },
+        {
+          "end_line": 267,
+          "path": "src/main/java/spark/utils/StringUtils.java",
+          "start_line": 218
+        },
+        {
+          "end_line": 57,
+          "path": "src/main/java/spark/resource/UriPath.java",
+          "start_line": 32
+        },
+        {
+          "end_line": 101,
+          "path": "src/main/java/spark/staticfiles/StaticFilesConfiguration.java",
+          "start_line": 80
+        },
+        {
+          "end_line": 60,
+          "path": "src/main/java/spark/resource/AbstractResourceHandler.java",
+          "start_line": 40
+        }
+      ],
+      "prerequisites": "The application must have enabled static files: `Spark.staticFileLocation(folder)` (classpath handler, folder existing in the file system classpath) or `Spark.staticFileLocation`/`externalStaticFileLocation` (external handler). The servlet container must deliver a decoded backslash in servletPath/pathInfo (Jetty 9.3.6, pinned in pom.xml, decodes %5C in the request path and predates later 'ambiguous URI' rejection), and the decoded request path must be reachable through the handler selected (external handler when externalStaticFileLocation is used). Note that ExternalResource converts '\\' to '/' inside cleanPath, so the bypass is not limited to Windows.",
+      "root_cause": "The static-file chain canonicalizes the attacker-supplied path with `UriPath.canonical`, which only recognizes '/'-delimited '.'/'..' segments (spark/resource/UriPath.java:32-57), and only then prefixes the configured base folder with `AbstractResourceHandler.addPaths` (spark/resource/AbstractResourceHandler.java:80-122). The prefixed string is finally normalized by `StringUtils.cleanPath` inside `ExternalResource`/`ClassPathResource`, and `cleanPath` first converts every backslash to '/' (StringUtils.java:222) and then folds '..' elements against whatever precedes them — including the base-folder elements (StringUtils.java:239-266). Because the two normalizers disagree about the separator set and about ordering (canonicalize-then-prefix vs. prefix-then-`..`-folding), a request path whose dot-dot segments are backslash-delimited is left untouched by `UriPath.canonical`, and afterwards cancels the configured base folder in `cleanPath`, yielding a File / classpath resource outside the static folder (e.g. '/etc/passwd', WEB-INF resources, config files).",
+      "title": "Path traversal outside the configured static-file folder via '..\\' segments that survive canonicalization then escape the base folder during cleanPath",
+      "trace": "1) Request path such as '/..%5C..%5C..%5Cetc%5Cpasswd' arrives; container yields pathInfo containing '/..\\..\\..\\etc\\passwd'. 2) StaticFilesConfiguration.consume → consumeWithFileResourceHandlers → ExternalResourceHandler.getResource(path) / ClassPathResourceHandler.getResource(path) (StaticFilesConfiguration.java:80-101). 3) UriPath.canonical(path) scans for segments delimited only by '/' (UriPath.java:42-53) and therefore leaves '..\\'-style segments intact (it returns null only for dot-dots that exceed the '/'-root, which never happens here). 4) addPaths(baseResource, path) prepends the configured folder, e.g. '/public' + '/..\\..\\..\\etc\\passwd'. 5) ExternalResource ctor (ExternalResource.java:39-41) / ClassPathResource ctor (ClassPathResource.java:75-83) call StringUtils.cleanPath, which replaces '\\' with '/' and folds each '..' against the preceding element — cancelling 'public' and then climbing above the root ('/public/../../..' → '/..'), so the resulting File is outside the configured folder; ClassPathResource additionally strips the leading slash and passes the '../..' path to ClassLoader.getResource/getResourceAsStream. 6) ExternalResourceHandler returns the resource, resource.isReadable() is true, and StaticFilesConfiguration streams it to the client via IOUtils.copy (StaticFilesConfiguration.java:86-96).",
+      "unverified": "Not verified at runtime: whether Jetty 9.3.6 (and the servlet container used with SparkFilter) passes a decoded '\\' through in servletPath/pathInfo instead of rejecting or re-encoding the request; whether the deployment in use has static files configured and points at a file-system folder; whether the JDK ClassLoader URL resolution actually follows '../' outside the configured classpath folder for the classpath variant. No execution, tests, or exploit payloads were run; all conclusions are from source reading plus the read-only relation index (which provides no data-flow or reachability proof).",
+      "weakness_type": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Reviewed all 95 files reported by get_source_scope (91 Java sources under src/main/java plus pom.xml, README.md, .travis.yml, .gitignore); the relation index reports 95/95 indexed files, 0 omitted, 0 parse errors, but semantic resolution, data flow and control flow are not implemented, and the snapshot contains no test tree, so no test-based corroboration was possible. Focus areas read in full: static file serving (StaticFilesConfiguration, resource/* handlers, UriPath, StringUtils, MimeType, GzipUtils), request/response (Request, Response, Session, QueryParamsMap, http/matching/*), routing (route/*, routematch/*, Routable), servlet/embedded entry points (MatcherFilter, SparkFilter, FilterTools, EmbeddedJetty*), serialization and util classes. Name-based index facts (redirect/output/network/process hints) were used only to navigate and were re-verified against source text; none of them indicated an additional sink beyond those examined.",
+  "limitations": [
+    "No runtime verification: code was not compiled, tests were not run, and no request/response behaviour was executed, so container-specific handling of encoded backslashes (%5C) and of dot-segments in Jetty 9.3.6 is unconfirmed.",
+    "The relation index provides only syntax/navigation candidates: no data-flow, control-flow, semantic resolution, reachability, DI/profile or enforcement analysis, so reachability of the static-file handlers in a real deployment is inferred from source only.",
+    "No sibling commits, patches, tests, issue trackers, CVE data or upstream sources were consulted, so it cannot be stated whether this chain matches a known advisory or a deliberately regressed line; the finding rests solely on the snapshot's own logic.",
+    "No application code (routes, filters, deployments) ships with this snapshot, so the practical impact depends on which static-file configuration an application uses and on the servlet container it is deployed to.",
+    "Only the single strongest candidate was submitted per the review cap; the other review leads above were not exhaustively validated and must not be treated as findings."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unbounded request-body buffering in HttpRequestWrapper.cacheInputStream (src/main/java/spark/embeddedserver/jetty/HttpRequestWrapper.java:49-59) reading the whole body into a byte[] with no size limit",
+      "reason": "Memory-exhaustion style DoS depends on the application reading the body and on server/connector limits; it matches upstream Spark behaviour rather than a clearly introduced flaw, and the security impact is speculative without runtime limits data. Kept as a rejected lead, not a candidate."
+    },
+    {
+      "lead": "Double URL decoding of the request path in FilterTools.getRelativePath (src/main/java/spark/servlet/FilterTools.java:33-59) and URLDecoder use in Request.getParams/getSplat (src/main/java/spark/Request.java:468-525)",
+      "reason": "The decoded value feeds route matching and params, not a filesystem/OS sink in this snapshot; '+' to space and %2F decoding are behavioural/licensing concerns whose attacker-impact depends entirely on application code. No source-level sink was found that turns this into a framework vulnerability."
+    },
+    {
+      "lead": "Static files are served with a content type derived from the requested resource extension (src/main/java/spark/staticfiles/MimeType.java:97-101, StaticFilesConfiguration.java:89) — a user-uploaded .html/.svg would be served as active content",
+      "reason": "This is documented design of a static file server and requires the application to place attacker-controlled content in the static folder; the mapping itself is not attacker-controlled. Rejected as not demonstrably a vulnerability of this codebase."
+    },
+    {
+      "lead": "Lenient Content-Encoding/quality handling in GzipUtils (src/main/java/spark/utils/GzipUtils.java:59-97, String.contains(\"gzip\") ignores q=0) and MimeParse accept negotiation (src/main/java/spark/utils/MimeParse.java:138-189, no fitness computed when the target has no params)",
+      "reason": "Functional/negotiation quirks with no concrete confidentiality, integrity, or availability impact demonstrated from source alone; not reported as candidates."
+    },
+    {
+      "lead": "Missing bounds/None-handling around MimeParse.bestMatch when the supported collection is empty (MimeParse.java:173-189) and exception-swallowing paths in static resource lookup",
+      "reason": "Call sites supply non-empty collections in this snapshot (route entries exist when called); worst case is a 500/RuntimeException, i.e. low impact, and no attacker-controlled empty collection was traced."
+    },
+    {
+      "lead": "Insecure defaults in the public API (no-nonce/none used, no CSRF or security headers, cookies not HttpOnly/Secure by default in Response.cookie overloads, SocketConnectorFactory leaving Jetty SSL defaults untouched)",
+      "reason": "Framework-level hardening opportunities controlled by application code; no attacker-controlled path to a violated security boundary was identified in source, so not reported."
+    }
+  ],
+  "summary": "Repository snapshot is sparkjava/spark-core (pom version 2.5.1; Jetty 9.3.6). Coverage: 95 text files under src/main/java plus pom.xml, README.md, .travis.yml, .gitignore — the entire source scope reported by get_source_scope/get_relation_scope (no files omitted or binary-skipped; no test tree present in the snapshot). I traced the request-controlled data paths (servlet path/path info → static resource resolution; query/body/header access; Accept-header content negotiation; route matching; response writing) and reviewed the relation-index facts (name-based security_call hints only, no data flow). One source-supported candidate is submitted: path traversal in the static-file resolution chain, where the '/'-only canonicalizer is followed by a base-folder-prefixed `cleanPath` that treats '\\\\' as a separator and re-resolves '..'. Everything else reviewed looked like upstream framework behavior or required developer-controlled misconfiguration, so it is listed as rejected leads rather than extra candidates."
+}

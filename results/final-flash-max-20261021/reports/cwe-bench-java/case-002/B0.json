@@ -1,0 +1,108 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The HTTP request target is fully attacker-controlled. In embedded mode `AbstractResourceHandler.getResource` (AbstractResourceHandler.java:40-60) builds the path from `HttpServletRequest.getServletPath()`/`getPathInfo()`; in servlet-container mode `FilterTools.getRelativePath` derives it from `getRequestURI()` and URL-decodes it. Either string reaches the static-file handlers via `StaticFilesConfiguration.consume` (called from MatcherFilter.java:91 and SparkFilter.java:167) without application involvement, so any unauthenticated client can supply the traversal payload (e.g. a path containing `..\\` or `%5c`-encoded backslashes).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether `UriPath.canonical` returns null for the payload: it does for slash-delimited over-traversal (e.g. `/../secret`), so ordinary `../` is blocked; the bypass requires separator representations that canonical does not recognize but cleanPath does. Checked that all three handlers call canonical before resource construction (they do), so the weakness is the canonical/cleanPath semantic gap rather than a missing canonical call. Checked that no containment check exists after file resolution (none found; `ExternalResource` has no knowledge of the base folder). Checked whether the path could instead be normalized by the container: in embedded Jetty the root handler is `JettyHandler extends SessionHandler` (no ServletHandler ambiguous-URI rejection); in servlet mode `FilterTools.getRelativePath` adds a second `URLDecoder.decode` pass (FilterTools.java:55). Checked `MimeType` default (application/octet-stream) and error pages (static HTML) and found no competing higher-impact issue.",
+      "id": "spark-static-file-dir-traversal",
+      "impact": "Unauthenticated arbitrary file read outside the configured static content folder (configuration files, credentials/keystore files, application classes, source, system files such as /etc/passwd), i.e. information disclosure that can directly enable further compromise. Severity depends on deployment privileges and on the container delivering backslash path characters, but the configured static-folder boundary is not enforced by the code itself.",
+      "locations": [
+        {
+          "end_line": 165,
+          "path": "src/main/java/spark/resource/UriPath.java",
+          "start_line": 32
+        },
+        {
+          "end_line": 87,
+          "path": "src/main/java/spark/resource/ExternalResourceHandler.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 88,
+          "path": "src/main/java/spark/resource/ClassPathResourceHandler.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 106,
+          "path": "src/main/java/spark/resource/JarResourceHandler.java",
+          "start_line": 79
+        },
+        {
+          "end_line": 267,
+          "path": "src/main/java/spark/utils/StringUtils.java",
+          "start_line": 218
+        },
+        {
+          "end_line": 41,
+          "path": "src/main/java/spark/resource/ExternalResource.java",
+          "start_line": 39
+        },
+        {
+          "end_line": 83,
+          "path": "src/main/java/spark/resource/ClassPathResource.java",
+          "start_line": 75
+        },
+        {
+          "end_line": 101,
+          "path": "src/main/java/spark/staticfiles/StaticFilesConfiguration.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 60,
+          "path": "src/main/java/spark/servlet/FilterTools.java",
+          "start_line": 33
+        },
+        {
+          "end_line": 174,
+          "path": "src/main/java/spark/servlet/SparkFilter.java",
+          "start_line": 141
+        }
+      ],
+      "prerequisites": "The application must enable static file serving (`staticFileLocation(...)`, `staticFiles.location(...)`, `externalStaticFileLocation(...)`, or `staticFiles.externalLocation(...)`). Exploitation additionally requires the container/request pipeline to deliver a backslash character into the servletPath/pathInfo or decoded relative path used by the handlers (embedded raw Jetty handler path does not run the servlet-layer ambiguous-URI rejection; in servlet mode the extra `URLDecoder.decode` in FilterTools can create backslashes from double-encoded input). On Windows the escaped backslash is doubly effective because '\\' is a native separator as well; on Unix the escaping still works because `StringUtils.cleanPath` converts '\\' to '/' before `File` resolution.",
+      "root_cause": "Static-file path validation and path normalization use inconsistent separator semantics, and no final containment check is performed. `UriPath.canonical` (src/main/java/spark/resource/UriPath.java:32-165) only treats '/' as a separator: its backward scans use path.lastIndexOf('/') and segment-length arithmetic, so a segment such as \"..\\\\\" or a path like \"/..\\\\..\\\\etc/passwd\" is not recognized as a parent-directory reference and is returned unchanged (\"too many ..\" detection at line 155 never triggers). The handlers then prepend the configured base (`ExternalResourceHandler.java:65-69`, `ClassPathResourceHandler.java:66-70`, `JarResourceHandler.java:87-88`). Only afterwards do the resource constructors call `StringUtils.cleanPath` (ExternalResource.java:40, ClassPathResource.java:77), which first replaces '\\' with '/' (StringUtils.java:222, `WINDOWS_FOLDER_SEPARATOR` -> `FOLDER_SEPARATOR`) and then resolves '..' pairs (StringUtils.java:243-259). The backslash-glued dot segments therefore become real \"..\" segments after validation, and `new File(...)`/classloader lookup resolves them against the file system, escaping the configured static directory. `StaticFilesConfiguration.consumeWithFileResourceHandlers` (StaticFilesConfiguration.java:80-101) performs no additional check that the resolved resource is under the base folder. Secondary contributing factor: in servlet mode `FilterTools.getRelativePath` (FilterTools.java:54-58) applies `URLDecoder.decode` on top of the container's already-decoded URI and the result is returned by the wrapper's `getPathInfo()` (SparkFilter.java:154-164), providing a second decoding pass that can introduce backslashes into the path that the static-file handler consumes.",
+      "title": "Static-file handlers allow directory traversal via backslash-separated dot segments (canonical check vs. cleanPath mismatch)",
+      "trace": "HTTP request (e.g. path containing `..\\..\\` segments, optionally %5c-encoded) -> Jetty embedded `JettyHandler`/MatcherFilter (or SparkFilter -> MatcherFilter in servlet mode) -> `StaticFilesConfiguration.consume` -> `AbstractResourceHandler.getResource` (servletPath+pathInfo) -> `ExternalResourceHandler.getResource`/`ClassPathResourceHandler.getResource`/`JarResourceHandler.getResourceStream` -> `UriPath.canonical(path)` returns the input unchanged because the '..' are not '/'-delimited (UriPath.java:40-57, 155-157) -> `addPaths(baseResource, path)` prepends the configured folder -> `new ExternalResource(...)` / `new ClassPathResource(...)` calls `StringUtils.cleanPath`, which replaces '\\' with '/' (StringUtils.java:222) and collapses the now-real '..' pairs (StringUtils.java:243-259) -> `new File(...)` / ClassLoader lookup resolves outside the static root -> `isReadable()`/`consumeWithFileResourceHandlers` streams the file contents back to the client (StaticFilesConfiguration.java:86-96).",
+      "unverified": "Runtime exploitability was not executed or reproduced. The exact behavior of the bundled Jetty 9.3.6 (whether literal/percent-encoded backslashes survive into `Request.getServletPath()`/`getPathInfo()` for a non-servlet handler) and of external servlet containers is not visible in this source-only snapshot, so the concrete payload encoding is unverified. The snapshot's pom (2.5.1) and the historical fix for the Spark directory-traversal CVE (2.7.2) could not be cross-checked offline; the finding is based solely on the code paths present here. `ClassPathResource` behavior for directory-based classpaths vs JARs may differ (JAR lookups with '..' generally fail).",
+      "weakness_type": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Inspected the entire assigned scope: 95 readable files under src/main/java (plus pom.xml, README.md, .travis.yml), covering spark core routing/matching (MatcherFilter, Routes, RouteEntry, Service, Routable, Request/Response), static-file and resource handling (StaticFilesConfiguration, MimeType, External/ClassPath/Jar handlers, UriPath, StringUtils, resource classes), embedded Jetty wiring, servlet-filter mode (SparkFilter, FilterTools), serialization, sessions, websockets, and utilities. No test sources, resources, or dependency sources are present in the snapshot, so container behavior and historical fixes could not be inspected. All claims are source-based; nothing was executed.",
+  "limitations": [
+    "Binary/dependency behavior (Jetty 9.3.6, external servlet containers) is not in scope; the exploit requires a container that passes literal or percent-encoded backslashes into the path Spark reads, which could not be verified from the snapshot.",
+    "Only src/main sources of this snapshot were available (no tests, no changelog, no git history), so the exact historical fix/CVE mapping for this code state could not be confirmed.",
+    "No code execution, tests, or scanners were run; the traversal was traced statically and is therefore a lead, not a runtime-confirmed vulnerability.",
+    "Path handling was reasoned about on Unix semantics plus the code's explicit '\\'->'/' replacement; Windows trailing-dot/space normalization and alternate-data-stream behaviors were not verified and are not claimed.",
+    "Other areas (TLS connector configuration, websocket setup, exception mapping) were reviewed only at a high level and could contain additional lower-impact issues."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "MatcherFilter's X-HTTP-Method-Override header changes the HTTP method used for route matching (MatcherFilter.java:47-48, 165-172), potentially bypassing method-scoped guards.",
+      "reason": "This is an intentional, documented framework feature present in upstream Spark; the application's route/filter definitions are evaluated with the overridden method, so it is not a framework vulnerability by itself."
+    },
+    {
+      "lead": "HttpRequestWrapper caches the entire request body in memory (HttpRequestWrapper.java:49-59), allowing memory-exhaustion DoS.",
+      "reason": "Design property of the body-caching feature; no unbounded attacker-controlled file/path or trust-boundary violation, and DoS-by-large-body is a generic server concern rather than clear source evidence of the benchmarked flaw."
+    },
+    {
+      "lead": "QueryParamsMap recursive key parsing (QueryParamsMap.java:109-124) could cause deep recursion/StackOverflowError on crafted parameter names.",
+      "reason": "Recursion depth is bounded by parameter key length; the regex KEY_PATTERN has no catastrophic backtracking, and no crash was demonstrated. Unconfirmed DoS lead only."
+    },
+    {
+      "lead": "Default response content type is text/html (Body.java:64-66) and static MIME mapping could enable XSS for attacker-uploaded files.",
+      "reason": "Only relevant if an application returns or stores untrusted content; `MimeType` defaults unknown extensions to application/octet-stream (MimeType.java:97-101), so no framework-level XSS was established."
+    },
+    {
+      "lead": "Response.redirect/header and cookie helpers pass values into the container (Response.java:117-155, 229-236), potentially allowing header/response splitting or open redirects.",
+      "reason": "Values come from application code, not the framework's parsing of attacker input; Jetty validates header values. No source-evident framework flaw."
+    },
+    {
+      "lead": "SparkFilter instantiates application classes via Class.forName/newInstance (SparkFilter.java:101-107).",
+      "reason": "The class name comes from filter configuration (web.xml), which is trusted deployment configuration, not attacker-controlled input."
+    },
+    {
+      "lead": "Servlet-mode path handling: FilterTools URL-decodes the request path a second time and MatcherFilter matches routes on the decoded value (FilterTools.java:55, SparkFilter.java:154-164).",
+      "reason": "Real robustness concern and a contributing factor to the submitted candidate, but by itself it only normalizes to slash-delimited '..' which `UriPath.canonical` blocks, so it is not reported as a separate candidate."
+    }
+  ],
+  "summary": "Reviewed all 95 main-source files of the Spark (com.sparkjava:spark-core 2.5.1) snapshot with text search and bounded reading, focusing on where attacker-controlled HTTP input crosses into file-system access. The strongest source-evidence issue is a directory-traversal weakness in the static-file path resolution chain: request paths are validated with `UriPath.canonical`, which only recognizes '/' as a separator and returns the input unchanged when dot segments are not slash-delimited, but the path is then normalized by `StringUtils.cleanPath` (which converts '\\\\' to '/' and collapses \"..\") and finally handed to `new File(...)` / ClassLoader/classpath resolution with no check that the resolved file remains inside the configured static folder. Backslash-separated traversal sequences (\"..\\\\..\\\\\") therefore pass validation and are converted into real \"..\" segments afterwards, allowing reads outside the configured static root. Only this single candidate is submitted; other leads were examined and rejected as unconfirmed/expected behavior."
+}

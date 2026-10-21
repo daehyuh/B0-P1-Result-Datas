@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A network attacker able to intercept the TCP connection (DNS/route hijack, malicious proxy, rogue Wi-Fi, etc.) supplies any server certificate whose chain terminates in a CA already in the client's trust store (for example, a free/cheap certificate for a domain the attacker owns, or an existing certificate from a compromised/negligent CA). The attacker does not need a certificate for the impersonated hostname and does not need to break the CA trust anchor; the client accepts the attacker's certificate because only path validation is performed.",
+      "confidence": "medium",
+      "counterevidence_checked": "The provider's TODO comments show the omission was known to the developers, i.e., this is an unimplemented feature in a then-beta provider rather than a locally injected regression; applications that pass a custom X509ExtendedTrustManager with their own hostname checks in the 2-arg method, set a HostnameVerifier, or use the JDK provider are unaffected. I also verified that no other code path in the TLS/JSSE provider performs hostname matching (searches for HostnameVerifier, EndpointIdentification consumers, matchHostname, getPeerHost use), that the trust manager really is reachable via BouncyCastleJsseProvider (SSLContext.TLS / TrustManagerFactory registration), and that JsseDefaultHostnameAuthorizer is EST-only. No dynamic testing was performed.",
+      "id": "bcjsse-missing-endpoint-identification",
+      "impact": "Silent man-in-the-middle/impersonation of arbitrary TLS servers toward BCJSSE-based clients: theft of credentials/session tokens and cookies, injection or modification of application data, and defeat of the server-authentication guarantee that the endpointIdentificationAlgorithm contract is meant to provide. This is the same defect class later assigned CVE-2024-34447 for this provider.",
+      "locations": [
+        {
+          "end_line": 283,
+          "path": "tls/src/main/java/org/bouncycastle/jsse/provider/ProvTlsClient.java",
+          "start_line": 265
+        },
+        {
+          "end_line": 391,
+          "path": "tls/src/main/java/org/bouncycastle/jsse/provider/ProvSSLSocketDirect.java",
+          "start_line": 374
+        },
+        {
+          "end_line": 629,
+          "path": "tls/src/main/java/org/bouncycastle/jsse/provider/ProvSSLEngine.java",
+          "start_line": 612
+        },
+        {
+          "end_line": 589,
+          "path": "tls/src/main/java/org/bouncycastle/jsse/provider/ProvSSLSocketWrap.java",
+          "start_line": 572
+        },
+        {
+          "end_line": 141,
+          "path": "tls/src/main/java/org/bouncycastle/jsse/provider/ProvSSLParameters.java",
+          "start_line": 33
+        },
+        {
+          "end_line": 125,
+          "path": "tls/src/main/java/org/bouncycastle/jsse/provider/ProvX509TrustManagerImpl.java",
+          "start_line": 103
+        },
+        {
+          "end_line": 54,
+          "path": "tls/src/main/java/org/bouncycastle/jsse/provider/ProvX509ExtendedTrustManager_7.java",
+          "start_line": 38
+        }
+      ],
+      "prerequisites": "The application uses the BCJSSE provider for client-side TLS (e.g., SSLContext.getInstance(\"TLS\", \"BCJSSE\"), BCJSSE installed as default/first provider, or HttpsURLConnection using a BCJSSE SSLContext) and expects standard JSSE endpoint identification: HttpsURLConnection sets endpointIdentificationAlgorithm=\"HTTPS\" by default, or the application calls SSLParameters.setEndpointIdentificationAlgorithm(\"HTTPS\")/relies on the default no-op HostnameVerifier. Applications that install their own HostnameVerifier or manually verify the session's peer certificate, or that use the JDK's JSSE provider, are not affected.",
+      "root_cause": "The BCJSSE provider accepts and stores SSLParameters.setEndpointIdentificationAlgorithm() in ProvSSLParameters, but nothing in the handshake consults it. Certificate validation for clients is performed only through TlsAuthentication.notifyServerCertificate -> ProvTlsManager.isServerTrusted(chain, authType), which calls the 2-argument X509TrustManager.checkServerTrusted(chain, authType) in ProvSSLSocketDirect, ProvSSLEngine and ProvSSLSocketWrap. Neither the socket/engine overloads nor the provider's own trust-manager implementation (ProvX509TrustManagerImpl) ever compare the peer host with the certificate identities; ProvX509ExtendedTrustManager_7 simply forwards socket/engine overloads back to the same non-verifying 2-argument path. The only hostname matching code in the tree (JsseDefaultHostnameAuthorizer) belongs to the separate EST client and is not used by BCJSSE.",
+      "title": "BC JSSE client never enforces endpoint identification (hostname verification)",
+      "trace": "1) ProvSSLContextSpi.engineInit (tls/.../ProvSSLContextSpi.java:527-535) selects the X509TrustManager via selectTrustManager (lines 596-617) and stores it in ContextData (ContextData.java:46-49). 2) The application's SSLParameters.setEndpointIdentificationAlgorithm(\"HTTPS\") is only stored/round-tripped in ProvSSLParameters (lines 33, 133-141) and SSLParametersUtil (lines 195-199, 296-299); no source location ever reads the value for a verification decision (grep for getEndpointIdentificationAlgorithm() shows only the accessor and the JDK round-trip). 3) During the handshake, ProvTlsClient.getAuthentication().notifyServerCertificate (ProvTlsClient.java:265-283) builds the X509 chain and calls manager.isServerTrusted(chain, authType) (line 278). 4) That call lands in ProvSSLSocketDirect.isServerTrusted (line 374), ProvSSLEngine.isServerTrusted (line 612) or ProvSSLSocketWrap.isServerTrusted (line 572), each of which invokes only the 2-argument tm.checkServerTrusted(chain, authType) (lines 383, 621, 581) and carries a TODO stating that X509ExtendedTrustManager/HostnameVerifier functionality is not considered. 5) For applications using BCJSSE's own trust manager factory, ProvTrustManagerFactorySpi wraps ProvX509TrustManagerImpl in ProvX509ExtendedTrustManager_7, whose socket/engine overloads (lines 38-54) forward to the non-verifying 2-argument methods; ProvX509TrustManagerImpl's socket/engine overloads (lines 103-125) likewise only validate the path. 6) Consequently the handshake succeeds with a certificate that does not match the requested host, and the application treats the attacker as the intended server.",
+      "unverified": "Whether this snapshot is the benchmark's intended ground-truth vulnerability; the exact ownership split between JSSE provider and application for hostname verification in each supported JDK (JDK-version-dependent HttpsURLConnection behaviour was reasoned about, not executed); no runtime confirmation that HttpsURLConnection on a given JDK uses BCJSSE's socket without an app-installed HostnameVerifier.",
+      "weakness_type": "CWE-295 Improper Certificate Validation (missing hostname/endpoint identification); also CWE-297-adjacent trust-boundary failure"
+    }
+  ],
+  "coverage_summary": "Source scope: 3,816 model-visible files, all present in the P1 relation index (0 missing, 0 hash mismatches); the same filters apply to B0 and P1. Files examined in depth include: TLS/JSSE provider (ProvTlsClient, ProvTlsServer, ProvSSLSocketDirect/Wrap, ProvSSLEngine, ProvSSLContextSpi, ProvTrustManagerFactorySpi, ProvX509TrustManager*, ProvSSLParameters, SSLParametersUtil, SupportedGroups), new and legacy TLS APIs (TlsProtocol, RecordStream, TlsUtils signature/version checks, TlsRSAUtils, Bc/Jce DefaultTlsCredentialedDecryptor, DTLSReplayWindow), RSA/PKCS#1 (PKCS1Encoding, RSABlindedEngine, RSACoreEngine, RSADigestSigner), signers (DSASigner, ECDSASigner, DSTU4145Signer), keystores (BcKeyStoreSpi/BKS+UBER, BcFKSKeyStoreSpi, PKCS12KeyStoreSpi, JCE DSA/EC SignatureSpi DER handling), CMS SignerInformation verification, OpenPGP PGPSignature verification, PKIXCertPathValidatorSpi, LDAP cert store SPIs, EST hostname authorizer, ASN1ObjectIdentifier interning. The P1 index was used only for navigation (facts are name-based hints, not findings); every claim above was re-checked against source text. No tests are present in the snapshot (test trees are absent).",
+  "limitations": [
+    "Not exhaustive over all 3,816 files: large areas were only sampled (most ASN.1 type classes, PQC/XMSS/SPHINCS/NewHope, mail module, much of pkix cert path building/validation, JCE provider plumbing, many symmetric ciphers/modes).",
+    "Snapshot sits in the 1.60-beta window (late 2017/early 2018); the benchmark's ground-truth vulnerability could not be tied to a specific CVE because the 1.60/1.61 security-fix content is not present in-tree and could not be recalled with confidence, so a version-consistent 2018-era finding may have been missed.",
+    "The relation index is syntactic/navigation-only (no data flow, reachability, or exploitability proof) and several files are duplicated across JDK-target variants (jdk1.1/jdk1.3/jdk1.4/j2me) whose in-sync status was not exhaustively diffed.",
+    "No code was executed, no tests or static analyzers were run, and no network interactions were attempted; exploitability conclusions are static-reasoning based.",
+    "JDK-version-dependent JSSE behaviour (e.g., whether a given JDK's HttpsURLConnection sets endpointIdentificationAlgorithm rather than using a default HostnameVerifier) was reasoned about but not verified at runtime."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "LDAP filter injection: X509LDAPCertStoreSpi.search builds JNDI filters by string concatenation ('(&(' + filter + ')(' + attrName + '=*))') from certificate subject/issuer DN values (X509LDAPCertStoreSpi.java:408-438, via parseDN at 106-141; same pattern in LDAPStoreHelper.java:486-536), and both stores are registered in BouncyCastleProvider (CertStore.LDAP, X509Store.*/LDAP).",
+      "reason": "Real injection pattern (CVE-2023-33201 class), but exploitation is weakened because returned entries are re-filtered by the selector (X509LDAPCertStoreSpi.engineGetCertificates calls xselector.match, line 207) and reachability requires the legacy LDAP-backed store to be explicitly configured; kept as the second-strongest lead, not the submitted candidate."
+    },
+    {
+      "lead": "ECDSA signature generation uses variable-time k.modInverse(n) (core/.../crypto/signers/ECDSASigner.java:122) with no blinding/randomizer (in contrast to DSASigner.getRandomizer), enabling a timing side channel on the nonce (CVE-2020-15522 class).",
+      "reason": "Timing/observability-dependent and closer to a hardening opportunity than a directly exploitable source-visible flaw; the required local timing measurement and its practical signal-to-noise could not be established from source alone."
+    },
+    {
+      "lead": "PKCS#12 keystore loads without any integrity verification when the optional MacData field is absent (prov/.../PKCS12KeyStoreSpi.java:815-857 only verifies when getMacData()!=null), allowing an attacker who can edit a .p12 file to add/modify unencrypted certificate entries undetected.",
+      "reason": "Plausible integrity gap, but MAC-less PKCS#12 may be an intentional interoperability decision (the PKCS#12 MAC is defined as optional); no evidence in-tree that this was treated as a defect, so it fails the evidence threshold."
+    },
+    {
+      "lead": "BKS (Std) keystore load reads a 32-bit iteration count without validation (prov/.../BcKeyStoreSpi.java:814-846), unlike BouncyCastleStore (lines 971-983) and PKCS12KeyStoreSpi (validateIterationCount, lines 1230-1245), enabling CPU-exhaustion DoS from a crafted keystore.",
+      "reason": "Concrete robustness gap but impact is limited to DoS of a caller that loads an attacker-supplied keystore, and no corroborating fix/CVE evidence was found."
+    },
+    {
+      "lead": "JceDefaultTlsCredentialedDecryptor still uses a JCE RSA cipher whose BadPaddingException timing differs from the success path (tls/.../JceDefaultTlsCredentialedDecryptor.java:96-114) despite the 1.59 ROBOT countermeasure fallback.",
+      "reason": "Residual timing behaviour is speculative from source and the 1.59 release notes state the JCE-crypto case was addressed; not submitted."
+    }
+  ],
+  "summary": "bc-java snapshot at the 1.60-beta development point (provider string \"BouncyCastle Security Provider v1.60b\"; in-tree release notes for 1.60 in progress; no Ed25519). I reviewed the TLS/JSSE provider, low-level TLS API and record layer, RSA/PKCS#1 decryption paths, keystores (BKS/UBER/BCFKS/PKCS#12), CMS/PGP signature verification, PKIX path validation code, LDAP-backed certificate stores, EST hostname authorizer, DSA/ECDSA/DSTU signers, and ASN.1 OID interning. One candidate is submitted: the BC JSSE provider never performs TLS endpoint identification (hostname verification) for clients, so an attacker in a MITM position with any certificate chaining to a trusted CA can impersonate any server. Other real but weaker/farther-removed leads (LDAP filter injection, ECDSA nonce modInverse timing, PKCS#12 missing-MAC acceptance, BKS iteration-count DoS, residual JCE padding-exception timing) are listed as rejected/unconfirmed leads. No code was executed; all statements are static source observations."
+}

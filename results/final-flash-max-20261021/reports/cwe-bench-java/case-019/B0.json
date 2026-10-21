@@ -1,0 +1,60 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The path/location argument is supplied by application code and is exactly the value the guard is designed to make safe; in typical usage it is request-derived (e.g. a view/page/forward parameter concatenated into a dispatch path), and the wrapper is applied to every incoming request by the ESAPI SecurityWrapper filter (SecurityWrapper.java:99-107, which also sets the allowable root). The interface Javadoc (HTTPUtilities.java:430-443) states forwards are limited to non-public WEB-INF resources precisely because \"the request will have already passed the URL based access control check\", confirming the parameter is treated as untrusted.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that naive absolute traversal is blocked (\".../etc/passwd\" does not start with WEB-INF), that sendRedirect uses Validator.isValidRedirectLocation (DefaultHTTPUtilities.java:844-849) and that getValidFileName uses a canonical-name comparison, i.e. the project has stricter validation elsewhere; checked that ESAPIFilter itself forwards only to constant configured pages (ESAPIFilter.java:109-121) so it does not exercise the flawed guard. The guards do reject targets that do not begin with the allowed root; the flaw is specifically the missing boundary/canonicalization check. A null-returning dispatcher NPE at DefaultHTTPUtilities.java:828-829 is a separate robustness issue, not the reported root cause.",
+      "id": "esapi-forward-path-traversal",
+      "impact": "Security-control bypass: server-side forwarding to resources outside the intended/guarded root that the application assumed were unreachable or protected by URL-based access control (e.g. restricted JSPs/servlets/pages). Depending on application wiring this can cause authorization bypass and disclosure or execution of sensitive handlers after the original request has already passed the URL check, which is exactly the danger the sendForward documentation warns about. The SecurityWrapperRequest variant additionally breaks the class's documented promise to return only safe values when a validation error is detected.",
+      "locations": [
+        {
+          "end_line": 591,
+          "path": "src/main/java/org/owasp/esapi/filters/SecurityWrapperRequest.java",
+          "start_line": 578
+        },
+        {
+          "end_line": 830,
+          "path": "src/main/java/org/owasp/esapi/reference/DefaultHTTPUtilities.java",
+          "start_line": 818
+        }
+      ],
+      "prerequisites": "Application uses SecurityWrapper/SecurityWrapperRequest (so request.getRequestDispatcher() resolves through the wrapper) or calls HTTPUtilities.sendForward()/DefaultHTTPUtilities.sendForward() with an attacker-influenced location. The servlet container must resolve relative dispatcher paths containing '..' (standard behavior for Tomcat/Jetty class containers: the path is normalized within the servlet context). No special configuration required beyond ESAPI's normal filter/API usage.",
+      "root_cause": "Both guards enforce path containment with an uncanonicalized prefix test: SecurityWrapperRequest.getRequestDispatcher() accepts path if path.startsWith(allowableContentRoot) (default \"WEB-INF\", or \"/WEB-INF\" after setAllowableContentRoot(), which the SecurityWrapper filter calls), and DefaultHTTPUtilities.sendForward() accepts location if location.startsWith(\"WEB-INF\"). No canonicalization, no File/Path containment check, and no check for \".\"/\"..\" segments. Any value that merely begins with the guarded root — e.g. \"/WEB-INF/../admin/secret.jsp\" for the wrapper or \"WEB-INF/../admin/secret.jsp\" / \"WEB-INFevil/...\" for sendForward — passes, and the container normalizes the path when resolving the RequestDispatcher, so the dispatch target is outside the intended root.",
+      "title": "Path-traversal bypass of ESAPI's WEB-INF-only forward/dispatch guard (SecurityWrapperRequest.getRequestDispatcher / DefaultHTTPUtilities.sendForward)",
+      "trace": "1) Request enters the ESAPI filter chain; URL-based authorization is checked against the original request URI (ESAPIFilter.java:118) and the request is wrapped by SecurityWrapper/SecurityWrapperRequest when that filter is used. 2) Application builds a dispatch target from request data and calls either request.getRequestDispatcher(target) on the wrapped request or ESAPI.httpUtilities().sendForward(request, response, target). 3) Guard: SecurityWrapperRequest.java:587 tests path.startsWith(allowableContentRoot) and DefaultHTTPUtilities.java:825 tests !location.startsWith(\"WEB-INF\"); a target containing '..' (or sharing the root's textual prefix) satisfies the test. 4) A target like \"/WEB-INF/../admin/secret.jsp\" (or \"WEB-INF/../admin/secret.jsp\" relative to the current request directory, or escalating with additional \"../\") is passed to the container's getRequestDispatcher(), which normalizes it to a context path outside WEB-INF (e.g. \"/admin/secret.jsp\"). 5) The dispatcher performs a server-side forward to that resource without the URL-based access-control check that a direct request would have triggered, so the documented 'only non-public WEB-INF resources' guarantee is violated.",
+      "unverified": "Not runtime-confirmed. Exact normalization of relative dispatcher paths containing '..' is container-specific and was not executed; exploitability depends on an application passing a request-influenced value into these APIs. No tests are present in the snapshot to confirm intended call patterns or to observe the guard in action.",
+      "weakness_type": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') (path containment enforced by naive String.startsWith prefix check)"
+    }
+  ],
+  "coverage_summary": "Visible scope: 301 repository text files (binary-like/sensitive files excluded by the harness filters; no test sources present). Reviewed source in org.owasp.esapi.filters (SecurityWrapperRequest/Response, SecurityWrapper, ESAPIFilter, ClickjackFilter, RequestRateThrottleFilter), HTTPUtilities + DefaultHTTPUtilities, Validator + DefaultValidator + validation rules, crypto (JavaEncryptor, CipherText, CipherTextSerializer, CryptoHelper, KeyDerivationFunction, CipherSpec), auth/User (FileBasedAuthenticator, AbstractAuthenticator, DefaultUser), access control (DefaultAccessController, FileBasedACRs, ACR policy loaders), WAF (filter, configuration parser, rules), configuration loaders and ESAPI.properties/validation.properties, plus pom.xml and documentation. Non-source and binary files (PDFs, jars) are not visible to the tools and were not inspected. The submission selects one candidate (forward/dispatch guard bypass) and lists the other plausible weakness (DefaultValidator.getValidDirectoryPath prefix check) as a rejected lead, together with other reviewed-but-unconfirmed areas.",
+  "limitations": [
+    "No code execution, tests, or scanners were run; findings are source-reading only and are not runtime-confirmed.",
+    "The snapshot contains no src/test sources, so intended usage patterns and regression tests for these guards could not be reviewed.",
+    "Exact servlet-container normalization of dispatcher paths with '..' segments (and whether security constraints are re-applied on FORWARD) was not verified; impact depends on container behavior and application wiring.",
+    "Large classes (JavaEncryptor ~56 KB, DefaultValidator ~49 KB, DefaultSecurityConfiguration ~52 KB, DefaultHTTPUtilities ~39 KB) and the codec package were reviewed selectively rather than line-by-line; crypto/WAF internals may contain additional issues not identified here.",
+    "Dependency binaries/jars are outside the visible scope; dependency-level vulnerability claims (e.g. commons-io CVE-2021-29425) are based only on pom.xml comments/release notes, not on library source."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DefaultValidator.getValidDirectoryPath() (DefaultValidator.java:469-470) enforces 'directory is inside parent' with dir.getCanonicalPath().startsWith(parent.getCanonicalPath()) and no separator/boundary check; a sibling directory whose canonical path shares the parent's string prefix (e.g. parent /srv/uploads, input /srv/uploads-2019) passes, violating the documented contract (Validator.java:252-257 'subdirectory of the specified parent').",
+      "reason": "Same class of prefix-check weakness and plausibly a real validation bypass, but the exploitation condition is narrower (an existing, name-known sibling directory with a colliding prefix must exist) and the impact depends on how the returned directory is later used; not the single strongest candidate in this snapshot, so it is noted only as an unconfirmed secondary lead."
+    },
+    {
+      "lead": "commons-io 2.6 dependency exposure to CVE-2021-29425 (pom.xml:264-270; release notes 2.2.3.1, lines 57-58).",
+      "reason": "Dependency-level issue; the code snapshot does not demonstrate a reachable in-repo sink that passes attacker input into the affected FilenameUtils behavior, so no concrete source-evidenced exploit path was established."
+    },
+    {
+      "lead": "SafeFile (SafeFile.java:63-105) throws NullPointerException when getParent() is null, and the class Javadoc explicitly says it does not prevent directory traversal.",
+      "reason": "Robustness/design limitation (NPE is a potential DoS only in callers that pass parentless paths), not a demonstrated attacker-controlled security boundary bypass; class contract is documented."
+    },
+    {
+      "lead": "Crypto MAC handling (CipherText.validateMAC, CryptoHelper.isCipherTextMACvalid, CipherTextSerializer.convertToCipherText) and the CVE-2013-5960 comments.",
+      "reason": "Reviewed at a high level: decrypt() validates the MAC before handleDecryption() and validateMAC() fails closed when no MAC is present/when lengths differ; no concrete MAC-bypass or serialization-driven integrity bypass was established from source in the time available."
+    },
+    {
+      "lead": "SecurityWrapperRequest request-parameter/header sanitization methods (lines 338-420, 616-643) and WAF rule/config parsing.",
+      "reason": "Methods generally delegate to ESAPI.validator() with configured regexes; no clearly incorrect validation or reachable unvalidated sink was identified, so these remain unconfirmed leads rather than candidates."
+    }
+  ],
+  "summary": "Reviewed the ESAPI (esapi-java-legacy) 2.2.3.1 snapshot: 301 visible text files covering org.owasp.esapi (Validator/DefaultValidator, HTTPUtilities/DefaultHTTPUtilities, filters, crypto, auth/User, access control, WAF), configuration (ESAPI.properties, validation.properties, WAF policies), build files and documentation. No test sources are present in the snapshot. Strongest issue found: the forward/dispatch \"allowed root\" guards in SecurityWrapperRequest.getRequestDispatcher() and DefaultHTTPUtilities.sendForward() validate the target path only with an uncanonicalized String.startsWith() prefix test, while the API contract explicitly promises forwards are restricted to non-public WEB-INF resources. A target such as \"/WEB-INF/../admin/x.jsp\" (or \"WEB-INF/../admin/x.jsp\", or a prefix-colliding \"WEB-INFfoo...\") passes the check and the servlet container then normalizes the \"..\" segments and dispatches to a resource outside the guarded root, after the URL-based access-control check has already been passed. This is one root cause (naive textual prefix containment check on a dispatch path) duplicated in two classes; the analogous prefix check in DefaultValidator.getValidDirectoryPath is noted as a separate, weaker rejected lead, and dependency-level CVE-2021-29425 (commons-io 2.6) has no demonstrated in-repo exploit path."
+}

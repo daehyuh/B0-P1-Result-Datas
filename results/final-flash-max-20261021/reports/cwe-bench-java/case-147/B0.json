@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Result-extension names accepted by public APIs such as SecurityAnalysisExecutionInput.addResultExtension / addResultExtensions (only Objects.requireNonNull, no character validation) flow into command arguments. In a server deployment these strings are built from caller requests (e.g., requested result extensions); similarly, callers of the public LocalCommandExecutor/LocalComputationManager APIs supply arbitrary argument lists and execution variables that reach the same sink.",
+      "confidence": "medium",
+      "counterevidence_checked": "No escaping, validation, or shell-free alternative exists at any stage: AbstractLocalCommandExecutor uses the safe list-based ProcessBuilder, but the Unix/Windows subclasses re-introduce a shell string; SimpleCommandBuilder.option/arg perform no sanitization; AbstractSecurityAnalysisExecutionInput only null-checks values. In-repo option values in the security-analysis flow (output format \"JSON\", task numbers, fixed working-directory paths) are internal, so the demonstrated taint depends on a caller-controlled string such as result extensions. The action-ial `--contingencies` argument path derives IDs from a Groovy DSL, but that DSL is already arbitrary Groovy code by design, so it is not an additional escalation.",
+      "id": "powsybl-local-command-injection",
+      "impact": "Arbitrary command execution on the host running the local computation manager (typically the application/grid server or the user workstation) with that process's privileges; enables data tampering/exfiltration and pivot to other services. On Windows, argument/env values containing quotes or `&` also allow command chaining (`cmd /c`).",
+      "locations": [
+        {
+          "end_line": 61,
+          "path": "computation-local/src/main/java/com/powsybl/computation/local/UnixLocalCommandExecutor.java",
+          "start_line": 41
+        },
+        {
+          "end_line": 65,
+          "path": "computation-local/src/main/java/com/powsybl/computation/local/WindowsLocalCommandExecutor.java",
+          "start_line": 43
+        },
+        {
+          "end_line": 202,
+          "path": "security-analysis/security-analysis-api/src/main/java/com/powsybl/security/distributed/AbstractSecurityAnalysisCommandOptions.java",
+          "start_line": 178
+        },
+        {
+          "end_line": 84,
+          "path": "security-analysis/security-analysis-api/src/main/java/com/powsybl/security/execution/AbstractSecurityAnalysisExecutionInput.java",
+          "start_line": 76
+        }
+      ],
+      "prerequisites": "An application forwards a caller-influenced string into a command argument (the in-repo example is a distributed/forwarded security analysis with attacker-chosen `--with-extensions` values) and executes it with the default local computation manager; running on Unix (bash -c) or Windows (cmd /c); payload needs shell metacharacters such as `$(...)`, backticks, or `\"` (Unix) or `&`/`%VAR%`/`\"` (Windows).",
+      "root_cause": "UnixLocalCommandExecutor.execute and WindowsLocalCommandExecutor.execute assemble a single shell command string and hand it to `bash -c` / `cmd /c`. Arguments are only wrapped in double quotes with no escaping (`\"`, `$`, backticks, `\\` on Unix; `\"`, `%`, `&` on Windows), and environment-variable names/values are concatenated raw (`name + \"=\" + value`). Shell metacharacters in any argument or variable value are therefore evaluated by the shell.",
+      "title": "OS command injection through unescaped arguments in Unix/Windows local command executors",
+      "trace": "AbstractSecurityAnalysisExecutionInput.addResultExtension(String) (no validation) -> AbstractSecurityAnalysisExecutionHandler.mapInputToCommand -> options.resultExtensions(input.getResultExtensions()) -> AbstractSecurityAnalysisCommandOptions.toCommandBuilder() -> commandBuilder.option(WITH_EXTENSIONS_OPTION, String.join(\",\", resultExtensions)) (line 197-199) -> SimpleCommandBuilder.arg/option -> SimpleCommandImpl.getArgs -> LocalComputationManager.process -> LocalCommandExecutor.execute(program, args, ...) -> UnixLocalCommandExecutor appends each arg as `\" + arg + \"` into `internalCmd` and runs `bash -c internalCmd` (lines 51-60). The shell performs command substitution/word expansion on the caller string before `itools` ever starts, so downstream option validation cannot prevent execution.",
+      "unverified": "No runtime test or payload was executed. The exact mapping from a particular server's request fields to SecurityAnalysisExecutionInput.getResultExtensions was not verifiable from this snapshot, and Windows `cmd /c` quoting/expansion behavior was not runtime-verified. Reachability therefore depends on the embedding application forwarding user-influenced strings into these APIs.",
+      "weakness_type": "CWE-78 OS Command Injection"
+    }
+  ],
+  "coverage_summary": "Coverage was broad but not exhaustive: I inspected the computation/computation-local, security-analysis-api, commons (XML, datasource, compress, config, io), iidm-serde/iidm-api, cgmes model/conversion/completion, triple-store, cim-anonymiser, ampl-executor, action-ial, ucte/psse/matpower/ieee-cdf entry points plus root build files, docs and .github workflows. Focus areas were XML parsing, archive/zip handling, file-path construction from untrusted names, shell/process execution, deserialization and CI trust boundaries. Per the source-scope filters, test sources are absent from this snapshot (main/build/docs only), and binary/over-limit/symlinked files were excluded by the harness.",
+  "limitations": [
+    "No source-relation index was available (B0 condition); tracing was done by manual search/reading, so lower-signal modules (psse/matpower/ieee-cdf numeric parsers, most iidm-implementation classes) were only spot-checked.",
+    "Test sources are excluded from the snapshot, so intended validation behavior and any security-relevant regression tests could not be corroborated.",
+    "No code was executed and no runtime/exploit verification was performed; reachability of the command-injection sink from a specific embedding application (e.g., how a server maps request fields to result extensions) remains unverified.",
+    "Dependency behavior (RDF4J parser defaults, SnakeYAML 2.4 defaults, Apache Commons Compress handling) was assessed by source inspection only, not by evaluating the pinned dependency versions."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Zip Slip in LocalComputationManager.preProcess ARCHIVE_UNZIP: zip entry names are used directly in workingDir.resolve(ze.getName()) and Files.copy without normalizing/verifying the target stays under workingDir (computation-local/.../LocalComputationManager.java lines 231-239).",
+      "reason": "Genuine missing validation, but within this snapshot no in-repo caller ever constructs an InputFile with the ARCHIVE_UNZIP preprocessor, so attacker control requires an external computation implementation; kept as the second-strongest lead rather than the submitted candidate."
+    },
+    {
+      "lead": "GitHub Actions environment-file injection in .github/workflows/fork-sonar.yml: values read from workflow_run artifacts (repo-name/head-ref/...) are echoed line-by-line into $GITHUB_ENV (lines 58-69) and attacker-influenced artifact contents are copied into the workspace (lines 118-123) before the secret-bearing Sonar step (lines 172-196).",
+      "reason": "Plausible CI trust-boundary issue (fork PR can control artifact contents if it modifies its own workflow), but impact and exploitability depend on GitHub platform semantics (workflow selection, artifact ordering, runner env handling) that cannot be verified from source alone; also less clearly a product-code vulnerability."
+    },
+    {
+      "lead": "Java deserialization in SparseMatrix.read(InputStream) using ObjectInputStream (math/.../SparseMatrix.java lines 487-496).",
+      "reason": "No in-repo caller reads untrusted data through this method, and no attacker-controlled path to it was found; weak reachability."
+    },
+    {
+      "lead": "SnakeYAML loading in YamlModuleConfigRepository/BaseVoltagesConfig, and RDF4J RDF/XML parsing in TripleStoreRDF4J.",
+      "reason": "Configuration files are local/trusted and SnakeYAML 2.4 with restricted Constructor is used; XmlUtil-based StAX parsing is hardened (DTD/external entities disabled). No concrete untrusted-source-to-sink evidence was established."
+    },
+    {
+      "lead": "Path traversal on caller-supplied base names in DirectoryDataSource.getPath / Importers.importData.",
+      "reason": "Requires an embedding application to pass raw attacker strings as data-source base names; no in-repo untrusted flow was demonstrated, and stronger candidates exist."
+    }
+  ],
+  "summary": "Reviewed the powsybl-core 6.8.0-SNAPSHOT snapshot (main sources, build files, docs, and .github workflows; 2,923 visible files). The strongest single candidate is an OS-command-injection sink in the local computation executors: arguments and environment variables are pasted into a shell command string executed via `bash -c` / `cmd /c` with only naive double-quoting, so any argument containing `$(...)`, backticks, a double quote, or an unquoted env value is interpreted by the shell. A concrete in-repo taint path exists from the public security-analysis execution API (`AbstractSecurityAnalysisExecutionInput.addResultExtension`, arbitrary strings with no validation) through `AbstractSecurityAnalysisCommandOptions` (`--with-extensions` option) to `UnixLocalCommandExecutor`/`WindowsLocalCommandExecutor`. If an embedding application (e.g., a security-analysis service) forwards caller-supplied extension names/arguments into a distributed/forwarded computation executed by the default local computation manager, this yields arbitrary command execution with the application's privileges. Two other real-looking issues (Zip Slip in `LocalComputationManager` ARCHIVE_UNZIP, and `$GITHUB_ENV` injection from untrusted fork artifacts in `fork-sonar.yml`) were kept as unconfirmed rejected leads per the one-candidate cap."
+}

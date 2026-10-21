@@ -1,0 +1,99 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote HTTP client controls the request path of any GET that matches a registered asset route (AssetCompiler.patterns() produces routes such as '/css/**' and '/js/**' from configured filesets). It can supply encoded traversal segments (e.g. '/css/%2e%2e/%2e%2e/%2e%2e/etc/passwd', or double-encoded '%252e%252e' against servlet/undertow) which Jooby decodes before asset resolution.",
+      "confidence": "medium",
+      "counterevidence_checked": "The parent AssetHandler.loader() normalizes and verifies path.startsWith(basedir) before returning a URL (AssetHandler.java:567-582) - but that code is bypassed because FileSystemAssetHandler overrides resolve(String), not loader(). Prod packaging disables watch (jooby-maven-plugin AssetMojo.java:306-308 and jooby-gradle-plugin AssetTask.java:352-354 write 'assets.watch = false' into dist configs), so the exposure is mainly dev/staging unless watch is enabled elsewhere; the Jooby default application.host may be loopback, limiting remote exposure. Jetty rejects single-encoded dot segments as ambiguous, but the double-decoding in ServletServletRequest means a double-encoded '%252e%252e' passes container validation and is decoded to '..' by Router.decode; Netty does not normalize at all. No other path-confinement/validation filter for asset requests was found in the snapshot. Files.exists() does not canonicalize and therefore cannot substitute for the missing check.",
+      "id": "case-023-cand-1",
+      "impact": "Arbitrary read of files readable by the server process (application source, configuration/secrets, other users' files) via a normal GET to an asset route; information disclosure that can directly enable further compromise (credentials, keys, environment files). Responses are served as assets, so response size/media type follow the target file.",
+      "locations": [
+        {
+          "end_line": 231,
+          "path": "modules/jooby-assets/src/main/java/org/jooby/internal/assets/FileSystemAssetHandler.java",
+          "start_line": 224
+        },
+        {
+          "end_line": 523,
+          "path": "modules/jooby-assets/src/main/java/org/jooby/assets/Assets.java",
+          "start_line": 517
+        },
+        {
+          "end_line": 566,
+          "path": "modules/jooby-assets/src/main/java/org/jooby/assets/Assets.java",
+          "start_line": 566
+        },
+        {
+          "end_line": 460,
+          "path": "jooby/src/main/java/org/jooby/handlers/AssetHandler.java",
+          "start_line": 457
+        },
+        {
+          "end_line": 560,
+          "path": "jooby/src/main/java/org/jooby/handlers/AssetHandler.java",
+          "start_line": 554
+        },
+        {
+          "end_line": 582,
+          "path": "jooby/src/main/java/org/jooby/handlers/AssetHandler.java",
+          "start_line": 567
+        },
+        {
+          "end_line": 296,
+          "path": "jooby/src/main/java/org/jooby/internal/URLAsset.java",
+          "start_line": 288
+        },
+        {
+          "end_line": 255,
+          "path": "modules/jooby-servlet/src/main/java/org/jooby/servlet/ServletServletRequest.java",
+          "start_line": 251
+        },
+        {
+          "end_line": 294,
+          "path": "modules/jooby-netty/src/main/java/org/jooby/internal/netty/NettyRequest.java",
+          "start_line": 289
+        }
+      ],
+      "prerequisites": "Application uses the jooby-assets module; assets watch/live-compiler mode is active (default in dev per doc/doc/assets/assets.md and Assets.configure:517, and settable via assets.watch anywhere); at least one asset pattern is registered and matches the request; the target file is readable by the JVM process; the dev/watched server is reachable from the attacker (default host may be loopback, but dev servers are routinely exposed on 0.0.0.0/containers).",
+      "root_cause": "FileSystemAssetHandler.resolve(String) joins the request-derived asset path onto configured roots with Path.resolve() and only tests Files.exists(), without normalize()/startsWith(root) confinement. The parent AssetHandler.loader() performs exactly that check (normalize + startsWith(basedir)) before returning a resource, but the assets subclass overrides resolve() and drops the confinement for the watch/live-compiler mode. Because the asset path is built from the decoded HTTP path (HttpHandlerImpl normalizes only the trailing slash; NettyRequest/UndertowRequest/ServletServletRequest call Router.decode, which URL-decodes the path, and servlet/undertow input is already container-decoded), '%2e%2e'/'%2f' sequences become '..'/'' and escape the configured roots. URLAsset then opens the resulting file (FileInputStream) and the framework serves it.",
+      "title": "Path traversal in jooby-assets watched asset handler (FileSystemAssetHandler) allows arbitrary file read",
+      "trace": "Observed source path: (1) Assets.configure selects the watch branch when watch=true and constructs new FileSystemAssetHandler(\"/\", workdir, publicDir) (Assets.java:517-523); (2) routes are registered for configured asset patterns, e.g. '/css/**' (Assets.java:566; AssetCompiler.patterns() javadoc, lines 340-359); (3) AssetHandler.handle() takes req.path() and calls resolve(req, path) (AssetHandler.java:458-460); (4) init() sets fn = p -> p.substring(1) for pattern '/', so the target is the decoded request path without its leading slash (AssetHandler.java:554-560); (5) dynamic dispatch reaches FileSystemAssetHandler.resolve(), which does source.resolve(path).filter(Files::exists) with no normalize/containment (FileSystemAssetHandler.java:224-231) - e.g. workdir.resolve(\"css/../../../etc/passwd\") exists; (6) the resulting file URL is wrapped in URLAsset, whose attr() opens a FileInputStream for local files (URLAsset.java:288-296), and the file content is sent. Encoding gate: HttpHandlerImpl.normalizeURI only strips a trailing slash (HttpHandlerImpl.java:604-607) and Router.decode() applies URLDecoder.decode to the path (Router.java:234-236); NettyRequest decodes query.path() once (NettyRequest.java:289-294) while ServletServletRequest/UndertowRequest decode an already container-decoded path a second time (ServletServletRequest.java:251-255, UndertowRequest.java:256-261), so '%252e%252e' survives container normalization and becomes '..' for Jooby.",
+      "unverified": "assets.conf (which defines the actual fileset/route patterns) and all test sources are absent from this snapshot, so the exact registered patterns could not be read (AssetCompiler.patterns() documentation and usage imply '/css/**', '/js/**'); no code was executed, so the end-to-end request could not be confirmed at runtime and server-specific path handling is argued from source, not observed. Whether the ground-truth exposure is considered dev-only in the project's security model is unknown.",
+      "weakness_type": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Scope reported by get_source_scope: 4,849 readable files, 5 MiB per-file text limit, no binary/sensitive-name/symlink exclusions; get_relation_scope: 904 files indexed, 493 Java files parsed, 7 omitted, 1 parse error, index status 'partial' with no control-flow/data-flow/semantic resolution. I inspected the core framework (handlers/AssetHandler, Cors/CorsHandler, CsrfHandler, SSIHandler, HttpHandlerImpl, Request/Response implementations, routing/RoutePattern, sessions and cookie/session managers, MediaType, Err/error rendering, FlashScope) and the security-relevant modules (jooby-assets including FileSystemAssetHandler/AssetCompiler/LiveCompiler/AssetVars, jooby-apitool, jooby-crash, jooby-pac4j and jooby-pac4j2, jooby-metrics, jooby-whoops, jooby-livereload, and the netty/servlet/undertow/jetty backends). No test sources and no .conf files exist in the snapshot; third-party webjar contents are absent. Uninspected areas include most data-store/ORM/template/asset-processor modules (e.g. jdbc/jdbi/jooq/ebean/mongodb/cassandra/neo4j, ftl/hbs/pebble/thymeleaf/jade/rocker, asset processors) and build tooling, which were only spot-checked via text search.",
+  "limitations": [
+    "No runtime execution, dependency resolution, or HTTP testing was performed; reachability arguments are source-based (index explicitly lacks data flow and reachability).",
+    "assets.conf and test sources are not part of the snapshot, so the exact asset route patterns and expected behavior could not be read directly; module docs and code indicate patterns such as /css/** and /js/**.",
+    "Server-specific URI handling (Jetty rejection of encoded dot segments, Undertow normalization) is argued from the request classes in this snapshot, not observed.",
+    "The candidate is exposed in watch/live-compiler mode, which is enabled by default only in dev and explicitly disabled in generated dist configs; production exposure requires assets.watch=true.",
+    "The exact upstream fix history/CVE mapping for this snapshot could not be consulted (no web, no repository history in the snapshot)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected XSS via the 'theme' query parameter in jooby-apitool (ApiTool.java:1035-1041 RAML and 1093-1100 Swagger): req.param(\"theme\") is concatenated into the HTML page returned with MediaType.html with no escaping.",
+      "reason": "Attacker control and unescaped HTML concatenation are visible in source, but the injection only occurs if the external webjar index pages (api-console 3.0.17 / swagger-ui 3.17.1) actually contain the replace anchors ('api-console-light-theme.css', '<style>'); those artifacts are not in the snapshot, so exploitability could not be verified. Kept as an unconfirmed lead."
+    },
+    {
+      "lead": "Unauthenticated CRaSH web shell: WebShellHandler.onOpen (modules/jooby-crash/.../WebShellHandler.java:233-269) and HttpShellPlugin (lines 225-241) call ShellFactory.create(null) and execute client-supplied commands with no authentication or environment guard.",
+      "reason": "High impact (remote command execution) but the module is an explicitly opt-in developer tool whose documentation advertises the shell; it additionally requires an extra connector artifact (crash.connectors.web or explicit plugin registration). Documented/opt-in behavior made this a rejected rather than selected lead."
+    },
+    {
+      "lead": "Java deserialization of session values via ObjectInputStream.readObject in modules/jooby-pac4j (AuthSerializer.java:219-230) and modules/jooby-pac4j2 (Pac4jSessionStore.java:272-281).",
+      "reason": "The serialized values come from Jooby Session attributes, which are server-side (Mem/other stores) or, for cookie sessions, HMAC-signed and rejected when the signature does not verify (CookieSessionManager.attributes / Cookie.Signature.unsign). No path was found where an attacker can place serialized data into the session."
+    },
+    {
+      "lead": "Non-constant-time comparison of HMAC/token values (Cookie.Signature.unsign uses mac.equals(value), Cookie.java:654-665; CsrfHandler token.equals(candidate), CsrfHandler.java:343).",
+      "reason": "Timing side channel / hardening issue only; practical MAC or CSRF-token recovery over a network was not substantiated from source evidence."
+    },
+    {
+      "lead": "CORS handler reflects the request Origin and sets Access-Control-Allow-Credentials when the default origin '*' is configured (CorsHandler.java:284-307, Cors.java:324-332).",
+      "reason": "Behavior is opt-in via installing CorsHandler and is configuration-dependent (origin/credentials values come from cors config not present in this snapshot); treated as a misconfiguration risk, not the strongest distinct vulnerability."
+    },
+    {
+      "lead": "Jooby URL-decodes paths with URLDecoder (Router.decode, Router.java:234-236) in servers that already decoded them (ServletServletRequest.java:255, UndertowRequest.java:260), i.e. double decoding.",
+      "reason": "This is an enabling condition for the selected finding rather than a separate root cause, so it is not submitted as its own candidate (avoiding splitting one root cause)."
+    }
+  ],
+  "summary": "Snapshot is Jooby 1.6.4-SNAPSHOT (mid-2019; Jetty 9.4.19 / Netty 4.1.37). I reviewed core HTTP handling (routing, request/response, sessions/cookies, CSRF/CORS, error rendering, assets) and the security-relevant modules (assets, apitool, crash, pac4j/pac4j2, metrics, whoops, livereload, servlet/netty/undertow/jetty backends). The single strongest source-evidenced issue is a path-traversal/arbitrary-file-read in the jooby-assets live (watched) asset handler: the request-derived asset path is resolved against configured directories with no normalization or containment check, unlike its parent class, and the HTTP path is URL-decoded by Jooby (twice on servlet/undertow), so encoded dot-dot segments reach the resolver. Other plausible issues (ApiTool `theme` reflected XSS, unauthenticated CRaSH web shell, pac4j `readObject`, non-constant-time MAC comparison, CORS origin reflection) were examined but are weaker, dependency-gated, or not attacker-controllable on the evidence available; they are listed as rejected leads."
+}

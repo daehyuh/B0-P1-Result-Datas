@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated caller holding the `jpawebapi.api.enabled` specific permission controls the request body and, for `/service.json`, the service name/method name and parameters (bounded by `cuba.restServicesConfig`), and for `/commit.json` the full entity payload. The response is serialized by JSONConverter with the caller's UserSession as the SecurityContext.",
+      "confidence": "medium",
+      "counterevidence_checked": "Attack paths that are already covered were checked: find/query paths call entityOpPermitted(metaClass, EntityOp.READ) before loading (DataServiceController.java:115, 173, 255), so the missing encoder check is not observable there unless the declared metaClass differs from the returned entity type; the association branches of both converters do check readNotPermitted(); attribute-level VIEW checks exist in the JSON encoder. The XMLConverter root check proves the platform's intended behavior for service/commit results. I could not verify from this snapshot whether CUBA's middleware DataManager additionally enforces entity-op permissions for service-internal loads, which would reduce exploitability; that is an uncertainty, not counterevidence of the missing check.",
+      "id": "json-encoder-missing-entity-read-permission-check",
+      "impact": "Information disclosure: attribute values (subject to attribute VIEW permissions) of entity types the caller has no READ permission for can be returned by the default JSON API (API version 2 is the default per JpaWebApiConfig, and JSON is the primary documented format), where the XML representation of the identical request is refused. Practical exposure depends on whether the invoked service or the commit pipeline itself bypasses READ enforcement (services execute with the caller's security context, so row-level/group constraints still apply).",
+      "locations": [
+        {
+          "end_line": 631,
+          "path": "modules/jpawebapi/src/com/haulmont/addon/jpawebapi/api/converter/impl/JSONConverter.java",
+          "start_line": 617
+        },
+        {
+          "end_line": 769,
+          "path": "modules/jpawebapi/src/com/haulmont/addon/jpawebapi/api/converter/impl/JSONConverter.java",
+          "start_line": 765
+        },
+        {
+          "end_line": 590,
+          "path": "modules/jpawebapi/src/com/haulmont/addon/jpawebapi/api/converter/impl/XMLConverter.java",
+          "start_line": 583
+        },
+        {
+          "end_line": 566,
+          "path": "modules/jpawebapi/src/com/haulmont/addon/jpawebapi/api/controller/DataServiceController.java",
+          "start_line": 544
+        }
+      ],
+      "prerequisites": "1) A valid user session with the `jpawebapi.api.enabled` specific permission (Authentication.begin). 2) An endpoint whose root entity is not already filtered by the controller's own check: `/service.json` (service-method results) and `/commit.json` (commit results), and generally any entity reached as the encoding root. 3) The session lacks READ (EntityOp.READ) for the returned entity type, but holds attribute VIEW permissions (attribute permissions are separate from entity-op permissions) and satisfies row-level constraints. 4) For `/service.json`, the service/method must be listed in the deployment's `*-rest-services.xml` config.",
+      "root_cause": "JSONConverter.encodeInstance() (the entry point used for every JSON response) does not verify `readNotPermitted(metaClass)` for the entity being encoded, while the parallel XML implementation XMLConverter.encodeEntity() throws IllegalAccessException for the same condition. JSONConverter defines and uses readNotPermitted() only for association properties (line 695), so the root/result entity of a JSON response is encoded without any EntityOp.READ authorization check (attribute-level VIEW checks at line 659 and the association checks at 695 remain, but neither implies entity READ permission).",
+      "title": "JSON response encoder omits the entity READ-permission check applied by the XML encoder, allowing entity data to be serialized for users without READ permission",
+      "trace": "POST /api/service.json (or /commit.json) with a JSON body -> ConversionFactory.getConverter(MimeType) selects JSONConverter for application/json -> DataServiceController.serviceByPost (DataServiceController.java:544-566) authenticates the session, checks RestServicePermissions.isNotPermitted(...), invokes the service under the user's SecurityContext (ServiceRequest.invokeMethod) -> converter.processServiceMethodResult(result, returnType) (JSONConverter.java:131-162) -> for Entity results, _process/encodeInstance(e, visited, entity.getMetaClass(), null) -> encodeInstance (JSONConverter.java:617-738) serializes attributes after attrViewPermitted() but with no readNotPermitted() check -> response body contains the entity fields. The same request with Content-Type text/xml goes through XMLConverter.encodeEntity (XMLConverter.java:583-590), which throws IllegalAccessException when READ is not permitted, demonstrating the intended control is missing only in the JSON path.",
+      "unverified": "Not runtime-confirmed. Whether an API-permitted user without READ permission for an entity type can receive that entity through a configured service method depends on the target application's service implementations and on middleware-level permission enforcement (library code not present in this snapshot). I also cannot confirm whether the check was removed relative to upstream or was never present in the JSON converter; the sibling XML implementation and the otherwise-unused `new MyJSONObject(id, /*ref*/ true)` reference-only mode are the internal indications of an intended reference/abort behavior for non-readable entities.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-200 Exposure of Sensitive Information"
+    }
+  ],
+  "coverage_summary": "Reviewed every one of the 55 files exposed by get_source_scope (no binaries/symlinks excluded, per the scope report): all Java sources in modules/jpawebapi (4 controllers, Authentication, RestServicePermissions, ParseUtils, config, converters, models), all Spring/security XML (dispatcher, portal-security, web-spring, portal-spring, web.xml x3, context.xml x3, permissions XML), app properties for core/web/portal, metadata/app-component/bom, build.gradle/settings.gradle and checkstyle/CI files. Coverage of the add-on's own request-handling and authorization logic is complete; library code (CUBA platform/bali: Dom4j, DataService, ViewRepository, userSessionService) and the actual `*-rest-services.xml` runtime configuration are outside the snapshot and were not inspected.",
+  "limitations": [
+    "Only the 55 files in the assigned snapshot are visible; CUBA platform/bali library behavior (Dom4j XML parsing, DataService/DataManager permission enforcement, ViewRepository.deployViews) could not be verified and drives several uncertainties above.",
+    "No tests are present in the snapshot, so intended behavior (e.g., whether the JSON encoder's missing read check is a regression or the XML extra check is the anomaly) cannot be confirmed.",
+    "No runtime execution, dependency resolution, or scanner was used; all conclusions are static source evidence and are not runtime-confirmed.",
+    "The effective runtime configuration of a deploying application (`cuba.restServicesConfig`, roles granting `jpawebapi.api.enabled`, `cuba.rest.productionMode`, allowedOrigins) is deployment-specific and unknown."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE: XML request bodies are parsed with com.haulmont.bali.util.Dom4j.readDocument() in XMLConverter.parseCommitRequest/parseServiceRequest/parseQueryRequest/parseEntity/parseEntitiesCollection (XMLConverter.java:208, 267, 333, 340, 415), reachable via POST /query|/commit|/service with Content-Type text/xml, and Dom4j is a generic SAXReader-based helper that is not hardened in this snapshot.",
+      "reason": "The parser implementation lives in a CUBA library outside the snapshot; I could not verify from available files whether external entity resolution is enabled. This is a classic hardening concern but the security claim rests on unverifiable library behavior and pre-existing framework usage, so it is not reported as a candidate."
+    },
+    {
+      "lead": "FileUploadController.upload () and RestFileDownloadController.download (/download) authenticate with userSessionService.getUserSession(sessionId) only, while every DataServiceController endpoint enforces the `jpawebapi.api.enabled` specific permission through Authentication.begin. A user deliberately denied API access can still use the file endpoints.",
+      "reason": "The affected code path still executes under the caller's own session, so FileDescriptor CREATE/READ and row-level constraints apply in the middleware; the only control bypassed is the API-enabled flag. The pattern also matches CUBA's generic web-client upload/download controllers, making intended-vs-defect attribution unclear. Rejected as a weaker, possibly by-design authorization gap."
+    },
+    {
+      "lead": "DataServiceController.deployViews (lines 435-454) lets any API-permitted user replace the global server-side ViewRepository from a request body; only connect() is checked, no administrative privilege is required.",
+      "reason": "No in-snapshot evidence of a required privilege for view deployment, and attribute VIEW/entity READ checks in the converters still gate what data can be encoded, so the security impact (global state modification/DoS) is speculative."
+    },
+    {
+      "lead": "JSONConverter.parseQueryRequest applies params.get(0) inside a loop over all params (JSONConverter.java:455-457), so every named query parameter is bound to the first parameter's value.",
+      "reason": "Clearly a defect, but the caller supplies both the JPQL query and all parameters, so wrong parameter binding changes results rather than granting access; no security impact demonstrated. Not submitted."
+    },
+    {
+      "lead": "cuba.rest.productionMode defaults to false (JpaWebApiConfig.java:36-38), so sendError (DataServiceController.java:593-606) returns full stack traces to API clients; core app.properties sets cuba.security.undefinedAccessPolicy=ALLOW and portal-app.properties contains a hard-coded trusted client password and admin anonymous login.",
+      "reason": "Deployment/test-configuration hardening items (error-message verbosity, demo app settings) rather than a code-level vulnerability with a concrete attacker-controlled impact in the add-on logic. Not submitted."
+    }
+  ],
+  "summary": "The snapshot is the CUBA \"JPA Web API\" add-on (55 files: REST controllers, JSON/XML converters, authentication/permission helpers, Spring/security configuration). I reviewed all Java sources and the security-relevant XML/properties files. The strongest in-snapshot security defect I found is an authorization inconsistency in the JSON response encoder: unlike the XML encoder, it never checks the current user's READ (EntityOp.READ) permission for the entity instance being serialized, so the primary/default JSON representation can emit entity data for types the session is not permitted to read. Other candidates (unhardened XML parsing, file upload/download endpoints that skip the `jpawebapi.api.enabled` check, unrestricted `deployViews`, and a parameter-indexing bug in JSON query parsing) are listed as unconfirmed/rejected leads because their security impact or provenance could not be established from the snapshot alone."
+}

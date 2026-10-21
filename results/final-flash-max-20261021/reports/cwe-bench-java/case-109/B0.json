@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A network client fully controls the HTTP request body and path for the invoker context: JSON fields `lookup` (EJB JNDI name), `method`, `argTypes`, `argValues`, and optional base64 `java.naming.security.principal`/`credentials`. The v0 client code (`LookupV0`/`EjbHttpProxyHandler`) confirms the legacy paths `/ejb/lookup` and `/ejb/invoke` are the supported protocol-v0 endpoint, reachable under the deployed `__ejb-invoker` context (default `/ejb-invoker`).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the container enforces constraints on `/ejb/*`: `EjbInvokerContainerInitializer` calls `setServletSecurity` only on the `EjbOverHttpApplication` registration, and the endpoint war's `web.xml` contains no `security-constraint`, so the legacy servlet is not container-protected. Checked whether `invokeBeanMethod` compensates: it only performs `ProgrammaticLogin` when the caller supplies a principal, which the attacker can omit, and it does not check roles. Checked whether the servlet is dead code: it is marked `@Deprecated`, but it remains an annotated `@WebServlet(\"/ejb/*\")` inside the deployed war and is the endpoint used by protocol-v0 clients. Checked whether the 403 status mitigates: the method invocation and side effects occur independently of the response status. Checked the default configuration: `enabled` defaults to false and `securityEnabled` defaults to false, so the feature must be explicitly enabled (significant precondition that limits severity).",
+      "id": "case-109-cand-1",
+      "impact": "Authorization bypass: an attacker who cannot authenticate (or is authenticated without the `invoker` role) can invoke business methods on EJBs of deployed applications by global JNDI name (and, for non-`java:global` names, the servlet iterates every deployed application). This enables unauthorized data disclosure/modification and business-logic abuse, and can escalate to remote code execution if reachable EJBs expose sensitive methods; the legacy path also bypasses the TLS requirement applied to the JAX-RS registration when security is enabled.",
+      "locations": [
+        {
+          "end_line": 157,
+          "path": "appserver/ejb/ejb-http-remoting/endpoint/src/main/java/fish/payara/ejb/invoke/InvokeEJBServlet.java",
+          "start_line": 107
+        },
+        {
+          "end_line": 192,
+          "path": "appserver/ejb/ejb-http-remoting/endpoint/src/main/java/fish/payara/ejb/invoke/InvokeEJBServlet.java",
+          "start_line": 177
+        },
+        {
+          "end_line": 91,
+          "path": "appserver/ejb/ejb-http-remoting/endpoint/src/main/java/fish/payara/ejb/invoke/EjbInvokerContainerInitializer.java",
+          "start_line": 77
+        },
+        {
+          "end_line": 90,
+          "path": "appserver/ejb/ejb-http-remoting/admin/src/main/java/fish/payara/ejb/http/admin/EjbInvokerConfiguration.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 93,
+          "path": "appserver/ejb/ejb-http-remoting/client/src/main/java/fish/payara/ejb/http/client/LookupV0.java",
+          "start_line": 62
+        }
+      ],
+      "prerequisites": "The `__ejb-invoker` web application must be deployed (feature is disabled by default; an administrator enables it via `set-ejb-invoker-configuration --enabled=true`, `enable-ejb-invoker`, or equivalent) and `securityEnabled=true` must be configured, since the bug is in the branch that is supposed to enforce security. The HTTP listener hosting the invoker must be reachable by the attacker. When security is enabled, requests to the JAX-RS paths are additionally constrained to CONFIDENTIAL (TLS), while the legacy `/ejb/*` path is not covered by that constraint.",
+      "root_cause": "In `InvokeEJBServlet.doPost`, when `securityEnabled` is true the servlet loops over the configured roles (`roles = config.getRoles().split(\",\")`, default `invoker`) and calls `response.setStatus(HttpServletResponse.SC_FORBIDDEN)` whenever the caller is not in a role, but it never `return`s (and the loop does not implement any-role matching). Execution therefore falls through to `invokeBeanMethod(...)`, which only performs `ProgrammaticLogin` when the caller supplies its own `java.naming.security.principal`/`credentials` in the request body; otherwise the target EJB method is invoked with no authentication. The dynamic `ServletSecurityElement(new HttpConstraintElement(CONFIDENTIAL, roles))` added by `EjbInvokerContainerInitializer` is applied only to the JAX-RS (`EjbOverHttpApplication`) servlet registration, not to the legacy `@WebServlet(\"/ejb/*\")` registration, so the legacy servlet's own (ineffective) check is the only control on that URL path.",
+      "title": "EJB Invoker legacy servlet does not enforce its role check, allowing unauthorized EJB method invocation",
+      "trace": "POST to `<invoker-context>/ejb/invoke` (or `/ejb/lookup`) -> `InvokeEJBServlet.doPost` (line 108) -> `if (securityEnabled)` role loop (lines 111-117): `request.isUserInRole(role)` returns false for an unauthenticated caller in Catalina (`Request.isUserInRole` returns false when `getUserPrincipal()` is null), 403 is set, but no return/abort occurs -> JSON body parsed and dispatched (lines 119-138) -> `invokeBeanMethod` (lines 177-192): `ProgrammaticLogin` only if attacker-supplied `principal` is non-empty -> `excuteInAppContext` resolves the EJB via `InitialContext.lookup` in the target application classloader -> `Invocation.invoke()` (`method.invoke(bean, argValues)`, lines 224-226) executes the business method. The 403 status does not prevent the invocation or its side effects.",
+      "unverified": "Not runtime-confirmed; no deployment was executed. The exact upstream CVE/fix associated with this snapshot is not identifiable from the source alone, so this candidate is the strongest source-evidenced defect found rather than a confirmed mapping to the case's ground-truth issue. Whether any deployment-specific container configuration could cover the `/ejb/*` mapping, and whether a gadget chain exists for the related deserialization path, were not verified.",
+      "weakness_type": "CWE-863 Improper Authorization (authorization bypass / missing access control)"
+    }
+  ],
+  "coverage_summary": "Scope was the assigned source tree only (11,899 readable files; binary-like files skipped, sensitive-name/symlink filters reported as 0 exclusions by get_source_scope). Tests/build outputs are not present, so verification artifacts were unavailable. I used text search across the repo for dangerous sinks (Runtime.exec/ProcessBuilder, ObjectInputStream/readObject, createStatement/executeQuery with concatenation, DocumentBuilderFactory/XXE hardening, new File with request data, path normalization/canonicalization, ClassLoaderObjectInputStream, ObjectInputFilter) and then read the surrounding code. I additionally reviewed the Payara-specific modules most likely to carry a product vulnerability: EJB-over-HTTP invoker (endpoint, admin, client), MicroProfile JWT auth, REST monitoring auth module and MBeans resources, healthcheck/metrics servlet initializers, Yubikey identity store, admin-console authentication/download/log-viewer paths, backup/restore zip handling, and selected admin CLI/launcher command construction. Coverage is not exhaustive: generic GlassFish-derived code (web container, security realm/JACC, deployment descriptors, JMS/JDBC runtime, admingui JSF pages) was searched by pattern but not read file-by-file.",
+  "limitations": [
+    "No build, test execution, or runtime validation was performed; findings are source-evidence based only and are leads, not confirmed vulnerabilities.",
+    "Repository history/patches/CVE metadata are not available in the snapshot, so the mapping between this case and any specific CVE/fix commit could not be verified.",
+    "The EJB Invoker feature is disabled by default; the selected candidate's exploitability depends on an administrator having deployed `__ejb-invoker` (and the severity depends on which EJBs are reachable), which I could not validate at runtime.",
+    "Pattern searches return bounded/truncated results (max 50 matches), so some occurrences of the searched sinks in the large codebase may not have been inspected.",
+    "The endpoint war's actual registration behavior of `@WebServlet` vs dynamic JAX-RS security constraints was reasoned from source (annotation scanning on, no `metadata-complete`, `setServletSecurity` applied only to the Jersey registration) but not confirmed on a running container."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unfiltered Java deserialization in the EJB-over-HTTP endpoint: `ObjectStreamInvokeMethodMessageBodyReader.readFrom` (lines 85-89) and `ObjectStreamMessageBodyReader.readFrom` (line 79) call `ObjectInputStream.readObject()` on `application/x-java-object` request bodies with no `ObjectInputFilter`/class whitelist (CWE-502).",
+      "reason": "Real sink, but it is a separate root cause from the authorization bypass, the endpoint is disabled by default and Java serialization is opt-in on the client (v1 default media type is JSON), and no usable gadget chain was verified in this snapshot, so impact is less certain than the auth bypass."
+    },
+    {
+      "lead": "Hard-coded default credentials: `SetEjbInvokerConfigurationCommand.createDefaultUser` creates file-realm user `invoker` with password `invoker` (`parameters.add(\"userpassword\", DEFAULT_USER_NAME)`, line 373; constants at Constants.java lines 48-50).",
+      "reason": "Clear CWE-798 lead, but it is a separate root cause, requires the invoker to be enabled with security, and presumes the default account was not changed. Not selected under the one-candidate limit."
+    },
+    {
+      "lead": "Yubikey identity store fail-open: `YubikeyIdentityStore.validate` returns a successful `CredentialValidationResult` for the `default:` case of the response-status switch (lines 114-134).",
+      "reason": "Appears unreachable with the response-status enum shipped by the bundled yubico client (all listed statuses are handled), so exploitability is unconfirmed."
+    },
+    {
+      "lead": "Admin-console DownloadServlet content sources (`LogFilesContentSource`, `ClientStubsContentSource`, `LBConfigContentSource`) build temp file paths from request parameters (`target`, `appName`, `lbName`) without sanitization and use an attacker-influenced `restUrl` as a Jersey WebTarget destination.",
+      "reason": "Pre-existing GlassFish-era code; exploitation requires an already-authenticated admin-console session, and the practical impact (arbitrary path with fixed `.zip` suffix, SSRF with admin token) is weaker and less certain than the selected candidate."
+    },
+    {
+      "lead": "`com.sun.enterprise.util.zip.ZipFile.explode` extracts archive entries via `new File(explodeDir, filename)` without canonical-path containment (zip-slip).",
+      "reason": "Reachable through `restore-domain` from a locally supplied backup archive; it is an admin-privileged/local operation, so it was not selected."
+    }
+  ],
+  "summary": "Payara Server/Payara Micro 5.2022.2 source snapshot (GlassFish-derived, 11,899 readable files). I reviewed the Payara-specific attack surface (EJB-over-HTTP invoker, MicroProfile JWT/auth, REST monitoring, healthcheck/metrics servlets, Yubikey identity store, admin-console auth and download content sources, backup/restore, admin CLI) plus repo-wide sink searches (Runtime.exec/ProcessBuilder, ObjectInputStream, SQL statement construction, XML parser configuration, path/file handling). The strongest single source-evidenced candidate is an authorization bypass in the EJB Invoker feature: the legacy `InvokeEJBServlet` (mapped `/ejb/*`) performs a role check that never aborts processing, so when the service is enabled with security, an unauthenticated/under-privileged caller can still have EJB business methods invoked. Related EJB-invoker leads (unfiltered Java deserialization readers, hard-coded default file-realm password) are distinct root causes and were not selected."
+}

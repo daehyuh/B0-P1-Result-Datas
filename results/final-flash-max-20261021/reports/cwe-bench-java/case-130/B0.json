@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The multipart filename parameter of POST /staticfiles (FileItemStream.getName(), copied to `filename` at StaticFileRestService line 260) and the entire uploaded byte stream. The filename can contain POSIX/Windows path separators and `../` sequences and is fully attacker-controlled; only the target's existence and the process's filesystem permissions limit the write.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the endpoint is NOT anonymous: POST /staticfiles requires ROLE_ADMIN/ROLE_UI_THEMES_* (etc/security/mh_default_org.xml:153). Verified Files.copy() uses no REPLACE_EXISTING, so this is create-only, not overwrite. Verified sibling code in the same repo explicitly defends against exactly this class of filename: WorkingFileRepositoryImpl.toSafeName()/checkPathSafe() (lines 236-247, 497-501, 655-658) and the repo's own etc/org.opencastproject.workingfilerepository.impl.WorkingFileRepository.cfg comment documents client file names containing '/../' being sanitised, and FilenameUtils.getName() is the codebase-wide idiom — StaticFileServiceImpl is the outlier with no validation at all. Checked that no other sanitisation happens between the REST endpoint and Files.copy (uuid is server-generated and does not neutralise embedded '../').",
+      "id": "case-130-cand-1",
+      "impact": "Arbitrary creation of files with attacker-controlled content as the Opencast service account, outside the intended <org>/temp/<uuid>/ static-files directory (e.g. into the storage/workspace/archive area, the service user's home, or any writable deployment/config directory such as an OSGi/Karaf drop folder). This breaks the filesystem trust boundary and can escalate to data corruption, persistence or code execution depending on the deployment's permissions; even in the worst-permission case it is unauthorised file write by a non-admin role.",
+      "locations": [
+        {
+          "end_line": 187,
+          "path": "modules/static-file-service-impl/src/main/java/org/opencastproject/staticfiles/impl/StaticFileServiceImpl.java",
+          "start_line": 162
+        },
+        {
+          "end_line": 308,
+          "path": "modules/static-file-service-api/src/main/java/org/opencastproject/staticfiles/endpoint/StaticFileRestService.java",
+          "start_line": 243
+        },
+        {
+          "end_line": 153,
+          "path": "etc/security/mh_default_org.xml",
+          "start_line": 153
+        },
+        {
+          "end_line": 247,
+          "path": "modules/working-file-repository-service-impl/src/main/java/org/opencastproject/workingfilerepository/impl/WorkingFileRepositoryImpl.java",
+          "start_line": 236
+        }
+      ],
+      "prerequisites": "An authenticated account holding ROLE_ADMIN, ROLE_UI_THEMES_CREATE or ROLE_UI_THEMES_EDIT (default rule `pattern=\"/staticfiles\" method=\"POST\"`, etc/security/mh_default_org.xml line 153); the GraphQL/theme feature need not be involved. The target file must not already exist (Files.copy(InputStream,Path) has no REPLACE_EXISTING), and the parent directory must be creatable/writable by the Opencast service account. Requires commons-fileupload's FileItemStream.getName() to preserve path components (no stripping) — see uncertainties.",
+      "root_cause": "StaticFileServiceImpl.storeFile() builds the destination path as getTemporaryStorageDir(org).resolve(Paths.get(uuid, filename)) using the client-supplied multipart filename verbatim, and StaticFileRestService.postStaticFile() passes FileItemStream.getName() straight through. No base-name extraction, allow-list or 'checkPathSafe'-style validation is applied (unlike the working-file-repository code, which sanitizes names via toSafeName()/FilenameUtils.getName()). `..` path segments therefore survive Paths.get/resolve, and Files.createDirectories(parent)+Files.copy() create and write the attacker-chosen target outside <staticfiles root>/<org>/temp/<uuid>/.",
+      "title": "Path traversal in static file upload (client multipart filename used as path) allows arbitrary file write",
+      "trace": "POST /staticfiles (multipart) -> StaticFileRestService.postStaticFile() -> filename = item.getName() (line 260) -> staticFileService.storeFile(filename, inputStream) (line 293) -> StaticFileServiceImpl.storeFile() computes Path file = getTemporaryStorageDir(org).resolve(Paths.get(uuid, filename)) (line 168, no sanitisation) -> Files.createDirectories(file.getParent()) + Files.copy(progressInputStream, file) (lines 179-180) -> file created at the normalized attacker path (traversal with enough '../' segments reaches absolute paths outside the static-files root). The method then returns the random uuid, so the caller's subsequent getStaticFileURL()/getFileName() fails with 500 — the write itself has already happened.",
+      "unverified": "Not runtime-confirmed. Exploitability depends on commons-fileupload 1.5 FileItemStream.getName() preserving path separators (its documented behaviour and the repo's own WFR safeguards indicate it does, but the library source/jar could not be inspected in this run) and on write permissions of the chosen target directory. Exact number of '../' segments needed depends on the configured staticfiles rootdir.",
+      "weakness_type": "CWE-22 (Path Traversal) / CWE-434 (Unrestricted Upload of File with Dangerous Type)"
+    }
+  ],
+  "coverage_summary": "Scope: all 2731 readable source files under the assigned root (no binary/symlink/sensitive-name exclusions reported; NUL-containing files are skipped by the tooling). Reviewed in depth: admin-ui REST endpoints and their role mapping in etc/security/mh_default_org.xml, the agent/event/series/workflow/asset-manager/index/search services, static-file-service (api+impl), working-file-repository, urlsigning verifier/filter, security-jwt/lti/kernel filters, user-settings, GraphQL module and schema/authorization wiring, playlists, ingest/zip handling, cover-image and XSLT/XML parser usages, and the Paella 7 player JS. Swept for command execution, SQL/JPA query construction, XXE, deserialization, path construction (Paths.get/new File with request data), role checks and ownership checks. Not covered: no execution/tests, no git history/diff, no dependency sources/jars, and the separately hosted admin-UI/editor front-ends are not part of this tree.",
+  "limitations": [
+    "Read-only review: nothing was executed, built, fuzzed or deployed; findings are source-level leads, not runtime confirmations.",
+    "No git metadata/history is present, so I could not diff against upstream or determine which code was recently changed/regressed.",
+    "Third-party library behaviour could not be inspected from source: the claim that commons-fileupload 1.5 does not strip path components from multipart filenames (central to the selected candidate) is based on its documented behaviour and on Opencast's own filename-sanitisation code/config, not on the vendored artifact.",
+    "Exploitability of the selected candidate depends on deployment specifics (staticfiles rootdir, service-account permissions on the chosen target directories) that are not visible in the tree.",
+    "The admin UI/editor front-ends are separate repositories; any client-side issues there are outside this snapshot. Large modules were sampled rather than exhaustively line-reviewed, and others (e.g. deeper workflow-operation handlers, transcription providers) were reviewed only where input flows looked security-relevant."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "GraphQL API (/graphql) is configured ROLE_ANONYMOUS and its mutation fields (updateSeries, updateSeriesAcl, updateEvent, updateEventAcl, createSeries) carry no @RolesAllowed, while the invoked services only check read/existence: IndexServiceImpl.updateAllSeriesMetadata() calls checkSeriesExists() -> ElasticsearchIndex.getSeries(...) which uses SeriesSearchQuery.withoutActions() (ACL filter skipped, SeriesQueryBuilder lines 76-85), then SeriesServiceImpl.updateSeries()/updateExtendedMetadata() do no authorization checks, and SeriesServiceDatabaseImpl.storeSeriesAccessControl() skips the write check when a series has no ACL yet. Not selected as the single candidate because the GraphQL plugin is disabled by default (etc/org.opencastproject.plugin.impl.PluginManagerImpl.cfg line 17), and the concrete default impact is metadata/ACL integrity rather than file/RCE impact.",
+      "reason": "Strong alternative and plausibly a real missing-authorization issue, but non-default feature enablement and lower impact than the submitted candidate; kept as an unconfirmed lead rather than a second candidate."
+    },
+    {
+      "lead": "UserSettings IDOR: UserSettingsEndpoint PUT/DELETE /admin-ng/user-settings/setting/{id} -> UserSettingsService.updateUserSetting(long id,...)/deleteUserSetting(long id) load the DTO with em.find() and never verify it belongs to the current user, although the named query UserSettings.findByIdAndUsernameAndOrg exists (UserSettingDto.java line 47).",
+      "reason": "Clear ownership-check gap but limited impact (modify/delete other admin-UI users' settings) and any ROLE_ADMIN_UI user can already reach it only via the UI role gate; not the strongest candidate."
+    },
+    {
+      "lead": "Paella 7 origin check bypass: modules/engage-paella-player-7/src/js/PaellaOpencast.js getUrlFromBase() trusts a user-supplied oc.config/oc.server base when it merely startsWith(window.location.origin), so bases such as 'https://opencast.example.com@evil.com' or '...:origin.evil.com' bypass the #6783 same-origin restriction and let the player fetch its config/manifests from an arbitrary server.",
+      "reason": "The flawed prefix check is real, but the impact is client-side (config/manifest loading) and requires a crafted player link; it is consistent with the just-released #6783 fix, so I could not rule out that this is an accepted/incomplete hardening rather than the target issue."
+    },
+    {
+      "lead": "Anonymous legacy annotation service (PUT /annotation/** creates/changes any annotation by id with no ownership check; etc/security/mh_default_org.xml lines 338-339).",
+      "reason": "Long-standing, deprecated module that is disabled by default (opencast-plugin-legacy-annotation = off) and semantically public/community annotations; too weak to be the selected candidate."
+    },
+    {
+      "lead": "Search service query handling uses unbounded leading-wildcard Elasticsearch queries ('*'+text+'*') and admin-only unbounded size (SearchRestService lines 204-205, 394-395, 417).",
+      "reason": "Plausible DoS hardening opportunity, but the non-admin limit (250) and simple wildcard query appear to be the result of the CVE-2024-52797 fix and there is no direct evidence of a new unfixed flaw."
+    }
+  ],
+  "summary": "Reviewed the Opencast 17-SNAPSHOT tree (2731 files, no binary/symlink/sensitive-name exclusions reported) with emphasis on request-handling code, file/path handling, authorization checks, the security configuration, the new GraphQL API, LTI/JWT/URL-signing, search/asset-manager and admin-ui endpoints. The single strongest candidate is an unvalidated, client-supplied multipart filename that is used to build a filesystem path in the static file upload flow, letting a theme-editing/admin user create files outside the configured static-files root (path traversal / arbitrary file write). Several other plausible but weaker/unconfirmed leads are listed as rejected."
+}

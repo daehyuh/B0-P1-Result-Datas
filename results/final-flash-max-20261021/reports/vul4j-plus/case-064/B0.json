@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Attacker controls the bytes of the imported archive (an uploaded .tar/.tar.gz file, or, via the `url` form field, an archive served from an attacker-controlled server that OpenRefine itself fetches). Tar entry names are fully attacker-controlled. The HTTP request itself is likewise attacker-influenced: /command/core/import-project is a plain multipart POST handled by RefineServlet with no authentication, no Origin/Referer check and no anti-CSRF token, so the request can be issued cross-site by a malicious page (the `url` field means the attacker does not need the victim to pick a local file).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the raw-data import path is protected: ImportingUtilities.allocateFile (lines 437-460) normalizes and enforces startsWith(dir), citing CVE-2018-19859, and that check is correct (absolute child names stay under `dir` on Unix because File(parent,child) concatenates, and `..` is caught by normalize/startsWith) - but untar() does not call allocateFile and has no equivalent check. Confirmed the route is registered (main/webapp/modules/core/MOD-INF/controller.js:65) and reachable via plain doPost with no auth/CSRF/token check in RefineServlet.service (171-214) or web.xml (no security constraints). Confirmed there is no other canonicalization check in ProjectManager.importProject or FileProjectManager.importProject. Apache Ant's TarInputStream simply exposes entry names as stored in the archive; the code performs no `getName()` sanitization. Noted the mitigating conditions: the UI only offers a file input (user must pick an archive for the pure upload variant), OpenRefine defaults to listening on localhost, and the import may end in an error page after the files are written - none of these prevents the traversal itself.",
+      "id": "candidate-1-tar-slip-project-import",
+      "impact": "Arbitrary file write with the privileges of the OpenRefine server process, outside the project workspace. This can overwrite or create files such as shell profiles/startup scripts, cron entries, `authorized_keys`, or application configuration, giving a plausible path to code execution; it can also destroy or corrupt other projects, the workspace metadata (`workspace.json`) or files outside the data directory. When reached via CSRF, no user interaction beyond visiting a malicious page is required and no credentials exist to stop it. Even where attackers cannot choose an executable destination, data destruction of anything the process can write is possible.",
+      "locations": [
+        {
+          "end_line": 187,
+          "path": "main/src/com/google/refine/io/FileProjectManager.java",
+          "start_line": 149
+        },
+        {
+          "end_line": 163,
+          "path": "main/src/com/google/refine/commands/project/ImportProjectCommand.java",
+          "start_line": 98
+        },
+        {
+          "end_line": 172,
+          "path": "main/src/com/google/refine/ProjectManager.java",
+          "start_line": 165
+        },
+        {
+          "end_line": 460,
+          "path": "main/src/com/google/refine/importing/ImportingUtilities.java",
+          "start_line": 437
+        },
+        {
+          "end_line": 214,
+          "path": "main/src/com/google/refine/RefineServlet.java",
+          "start_line": 171
+        }
+      ],
+      "prerequisites": "1) OpenRefine reachable from the victim's browser (default 127.0.0.1:3333 is reachable by cross-site form POSTs; instances exposed on a network are directly reachable). 2) Attacker can deliver a multipart/form-data POST to /command/core/import-project (CSRF form, or any client that can reach the server), supplying either a crafted project-file archive or `url=http://attacker/evil.tar.gz`. 3) The tar contains an entry whose name uses `../` segments; the OpenRefine OS user must have write permission to the chosen destination. No project ID or prior state is needed — the command generates a fresh project ID itself.",
+      "root_cause": "FileProjectManager.untar() trusts tar entry names from an untrusted archive: it does `File destEntry = new File(destDir, tarEntry.getName())`, creates parent directories and writes the entry contents with `new FileOutputStream(destEntry)` without normalizing the resulting path or verifying it remains inside `destDir`. The equivalent hardening exists elsewhere in the codebase (`ImportingUtilities.allocateFile()` normalizes with `toPath().normalize()` and rejects names that escape the archive root, with the comment 'For CVE-2018-19859, issue #1840'), but this project-import path was not covered by that guard, so a `../` entry (e.g. `../../../../home/user/.bashrc`) escapes the project directory.",
+      "title": "Path traversal (Tar Slip) in project archive import allows arbitrary file write outside the workspace",
+      "trace": "POST /command/core/import-project (multipart/form-data) -> RefineServlet.service (RefineServlet.java:171-214, no CSRF/auth check) -> ImportProjectCommand.doPost (ImportProjectCommand.java:63-96) -> internalImport() iterates the upload: for the file part it calls ProjectManager.singleton.importProject(projectID, stream, !fileName.endsWith(\".tar\")) (line 122); for the `url` field it calls internalImportURL() -> importProject(..., !urlString.endsWith(\".tar\")) (line 159) -> ProjectManager.importProject abstract contract (ProjectManager.java:165-172) -> FileProjectManager.importProject (FileProjectManager.java:149-160) wraps the stream in GZIPInputStream when needed -> untar(destDir, stream) (FileProjectManager.java:162-187) -> `new File(destDir, tarEntry.getName())` (line 167), `parent.mkdirs()` (line 171), `new FileOutputStream(destEntry)` + `copyEntryContents` (lines 177-182). For an entry name of `../../../<target>`, the normalized path is outside `destDir`, and the file/directory is created and written there. Nothing later in the request re-validates what was written.",
+      "unverified": "Not runtime-confirmed: no archive was created or imported, per the no-execution constraint. I assumed standard Apache Ant TarInputStream semantics (entry name taken verbatim) and that the bundling/build uses that library as the imports indicate. I could not determine whether this path was later hardened upstream or whether it is the specific flaw the benchmark case targets; it is reported here as the strongest source-evidence candidate among several plausible issues.",
+      "weakness_type": "CWE-22: Path Traversal (unrestricted archive extraction / 'Tar Slip'); arbitrary file write"
+    }
+  ],
+  "coverage_summary": "Read the scope report (941 files; binary files and test/support trees excluded by the harness filters; no symlinks, no oversize files). Inspected the core HTTP dispatch and command layer (RefineServlet, Command, HttpUtilities, all command classes under commands/ plus the lang, importing and project commands), the project lifecycle and IO layer (ProjectManager, FileProjectManager, ProjectUtilities, ProjectMetadataUtilities, FileHistoryEntryManager, ImportingManager, ImportingJob, ImportingUtilities), the importers (Xml, Json, Excel, Ods, Separator, FixedWidth, Marc, Rdf*, Wikitext, tree parsers), the preference/serialization layer (PreferenceStore, PreferenceValue, ParsingUtilities, SerializationFilters, OperationResolver/ReconConfigResolver), the expression layer samples (MetaParser, JythonEvaluable), OAuth/cookie helpers, and the database, gdata, jython, pc-axis and Wikidata extensions at a targeted level. This was a targeted review, not an exhaustive line-by-line audit of all 941 files.",
+  "limitations": [
+    "No execution, tests, scanners or PoC building; all conclusions are from static reading, so exploitability is not runtime-confirmed.",
+    "Test sources are excluded from the snapshot, so regression tests could not corroborate the intended security invariants.",
+    "Vendored client-side libraries (jQuery, jQuery UI, tablesorter, etc.) were not audited beyond spot checks.",
+    "The exact upstream commit/version could not be pinned (pom says 3.2-SNAPSHOT; no .git metadata in scope), so mapping to a specific published advisory or fix commit was not possible without external lookups, which are out of scope.",
+    "Several independent plausible issues remain (see rejected leads); only one candidate is allowed by the review protocol."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE in the StAX-based XML importer (main/src/com/google/refine/importers/XmlImporter.java:320-326): XMLInputFactory is configured only with IS_COALESCING and IS_REPLACING_ENTITY_REFERENCES; DTD support and external entities are not disabled, so a crafted XML import could resolve file:// URLs into cell content (CWE-611).",
+      "reason": "Plausible but runtime-default dependent (JDK StAX defaults), requires the victim to import/fetch a malicious XML, and the source shows no explicit missing check to compare against; ranked below the import traversal, which is reachable without user file selection."
+    },
+    {
+      "lead": "Reflected XSS through the JSONP `callback` parameter of GetRowsCommand (main/src/com/google/refine/commands/row/GetRowsCommand.java:145-163, 219-221): the request parameter is written verbatim into a text/javascript response.",
+      "reason": "Source-evident, and the UI itself uses JSONP, but exploitation needs a valid project ID (or importing-job ID) that an off-site attacker cannot normally know, since project lookup fails before the callback is echoed."
+    },
+    {
+      "lead": "Repository-wide absence of CSRF protection: RefineServlet dispatches POST/PUT/DELETE/GET to state-changing commands with no token, Origin/Referer or auth check (RefineServlet.java:171-214; Command.java).",
+      "reason": "Real and serious, but systemic rather than a single localized defect; treated here as an enabling condition for the submitted candidate instead of a separate candidate."
+    },
+    {
+      "lead": "Jackson polymorphic deserialization in PreferenceStore.PreferenceValue (@JsonTypeInfo(use = Id.CLASS), property \"class\") fed from SetPreferenceCommand (Value string -> loadObject -> treeToValue).",
+      "reason": "Classic unsafe-typing pattern, but I found no in-repo gadget chain or downstream exploit evidence, so the security impact is speculative from source alone."
+    },
+    {
+      "lead": "LoadLanguageCommand builds a file path from the `lang` request parameter without validation (main/src/com/google/refine/commands/lang/LoadLanguageCommand.java:75-119).",
+      "reason": "The parameter is glued between the fixed prefix 'translation-' and suffix '.json', so path components like 'translation-..' would have to exist as directories for traversal; not practically exploitable as written."
+    },
+    {
+      "lead": "Hardcoded PBE password for stored database credentials in extensions/database (DatabaseUtils.java:56, SimpleTextEncryptor uses PBEWithMD5AndDES).",
+      "reason": "Weak cryptography/hardcoded key is a design weakness, but it does not by itself give an attacker a concrete entry point; lower severity than the write primitive above."
+    },
+    {
+      "lead": "OpenWorkspaceDirCommand executes Runtime.getRuntime().exec(\"open .\") (OpenWorkspaceDirCommand.java:63-67).",
+      "reason": "Arguments are constant and the command is gated on a localhost Host header check; no attacker-controlled command string."
+    }
+  ],
+  "summary": "Snapshot is OpenRefine at ~3.2-SNAPSHOT (Nov 2018–Dec 2019 development line), 941 model-visible files (tests and binaries excluded by the scope filters). I reviewed the HTTP command dispatcher, the project/import pipeline (ProjectManager, FileProjectManager, ImportingUtilities), the command classes that take raw request parameters, the preference/serialization layer, the OAuth/lang helpers, the database and Wikidata extensions, and the client-side rendering code.\n\nStrongest source-supported issue: the project-archive import path is a Tar Slip / path traversal. `ImportProjectCommand` (registered as /command/core/import-project) passes an uploaded or URL-fetched .tar/.tar.gz stream to `FileProjectManager.importProject`, whose `untar` method builds `new File(destDir, tarEntry.getName())` and writes each entry with a plain `FileOutputStream` without normalizing the result or checking that it stays under `destDir`. An archive entry such as `../../../../home/<user>/.bashrc` is written outside the workspace. The same repository contains the normalization/startsWith guard in `ImportingUtilities.allocateFile` (added for CVE-2018-19859 / issue #1840) for raw-data extraction, which shows the expected invariant for archive extraction, and that guard does not cover this code path. No authentication or anti-CSRF token is enforced anywhere in `RefineServlet`/`Command`, and `ImportProjectCommand` also honors a `url` form field, so a browser-driven multipart POST (no user file selection needed) can make the server fetch an attacker-controlled archive. Impact: arbitrary file write as the OpenRefine process user (config/startup files, shell profiles, other projects) with a plausible path to code execution, or destructive overwrite. Confidence medium: the flaw is clearly present in source, but I could not verify at runtime and the exact code path is only exercised by the \"import project\" feature.\n\nRejected/unconfirmed leads are listed in the review; the most notable are XXE in the StAX-based XML importer, reflected XSS via the get-rows JSONP `callback`, and the repo-wide absence of CSRF protection (which is an enabling condition for the chosen candidate rather than a separate submission)."
+}

@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the value of the `Long-Running-Action` message header (e.g. an HTTP request header delivered through camel-http/netty-http/servlet/undertow, a JMS property, a file/Kafka header, etc.). `HttpHeaderFilterStrategy`/`DefaultHeaderFilterStrategy` only filter names matching `(Camel|org.apache.camel)...`, so this name passes through unchanged and becomes a normal Camel header. Value can be any URL, e.g. `http://169.254.169.254/...`, `http://internal-host/admin/...` or `http://attacker/`; the `timeLimit` query parameter (`join`) can be attacker-chosen too.",
+      "confidence": "medium",
+      "counterevidence_checked": "I verified that the header is not removed or filtered on ingress (HttpHeaderFilterStrategy filters only `Camel`/`org.apache.camel` names) and that no allow-list check exists on the coordinator-side path; the LRA participant routes do have a `verifyRequest()` allow-list against registered URIs (LRASagaRoutes.java:61-84), which shows the component already treats \"unauthorized remote uri invocation\" as a security concern, yet the coordinator-side `getSaga()` remains unvalidated. I also checked that `InMemorySagaService.getSaga()` is a pure map lookup (not exploitable) and that the header is a documented saga-propagation mechanism, which is the main argument for considering the behavior intentional; that is why this is reported as a lead with medium confidence rather than a confirmed vulnerability.",
+      "id": "camel-lra-saga-header-ssrf",
+      "impact": "Server-side request forgery: the Camel application can be steered into sending PUT requests to internal or external systems reachable from it (cloud metadata endpoints, internal REST services, admin APIs), enabling internal port/host probing and unauthenticated state-changing calls (join/close/cancel semantics), plus resource/timeout abuse. Signed-in/authenticated perimeter controls (HTTP clients can set arbitrary non-Camel headers) do not prevent it. No direct response-body exfiltration to the attacker was identified, so impact is primarily SSRF/state change/DoS rather than direct data theft.",
+      "locations": [
+        {
+          "end_line": 65,
+          "path": "core/camel-base/src/main/java/org/apache/camel/processor/saga/SagaProcessor.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 75,
+          "path": "components/camel-lra/src/main/java/org/apache/camel/service/lra/LRASagaService.java",
+          "start_line": 66
+        },
+        {
+          "end_line": 59,
+          "path": "components/camel-lra/src/main/java/org/apache/camel/service/lra/LRASagaCoordinator.java",
+          "start_line": 38
+        },
+        {
+          "end_line": 159,
+          "path": "components/camel-lra/src/main/java/org/apache/camel/service/lra/LRAClient.java",
+          "start_line": 84
+        },
+        {
+          "end_line": 49,
+          "path": "components/camel-http-common/src/main/java/org/apache/camel/http/common/HttpHeaderFilterStrategy.java",
+          "start_line": 27
+        }
+      ],
+      "prerequisites": "A Camel application must configure the LRA saga service (`org.apache.camel.service.lra.LRASagaService`) and use the saga EIP with a propagation mode that consults an existing saga (`SupportsSagaProcessor` or `RequiredSagaProcessor` with an inherited coordinator) in a route that can receive messages from an untrusted source. `LRASagaService.getSaga()` only parses the header as a URL; the join/complete/compensate requests are then performed by the Camel JAX-RS client. The in-memory saga service does map lookups only, so the SSRF is specific to the LRA-backed implementation.",
+      "root_cause": "The saga EIP treats the message header `Exchange.SAGA_LONG_RUNNING_ACTION` (\"Long-Running-Action\") as the identifier of an existing saga without any validation of its content or origin. `SagaProcessor.getCurrentSagaCoordinator()` passes the header value directly to `CamelSagaService.getSaga(String)`. For the LRA implementation, `LRASagaService.getSaga()` executes `new URL(id)` and wraps it in `LRASagaCoordinator`, whose `beginStep()/compensate()/complete()` delegate to `LRAClient`, which builds a JAX-RS `WebTarget` from that URL (`client.target(lra.toString())`) and sends PUT requests. There is no check that the URL/authority matches the configured `coordinatorUrl`, and the header is not filtered by any HTTP/JMS header filter strategy (those only match the `Camel`/`org.apache.camel` pattern).",
+      "title": "SSRF via untrusted `Long-Running-Action` header in the LRA saga EIP",
+      "trace": "Attacker header `Long-Running-Action: http://attacker-controlled/…` → `SagaProcessor.getCurrentSagaCoordinator()` (SagaProcessor.java:58-62) reads the header with no validation and calls `sagaService.getSaga(header)` → `LRASagaService.getSaga()` (LRASagaService.java:66-74) does `new URL(id)` and constructs `LRASagaCoordinator` → `SupportsSagaProcessor`/`RequiredSagaProcessor` call `coordinator.beginStep()` (SupportsSagaProcessor.java:40-45; RequiredSagaProcessor.java:51-53) → `LRASagaCoordinator.beginStep()` (LRASagaCoordinator.java:48) calls `LRAClient.join(lraURL, step)` → `LRAClient.join()` (LRAClient.java:103-113) performs `client.target(lra.toString()).request().header(HEADER_LINK, …).put(...)`; similarly `complete()`/`compensate()` (LRAClient.java:127-159) issue PUTs to `lra.toString()`+'/close' or '/cancel'. The victim application therefore makes HTTP requests to an arbitrary URL chosen by whoever supplied the header.",
+      "unverified": "No upstream fix/commit was inspected (web and ground-truth data are out of scope), so I cannot confirm that Apache considered or fixed this path, nor that it matches the benchmark's expected vulnerability. Reachability depends on the application using the LRA saga service and a saga propagation mode that begins a step for an existing coordinator; no runtime execution or exploit payload was attempted.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery (unvalidated authority/URL taken from a message header)"
+    }
+  ],
+  "coverage_summary": "Covered the whole assigned tree at a structural level (get_source_scope: 10,041 model-visible files, 6 excluded by sensitive-name filter, no symlinks/oversize files) via repository-wide literal searches for dangerous sinks (ObjectInputStream/readObject, XStream/SnakeYAML, DocumentBuilderFactory/SAXParserFactory/XMLInputFactory/TransformerFactory/XPathFactory/SchemaFactory, Runtime.exec/ProcessBuilder, Cipher/MessageDigest, trust managers, CRLF handling, header filtering, path/jail logic, saga/LRA, HTTP bindings) followed by targeted reads of the relevant Java sources. Deepest tracing was on core/camel-base saga processors, components/camel-lra, camel-stax, camel-netty-http, camel-http-common, camel-file, camel-rabbitmq, camel-consul, camel-shiro, camel-xstream, camel-snakeyaml, camel-sql, camel-exec, camel-jsch, camel-spring-ws, camel-undertow, camel-vertx, camel-ldap. Generated catalog/configurer/JSON files were used only as corroboration, not as runtime evidence. No tests or docs are present in the snapshot (test files were filtered out), so behavior could not be validated by tests or execution.",
+  "limitations": [
+    "Source-only review: no code was executed, no tests exist in the snapshot, and no runtime/exploit confirmation was performed.",
+    "Web access and ground-truth/CVE/patch data are out of scope, so I could not verify whether the LRA header issue was ever treated or fixed as a vulnerability upstream; the candidate is a medium-confidence lead.",
+    "Test sources and docs (.adoc) are absent; generated files were used for cross-checking only, and the snapshot is a pre-release 3.2.0-SNAPSHOT whose exact commit date could not be established.",
+    "Approximately 10k files were searched with literal text queries, not exhaustively line-by-line; components far from security-relevant sinks may not have been individually audited.",
+    "Assessing reachability of the saga SSRF depends on application configuration (LRA saga service + saga EIP propagation mode) that is not present in the repository, so exploitability was reasoned from the code flow only."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "camel-stax `StAXJAXBIteratorExpression` creates `XMLInputFactory.newInstance()` and only sets IS_NAMESPACE_AWARE (components/camel-stax/.../StAXJAXBIteratorExpression.java:123-125), leaving DTD/external-entity resolution enabled for the message body (XXE).",
+      "reason": "The hardened core converter (`StaxConverter.createXMLEventReader`) is normally used first via `tryConvertTo(XMLEventReader.class, ...)`; the unhardened factory is only reached if that conversion returns null, so reachability from ordinary bodies is uncertain and no runtime confirmation is possible here."
+    },
+    {
+      "lead": "`NettyHttpHelper.deserializeJavaObjectFromStream` and `AhcHelper.deserializeJavaObjectFromStream` use a plain `ObjectInputStream` on responses.",
+      "reason": "Both paths are gated by `transferException`/`allowJavaSerializedObject`, which default to false, and by the `application/x-java-serialized-object` content type; the sibling `HttpHelper` already uses `CamelObjectInputStream`. Not sufficient attacker control by default."
+    },
+    {
+      "lead": "`ConsulRegistry` deserializes Consul KV values with a plain `ObjectInputStream` (components/camel-consul/.../ConsulRegistry.java:273-277).",
+      "reason": "Requires write access to the Consul KV keys used by the registry; that is an administrative/trusted data store, and no unauthenticated path from external message input to this sink was found."
+    },
+    {
+      "lead": "`RabbitMQMessageConverter.populateMessageBody`/`deserializeBody` (components/camel-rabbitmq/.../RabbitMQMessageConverter.java:299-323) can deserialize Java objects from messages.",
+      "reason": "Gated by the endpoint option `allowMessageBodySerialization` (default false) and a `CamelSerialize` header the producer itself sets; default configuration is not exploitable."
+    },
+    {
+      "lead": "`GenericFileProducer.createFileName` path jail uses `compatchAnswer.startsWith(compatchBaseDir)` (components/camel-file/.../GenericFileProducer.java:397-405).",
+      "reason": "I traced `compactPath` behavior with the trailing-separator base directory; `../` escapes normalize to paths that do not start with the jailed base (`/foo/`), so I could not construct a bypass from source alone."
+    },
+    {
+      "lead": "SQL/LDAP/JDBC components accept queries/filters from message headers or bodies (e.g. `SqlProducer` uses `CamelSqlQuery`/body when `useMessageBodyForSql`).",
+      "reason": "These are explicit, documented component features (caller-supplied query), not a validation gap within a trust boundary of the component itself."
+    }
+  ],
+  "summary": "This is a source-only review of the anonymous Camel 3.2.0-SNAPSHOT snapshot (Apache Camel, 10,041 readable files; tests/docs stripped; 6 files excluded by name filters). I traced several attacker-input handlers, validation/trust-boundary points and dangerous sinks (XML parsers, Java deserialization, file jailing, HTTP bindings, saga/LRA). The strongest source-evidenced issue is an SSRF in the camel-lra saga implementation: the message header `Long-Running-Action` (a plain, unfiltered header) is taken as an LRA coordinator URL and turned into an outbound HTTP PUT target (`new URL(id)` then `client.target(...).request().put(...)`) with no validation that the URL belongs to the configured coordinator, so a caller who can inject that header into a route using the `saga()` EIP can make the application issue attacker-directed HTTP requests and force `join`/`complete`/`compensate` calls against arbitrary hosts (CWE-918). The candidate is a lead, not a runtime-confirmed finding."
+}

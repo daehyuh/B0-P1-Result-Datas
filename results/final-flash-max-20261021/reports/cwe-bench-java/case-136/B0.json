@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `Map` parameters passed to `RepositoryFactory.getRepository(Map)` (and to `JcrUtils.getRepository(Map/String)`), typically derived from an application-supplied repository URI or configuration: the attacker controls the `org.apache.jackrabbit.repository.jndi.name` value or the `jndi:` URI, including its authority, and thus the JNDI provider/context factory and lookup target. In the secondary paths, the `Context`/`name` (JNDIRepositoryFactory) or the repository binding name (RegistryHelper) are supplied by the application using the API.",
+      "confidence": "medium",
+      "counterevidence_checked": "Critical counterevidence: in this snapshot the lookup is disabled unless the system property `jackrabbit.jndi.enabled` is set (JndiRepositoryFactory line 62; JNDIRepositoryFactory line 65; RegistryHelper lines 64/100), and `JndiRepositoryFactory.getRepository` returns null without looking anything up, so a default build is not exploitable via this path. I confirmed the gate is applied consistently to the generic factory, the deprecated factory and the bind/unbind helper, and that the only other JNDI lookups in the tree (`ConnectionFactory`, `JNDIRepositoryServlet`, `JNDIBindingServlet`, `JNDIDatabaseJournal`/`JNDIDatabasePersistenceManager`) use names taken from repository/servlet configuration rather than remote request data. No runtime testing was performed; exploitability above the flag was not verified.",
+      "id": "case-136-cand-1",
+      "impact": "Remote code execution (or at least attacker-directed class loading / deserialization) in the process that resolves the JCR repository, as well as SSRF-style access to internal JNDI services, when JNDI lookups are enabled and the repository parameters come from an untrusted source. If treated as the historical JCR-5135 issue, this is the code location the project disabled by default to remove the RCE exposure.",
+      "locations": [
+        {
+          "end_line": 138,
+          "path": "jackrabbit-jcr-commons/src/main/java/org/apache/jackrabbit/commons/JndiRepositoryFactory.java",
+          "start_line": 57
+        },
+        {
+          "end_line": 87,
+          "path": "jackrabbit-jcr-commons/src/main/java/org/apache/jackrabbit/commons/repository/JNDIRepositoryFactory.java",
+          "start_line": 64
+        },
+        {
+          "end_line": 104,
+          "path": "jackrabbit-core/src/main/java/org/apache/jackrabbit/core/jndi/RegistryHelper.java",
+          "start_line": 59
+        }
+      ],
+      "prerequisites": "JNDI must be enabled: `-Djackrabbit.jndi.enabled=true` (JCR-5135 made this non-default) — lines 62/72 of JndiRepositoryFactory, line 65 of JNDIRepositoryFactory, lines 64/100 of RegistryHelper. The application must pass untrusted values into the repository lookup (URI or parameter map). A reachable malicious LDAP/RMI/other JNDI provider must be resolvable by the client, and the target JVM must be able to deserialize/load the returned object (typical pre-JDK 8u191 or permissive `trustURLCodebase` settings, or any gadget/`ObjectFactory` on the classpath).",
+      "root_cause": "`JndiRepositoryFactory.getRepository(Map)` converts caller-supplied repository settings directly into a JNDI environment and lookup: any `org.apache.jackrabbit.repository.jndi.name` value becomes the JNDI name, and for a `jndi:` repository URI the URI authority is copied verbatim into `Context.INITIAL_CONTEXT_FACTORY` (line 115). `getRepository(name, environment)` then executes `new InitialContext(environment).lookup(name)` (line 124). Because both the context factory and the lookup name are attacker-influenceable, a crafted value (e.g. an LDAP/RMI URL) causes the JVM to resolve a remote context and load/execute remote classes (RemoteObject factory / codebase), i.e. RCE in the process that resolves the repository. The same sink exists in `org.apache.jackrabbit.commons.repository.JNDIRepositoryFactory.getRepository()` (line 67) and in `RegistryHelper.unregisterRepository()` (line 101, `ctx.lookup(name)`), all three of which are gated by the shared `JNDI_ENABLED` constant. The source documents this history: `JndiRepositoryFactory` line 60 says \"Disabled by default, see JCR-5135\".",
+      "title": "Untrusted repository parameters drive JNDI lookup in JndiRepositoryFactory (JNDI injection; mitigated by disabled-by-default JCR-5135 gate)",
+      "trace": "Untrusted repository URI/parameter -> `JcrUtils.getRepository(Map)`/`JcrUtils.REPOSITORY_URI` -> `JndiRepositoryFactory.getRepository(Map)` (line 70) -> `new URI(...)` parsed, scheme `jndi` -> `getRepository(uri, environment)` (line 100) -> `environment.put(Context.INITIAL_CONTEXT_FACTORY, authority)` (line 115) -> `new InitialContext(environment).lookup(name)` (line 124) -> remote context resolves and returns the repository object, loading attacker-directed classes. Parallel: `JNDIRepositoryFactory.getRepository()` line 67 `context.lookup(name)`; `RegistryHelper.unregisterRepository` line 101 `ctx.lookup(name)`.",
+      "unverified": "Whether any deployment in scope re-enables `jackrabbit.jndi.enabled`, and whether this snapshot is the pre-fix state of a different security change (the snapshot already contains the JCR-5135 gate, so I could not prove the snapshot precedes a specific unfixed vulnerability). The JNDI provider used, class-loading restrictions in the target JVM, and the concrete gadget chain were not executed or validated.",
+      "weakness_type": "JNDI injection / code injection via untrusted lookup name and context environment (CWE-94-class, related to CWE-502/unsafe JNDI usage)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot (2,064 model-visible files: all 18 modules' `src/main` Java/resources plus build/webapp files; the snapshot contains no test sources, so no test-based signals were available). Work was source-only: full file listing and text search across the tree, then targeted reading of the security-critical paths — jackrabbit-jcr-commons (`JndiRepositoryFactory`, `JNDIRepositoryFactory`, `JcrUtils`, XML/JSON helpers), jackrabbit-core (JNDI helpers, authentication/token, ACL/user management, node type XML, persistence/data store, WebDAV-free core session), jackrabbit-webdav (request parsing, CSRF, servlet dispatch, XML factory), jackrabbit-jcr-server (remoting servlet/diff handling, WebDAV resources, import handlers), jackrabbit-spi-commons/spi2dav (parsers, ExceptionConverter, HTTP/TLS setup), jackrabbit-webapp (servlets/JSPs), and jackrabbit-data (FileSystem/DataStore). Line-level reads were performed on the strongest candidates and their callers; all other files were searched systematically for dangerous sinks (exec, deserialization, Class.forName/newInstance, JNDI, XML factories, SQL/statement construction, file/path building, random/crypto, permission checks).",
+  "limitations": [
+    "No code was compiled, executed, or dynamically tested; all conclusions are static and could not be runtime-confirmed.",
+    "The snapshot contains only main sources and resources (no tests, no git history, no build artifacts), so recently changed lines and the corresponding fix/test cannot be identified directly.",
+    "The repository version (2.23.2-beta-SNAPSHOT) already contains the JCR-5135 JNDI mitigation (and other historical fixes such as JCR-3174/CSRF hardening), so I could not rule out that this case concerns a later, not-yet-visible fix in a file I could not single out.",
+    "Dependency code (e.g., Apache HttpClient, Tika, Lucene, Derby) is not present in the snapshot and was not audited.",
+    "Exploitability of the JNDI candidate depends on deployment configuration (`jackrabbit.jndi.enabled`), the JNDI provider available at runtime, and JDK class-loading restrictions, none of which can be verified from source alone."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "`jackrabbit-spi2dav` ExceptionConverter instantiates classes named by the WebDAV server's error XML (`Class.forName(getChildText(exc,\"class\")).getConstructor(String.class).newInstance(msg)`, lines 61-80): a malicious/compromised server can force construction of arbitrary `(String)`-constructor classes on the client (e.g. FileWriter/FileOutputStream side effects).",
+      "reason": "Real unsafe-reflection pattern, but the code is long-standing (references JCR-2536, 2007), only reachable client-side from a server-supplied error body, and I found no fix marker or advisory tie in the snapshot; impact depends on gadget classes and is weaker/more speculative than the JNDI sink."
+    },
+    {
+      "lead": "XML parsing without entity-resolution/DTD restrictions: `DOMWalker`/`NodeTypeReader` (jackrabbit-core, lines 40-67/57-60) and `PrivilegeXmlHandler` (spi-commons, lines 110-116, used by `AbstractRecord.readPrivilegeDef`) create DocumentBuilderFactories without disabling external entities.",
+      "reason": "XXE pattern is real, but reachable only through privileged node-type registration/local nodetype files, local privilege XML, or cluster-journal records (trusted shared storage); no remote, low-privileged path was identified in the snapshot, so it does not meet the top-candidate bar."
+    },
+    {
+      "lead": "Java deserialization sinks: `SessionInfoImpl.duplicateCredentials` round-trips `Credentials` through ObjectInputStream, and `AsyncUploadCache` reads maps/sets via ObjectInputStream from local files.",
+      "reason": "The serialized data is self-produced (credentials that the application already created) or read from local data-store files, not from remote/untrusted input; no attacker-controlled stream could be traced."
+    },
+    {
+      "lead": "Path handling in `LocalFileSystem`, `FSDirectoryManager`, `FileDataStore`/`CachingDataStore` (`new File(root, name)`, 2/4/6-char `substring` on identifiers).",
+      "reason": "Names are internal (index names, digest-derived identifiers) or MAC-validated in `AbstractDataStore.getRecordFromReference`; the `substring` assumptions can only yield an exception (local DoS), not a traversal, for the reachable inputs I traced."
+    },
+    {
+      "lead": "WebDAV request handling oddities: `WebdavRequestImpl.getMemberLocator` string concatenation, `AbstractLocatorFactory` path handling, `AbstractWebdavServlet` continuing after a 415 content-coding rejection, `CSRFUtil` log message claiming protection is disabled on the enabled default path.",
+      "reason": "JCR path validation rejects traversal in the repository layer, the 415 branch is unreachable for requests created by `AbstractWebdavServlet` (WebdavRequestImpl implements ContentCodingAwareRequest), and the CSRF mismatch is a log-text defect with protection still enabled — no security impact established."
+    }
+  ],
+  "summary": "Source-only review of the Apache Jackrabbit trunk snapshot (all 18 modules, 2,064 files, main sources/resources only — no tests). I traced the remote/parameter-driven input paths (WebDAV request handling, JCR remoting, XML import/parsing, user/ACL administration, data-store and persistence file handling) and the most recent security-relevant change markers in the tree. The strongest distinct candidate is the JNDI lookup in `jackrabbit-jcr-commons`' `JndiRepositoryFactory` (with the same pattern in `repository/JNDIRepositoryFactory` and `jackrabbit-core`'s `RegistryHelper`): caller-supplied repository parameters / a `jndi:` repository URI control both the JNDI name and, via the URI authority, `Context.INITIAL_CONTEXT_FACTORY`, and are passed to `new InitialContext(environment).lookup(name)` — the classic JNDI-injection/RCE sink that the source itself documents as the reason for the `JCR-5135` mitigation (`JNDI_ENABLED`, disabled by default). Counterevidence is important: in this exact snapshot the lookup is gated behind `-Djackrabbit.jndi.enabled=true`, so it is not exploitable in a default deployment; I therefore report it as a lead (medium confidence), not a confirmed vulnerability. I found no other enabled, demonstrably exploitable flaw of comparable severity in the inspected code."
+}

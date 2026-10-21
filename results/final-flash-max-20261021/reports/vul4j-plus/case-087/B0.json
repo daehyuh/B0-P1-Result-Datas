@@ -1,0 +1,56 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker is the code/data that determines the executable and arguments passed to a NuProcessBuilder (i.e. a spawned child program, e.g. a build tool, script interpreter or other external process whose behavior is not fully trusted), or a local process able to run inside a child spawned by the same JVM. The attacker does not need to control the Java application; it only needs to run as a child spawned while other NuProcess children are alive (or while other inheritable handles exist). Handle values are reachable by the child by probing its own handle table (e.g. DuplicateHandle/ReadFile/WriteFile over small integer handle values).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the escaping concern is not the actual defect: WindowsCreateProcessEscape.quote() implements the standard algorithm (empty/space/tab/quote trigger quoting; backslash runs doubled before embedded and trailing quotes), and getCommandLine() quotes every argument including the executable, so attacker-controlled arguments do not re-tokenize. Also verified the pipe creation uses bInheritHandle=true only on the three server ends and that client ends opened via CreateFile are not inheritable, and that CreateIoCompletionPort/ReadFile/WriteFile usage is per-process. Considered that java.lang.ProcessImpl on Windows also passes bInheritHandles=true, so this is a known platform pattern rather than a NuProcess-only deviation; however NuProcess creates *all* child pipes inheritable and does not use a handle whitelist, so sibling pipes are reachable, which is more than the minimum needed. Confirmed no code disables inheritance or uses PROC_THREAD_ATTRIBUTE_HANDLE_LIST. Could not execute anything on Windows to confirm the inherited access bits for each pipe direction.",
+      "id": "cand-1",
+      "impact": "Confidentiality and integrity violation across sibling subprocesses spawned by the same JVM: theft of data written to another child's stdin (including credentials/pipes meant for a specific tool), and injection of forged bytes into another child's stdout/stderr as observed by the host application. Secondary impact: handle inheritance can also cause resource leaks/DoS by keeping other children's pipe ends open. No memory-safety impact identified.",
+      "locations": [
+        {
+          "end_line": 303,
+          "path": "src/main/java/com/zaxxer/nuprocess/windows/WindowsProcess.java",
+          "start_line": 302
+        },
+        {
+          "end_line": 604,
+          "path": "src/main/java/com/zaxxer/nuprocess/windows/WindowsProcess.java",
+          "start_line": 560
+        }
+      ],
+      "prerequisites": "Windows platform (WinProcessFactory); at least two NuProcess children overlapping in time, or one untrusted child plus any other inheritable handle in the JVM; the child must be able to enumerate/probe its inherited handles. The pipe server ends are created with lpSecurityDescriptor=null and default DACL, so the inherited duplicates carry whatever access the server end has (read end for stdin, write ends for stdout/stderr).",
+      "root_cause": "WindowsProcess.createPipes() builds one SECURITY_ATTRIBUTES with bInheritHandle=true and lpSecurityDescriptor=null and applies it to the server end of all three named pipes (stdout, stderr, stdin), and prepareProcess() then calls CreateProcessW with bInheritHandles=true. Because every NuProcess child is started with bInheritHandles=true, each new child receives duplicates of all currently open inheritable handles in the JVM, including the stdin/stderr/stdout pipe server handles created for other NuProcess instances that are still running (all of which are marked inheritable for the lifetime of the process). Nothing constrains inheritance to the specific per-child handle triplet (e.g. no PROC_THREAD_ATTRIBUTE_HANDLE_LIST).",
+      "title": "Windows child processes inherit named-pipe handles of other NuProcess children (cross-process stdio exposure)",
+      "trace": "NuProcessBuilder.start() -> WinProcessFactory.createProcess() -> WindowsProcess.start() -> prepareProcess() (line 282) -> createPipes() (line 560): sattr.bInheritHandle=true (line 564) is used for CreateNamedPipeW of stdout (line 570), stderr (line 583) and stdin (line 596); the parent then calls CreateProcessW(..., true /*bInheritHandles*/, ...) (lines 302-303). With bInheritHandles=true Windows duplicates every inheritable handle of the JVM into the new child, so child N receives the server-end handles of children 1..N-1: stdinPipe server handle (the read end the sibling uses as its stdin), stdoutPipe server handle (the write end feeding the sibling's stdout) and stderrPipe server handle. A malicious child can then ReadFile on the sibling's stdin read-end (stealing input such as passwords/tokens written by the parent) or WriteFile on the sibling's stdout/stderr write-end (injecting forged output that the parent attributes to the other process).",
+      "unverified": "Not runtime-confirmed. I did not verify at runtime that (a) a child can practically locate/duplicate the sibling handles, (b) the exact access rights granted to the inherited server-end duplicates are sufficient for ReadFile on a sibling's stdin and WriteFile on a sibling's stdout/stderr, and (c) how the default DACL/security descriptor affects handle duplication by the child. The strength of the inherited-access argument also depends on Windows named-pipe direction semantics (PIPE_ACCESS_INBOUND/OUTBOUND), which I could only reason about from the source's own usage rather than test. Whether the maintainers consider this in-scope is unknown.",
+      "weakness_type": "CWE-403 Exposure of Resource to Wrong Sphere / CWE-538 File and Directory Information Exposure (child-process handle inheritance)"
+    }
+  ],
+  "coverage_summary": "Reviewed all 52 text files exposed by the source scope, including full reads of the core spawning paths (WindowsProcess, ProcessCompletions, NuKernel32/NuWinNT bindings, WindowsCreateProcessEscape, LinuxProcess/ProcessEpoll, OsxProcess/ProcessKqueue, BasePosixProcess/BaseEventProcessor, LibC/LibJava8/LibJava10, codecs, examples and build files). No test sources are present in the snapshot (src/test/java referenced by README/examples but absent), so no regression-test hints were available. Binary-like files were skipped by the tool filters; none were present in the listed tree. Static review only: no code execution, compilation, or runtime verification was performed, and the Windows-only candidate could not be exercised.",
+  "limitations": [
+    "No tests are included in the snapshot; the removed test suite could not be used to identify the intended vulnerable behavior.",
+    "The Windows handle-inheritance candidate depends on Windows API semantics (named-pipe direction/access rights and default DACL) that I could only infer from source usage, not validate at runtime.",
+    "No Java compiler or runtime was used; all conclusions are static and no PoC was attempted.",
+    "Threading/race behavior (macOS __pthread_chdir, event-loop fd reuse, Windows completion port teardown) cannot be confirmed by reading source alone.",
+    "The snapshot's exact upstream commit and any later fix were not consulted (no web/diff access), so I could not compare against a patched version."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Windows command-line argument escaping allows command/argument injection (WindowsCreateProcessEscape / getCommandLine).",
+      "reason": "Traced the algorithm input-by-input against the MSVC/Python quoting rules: empty strings, quotes, spaces and tabs trigger quoting; backslash runs are doubled before embedded quotes and before the closing quote (2n+1 form), so quotes/backslashes cannot terminate a quoted argument. No counterexample found in the inspected source; this looks like the correct, already-hardened implementation."
+    },
+    {
+      "lead": "macOS OsxProcess.spawnWithCwd() changes the JVM-global current directory via syscall(SYS___pthread_chdir) around posix_spawnp (OsxProcess.java lines 161-185), racing other threads that resolve relative paths or spawn processes; the 1024-byte getcwd buffer can also fail to capture the old cwd.",
+      "reason": "Real design weakness (CWE-362) with plausible wrong-directory execution/file-resolution impact, but it requires concurrent NuProcess usage with setCwd() plus other threads doing relative-path work, and attacker control over what is resolved relative to the temporary cwd is not demonstrated in this source; the restore path also unmaps the old-cwd buffer. Kept as a secondary unconfirmed lead rather than the single submitted candidate."
+    },
+    {
+      "lead": "Embedded NUL characters in command arguments or environment values are not rejected before building POSIX argBlock/envBlock (LinuxProcess.toEnvironmentBlock, argBlock copy) or Windows environment/command-line buffers, so entries can be truncated/shifted (potential environment-variable injection, e.g. replacing a later entry with LD_PRELOAD).",
+      "reason": "The argument/environment arrays are unvalidated in NuProcess, but the JDK's own ProcessImpl builds these blocks the same way, so any injection needs the embedding application to pass NUL-containing strings; no source evidence shows attacker-controlled NULs reaching these builders. Impact and exploitability are speculative."
+    },
+    {
+      "lead": "Windows named-pipe names are built from a per-JVM UUID plus an incrementing counter (\\\\.\\pipe\\NuProcess-<uuid>-<n>) with a NULL security descriptor and nMaxInstances=1, so a local attacker who enumerates one name can predict later names and squat them.",
+      "reason": "The UUID makes guessing impractical and the parent connects its own client end immediately after creating each pipe, leaving no practical race window in this code; no evidence of an exploitable path."
+    }
+  ],
+  "summary": "Reviewed the NuProcess 2.0.5-SNAPSHOT source tree (52 files: main library for Linux/OSX/Windows, JNA bindings, codec helpers, examples, benchmark). The review focused on the process-spawning trust boundary — command/argument/environment handling, native handle plumbing, and per-platform event loops. The Windows command-line escaping was traced input-by-input and matches the standard Python/MSVC quoting algorithm (empty/space/tab/quote quoting, backslash-run doubling before quotes and before the closing quote), so the obvious 'argument injection on Windows' lead is rejected. The strongest source-evidenced issue is on Windows: all named-pipe server ends are created inheritable and CreateProcessW is invoked with bInheritHandles=true, so every spawned child inherits the pipe handles (and any other inheritable handles) of all other concurrently running NuProcess children; an untrusted child can therefore read data destined for a sibling's stdin and write forged data into a sibling's stdout/stderr. This is submitted as a lead only; it was not runtime-confirmed, and Windows API semantics/exploitability require validation."
+}

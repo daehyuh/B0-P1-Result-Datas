@@ -1,0 +1,64 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The redirectedFrom value is supplied entirely by the caller as a query-string/form parameter of a POST to /openmrs/module/appointmentscheduling/appointmentBlockForm.form (bound via @RequestParam(value = \"redirectedFrom\", required = false) String redirectedFrom). No format, allowlist, or same-origin check is applied before it is used as the redirect target; values such as http://attacker.example/ or //attacker.example/ are accepted as-is.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that the GET handler validates redirectedFrom (line 81) so the flaw is specific to the POST return path. Confirmed the redirect line is outside the Context.isAuthenticated() guard. Considered Spring's redirect-context handling: with the UrlBasedViewResolver/RedirectView defaults, absolute URLs (http(s):// or //host) are passed to sendRedirect rather than being reduced to a context path, so an external target is achievable in the supported configurations. Considered that the target string is not used in any server-side request (no SSRF) and that no JSP sink is present in this snapshot. No other request parameter flows unvalidated into a redirect sink: all other redirect returns use constants or server-derived integers.",
+      "id": "appointmentscheduling-open-redirect",
+      "impact": "Open redirect: a trusted OpenMRS module URL can bounce a victim to an arbitrary external site, enabling phishing/credential-harvesting pages that inherit the trust of the application origin (and, depending on client behavior, leakage of the redirecting context). It does not by itself read or modify data; impact is limited to redirect/phishing abuse.",
+      "locations": [
+        {
+          "end_line": 160,
+          "path": "omod/src/main/java/org/openmrs/module/appointmentscheduling/web/controller/AppointmentBlockFormController.java",
+          "start_line": 153
+        },
+        {
+          "end_line": 314,
+          "path": "omod/src/main/java/org/openmrs/module/appointmentscheduling/web/controller/AppointmentBlockFormController.java",
+          "start_line": 300
+        }
+      ],
+      "prerequisites": "The module is deployed and the victim's browser issues the POST (the attacker can use an auto-submitted cross-site form or a crafted page); an authenticated OpenMRS session for the victim makes the request reach the controller normally. Only the generic appointment-block form endpoint is needed; no special privilege is required by the handler itself, and the redirect is returned even if the request body contains no action/void/save/purge/unvoid parameter.",
+      "root_cause": "The POST handler of appointmentBlockForm binds the request parameter redirectedFrom (attacker-controlled, no validation/allowlist) and unconditionally returns it as a redirect view: \"redirect:\" + redirectedFrom. The GET handler in the same class validates redirectedFrom against a fixed value (\"appointmentBlockCalendar.list\"), but the POST path does not, and the return statement is outside the Context.isAuthenticated() block, so nothing constrains the target scheme/host.",
+      "title": "Open redirect via unvalidated redirectedFrom parameter in AppointmentBlockFormController",
+      "trace": "POST /module/appointmentscheduling/appointmentBlockForm.form?redirectedFrom=<malicious URL> -> AppointmentBlockFormController.onSubmit(...) binds redirectedFrom (lines 153-160) -> all action branches are skipped or fall through -> line 313 returns \"redirect:\" + redirectedFrom -> OpenMRS/Spring UrlBasedViewResolver creates a RedirectView -> HttpServletResponse.sendRedirect emits a 302 Location header pointing at the attacker-controlled absolute (or protocol-relative) URL.",
+      "unverified": "Not runtime-confirmed; the exact view resolver configuration used by the deployed OpenMRS core (redirectContextRelative/remote-host handling) could not be inspected because OpenMRS core is not part of this snapshot. The POST-only nature and the need for the victim to submit the form are user-interaction constraints that were not exercised.",
+      "weakness_type": "CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"
+    }
+  ],
+  "coverage_summary": "All 189 model-visible files were enumerable (0 excluded by sensitive-name/path, symlink, or size filters; no binary skips other than vendored minified libraries reported by search). I read or searched the full Java surface: AppointmentService interface and AppointmentServiceImpl, all Hibernate DAOs and mappings, all omod Spring MVC controllers, the DWR service and its config.xml exposure, the webservices.rest resources/search handler, validators, editors, extension HTML classes, and the reporting data/query/dataset evaluators; Liquibase, module contexts, config.xml privileges, and messages were also inspected. Vendored JS/CSS were only spot-checked. Coverage limitation: OpenMRS core and the appointmentschedulingui module are not part of the snapshot, so framework-level behavior (redirect view resolver settings, DWR servlet authentication filters, AdministrationService privilege annotations) had to be reasoned about from the module code alone.",
+  "limitations": [
+    "No runtime execution, deployment, or HTTP requests were performed; all conclusions are static.",
+    "OpenMRS core libraries (openmrs-api/openmrs-web) and the separate appointmentschedulingui module are not in scope, so Context.hasPrivilege/@Authorized enforcement semantics, PatientService.getPatient authorization, and Spring RedirectView host handling could not be verified from source in this snapshot.",
+    "The snapshot contains no JSP/UI templates and no tests, so any rendering-layer sink (e.g., XSS) for values such as patient name, reason, or appointment-type name cannot be traced here.",
+    "The open-redirect finding is POST-triggered and requires victim interaction; exploitability of an absolute/protocol-relative target depends on the deployed OpenMRS view-resolver configuration, which was not available for inspection.",
+    "Vendored JavaScript libraries were only inspected at a high level; their known-issue status is not treated as a finding because no attacker-controlled reachable sink was established in module code."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DWRAppointmentService.getPatientDescription lacks the Context.isAuthenticated() guard present in several sibling DWR methods (omod/.../web/DWRAppointmentService.java lines 39-61), and the method is exposed in omod/src/main/resources/config.xml lines 93-98.",
+      "reason": "Not confirmed as a data leak: the method immediately calls AppointmentService.getPatientIdentifiersRepresentation and getLastAppointment, both annotated @Authorized(AppointmentUtils.PRIV_VIEW_APPOINTMENTS) on the service interface and enforced by the module's preInterceptors (moduleApplicationContext.xml). An unauthenticated/low-privilege DWR caller therefore receives an APIAuthenticationException instead of PatientData; only a weak patient-existence oracle (null vs error) is theoretically possible, which did not meet the impact threshold."
+    },
+    {
+      "lead": "ProviderSchedule REST resource returns schedules through getProviderScheduleByUuid/getAllProviderSchedules(), whose interface annotations are bare @Authorized (authentication only) instead of PRIV_VIEW_PROVIDER_SCHEDULES, and createTimeSlotUsingProviderSchedule() (bare @Authorized) creates AppointmentBlock/TimeSlot rows reachable from AppointmentRequisitionController (POST /rest/v1/appointmentscheduling/createappointment).",
+      "reason": "Real authorization asymmetry (sibling read/write methods require View/Manage Provider Schedules), but the write path requires an existing ProviderSchedule and the created block/slot times are derived from that schedule, limiting impact; the bare annotations also appear to be a long-standing style choice across several interface methods, so this was judged a weaker, less certain candidate than the open redirect."
+    },
+    {
+      "lead": "The confidential-appointment control (privilege Task: appointmentschedulingui.viewConfidential, AppointmentType.confidential) is enforced only in the two reporting data evaluators; REST AppointmentResource1_9 and the web/DWR paths return confidential appointments' patient/type/reason to any user with View Appointments.",
+      "reason": "Plausible confidentiality gap, but it depends on interpreting the scope of a 'Task: appointmentschedulingui.*' privilege as covering the module's REST API rather than the reporting/UI layers where it is implemented; no server-side check exists to contradict, but no explicit in-repo policy statement ties it to REST either, so it was not submitted as the single candidate."
+    },
+    {
+      "lead": "The 'Squeezing Appointments' privilege is enforced only in AppointmentFormController.getAvailableTimes (UI-side slot offering) while AppointmentAllowingOverbookResource1_9.bookAppointment(appointment, true) and TimeSlotResource1_9 includeFull=true expose overbooking/full slots to users holding only Schedule Appointments.",
+      "reason": "Privilege-enforcement mismatch, but the overbook flag is an explicit service API parameter and the module's own web form also books without a server-side squeeze check (saveAppointment), so the intended enforcement point is ambiguous; treated as a rejected lead, not a confirmed vulnerability."
+    },
+    {
+      "lead": "HibernateAppointmentDAO.getAppointmentDailyCount builds MySQL SQL with positional parameter indices that do not match the dynamically added predicates when optional filters are null.",
+      "reason": "Correctness/robustness bug (wrong results or SQLException), not a security issue: all values are still bound with setParameter; no injection or data exposure."
+    },
+    {
+      "lead": "Vendored JavaScript libraries (jQuery 1.9.1, jQuery UI 1.10.2, FullCalendar, jqPlot, DataTables) are old and have publicly known client-side issues.",
+      "reason": "No module-specific sink with attacker-controlled input could be traced in this snapshot (the JSP/UI layer is not present), so this is dependency age/hardening, not an evidenced vulnerability."
+    }
+  ],
+  "summary": "Reviewed the OpenMRS Appointment Scheduling module snapshot (189 files; api + omod Java, Hibernate mappings, Liquibase, module/REST/DWR configuration, and vendored web resources). The audit covered the service API and its @Authorized privilege mapping, Hibernate DAOs (HQL/SQL construction), DWR-exposed methods, Spring MVC controllers, the webservices.rest resources/search handler, and the reporting-extension evaluators. No SQL injection, command execution, deserialization, path traversal, or unauthenticated PHI read was confirmed: all DAO queries use parameters/Criteria, REST and controller operations delegate to @Authorized service methods, and the DWR methods that lack an explicit Context.isAuthenticated() guard are ultimately blocked by @Authorized service calls. The strongest evidence-supported issue found is an unvalidated redirect in the appointment-block form controller: the request parameter redirectedFrom is concatenated directly into a Spring \"redirect:\" view, yielding an open redirect (CWE-601). All other leads were treated as unconfirmed and are listed under rejected leads."
+}

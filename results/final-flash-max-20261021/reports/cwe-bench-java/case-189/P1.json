@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A user who may submit SQL (e.g. POST /druid/v2/sql, /druid/v2/sql/task, or MSQ/Dart statements) controls the entire `EXTERN(...)` argument list, including which arguments are passed by name (`inputSource => '<json>', inputFormat => '<json>', signature => '<json>'`) and their order in the SQL text, and controls the contents of the input-source JSON (for example `{\"type\":\"local\",\"baseDir\":\"/etc\",\"filter\":\"...\"}` or an http source).",
+      "confidence": "low",
+      "counterevidence_checked": "1) If Calcite normalizes named arguments into declared parameter order before the shuttle sees the call, operand 0 is always the inputSource literal and the named branch is dead code (the preceding positional branch would already return the correct value) - I could not verify Calcite's internal named-argument handling from this snapshot because Calcite sources are not present. 2) For a silent mismatch the first argument's value must be simultaneously valid as its own parameter and as an InputSource: the `signature` parameter is a JSON ARRAY (RowSignature @JsonValue/@JsonCreator over List<ColumnSignature>, processing/.../RowSignature.java:90-91,190-191), which cannot deserialize as the object-shaped polymorphic InputSource; and the registered InputFormat type names (csv, json, regex, delimited, plus extension formats) do not collide with InputSource type names (local, http, inline, combine, ...), so an out-of-order named argument appears to fail closed with a deserialization error rather than silently authorizing another type. 3) `enableInputSourceSecurity` defaults to false, so the affected check is inactive by default. 4) No test in the snapshot exercises named parameters for EXTERN (searches for 'inputSource =>', 'inputFormat =>', 'signature =>' return only docs/comments), so the behaviour is unexercised. 5) The docs (docs/operations/security-overview.md:52-55) put raw input-source control in the 'highly trusted' bucket, which is a mitigating trust-model statement rather than a fix.",
+      "id": "cand-1-extern-inputsource-resource-mismatch",
+      "impact": "If reachable, an authenticated user could obtain an authorization decision for a benign external input-source type (e.g. 'inline') while the query actually reads from another type such as a local filesystem path or an arbitrary HTTP URL, i.e. bypass of the type-specific input-source authorization boundary: local file disclosure and/or SSRF performed by the Druid process. If not reachable (see counterevidence), the observable effect is only a spurious planner exception.",
+      "locations": [
+        {
+          "end_line": 98,
+          "path": "sql/src/main/java/org/apache/druid/sql/calcite/external/DruidExternTableMacro.java",
+          "start_line": 50
+        },
+        {
+          "end_line": 75,
+          "path": "sql/src/main/java/org/apache/druid/sql/calcite/planner/SqlResourceCollectorShuttle.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 145,
+          "path": "sql/src/main/java/org/apache/druid/sql/calcite/external/ExternalOperatorConversion.java",
+          "start_line": 63
+        },
+        {
+          "end_line": 179,
+          "path": "sql/src/main/java/org/apache/druid/sql/calcite/external/SchemaAwareUserDefinedTableMacro.java",
+          "start_line": 165
+        },
+        {
+          "end_line": 130,
+          "path": "sql/src/main/java/org/apache/druid/sql/calcite/planner/QueryHandler.java",
+          "start_line": 118
+        }
+      ],
+      "prerequisites": "Deployment enables `druid.auth.enableInputSourceSecurity=true` (AuthConfig.enableInputSourceSecurity) so that input-source types are supposed to be checked as `Resource(<inputSourceType>, EXTERNAL)/READ`; the requesting user holds EXTERNAL READ only for a type different from the one actually used; the call is made through the `EXTERN` path that reaches `DruidExternTableMacro.computeResources` (i.e. `SqlResourceCollectorShuttle` sees a call whose operand 0 is not the `inputSource` literal - e.g. `EXTERN(signature => ..., inputSource => ...)`); and one of the argument values must be simultaneously parseable as an `InputSource` and as its own parameter type.",
+      "root_cause": "`DruidExternTableMacro.getInputSourceArgument` is supposed to return the value of the `inputSource` parameter of the `EXTERN` table function so that `computeResources` can authorize the input source type actually used by the query. In the named-parameter branch (lines 80-94) it locates the parameter named `inputSource` but then returns the value of operand 0 of the call (`call.getOperandList().get(0).getOperandList().get(0)`) instead of the matched parameter's value. Consequently the resource actions are computed from whatever argument happens to be first, not from the input source the query is planned/executed with (the real input source is parsed independently in `ExternalOperatorConversion.ExternFunction.apply`, lines 124-131, from the `inputSource` parameter). The sibling 'shim' path (`SchemaAwareUserDefinedTableMacro.ShimUserDefinedTableMacro.computeResources`, lines 166-179) instead derives the type from the parsed `ExternalTable.getInputSourceTypeSupplier()`, i.e. the real input source, which shows the intended semantics and highlights the inconsistency.",
+      "title": "EXTERN input-source-type authorization resources computed from the wrong SQL argument in DruidExternTableMacro",
+      "trace": "SQL text -> Calcite parse/validate -> QueryHandler.validateAndGetResourceActions runs SqlResourceCollectorShuttle over the validated node (QueryHandler.java:118-130) -> SqlResourceCollectorShuttle.visit calls ((AuthorizableOperator) call.getOperator()).computeResources(call, authConfig.isEnableInputSourceSecurity()) (SqlResourceCollectorShuttle.java:64-71) -> DruidExternTableMacro.computeResources -> getInputSourceArgument: if operand 0 is an SqlCharStringLiteral, that literal is returned (positional case, correct); otherwise the loop finds the named parameter `inputSource` (argumentName == 'inputSource') but returns the value of operand 0 (`call.getOperandList().get(0).getOperandList().get(0)`) -> that string is parsed with `jsonMapper.readValue(..., InputSource.class)` and mapped to ResourceActions of that type (lines 56-63) -> those resources are what AuthorizationUtils.authorizeAllResourceActions authorizes, while the query's actual input source is separately parsed from the `inputSource` argument in ExternalOperatorConversion.ExternFunction.apply (lines 124-131). If the two disagree, the check covers a different input-source type than the one executed.",
+      "unverified": "Calcite named-argument/operand-order semantics for table macros (decisive for reachability); actual runtime behaviour of the planner/scheduler was not executed; whether any extension registers an InputSource and an InputFormat (or a dual-valid JSON value) that would make the mismatch silent is not exhaustively verified; no PoC was constructed or run.",
+      "weakness_type": "Incorrect authorization resource selection (potential bypass of input-source-type security; CWE-863/CWE-1284 class)"
+    }
+  ],
+  "coverage_summary": "Scope per get_source_scope: 6,361 repository files, all text-readable (no over-5MiB, sensitive-name, or symlink exclusions; binaries are refused/skipped). The tree is Apache Druid 31.0.1 with 5,451 Java files plus extension, docs, web-console and shell/build files; I inspected Java sources across core/processing/server/sql/services/indexing-service/extensions-core/extensions-contrib and selected docs as behavioural evidence. Per get_relation_scope the P1 index is partial: 6,286 indexed files, 75 source files missing from the index, 5,451 parsed Java files, unresolved calls 102,061, and capabilities limited to syntax containment plus name/type/arity call and inheritance candidates with no control-flow, data-flow, semantic resolution, runtime reachability or exploitability analysis; index facts are name-based navigation hints only and I verified each point I used against source text. Reviewed (not exhaustively): JAX-RS resources and resource filters, authenticator implementations (basic, trustedDomain, kerberos, pac4j, anonymous/allowAll), AuthorizationUtils/PreResponseAuthorizationCheckFilter/AuthConfig, basic-security DB/cache/updater/resource classes, lookup coordinator and lookups-cached-global URI/JDBC namespaces, SQL/EXTERN planning and AuthorizableOperator resource computation, MSQ/Dart controller/worker resources, task/supervisor/sampler authorization, k8s/azure/gcp/aws storage and export paths, and web-console JS for DOM-injection sinks (no dangerouslySetInnerHTML/innerHTML sinks found in console source). Coverage is partial: no runtime execution, no build/test, no dependency or bytecode analysis, and the 75 files absent from the relation index were not systematically enumerated.",
+  "limitations": [
+    "No code was executed, no build, tests, scanners or exploit payloads were run; all conclusions are static source reading, and the single candidate is an unverified lead.",
+    "The P1 relation index is partial (75 source files missing) and provides no data-flow, control-flow, semantic resolution or reachability proof; unresolved calls are not reported per-symbol, so call-graph completeness cannot be assumed.",
+    "Calcite internals (named-argument normalisation and operand ordering for table macros) are not part of this snapshot, and this is the decisive question for the candidate's reachability; the Calcite jar/version behaviour could not be inspected here.",
+    "Third-party dependency versions and bundled code (Calcite, Jetty, Hadoop, Jackson, Kafka, etc.) were not audited; owasp-dependency-check suppressions in the tree list known accepted dependency CVEs.",
+    "Runtime configuration actually used by any deployment (enableInputSourceSecurity, authorizeQueryContextParams, authenticator chain, unsecuredPaths) is unknown, so configuration-gated issues cannot be confirmed or excluded.",
+    "The web console (TypeScript/React) was only spot-checked for obvious DOM sinks; framework-specific XSS/CSRF behaviour was not systematically audited.",
+    "Areas given only survey-level attention: physical segment format/compression Internals, Hadoop indexing job path, extension loading/classloader code, coordinator/overlord metadata SQL, and the 75 files missing from the index."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "TrustedDomainAuthenticator authenticates any client whose remote address 'endsWith' the configured domain and, when useForwardedHeaders=true, takes the left-most (client-controlled) X-Forwarded-For value (server/.../security/TrustedDomainAuthenticator.java:113-150).",
+      "reason": "The X-Forwarded-For spoofing risk is explicitly documented in this snapshot ('It is possible to spoof X-Forwarded-For headers in HTTP requests, enable this with caution', docs/operations/auth.md:95) and the flag defaults to false, so this is a documented operator-controlled configuration risk rather than an unmitigated defect; the suffix match only widens a decision the operator already delegates by configuring a domain string."
+    },
+    {
+      "lead": "druid-pac4j JwtAuthFilter logs and continues the filter chain (fail-open) when a supplied JWT is malformed/invalid instead of returning 401 (extensions-core/druid-pac4j/.../JwtAuthFilter.java:81-109).",
+      "reason": "Not exploitable as an authentication bypass: with no authentication result set, PreResponseAuthorizationCheckFilter rejects the request (server/.../security/PreResponseAuthorizationCheckFilter.java:79-82,115-142); the effect is at most fallback to another authenticator in the chain (e.g. anonymous), which is not privilege escalation."
+    },
+    {
+      "lead": "DartWorkerResource returns the WorkerResource sub-resource for /druid/dart-worker/workers/{queryId}/... without authorizing in that branch (extensions-core/multi-stage-query/.../dart/worker/http/DartWorkerResource.java:155-173).",
+      "reason": "Every method of the returned WorkerResource (and of MessageRelayResource) performs its own MSQResourceUtils.authorizeAdminRequest/authorizeQueryRequest check using the queryId in its own path (WorkerResource.java:91-380), so the missing check in the dispatch branch does not grant access; the null-worker branch does authorize."
+    },
+    {
+      "lead": "AuthConfig.contextKeysToAuthorize subtracts unsecuredContextKeys before intersecting with securedContextKeys, so a key present in both lists is not checked, contradicting its own javadoc ('think of the secured list as exceptions to the unsecured key list') (server/.../security/AuthConfig.java:157-185).",
+      "reason": "Config-dependent (requires druid.auth.authorizeQueryContextParams=true and both key lists configured with an overlap) and I could not establish the intended precedence from any other in-repo artefact (the property is not documented in this snapshot's docs). This is a documentation/behaviour inconsistency and a possible fail-open only for explicitly mis-configured lists, so it does not meet the evidence threshold."
+    },
+    {
+      "lead": "UriExtractionNamespace / UriCacheGenerator pulls arbitrary URIs (file:, http(s):, extension schemes) and decompresses by URI path for cached lookups (extensions-core/lookups-cached-global/.../UriCacheGenerator.java:64-145).",
+      "reason": "Reachable only by principals holding CONFIG-related lookup permissions, i.e. the 'highly trusted' bucket in Druid's documented trust model; no missing validation specific to this snapshot was found (the header-injection-era 'headers' property is already absent)."
+    },
+    {
+      "lead": "MSQ/SQL statement ownership check compares the requesting identity to the '__user' query-context value stored in the controller task payload (extensions-core/multi-stage-query/.../SqlStatementResource.java:646-682).",
+      "reason": "'__user' is force-overwritten from the AuthenticationResult when the task is built (MSQTaskQueryMaker.java:158-162) before it is persisted, so a client cannot make the payload claim a different identity; no way to read another user's statement was found."
+    },
+    {
+      "lead": "thrift-extensions loads a user-specified JAR via URLClassLoader/Class.forName from the ingestion spec (extensions-contrib/thrift-extensions/.../ThriftInputRowParser.java:80-93).",
+      "reason": "Requires task-submission (DATASOURCE WRITE / STATE) privileges, which Druid documents as equivalent to trusting the OS user running Druid; no privilege boundary is crossed for the documented model."
+    },
+    {
+      "lead": "druid-catalog broker listener endpoints accept catalog update events (extensions-core/druid-catalog/.../CatalogListenerResource.java:61-87).",
+      "reason": "All three endpoints are annotated @ResourceFilters(ConfigResourceFilter.class), i.e. CONFIG permission, consistent with the documented model for cluster-wide configuration."
+    }
+  ],
+  "summary": "Reviewed the assigned Apache Druid 31.0.1 snapshot (parent pom 31.0.1, ~Dec-2024 era) as a defensive source review, using the P1 relation index only for navigation and verifying every candidate against source text. I focused on remote/untrusted-input boundaries (JAX-RS resources, filters, authenticators, SQL/EXTERN planning, input-source security, lookups, MSQ/Dart, catalog), validation/transformation code, and the authorization resources each endpoint computes. Most security-relevant code I inspected is consistently written: resource filters (Config/Datasource/Rules/State/Task/Supervisor/BasicSecurity/Catalog) authorize correctly; `AuthorizationUtils`/`PreResponseAuthorizationCheckFilter` fail closed for unauthenticated requests; path/ID handling in task, worker, shuffle, durable-storage, export and catalog paths uses `IdUtils.validateId`/`normalize().startsWith(baseDir)`; basic-security APIs are gated on the documented `CONFIG` \"security\" resource; query-context-key and input-source-type authorization are wired into planning. I could not substantiate an exploitable, end-to-end candidate. The single best-evidenced lead (one candidate, low confidence) is a logic defect in the SQL `EXTERN` input-source-type authorization helper, where the resource that is authorized is derived from the wrong SQL argument; I could not establish a working exploit path for it and I explicitly list the counterevidence below. Everything else I considered is recorded as rejected leads."
+}

@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Indirect. The triggering state transition is an in-place modification of a Kubernetes secret that matches the plugin's label selector (jenkins.io/credentials-type plus the optional labelSelector system property), so it requires Kubernetes RBAC to update/patch such secrets in the watched namespace. The primary security consequence falls on the defender/operator: a secret value that is believed to be revoked or rotated by editing the secret (e.g. removing a required data key, supplying invalid base64, setting an unknown jenkins.io/credentials-type, or an invalid jenkins.io/credentials-scope) continues to be handed to Jenkins builds and credential consumers. A secret writer could deliberately preserve a stale credential, but they can already create arbitrary credentials, so this is not a direct privilege-gain primitive.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified counter-paths: DELETED removes by ID (lines 260-263); start-up rebuilds the map from the API (lines 122-128); a MODIFIED secret that still converts (including a changed but valid type label or scope) replaces the entry. Label removal appears to deliver a DELETED event for selector-scoped watches, so that path should clear state. Permission checks are not bypassed here: the provider only serves non-ACL.SYSTEM callers nothing (line 211) and the store requires CredentialsProvider.VIEW (KubernetesCredentialsStore.java:39-51). Failure paths log a warning (line 303), which gives operators some visibility, and exploitation requires Kubernetes secret-write access that already implies a trusted position.",
+      "id": "kcp-stale-credential-on-failed-update",
+      "impact": "Credential revocation/rotation failure: a Kubernetes secret value that an operator intends to invalidate remains usable by every Jenkins credential consumer (builds, and users with Credentials/View through the store) until Jenkins restarts or the secret is deleted. Concretely, leaked credentials that were 'revoked' by blanking/corrupting the backing secret stay valid, and a job can continue to authenticate with old material; this is a confidentiality/credential-hygiene weakness, not code execution or authentication bypass on its own.",
+      "locations": [
+        {
+          "end_line": 244,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/kubernetes_credentials_provider/KubernetesCredentialProvider.java",
+          "start_line": 239
+        },
+        {
+          "end_line": 259,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/kubernetes_credentials_provider/KubernetesCredentialProvider.java",
+          "start_line": 255
+        },
+        {
+          "end_line": 310,
+          "path": "src/main/java/com/cloudbees/jenkins/plugins/kubernetes_credentials_provider/KubernetesCredentialProvider.java",
+          "start_line": 289
+        }
+      ],
+      "prerequisites": "1) Plugin installed and watching a namespace for labeled secrets; 2) a secret was previously converted successfully and is present in the in-memory credentials map; 3) the secret is then modified in place, keeping the selector match, into a state convertSecret cannot convert (missing/renamed data key, invalid base64/UTF-8, unknown type label, or invalid scope label); 4) Jenkins is not restarted and the secret is not deleted, so the live MODIFIED path is what is exercised.",
+      "root_cause": "KubernetesCredentialProvider.eventReceived handles MODIFIED exclusively by calling addSecret(secret) (lines 255-259). addSecret only performs map.put when convertSecret returns a non-null credential (lines 239-244). convertSecret returns null, without touching the existing map entry, when the type label has no registered SecretToCredentialConverter (lines 293-294 and 308-309) or when the converter raises CredentialsConvertionException (lines 295-306). There is no else-branch that removes the previously converted credential for that secret ID, so the in-memory credentials map keeps serving the old credential object (with the old secret value) after the Kubernetes secret has been edited into an unconvertible state.",
+      "title": "Kubernetes-backed credential is retained (revocation not enforced) when a MODIFIED secret fails conversion",
+      "trace": "Watch callback eventReceived(Action.MODIFIED, secret) (KubernetesCredentialProvider.java:247-259) -> addSecret(secret) -> convertSecret(secret) (line 240) -> label lookup SecretToCredentialConverter.lookup(type) (line 293); if null, only logs 'No SecretToCredentialConverter found' and returns null (lines 308-309); if a converter exists but throws CredentialsConvertionException (e.g. SecretUtils.getNonNullSecretData/getCredentialScope), it is caught, logged and null is returned (lines 295-306). Back in addSecret, cred == null means map.put(SecretUtils.getCredentialId(secret), cred) is skipped (lines 241-243), leaving the previous IdCredentials object in the ConcurrentHashMap keyed by the secret's metadata.name. Subsequent getCredentials calls (lines 209-227, invoked by builds with ACL.SYSTEM and by KubernetesCredentialsStore for Credentials/View holders, KubernetesCredentialsStore.java:46-51) still return that stale credential. Contrasting paths show the omission: DELETED events call credentials.remove(credentialId) (lines 260-263) and the start-up list builds a completely fresh map (lines 122-128), so deletion and restart do clear the entry.",
+      "unverified": "The runtime behaviour (that Kubernetes/fabric8 emits MODIFIED rather than DELETED for the specific mutations, and that no other component periodically reconciles the in-memory map) was not executed or tested; no tests exist in this snapshot. The severity judgement (revocation failure rather than a directly exploitable vulnerability) and whether maintainers consider this in scope are unverified. No runtime confirmation of a stale credential being served after a failed MODIFIED was performed.",
+      "weakness_type": "Incomplete credential revocation / operation on a resource after expiration (CWE-672, CWE-459)"
+    }
+  ],
+  "coverage_summary": "All 56 files exposed by get_source_scope were enumerated. Read in full: all 15 main Java sources (KubernetesCredentialProvider, KubernetesCredentialsStore, SecretUtils, SecretToCredentialConverter, CredentialsConvertionException, LabelSelectorExpressions, LabelSelectorParseException, package-info files, and all 11 convertors), pom.xml, .mvn/extensions.xml, .github workflows and dependabot config, README/docs (including examples and dev Kubernetes manifests). The snapshot contains no test sources, no Jelly/resource views, and no build scripts beyond Maven configuration. Binary-like files: none flagged. The review focused on the Kubernetes-secret -> credential conversion path, watch event handling, CredentialsStore/provider permission logic, and the label-selector parser; coverage of downstream consumers (credentials plugin UI rendering, plain-credentials file handling, GitHub/Vault credential use) is limited to what this snapshot shows because those sources are not present.",
+  "limitations": [
+    "No test sources are present in the snapshot, so intended behaviour could not be cross-checked against unit/integration tests.",
+    "No code execution, build, or dependency resolution was performed; findings are based on static reading only and are not runtime-confirmed.",
+    "The credentials plugin, plain-credentials, docker-commons, GitHub branch source, Vault and openstack-cloud dependencies are not part of the snapshot, so sinks or sanitization implemented there (notably UI escaping of credential descriptions/IDs and secret-file filename handling) could not be inspected.",
+    "Kubernetes server/API-server watch semantics (whether a given mutation produces MODIFIED vs DELETED) were reasoned about but not verified against a running cluster.",
+    "Dependency and GitHub Action versions were not assessed against vulnerability databases, per task constraints.",
+    "The label-selector parser was assessed only for its system-property input; no attacker-controlled caller of LabelSelectorExpressions.parse was found in this snapshot."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Stored XSS via Kubernetes-supplied credential metadata: jenkins.io/credentials-description annotation -> SecretUtils.getCredentialDescription (SecretUtils.java:141-148) -> credential description, and secret metadata.name -> credential ID, both surfaced in the Jenkins credentials UI.",
+      "reason": "Attacker-controlled strings (annotation/name) do reach credential objects and the UI, but the rendering/escaping sink is in the credentials plugin/Jelly views, which are outside this snapshot; no HTML-building sink exists anywhere in this repository (no Jelly/resources files). Jenkins UI layers typically escape these values, so this remains an unconfirmed hypothesis rather than evidence-supported."
+    },
+    {
+      "lead": "Raw label selector system property concatenated into an AdministrativeError HTML message (KubernetesCredentialProvider.java:162-170).",
+      "reason": "The value comes from the JVM system property com.cloudbees...KubernetesCredentialProvider.labelSelector, which only an administrator who can set Jenkins JVM options can control, and it is displayed to administrators; no lower-privileged attacker control was identified."
+    },
+    {
+      "lead": "Any user able to create/patch labeled Kubernetes secrets in the watched namespace can inject or shadow Jenkins credentials (including global-scope ones) used by builds.",
+      "reason": "This is the documented and intended trust model (docs/README.md:16-21 warns to use a dedicated service account and namespace, and docs/examples/README.md documents the label/annotation contract); the Kubernetes RBAC boundary, not this plugin, decides who may write secrets. No code-level validation gap beyond the design was found."
+    },
+    {
+      "lead": "Missing permission checks exposing Kubernetes credentials to low-privileged Jenkins users.",
+      "reason": "Counter-indicated by the code: KubernetesCredentialProvider.getCredentials returns an empty list unless authentication is ACL.SYSTEM (line 211), and KubernetesCredentialsStore both restricts hasPermission to CredentialsProvider.VIEW and re-checks CredentialsProvider.VIEW before listing (lines 39-51). No HTTP endpoint or Stapler method in this plugin bypasses those checks was found."
+    },
+    {
+      "lead": "Attacker-controlled apiUri/mountPath/namespace fields on Vault/GitHub credentials could redirect later plugin traffic (SSRF-like).",
+      "reason": "These are documented per-credential configuration fields (docs/examples/gitHubApp.yaml:16) settable only by the same Kubernetes secret authors who already control the credential's secret material; no trust-boundary crossing internal to this plugin was demonstrated."
+    },
+    {
+      "lead": "Vulnerable pinned dependencies (e.g. jackson2-api 2.13.0, commons-lang3 3.9) or CI workflow supply chain (reusable workflow at mutable tag v1, release-drafter@v5).",
+      "reason": "Dependency/CI vulnerability status cannot be established from this snapshot without external vulnerability data, and no exploit path through this plugin's source was traced; excluded as unverified and out of the source-evidence scope."
+    }
+  ],
+  "summary": "Reviewed the full 56-file snapshot of the Jenkins kubernetes-credentials-provider plugin (all main Java sources read end-to-end, plus pom.xml, .mvn/extensions.xml, both GitHub workflows, all docs and dev manifests; the snapshot contains no test sources). The plugin's main trust boundary is Kubernetes secrets carrying the jenkins.io/credentials-type label being converted into in-memory Jenkins credentials and served to builds. I traced secret metadata/data through SecretUtils, all convertor implementations, the watcher/event handler, and the CredentialsStore/CredentialsStoreAction permission paths. The permission model itself appears sound: KubernetesCredentialProvider.getCredentials only returns anything for ACL.SYSTEM (KubernetesCredentialProvider.java:211), and KubernetesCredentialsStore gates listing on CredentialsProvider.VIEW (KubernetesCredentialsStore.java:39-51). I did not find secret-value logging, path/injection sinks, unsafe deserialization, or attacker-reachable HTML sinks in this snapshot. The one concrete, source-verified defect I can substantiate is that a credential loaded from a Kubernetes secret is never invalidated when the backing secret is modified in place into a state the plugin cannot convert: the MODIFIED handler only adds on successful conversion and never removes the previous entry, so revoked/rotated secret material can remain usable to all credential consumers until Jenkins restarts or the secret is deleted. This is submitted as a lead, not a confirmed vulnerability, and is likely lower severity than a classic CVE-class flaw."
+}

@@ -1,0 +1,73 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker fully controls the request URL and query parameters: `plugin.<pluginName>.<siteId>` (existence of the parameter is all that matters) and `dynamicLoad`. No crumb or POST body is needed because the endpoint accepts GET and the CSRF filter ignores non-POST methods.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that UpdateSite.Plugin.deploy() does enforce Jenkins.ADMINISTER (so this is not an unauthenticated-install bug); verified that CrumbFilter blocks POST requests without a valid crumb (so the exposure is specifically via GET, which is unchecked); verified PluginManager is a plain root action (abstract class extending AbstractModelObject/OnMaster; no StaplerProxy/getTarget ACL gate); verified the method has no annotation between the Javadoc (lines 767-769) and the signature (line 770) and no permission call in its body (770-808); compared with all other administrative methods in the same class, which carry @RequirePOST.",
+      "id": "jenkins-updatecenter-get-csrf",
+      "impact": "Cross-site request forgery against a logged-in administrator leading to installation and immediate dynamic loading of attacker-chosen published plugins (code executes inside the Jenkins controller, a stepping stone to full compromise), and unauthenticated/low-privilege cancellation of scheduled restarts plus CSRF-driven restart scheduling (availability impact). A direct unauthenticated install is blocked only by the nested ADMINISTER check in deploy(), not by the endpoint itself.",
+      "locations": [
+        {
+          "end_line": 808,
+          "path": "core/src/main/java/hudson/PluginManager.java",
+          "start_line": 767
+        },
+        {
+          "end_line": 407,
+          "path": "core/src/main/java/hudson/model/UpdateCenter.java",
+          "start_line": 382
+        },
+        {
+          "end_line": 477,
+          "path": "core/src/main/java/hudson/model/UpdateCenter.java",
+          "start_line": 470
+        },
+        {
+          "end_line": 93,
+          "path": "core/src/main/java/hudson/security/csrf/CrumbFilter.java",
+          "start_line": 56
+        }
+      ],
+      "prerequisites": "1) A victim with Jenkins.ADMINISTER logged in (needed by UpdateSite.Plugin.deploy) for the plugin-install CSRF; 2) the update-site metadata must contain the chosen plugin name and the attacker must know a site id (the default site id is normally `default`); 3) for the restart variants, a logged-in admin (doSafeRestart/doRestart) or any user able to reach /updateCenter (doCancelRestart).",
+      "root_cause": "`PluginManager.doInstall` (which schedules installation and, with `dynamicLoad`, immediate loading of plugins chosen by request parameters) has neither `@RequirePOST` nor an explicit permission check in its body; every sibling administration endpoint in the same class (`doSiteConfigure`, `doProxyConfigure`, `doUploadPlugin`, `doPrevalidateConfig`, `doInstallNecessaryPlugins`, `doCheckUpdatesServer`) is annotated `@RequirePOST`. Because `CrumbFilter.doFilter` only validates crumbs for `POST` requests (core/src/main/java/hudson/security/csrf/CrumbFilter.java:56-93), a cross-site `GET /pluginManager/install?plugin.<plugin>.<site>=1&dynamicLoad=1` is processed with the victim's credentials and only the nested `UpdateSite.Plugin.deploy()` ADMINISTER check (UpdateSite.java:818-819) applies — that check establishes the privilege level but does not prevent CSRF. The same pattern exists in `hudson/model/UpdateCenter.java`: `doSafeRestart` (382-391) and `doRestart` (470-477) are GET-reachable (only an ADMINISTER check inside), and `doCancelRestart` (396-407) has no permission check at all, so any user able to send a GET can cancel a scheduled Jenkins restart.",
+      "title": "Privileged plugin installation / update-center operations are reachable via GET without CSRF protection (and one without any permission check)",
+      "trace": "Cross-site GET (e.g. an <img>/link) to /pluginManager/install?plugin.<name>.<site>=1&dynamicLoad=1 -> PluginManager.doInstall iterates request parameters (no @RequirePOST, no checkPermission) -> UpdateSite.Plugin.deploy(true) -> Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER) evaluated against the victim's session -> UpdateCenter.InstallationJob downloads the plugin from the configured update site and (dynamicLoad) PluginManager.dynamicLoad injects it into the running controller, executing the plugin's initializers/extensions. Similarly GET /updateCenter/safeRestart or /updateCenter/restart schedules a restart for the admin victim, and GET /updateCenter/cancelRestart cancels a pending restart with no permission check.",
+      "unverified": "No runtime/build verification was possible; the exact upstream fix commit/CVE for these endpoints was not inspected (no history/advisory data in scope), and it is not proven that a servlet-container or Stapler layer does not reject GET for these web methods. The end-to-end effect (download+dynamic load of a specific plugin) was reasoned from code paths, not executed.",
+      "weakness_type": "Missing CSRF/request-method protection on state-changing endpoints (CWE-352), with an authorization gap on doCancelRestart (CWE-862)"
+    }
+  ],
+  "coverage_summary": "Coverage was limited to files visible through the provided tools: 8,829 readable files under the repository root, comprising Jenkins core, cli and war main sources plus resources. The snapshot contains no test sources and no .jelly view files, so tests and template-layer (XSS/authorization markup) code could not be reviewed; binary-like files are skipped by the tooling. I focused on HTTP-exposed Java entry points and security controls: PluginManager/UpdateCenter/UpdateSite, CrumbFilter/CrumbIssuer, security realm and login/logout paths, AbstractItem/Job/Run/View/Computer/User request handlers, Api/XPath, DirectoryBrowserSupport, XML utilities and XStream2 hardening, ACL/permission helpers, and CLI commands. No candidate was runtime-confirmed; findings are source-level only.",
+  "limitations": [
+    "No git history, tags, or advisory/CVE data are available in the snapshot, so the specific release/CVE associated with this code state could not be confirmed; the pom identifies the branch only as 1.625.4-SNAPSHOT.",
+    "No code was built or executed, and no scanners or dynamic tests were run, so exploitability (especially servlet-container/Stapler handling of GET on these methods, browser content sniffing, and XPath evaluation) is reasoned from source only.",
+    "All .jelly view files and all test sources are absent from the snapshot, which removes a large part of Jenkins' UI security surface (escaping, permission-gated links/forms) and all behavior-encoding tests from review.",
+    "The snapshot is large (8,829 files); although security-relevant areas were inspected broadly, not every one of the ~954 core Java files and war/cli files was read line by line, so other defects may exist outside the reviewed paths."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Reflected XSS in hudson.model.Api.doXml: unescaped `xpath` printed via rsp.getWriter() with no content type in the 'XPath didn't match'/'multiple matches' branches (core/src/main/java/hudson/model/Api.java:146-153), unlike the text/plain content type set for simple output (line 176).",
+      "reason": "Plausible (browser sniffing of a content-type-less response), but a valid XPath expression that both parses and yields an empty node-set is required for the payload to be reflected, and it could not be verified that the response is treated as HTML or that upstream ever changed this code; not selected over the missing-POST finding."
+    },
+    {
+      "lead": "Missing `return` after the CSRF failure in Jenkins.doDoFingerprintCheck (core/src/main/java/jenkins/model/Jenkins.java:3251-3256): sendError(403) does not abort processing and the code continues to read the uploaded file item and redirect.",
+      "reason": "Genuine control-flow defect, but the continued operation only computes a digest of attacker-supplied file content and issues a redirect to the victim — no state change or data exposure to the attacker, so impact is too low to be the primary candidate."
+    },
+    {
+      "lead": "Dead multipart-CSRF helpers: CrumbFilter.isMultipart (core/src/main/java/hudson/security/csrf/CrumbFilter.java:96-102) is unused, and MultipartFormDataParser.isMultiPartForm (@since TODO, core/src/main/java/hudson/util/MultipartFormDataParser.java:83-100) only has that dead caller, suggesting a reverted hunk around multipart crumb handling.",
+      "reason": "Suspicious static relation, but no concrete exploitable behavior could be derived from the remaining code (the current filter denies multipart POSTs without a crumb rather than allowing them), and the prompt warns that an unused API alone is not a vulnerability."
+    },
+    {
+      "lead": "DirectoryBrowserSupport path check only rejects the substring '/../' (core/src/main/java/hudson/model/DirectoryBrowserSupport.java:168-173), so a path ending in '/..' is not rejected and can make baseFile resolve to the parent directory.",
+      "reason": "Container path normalization and Stapler rest-of-path behavior make reachability uncertain, and the same check appears to be long-standing upstream code rather than a reverted security patch; not enough evidence."
+    },
+    {
+      "lead": "Maintenance endpoints Jenkins.doFingerprintCleanup/doWorkspaceCleanup (core/src/main/java/jenkins/model/Jenkins.java:3621-3635) are POST/crumb protected but have no explicit ADMINISTER check, and ItemGroupMixIn.createProjectFromXML's `success` flag (core/src/main/java/hudson/model/ItemGroupMixIn.java:282-308) only controls cleanup rather than denying creation.",
+      "reason": "Low-impact authorization hardening and an upstream-inherited pattern; no concrete escalation path demonstrated from source."
+    },
+    {
+      "lead": "Older/other candidate areas (XStream/remoting deserialization, CLI commands, security realm signup, crumb issuer, update-site signature verification) were explicitly checked and their hardening is already present in this snapshot (BlacklistedTypesConverter/ClassFilter, per-command checkPermission, isIdOrFullnameAllowed, constant-time crumb compare, JSONSignatureValidator), so they were excluded.",
+      "reason": "Fixes already present in the snapshot — no missing control."
+    }
+  ],
+  "summary": "Reviewed the assigned Jenkins core snapshot (pom 1.625.4-SNAPSHOT; 8,829 files, main sources only — the harness contains no test module and no `.jelly` view files, so UI-layer templates/tests could not be inspected). The tree already contains several hardening measures of the 2015/2016 era (Util.isSafeToRedirectTo call sites, XMLUtils/RestrictiveEntityResolver XXE protection, ParametersAction safe-parameter filtering, ApiTokenProperty token hiding, XStream2 BlacklistedTypesConverter, User.isIdOrFullnameAllowed, ItemGroupMixIn secret filtering), so those were treated as fixed and excluded. The strongest remaining, source-verifiable issue is a missing request-method/CSRF gate on state-changing plugin-management and update-center endpoints: these operations can be triggered with a plain cross-site GET while the CSRF filter (CrumbFilter) only inspects POST requests, and one endpoint (UpdateCenter.doCancelRestart) additionally lacks any permission check. Submitted as a single candidate with the plugin-install endpoint as primary and the update-center methods as the same root cause."
+}

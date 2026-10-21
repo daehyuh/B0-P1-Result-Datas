@@ -1,0 +1,105 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated user with the `inputs:create` permission sends POST /api/system/inputs with type `org.graylog2.inputs.misc.jsonpath.JsonPathInput` and a `configuration` object whose `target_url` (HttpPollTransport.CK_URL, default `http://example.org/api`) is an internal/loopback/metadata URL and whose `path`/`headers`/`interval` values they also control. The transport then issues the GET on the attacker's behalf on a fixed schedule.",
+      "confidence": "medium",
+      "counterevidence_checked": "1) Graylog has a URL-whitelist mechanism and enforces it in HTTPJSONPathDataAdapter (line 162), DSVHTTPDataAdapter (lines 99/116), HTTPEventNotification (line 107) and HTTPAlarmCallback (line 90); HttpPollTransport includes none of it - the asymmetry is the core evidence. 2) The initial whitelist migration (V20191129134600_CreateInitialUrlWhitelist) deliberately collects URLs only from lookup data adapters and event notifications, which could indicate input URLs were intentionally never in whitelist scope ('accepted risk' / input creators are trusted). 3) Exploitation requires a privileged permission (`inputs:create`) and the one-input-per-cluster restriction reduces it. 4) The fetched content is only usable if it is JSON matching the configured JSON path. 5) No runtime testing was performed and I could not verify against upstream history whether this was later changed or is considered intended behavior.",
+      "id": "case-106-ssrf-httppoll-input",
+      "impact": "Server-side requests from the Graylog host to arbitrary destinations that are otherwise unreachable by the attacker: loopback/internal admin APIs, RFC1918 services, and cloud instance-metadata endpoints that return JSON (e.g. credential endpoints). Because the response is decoded into messages the attacker can read, the attacker can exfiltrate internal response data; arbitrary request headers also permit authenticated/credentialed requests to internal services. This defeats the network segmentation between the Graylog server and internal networks. Secondary effect: internal GET endpoints reachable only from the server can be triggered/abused (SSRF chaining), and HTTP redirects are followed by default (OkHttp default; OkHttpClientProvider lines 88-93 never disables them), so even a benign target that issues redirects can be used to pivot.",
+      "locations": [
+        {
+          "end_line": 101,
+          "path": "graylog2-server/src/main/java/org/graylog2/inputs/transports/HttpPollTransport.java",
+          "start_line": 88
+        },
+        {
+          "end_line": 190,
+          "path": "graylog2-server/src/main/java/org/graylog2/inputs/transports/HttpPollTransport.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 67,
+          "path": "graylog2-server/src/main/java/org/graylog2/inputs/misc/jsonpath/JsonPathInput.java",
+          "start_line": 32
+        },
+        {
+          "end_line": 146,
+          "path": "graylog2-server/src/main/java/org/graylog2/rest/resources/system/inputs/InputsResource.java",
+          "start_line": 120
+        },
+        {
+          "end_line": 104,
+          "path": "graylog2-server/src/main/java/org/graylog2/inputs/codecs/JsonPathCodec.java",
+          "start_line": 78
+        },
+        {
+          "end_line": 166,
+          "path": "graylog2-server/src/main/java/org/graylog2/lookup/adapters/HTTPJSONPathDataAdapter.java",
+          "start_line": 160
+        },
+        {
+          "end_line": 48,
+          "path": "graylog2-server/src/main/java/org/graylog2/lookup/adapters/dsvhttp/HTTPFileRetriever.java",
+          "start_line": 43
+        }
+      ],
+      "prerequisites": "Authenticated account granted `inputs:create` (not in the built-in Reader role, but grantable through a custom role; Admin has it); at most one JSON-path input may exist cluster-wide (`JsonPathInput.onlyOnePerCluster()` returns true), so exploitation requires that none is already configured; the attacker needs read access to a stream the input writes to (e.g. the default stream) for the exfiltration variant; the target endpoint must return JSON for JsonPathCodec to produce messages (otherwise the request is still performed, i.e. blind SSRF).",
+      "root_cause": "HttpPollTransport builds and executes an OkHttp GET directly from the input configuration value `target_url` (and attacker-supplied `headers`) and never consults UrlWhitelistService. It is the only user-configurable outbound HTTP fetcher in the repo that does not enforce the URL whitelist that Graylog applies elsewhere (HTTPJSONPathDataAdapter.doGet lines 160-166, DSVHTTPDataAdapter lines 99-104/116, HTTPEventNotification.execute lines 107-112, HTTPAlarmCallback lines 90-92). The whitelist dependency is simply absent from HttpPollTransport's constructor (lines 88-101), so there is no check at configuration time or at request time. The fetched body is decoded by JsonPathCodec and stored as log messages, turning a blind SSRF into an exfiltration-capable one.",
+      "title": "SSRF: HTTP-poll input (JSON path input) fetches attacker-controlled URLs without URL-whitelist enforcement",
+      "trace": "REST: POST /api/system/inputs -> InputsResource.create() (line 133-146) checks `@RequiresPermissions(INPUTS_CREATE)` and calls MessageInputFactory.create() -> JsonPathInput ctor (JsonPathInput.java lines 36-44) wires HttpPollTransport + JsonPathCodec -> input launch -> HttpPollTransport.doLaunch() (lines 137-190) reads `target_url` from configuration, builds Request.Builder().get().url(url).headers(...) at lines 170-172 and executes it with the shared OkHttpClient at line 174, with no call to UrlWhitelistService -> response bytes are fed to Input.processRawMessage (line 180) -> JsonPathCodec.decode (lines 78-104) extracts the configured JSON path into Message fields -> messages are routed to the input's streams where the attacker can search/export them.",
+      "unverified": "Not runtime-confirmed. Whether Graylog's threat model considers `inputs:create` holders trusted for arbitrary outbound network access is unverified; whether a whitelist check (or `followRedirects(false)`) was later added to this class in a fix commit is unverified from this snapshot. The existence/reachability of a JSON-returning internal target with sensitive data is deployment-dependent, and the single-JsonPath-input-per-cluster limit may block exploitation where one already exists.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery (SSRF)"
+    }
+  ],
+  "coverage_summary": "Reviewed the whole assigned tree at a structural level (4,445 files; no NUL/binary or sensitive-path exclusions reported by get_source_scope; notably, the snapshot contains no test sources and no .tsx/.jsx files). Deep-read Java areas: REST resources (inputs/transports, lookup tables, users/roles/authz, sessions/cookies/auth filters, content packs/catalog, support bundle, search/views/messages/export, events/notifications, tools/testers), security/GRN/grant code, session storage, crypto/token code, lookup adapters, pipeline functions, and the data-node REST surface; skimmed the web-interface .ts/.js subset and build/config files. Traced the URL-whitelist boundary across all HTTP-client sinks, file/URL handling in adapters and support bundles, permission annotations/asymmetries in REST resources, Mongo query construction, and FreeMarker/deserialization usage. Not exhaustively reviewed: all 2,922 Java files line-by-line (sampled by risk), graylog-storage-* modules beyond search/query paths, distribution/docker artifacts, most of the 864 web-interface files (component logic largely absent as .tsx), and the build/plugin archetype modules.",
+  "limitations": [
+    "Snapshot contains no test sources and no .tsx/.jsx files, so frontend/component-level issues and regression expectations could not be inspected.",
+    "No code was executed and no runtime/integration environment exists in this run; all conclusions are static and unconfirmed.",
+    "I could not consult advisory/CVE/patch history, so I cannot assert which defect (if any) is the repository's intended 'case' vulnerability.",
+    "Permission prerequisites were inferred from RestPermissions/role definitions in the snapshot; real deployments may differ.",
+    "Several equivalently plausible lower-severity leads exist (listed as rejected); the submitted candidate is the strongest by impact but remains a lead, not a confirmed exploit."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Regex/Grok tester endpoints (`/tools/regex_tester`, `/tools/grok_tester`, `/system/grok/test`) require only authentication and compile/match fully attacker-controlled regular expressions/grok patterns (RegexTesterResource.doTestRegex lines 80-100; GrokTesterResource.doTestGrok lines 79-95) without output/permission limits, allowing regex-denial-of-service (CWE-1333/400) by any authenticated user.",
+      "reason": "Plausible availability issue with an easy prerequisite, but impact is DoS only and there is no evidence it is the intended defect; the same 'authenticated-only' pattern applies to all tester resources, suggesting long-standing design rather than a targeted vulnerability."
+    },
+    {
+      "lead": "SupportBundleService.ensureFileWithinBundleDir (lines 515-519) validates traversal with `canonicalPath().startsWith(bundleDirCanonicalPath)`, a string prefix check that passes for sibling paths such as `<data_dir>/support-bundle-evil/...` (classic CWE-22 incomplete check) and is used by download/delete bundle handlers.",
+      "reason": "Requires `supportbundle:read`/`create` (admin-ish) plus a pre-existing attacker-accessible file under a sibling directory whose name starts with the bundle directory name; no such path is created by the API, so exploitation is speculative."
+    },
+    {
+      "lead": "MaxmindDataAdapter (GeoIP lookup adapter) reads a user-configured file path (doStart line 87, doRefresh line 132) without using the AllowedAuxiliaryPathChecker that CSVFileDataAdapter applies, unlike the neighboring adapter.",
+      "reason": "Clear inconsistency, but the file content is parsed as a MaxMind database and never returned to the requester, so confidentiality impact is negligible; no exploitation path to data disclosure was found."
+    },
+    {
+      "lead": "LookupTableTesterResource: the GET variant (lines 54-59) lacks the `LOOKUP_TABLES_READ` permission that the POST variant enforces (line 66), letting any authenticated user execute lookups and read lookup-table results (CWE-862).",
+      "reason": "Real asymmetry but limited impact (lookup values only) and likely pre-existing upstream design; lower severity than the selected lead."
+    },
+    {
+      "lead": "FavoritesService.addFavoriteItemFor/FavoritesService.findFavoritesFor (lines 74-85/63-72) and Catalog.getTitle accept arbitrary GRNs and return entity titles without checking read permission on the referenced entity.",
+      "reason": "Information disclosure limited to entity titles (no content), and GRN entity IDs are generally hard to enumerate; insufficient impact."
+    },
+    {
+      "lead": "SearchUser.owns (lines 116-119) returns true when a search has no owner (`orElse(true)`), so unowned/legacy search objects could be read and overwritten by any user.",
+      "reason": "All searches saved via SearchDomain.saveForUser receive an owner; unowned documents would only exist from legacy data, so exploitability is uncertain."
+    },
+    {
+      "lead": "MongoDbSession.getAttributes (lines 65-77) deserializes Java objects from MongoDB with an unrestricted ObjectInputStream (CWE-502).",
+      "reason": "Session attributes are written server-side as strings; exploitation would require the ability to write to the MongoDB sessions collection, which is outside the remote attack surface."
+    },
+    {
+      "lead": "URL-whitelist bypass via HTTP redirects: the whitelist is checked on the configured URL string (e.g. HTTPJSONPathDataAdapter line 162, HTTPEventNotification line 107, HTTPAlarmCallback line 90), but the OkHttp clients follow redirects by default (OkHttpClientProvider lines 88-93; HTTPFileRetriever explicitly enables them at lines 44-47), so a whitelisted host can 302 to an internal address.",
+      "reason": "Requires the attacker to control (or a permissive regex entry to cover) a whitelisted URL; conditional prerequisite weakens it versus the selected lead, which needs no whitelist condition at all."
+    },
+    {
+      "lead": "Bundled dependency versions: Netty 4.1.91.Final (pom.xml line 144) predates fixes for HTTP/2 Rapid Reset (CVE-2023-44487) and related Netty DoS issues.",
+      "reason": "Dependency-level availability risk only; not a source-logic vulnerability and not verifiable from this snapshot as the intended case."
+    },
+    {
+      "lead": "SystemNotificationRenderService constructs its own freemarker.template.Configuration (line 51) instead of the hardened SecureFreemarkerConfigProvider, leaving the default class resolver.",
+      "reason": "Template names are derived from fixed enums and bundled classpath resources; no attacker-controlled template code path was found."
+    }
+  ],
+  "summary": "I reviewed the Graylog 5.1.2 source snapshot (4,445 model-visible files; ~2,922 Java files in graylog2-server, ~89 in data-node, ~864 partial web-interface files) with a defensive focus on trust boundaries, attacker-controlled input, authorization checks, URL/file handling, deserialization, and HTTP-client sinks.\n\nStrongest candidate: server-side request forgery (SSRF) through the HTTP-poll input transport used by the \"JSON path value from HTTP API\" input. `HttpPollTransport.doLaunch()` takes the attacker-supplied `target_url` input configuration and performs a scheduled OkHttp GET with no URL-whitelist enforcement, unlike every other user-configurable HTTP fetcher in the codebase (HTTP JSON lookup adapter, DSV/HTTP lookup adapter, HTTP event notification, legacy HTTP alarm callback), which all call `UrlWhitelistService.isWhitelisted(...)` before issuing requests. Fetched JSON is decoded into messages and routed into the input's stream(s), so the attacker can read the response fields (exfiltration) and also set arbitrary request headers. A user holding `inputs:create` (grantable via a custom role; admin has it by default) can create such an input pointing at loopback/RFC1918/cloud-metadata endpoints; the input type is explicitly cloud-compatible.\n\nI considered and rejected (as weaker/unconfirmed) a number of other leads, listed below. I could not confirm the repository's intended \"known\" defect; the candidate is a lead, not a runtime-confirmed vulnerability, and no code was executed."
+}

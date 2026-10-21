@@ -1,0 +1,82 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the network path between the client and the database server (MITM/DNS or routing manipulation) and the TLS certificate the client sees. The victim side uses the documented `ssl=true` URL/property (typically application configuration, not attacker-chosen), and no `sslmode`/`sslhostnameverifier` is set. The attacker only needs any certificate for a hostname it controls that chains to a CA in the client JVM's default trust store (e.g. a public CA or enterprise CA); the target hostname need not appear in the certificate because the driver never checks it.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that `sslmode=verify-full` with the default factory does verify: MakeSSL.java:89-96 calls jdbc4 LibPQFactory.verify, which checks SAN dNSName and CN (jdbc4/LibPQFactory.java:281-328) - so the defect is configuration-dependent, not universal. Checked that `sslmode=require` intentionally skips certificate validation (libpq semantics) and that `sslmode=disable`/require/verify-* parsing in ConnectionFactoryImpl.java:96-105 is otherwise correct. Checked for any normalization of `ssl` into `sslmode` in the connection path (searched PGProperty.SSL.get / SSL_MODE.set / SSL_MODE.get): none exists; SslMode.of is only referenced from the unused org.postgresql.ssl.LibPQFactory. Checked docs: connect.md:77-83 for `ssl` only says 'Connect using SSL' / trusted-authority validation, which is weaker than the verify-full promise, but SslMode.of's ssl->VERIFY_FULL mapping plus ssl-client.md:12-20 ('validate the server's identity preventing man in the middle attacks') show the driver intends identity validation; also the default JVM trust store is used, so chain validation does occur - the missing piece is specifically endpoint identification.",
+      "id": "pgjdbc-tls-hostname-verification-skipped",
+      "impact": "Man-in-the-middle: an attacker able to intercept the connection can impersonate the database server to an application using `ssl=true`. All subsequent protocol traffic (startup parameters, authentication exchange such as MD5/SCRAM verifier data or cleartext password where applicable, queries and result data) is readable and modifiable by the attacker, and the client cannot detect the substitution. The same effect occurs for `sslmode=verify-full` combined with a custom sslfactory, contradicting the documented promise that verify-full 'will check that the ca is correct and the host is correct'.",
+      "locations": [
+        {
+          "end_line": 45,
+          "path": "pgjdbc/src/main/java/org/postgresql/ssl/MakeSSL.java",
+          "start_line": 35
+        },
+        {
+          "end_line": 99,
+          "path": "pgjdbc/src/main/java/org/postgresql/ssl/MakeSSL.java",
+          "start_line": 71
+        },
+        {
+          "end_line": 71,
+          "path": "pgjdbc/src/main/java/org/postgresql/jdbc/SslMode.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 106,
+          "path": "pgjdbc/src/main/java/org/postgresql/core/v3/ConnectionFactoryImpl.java",
+          "start_line": 92
+        },
+        {
+          "end_line": 328,
+          "path": "pgjdbc/src/main/java/org/postgresql/ssl/jdbc4/LibPQFactory.java",
+          "start_line": 281
+        },
+        {
+          "end_line": 102,
+          "path": "docs/documentation/head/connect.md",
+          "start_line": 96
+        },
+        {
+          "end_line": 20,
+          "path": "docs/documentation/head/ssl-client.md",
+          "start_line": 12
+        }
+      ],
+      "prerequisites": "1) Application connects with `ssl=true` and without `sslmode` (or sets `ssl` via PGSimpleDataSource/URL); 2) server responds 'S' to SSLRequest so MakeSSL.convert runs; 3) attacker can intercept the TCP connection and present a certificate whose chain is trusted by the JVM default trust store (because with `ssl=true` no `sslrootcert`/LibPQFactory trust store is used); 4) client accepts because no hostname check is executed. A second variant needs `sslmode=verify-full` plus a custom `sslfactory` that is not `org.postgresql.ssl.jdbc4.LibPQFactory`.",
+      "root_cause": "MakeSSL.convert decides whether to verify the server certificate identity from the raw `sslmode` property value (`\"verify-full\".equals(sslmode)`) and from `factory instanceof LibPQFactory` (lines 88-98), instead of the driver's SslMode model. `SslMode.of()` (SslMode.java lines 63-71) explicitly maps the legacy `ssl` property to VERIFY_FULL, and ssl-client.md promises server identity validation that prevents man-in-the-middle attacks, but the connection path never uses SslMode.of()/verifyPeerName(). Consequently: (1) with `ssl=true` and no `sslmode`, the property is null, so MakeSSL picks `SSLSocketFactory.getDefault()` (line 44) and the verification block is skipped entirely (line 89 is false); (2) even with `sslmode=verify-full`, a user-supplied `sslfactory` makes `factory instanceof LibPQFactory` false, so no hostname check is performed. The only code that ever verifies the hostname is `org.postgresql.ssl.jdbc4.LibPQFactory.verify()` (lines 281-328), reachable only in the first configuration. Standard JSSE `SSLSocketFactory`/`SSLSocket` validate the chain against the default trust store but do not perform endpoint/hostname identification unless explicitly configured, which this code does not do.",
+      "title": "TLS hostname verification silently skipped for `ssl=true` (and for verify-full with a custom sslfactory), allowing server impersonation/MITM",
+      "trace": "Driver.connect (Driver.java:207) -> ConnectionFactoryImpl.openConnectionImpl (ConnectionFactoryImpl.java:92-106: trySSL/requireSSL computed from raw properties, no normalization of `ssl` to `sslmode`) -> enableSSL (ConnectionFactoryImpl.java:343-385, calls MakeSSL.convert at line 384 when server replies 'S') -> MakeSSL.convert: `sslmode = PGProperty.SSL_MODE.get(info)` is null for `ssl=true` (MakeSSL.java:35), so factory = SSLSocketFactory.getDefault() (line 44); handshake at line 62; the verification block at lines 71-98 is skipped because sslhostnameverifier is null and `\"verify-full\".equals(null)` is false -> PGStream.changeSocket (line 99) with an unverified peer identity. SslMode.of (SslMode.java:63-71) and SslMode.verifyPeerName (SslMode.java:59-61) are never called in this path (text/index search: only definition and the unused org.postgresql.ssl.LibPQFactory reference), so the driver's intended VERIFY_FULL semantics for `ssl=true` are never applied.",
+      "unverified": "No code was executed and no tests exist in this snapshot, so this is source-level inference, not runtime confirmation. The exact mapping of this snapshot to a specific published CVE/release fix was not verified with external data (snapshot is dated only by version 42.2.5-SNAPSHOT and the CHANGELOG ending at 42.2.4). It is also not proven that every JDK's default SSLSocketFactory omits hostname checks (standard JSSE does unless SSLParameters endpoint identification is enabled, and this code does not enable it). Finally, the secondary permissiveness of jdbc4 LibPQFactory.verifyHostName (CN fallback even when dNSName SANs are present, and patterns such as `*example.com` matching `myexample.com`, lines 237-268) was inspected but is not claimed as the primary root cause.",
+      "weakness_type": "Improper certificate validation / missing hostname verification (CWE-295, CWE-297)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 494-file snapshot (236 Java sources under pgjdbc/src/main plus docs, Maven/Travis/build files). The P1 index reports all 494 source files indexed (calls 10194, symbols 4230, 141 facts) with no missing files or hash mismatches, but it is syntactic navigation only and no test sources are present in the snapshot. Inspection focused on the SSL/TLS connection path (Driver, ConnectionFactoryImpl, MakeSSL, SslMode, socket/SSL factories, PGProperty), plus spot checks of SQL literal/identifier escaping (Utils, PgConnection, PgDatabaseMetaData), PgResultSet update/refresh paths, PgSQLXML XML parsing, reflection/ObjectFactory use, host chooser/socket factory selection, and simple-query mode handling. No build, tests, or scanners were run (source review only).",
+  "limitations": [
+    "No test sources are included in the snapshot, so behavior encoded in tests (e.g. SSL hostname-verification expectations) could not be checked.",
+    "No code, build, or scanner execution; all conclusions are static source reasoning and are not runtime-confirmed.",
+    "The relation index is syntactic only (no data flow/reachability proof) and was used solely for navigation; index edges such as the ambiguous MakeSSL -> LibPQFactory constructor call were resolved against source text and the explicit import of org.postgresql.ssl.jdbc4.LibPQFactory.",
+    "Snapshot dating relies on pgjdbc/pom.xml (42.2.5-SNAPSHOT), CHANGELOG.md (ends at 42.2.4) and docs/_posts; the correspondence to any specific published advisory or fix commit was not externally verified.",
+    "The interpretation of `ssl=true` as intended to imply verify-full is inferred from SslMode.of() and documentation wording; the driver's documentation for the `ssl` property is ambiguous, which is reflected in the medium confidence.",
+    "Translation message files, geometric/util helper classes and replication streaming were only spot-checked, not exhaustively reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ObjectFactory.instantiate (pgjdbc/src/main/java/org/postgresql/util/ObjectFactory.java:37-61) reflectively loads and instantiates any class name supplied through connection properties (`socketFactory`, `sslfactory`, `sslhostnameverifier`, `sslpasswordcallback`) via Class.forName + newInstance with no subtype/allow-list check (callers: SocketFactoryFactory.java:37, MakeSSL.java:48/75, LibPQFactory.java:80).",
+      "reason": "Real weakness (later class of CVE), but it requires the attacker to control the JDBC URL/properties, which is a different trust model than the certificate-validation issue; nothing in the snapshot shows untrusted input reaching these properties, so it is a weaker source-supported candidate for this review."
+    },
+    {
+      "lead": "PgResultSet.refreshRow builds `select <column names> from ... where <pk> = ?` using unescaped pgmd.getBaseColumnName(i) and primaryKey.name (PgResultSet.java:1269-1291), while updateRow escapes identifiers (Utils.escapeIdentifier at 1350/1364); resembles the known refreshRow SQL-injection issue.",
+      "reason": "Exploitation needs attacker-controlled column/PK names (malicious server or hostile DDL), which is a narrower scenario than the TLS identity gap; kept as unconfirmed because the query text is generated only from result-set metadata and I could not trace an attacker-controlled path."
+    },
+    {
+      "lead": "PgSQLXML.getSource uses DocumentBuilderFactory.newInstance()/XMLInputFactory without disabling DTDs or external entities (PgSQLXML.java:131-132, 142-143), enabling XXE-style behavior for attacker-influenced SQLXML content.",
+      "reason": "Only affects callers that fetch SQLXML data and convert it via getSource; the XML must be attacker-controlled and parsed by the client. Plausible but lower impact/evidence than the TLS issue."
+    },
+    {
+      "lead": "Simple-query mode inlines parameter values (PreferQueryMode.SIMPLE paths in PgStatement/PgPreparedStatement, e.g. PgStatement.java:771-776), the area later associated with line-comment parameter swallowing.",
+      "reason": "Requires the non-default `preferQueryMode=simple`; I did not trace the value-inlining code far enough to demonstrate a concrete injection, so it remains an unconfirmed lead."
+    }
+  ],
+  "summary": "Snapshot is the PostgreSQL JDBC driver (pgjdbc) at 42.2.5-SNAPSHOT (post-42.2.4, July 2018): 494 readable files, 236 Java main sources under pgjdbc/src/main. The strongest source-supported issue is in the TLS connection path: server hostname verification is not enforced for the documented `ssl=true` mode (and is skipped for `sslmode=verify-full` when a custom `sslfactory` is used), because MakeSSL keys verification off the raw `sslmode` string and `factory instanceof LibPQFactory` instead of the driver's own SslMode model, whose `SslMode.of()` maps `ssl=true` to VERIFY_FULL (and `verifyPeerName()` is never called anywhere). A MITM holding any JVM-trusted certificate for a hostname it controls can therefore impersonate the PostgreSQL server on such connections. This is a lead based on source evidence, not a runtime-confirmed vulnerability. Other real-looking weaknesses (ObjectFactory reflective instantiation from connection properties, unescaped identifiers in PgResultSet.refreshRow, XXE-style XML parsing in PgSQLXML, simple-query parameter inlining) were checked and are noted only as rejected/unconfirmed leads, since none has stronger evidence tied to this snapshot."
+}

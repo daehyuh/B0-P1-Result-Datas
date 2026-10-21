@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The StarRocks sink's jdbcUrl field (StarRocksSinkRequest.java:42-44) is fully attacker-controlled; the only validation is a no-whitespace @Pattern. It is stored through StarRocksSinkOperator.setTargetEntity -> StarRocksSinkDTO.getFromRequest (StarRocksSinkOperator.java:72-85) and later re-read in StarRocksResourceOperator.getStarRocksInfo -> createTable -> StarRocksJdbcUtils.createDb/addColumns. An attacker can point it at a host they control and append MySQL Connector/J properties such as '?autoDeserialize=true&queryInterceptors=com.mysql.cj.jdbc.interceptors.ServerStatusDiffInterceptor'.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that MySQLSinkDTO.getFromRequest (line 88), MySQLDataNodeDTO.convertToJdbcurl (line 84) and StarRocksDataNodeDTO.convertToJdbcUrl (line 75) do call MySQLSensitiveUrlUtils.filterSensitive, so the omission is an inconsistency rather than a global design choice; verified UrlVerificationUtils only checks the jdbc:mysql:// prefix and numeric host:port and does not strip query parameters; verified no other manager layer (StreamSinkServiceImpl, AbstractSinkOperator, StarRocksSinkOperator) calls filterSensitive for StarRocks; verified the sibling OceanBase sink has the same omission (OceanBaseSinkDTO.getFromRequest lines 86-91), but its manager-side connection goes through OceanBaseJdbcUtils that does filter at line 80, so the StarRocks sink is the cleaner manager-side path; verified sort v1.13 filters autoDeserialize via JdbcUrlUtils.replaceInvalidUrlProperty but v1.15/v1.18 JdbcDynamicTableFactory pass the URL through unfiltered.",
+      "id": "case-164-c1",
+      "impact": "Remote code execution in the InLong Manager process (the Manager holds the metadata-database credentials, MQ/cluster tokens and cluster configuration), or at minimum arbitrary object deserialization and SSRF to an attacker-chosen host from the Manager. The same unfiltered URL is also propagated into the sort dataflow for StarRocks/OceanBase load nodes, so sort TaskManagers that do not apply JdbcUrlUtils.replaceInvalidUrlProperty (only the v1.13 jdbc factory does) can be affected by the same class of attack.",
+      "locations": [
+        {
+          "end_line": 116,
+          "path": "inlong-manager/manager-pojo/src/main/java/org/apache/inlong/manager/pojo/sink/starrocks/StarRocksSinkDTO.java",
+          "start_line": 101
+        },
+        {
+          "end_line": 69,
+          "path": "inlong-manager/manager-service/src/main/java/org/apache/inlong/manager/service/resource/sink/starrocks/StarRocksJdbcUtils.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 116,
+          "path": "inlong-manager/manager-service/src/main/java/org/apache/inlong/manager/service/resource/sink/starrocks/StarRocksResourceOperator.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 90,
+          "path": "inlong-manager/manager-web/src/main/java/org/apache/inlong/manager/web/controller/StreamSinkController.java",
+          "start_line": 72
+        },
+        {
+          "end_line": 118,
+          "path": "inlong-manager/manager-pojo/src/main/java/org/apache/inlong/manager/pojo/util/MySQLSensitiveUrlUtils.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 90,
+          "path": "inlong-manager/manager-pojo/src/main/java/org/apache/inlong/manager/pojo/sink/mysql/MySQLSinkDTO.java",
+          "start_line": 85
+        }
+      ],
+      "prerequisites": "A valid InLong web account able to save a StarRocks sink on a stream it is in charge of (sink save is under /api/** and has no INLONG_ADMIN role annotation; ordinary-tenant save is a normal feature), and the workflow resource-creation step must run (SinkResourceListener / StreamSinkResourceListener invoke createSinkResource on stream submission/approval). The attacker's host must speak the MySQL wire protocol and be reachable from the Manager. RCE additionally requires a usable deserialization gadget on the Manager classpath.",
+      "root_cause": "Sink types that carry a MySQL-protocol JDBC URL do not consistently apply the project's sensitive-parameter filter. MySQLSinkDTO.getFromRequest calls MySQLSinkDTO.filterSensitive (MySQLSinkDTO.java:88) and the MySQL/StarRocks data-node paths call it too, but StarRocksSinkDTO.getFromRequest (lines 101-116) only copies the request into the DTO and persists it. StarRocksResourceOperator.createTable then passes that stored URL to StarRocksJdbcUtils.getConnection, which checks host:port with UrlVerificationUtils and calls DriverManager.getConnection(url, ...) with com.mysql.cj.jdbc.Driver (MySQL Connector/J, declared version 8.0.28 in the root pom) without any MySQLSensitiveUrlUtils.filterSensitive call. Dangerous Connector/J properties such as autoDeserialize=true plus queryInterceptors=com.mysql.cj.jdbc.interceptors.ServerStatusDiffInterceptor therefore survive request validation, storage and connection.",
+      "title": "StarRocks sink jdbcUrl is never sanitized before being passed to MySQL Connector/J, allowing JDBC-URL deserialization (autoDeserialize/queryInterceptors) in the Manager",
+      "trace": "POST /api/sink/save (StreamSinkController.save) -> StreamSinkServiceImpl.save -> StarRocksSinkOperator.setTargetEntity -> StarRocksSinkDTO.getFromRequest (no filterSensitive) -> sink ext_params persisted -> workflow listener SinkResourceListener/StreamSinkResourceListener -> resourceOperator.createSinkResource -> StarRocksResourceOperator.createTable -> StarRocksJdbcUtils.createDb(url,...) -> StarRocksJdbcUtils.getConnection -> UrlVerificationUtils.extractHostAndValidatePortFromJdbcUrl only validates prefix/host/port -> Class.forName(com.mysql.cj.jdbc.Driver) -> DriverManager.getConnection(url, user, password). Connector/J honours autoDeserialize/queryInterceptors from the URL and deserializes server-provided bytes (e.g. via ServerStatusDiffInterceptor), giving code execution in the Manager JVM with attacker-supplied serialized data.",
+      "unverified": "Not runtime-confirmed: no code, tests or scanners were executed and no exploit payload was sent. Whether a working gadget chain is present in the Manager classpath, and whether the deployed Connector/J build still resolves the ServerStatusDiffInterceptor/autoDeserialize combination, was not verified. The exact approval/auto-approve behaviour of the resource-creation workflow in a given deployment and end-to-end delivery of the URL to sort connectors were only source-traced, not executed. The same root cause appears in OceanBaseSinkDTO and other non-MySQL JDBC sink paths that were not fully enumerated.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (via JDBC connection URL properties); CWE-20 Insufficient Input Validation"
+    }
+  ],
+  "coverage_summary": "Scope: 6,185 repository files (all model-visible; no binary/symlink/sensitive-name exclusions). The P1 relation index is partial and navigation-only: 6,091 files indexed, 95 omitted, 211 files parsed for symbols, no control-flow/data-flow/semantic resolution, 118,100 unresolved calls; I used it only for orientation and verified all edges in source. Files inspected by area: manager-web (Shiro filters/realm, controllers incl. openapi), manager-service (sink/source/stream/group services and resource operators, installer/module/package services, workflow listeners, message deserializers, dirty-data stubs), manager-pojo (sink/data-node DTOs, MySQLSensitiveUrlUtils, UrlVerificationUtils, OrderFieldEnum), manager-dao mapper XMLs, agent (common utils, core, installer ModuleManager/ManagerFetcher, plugins sources/sinks), sort (sort-common InstantiationUtil, sort-core FlinkSqlParser, Flink v1.13/1.15/1.18 jdbc/starrocks/oceanbase connectors, sort-standalone SinkContext/config loaders), sdk (transform-sdk decoders used by production code, dataproxy-sdk local caches), dataproxy-source (HTTP handler, config servlet), audit-service/audit-sdk (query API and local deserialization caches), parts of tubemq. Not exhaustively reviewed: tubemq broker/manager internals, inlong-dashboard (TypeScript), distribution/docker scripts, most sort connector implementations and test code. No build, tests or scanners were run.",
+  "limitations": [
+    "Candidate is a lead, not a confirmed vulnerability; no runtime, build, test or scanner validation was performed.",
+    "The relation index is syntactic/navigation-only with partial coverage (95 omitted files, 211 parsed, no data flow or semantic resolution); unreported areas were not assumed safe.",
+    "Exploitability of the StarRocks candidate depends on runtime factors that source review cannot settle: a working deserialization gadget on the Manager classpath, Connector/J 8.0.28 behavior for autoDeserialize/queryInterceptors, and the deployment's workflow approval/auto-approval configuration.",
+    "Only the Manager side of the StarRocks path was fully traced; delivery of the stored URL into v1.15/v1.18 sort connectors was traced by source reading, not executed, and other sink types (e.g. OceanBase) share the same omitted filter.",
+    "Line ranges refer to this snapshot only; deployment-specific configuration (profiles, openapi auth, whether resource creation is enabled per sink) can change reachability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ModuleController/PackageController (/api/module/save, /api/package/save) have no @RequiresRoles while most other system-config controllers require INLONG_ADMIN, and the agent installer executes manager-supplied install/start/check commands via ExcuteLinux.exeCmd('/bin/sh -c ...') (agent-installer ModuleManager.java:487-524) and writes downloaded packages to attacker-chosen storagePath/fileName.",
+      "reason": "Plausible authenticated-to-agent RCE, but it depends on the installer deployment, the module-config delivery path (AgentServiceImpl/AgentClusterNodeOperator with several conditionals) and per-deployment cluster-node mapping; the delivery path could not be verified end-to-end from source, so it was not selected over the more direct JDBC-URL issue."
+    },
+    {
+      "lead": "YamlSourceDecoder.decode uses new Yaml().load(srcString) on message bytes (transform-sdk, line 63-64, Flink-shaded SnakeYAML).",
+      "reason": "No production caller found: SourceDecoderFactory.createYamlDecoder is referenced only inside transform-sdk; the only production decoder construction (sort-standalone SinkContext.createSourceDecoder) supports CSV/KV only, so untrusted-message reachability is not established. Same for XmlSourceDecoder/DocumentHelper.parseText (potential XXE)."
+    },
+    {
+      "lead": "StarRocks sink connectors call InstantiationUtil.deserializeObject on NestedRowData DDL bytes (StarRocksDynamicSinkFunction.java:217 and V2:181).",
+      "reason": "No producer of the Java-serialized DDL bytes was found in the repository, so attacker control of those bytes could not be established from source."
+    },
+    {
+      "lead": "openapi.auth.enabled defaults to false (application.properties:61) and OpenAPIFilter then authenticates /openapi/** as the default admin user, making many openapi endpoints reachable unauthenticated.",
+      "reason": "This is the documented intended default ('Clients ... must be authenticated by secretId and secretKey if turned on'); it is an insecure-default/deployment-hardening concern rather than an unambiguous code vulnerability."
+    },
+    {
+      "lead": "ObjectInputStream usages on locally cached files (audit-sdk SenderManager.java:271, dataproxy-sdk ProxyConfigManager.java:674, tubemq CliMetaDataBRU.java:1712).",
+      "reason": "Deserialization of files written locally by the same component; no remote/attacker write path to those cache files was found, so impact and attacker control are weak."
+    },
+    {
+      "lead": "MyBatis mappers use 'order by ${orderField} ${orderType}' (e.g. InlongGroupEntityMapper.xml:317, StreamSinkEntityMapper.xml:247).",
+      "reason": "OrderFieldEnum/OrderTypeEnum whitelist both values before every reachable mapper call that uses user page requests; internal callers pass no order field, so no injection path was confirmed."
+    }
+  ],
+  "summary": "Reviewed the Apache InLong 2.2.0-SNAPSHOT source tree (6,185 files; manager, agent/installer, sort (core + Flink v1.13/1.15/1.18 connectors), dataproxy, audit, sdk/transform, parts of tubemq). The strongest source-backed issue is a missing JDBC-URL sanitization on the StarRocks sink path: the project has a dedicated filter for the MySQL-Connector/J \"autoDeserialize/queryInterceptors\" deserialization attack (MySQLSensitiveUrlUtils) and applies it to MySQL sink/node and StarRocks/MySQL data nodes, but the StarRocks sink DTO stores the client-supplied jdbcUrl verbatim and the Manager then connects with com.mysql.cj.jdbc.Driver, allowing attacker-chosen Connector/J properties to reach the driver (CWE-502). One candidate is submitted as a lead; several other plausible issues were rejected due to missing reachability or intentional defaults."
+}

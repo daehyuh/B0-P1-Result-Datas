@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the HTTP Host header (and can add a header literally named \"scheme\") of a request to the application. In directly exposed deployments, or behind proxies that forward Host unchanged, this value is used verbatim. Triggering a normal bootstrap/page request is sufficient, because bootstrap processing calls FrontendUtils.getStatsAssetsByChunkName, and template parsing calls FrontendUtils.getStatsContent, both of which reach getStatsFromExternalUrl when external stats mode is on.",
+      "confidence": "medium",
+      "counterevidence_checked": "The feature is off by default (isStatsExternal defaults to false), so only apps configured for external stats/CDN-style frontends are affected; reverse proxies commonly rewrite Host, which mitigates it; the fetch path/suffix is fixed, limiting SSRF to one path per target; attacker-supplied stats content is parsed and mostly surfaced as relative \"./VAADIN/...\" chunk URLs (so direct external-script injection via chunk names is not established), and local-file reads via a spoofed scheme would not be returned directly to the attacker. I verified that the UIDL/CSRF, push-id, stream-key and static-file path checks in this snapshot already use constant-time comparisons or isPathUnsafe()/container normalization, so they were not selected.",
+      "id": "cand-010-ssrf-host-header-stats",
+      "impact": "Unauthenticated server-side request forgery: the Flow server issues HTTP(S) GETs to arbitrary hosts/ports chosen by the requester (fixed path/suffix), usable for internal network probing and requests to internal services. Because the attacker-supplied body is treated as authoritative stats.json and can be pinned into the app-wide Stats cache via a forged Last-Modified, it can also tamper with module/chunk resolution for other users' bootstrap pages and with template sources used by NpmTemplateParser, a plausible route to stored script/template injection (HTML/JS content) in victims' pages. The \"scheme\" header fallback also opens non-HTTP URL schemes (e.g. file:) whose usability depends on container header validation and is unverified.",
+      "locations": [
+        {
+          "end_line": 503,
+          "path": "flow-server/src/main/java/com/vaadin/flow/server/frontend/FrontendUtils.java",
+          "start_line": 461
+        },
+        {
+          "end_line": 517,
+          "path": "flow-server/src/main/java/com/vaadin/flow/server/frontend/FrontendUtils.java",
+          "start_line": 505
+        },
+        {
+          "end_line": 904,
+          "path": "flow-server/src/main/java/com/vaadin/flow/server/BootstrapHandler.java",
+          "start_line": 902
+        },
+        {
+          "end_line": 233,
+          "path": "flow-server/src/main/java/com/vaadin/flow/component/polymertemplate/NpmTemplateParser.java",
+          "start_line": 216
+        },
+        {
+          "end_line": 436,
+          "path": "flow-server/src/main/java/com/vaadin/flow/function/DeploymentConfiguration.java",
+          "start_line": 423
+        }
+      ],
+      "prerequisites": "1) The application is configured in external-stats mode: DeploymentConfiguration.isStatsExternal() true (external.stats.file=true, set via generated buildInfo/vaadin.externalStatsFile or the external.stats.file init parameter) and the external stats URL is relative (default \"/vaadin-static/VAADIN/config/stats.json\"); 2) the app is reachable with a Host header that is not rewritten/validated by a front proxy; 3) at least one request that triggers bootstrap or template parsing (unauthenticated page load is enough).",
+      "root_cause": "When deployment configuration has external stats enabled (isStatsExternal() == true) and the configured external stats URL is relative (the default is \"/vaadin-static/VAADIN/config/stats.json\"), FrontendUtils.getStatsFromExternalUrl builds the fetch URL as getHostString(request) + externalStatsUrl. getHostString() reads the raw \"host\" header from the current VaadinRequest (and, if Host has no scheme separator, an arbitrary \"scheme\" header as well) and never validates it against the application's own hosts. The resulting string is passed to new URL(...).openConnection()/getInputStream() and fetched server-side without allow-listing, so the request itself selects the outbound destination (host, port and even URL scheme).",
+      "title": "Host-header driven SSRF in external stats.json retrieval (FrontendUtils.getStatsFromExternalUrl)",
+      "trace": "Request -> VaadinService/BootstrapHandler.synchronizedHandleRequest -> BootstrapHandler.setupFrameworkLibraries -> appendNpmBundle (BootstrapHandler.java:886/902-904) -> FrontendUtils.getStatsAssetsByChunkName (575) -> config.isStatsExternal() true -> FrontendUtils.getStatsFromExternalUrl (461) -> externalStatsUrl.startsWith(\"/\") -> VaadinRequest.getCurrent() (467) -> getHostString(request) (468, 505-517) reads request.getHeader(\"host\") (and \"scheme\") -> url = host + \"/vaadin-static/VAADIN/config/stats.json\" -> new URL(url).openConnection().getInputStream() (473-475) server-side GET to the attacker-selected host/port. The response is parsed as stats JSON: chunk names become <script src> entries in the bootstrap page (931-954); in the template path (NpmTemplateParser.getSourcesFromStats -> FrontendUtils.getStatsContent (209-233/382-406)) the same content becomes the Polymer template sources. If the attacker's server returns Last-Modified, the response body is additionally cached application-wide in VaadinContext (Stats attribute, 480-495), and only a later newer Last-Modified can replace it.",
+      "unverified": "No runtime execution, proxy configuration check, or dynamic request was performed; the exact exploitability of the file:/scheme variant and of the stats-cache poisoning -> template XSS chain depends on container Host/scheme header validation, on whether the app uses Polymer template parsing, and on attacker knowledge of template file names; the application-wide Stats cache replacement condition (Last-Modified comparison) was only read, not tested.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery (host header injection into server-side URL)"
+    }
+  ],
+  "coverage_summary": "Source scope: 1891 visible files (1891 root files; 0 excluded by name/path/size/binary policy; no symlinks). The P1 index covers 1867 files / 1396 Java files (partial: syntax only, no control-flow or data-flow, 22749 unresolved calls, Spring/annotation hints unverified), with 14 omitted files; therefore unreported areas are not claimed as reviewed. I inspected the flow-server runtime surface most exposed to HTTP input: BootstrapHandler/BootstrapUtils/WebComponentBootstrapHandler, VaadinServlet/VaadinService request pipeline, UIDL/ServerRpcHandler and all RPC handlers, StaticFileServer/WebJarServer/ResponseWriter/HandlerHelper, StreamRequestHandler/StreamReceiverHandler/StreamResourceRegistry, PushHandler/PushRequestHandler, DevModeHandler and frontend/FrontendUtils/installer/JarContentsManager, PwaHandler/PwaRegistry, ElementPropertyMap/MapSyncRpcHandler/PublishedServerEventHandlerRpcHandler, and representative flow-tests usages. Not exhaustively reviewed: flow-client GWT/TypeScript client internals, flow-data, flow-dnd, html components, flow-maven-plugin/build-tools, and most flutter test applications. No tests are present in the snapshot and nothing was executed.",
+  "limitations": [
+    "No code execution, tests, scanners, or exploit payloads were used; all findings are static source readings and are not runtime-confirmed.",
+    "The strongest candidate depends on a non-default configuration (external stats file mode) and on the deployment not sanitizing the Host header; both conditions are environment-dependent and were not verifiable from source alone.",
+    "The stats-cache poisoning -> template/XSS escalation is inferential: I traced the data into NpmTemplateParser/BundleParser and the bootstrap chunk-name injection point, but did not prove browser-side execution or attacker knowledge of template names.",
+    "Concrete exploitation of the file:/scheme variant depends on servlet-container validation of Host/scheme headers, which cannot be determined from this source tree.",
+    "The P1 relation index is name/arity-based syntax navigation only; every edge I used (e.g. getStatsAssetsByChunkName -> getStatsFromExternalUrl) was re-verified in the source text, but unresolved calls mean some callers/callees in the repository may be missing from the index.",
+    "flow-tests, flow-client (browser), flow-data, flow-dnd, html-component, and build-tooling code received only spot checks, so other vulnerabilities may exist there."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal/zip-slip in DefaultArchiveExtractor.extractZipArchive (flow-server/.../installer/DefaultArchiveExtractor.java:81-98) — the tar branch (124-154) has a canonical-path containment check while the zip branch has none, so a malicious archive could write outside the destination.",
+      "reason": "Rejected as weaker than the selected candidate: exploitation requires control over the archive content (MITM of the node.js download or a malicious configured nodeDownloadRoot, plus build/runtime node installation); it is not reachable from an arbitrary HTTP request in a running app. Kept as an unconfirmed secondary lead."
+    },
+    {
+      "lead": "Unvalidated ?url parameter in WebComponentBootstrapHandler.getServiceUrl (flow-server/.../communication/WebComponentBootstrapHandler.java:432-447), which becomes the service URL / module base in the returned JS.",
+      "reason": "Rejected as primary: the value is passed through URI.create(checkURL(...)) (395-404), which rejects double quotes, and only \"src\" attributes are rewritten, so a concrete XSS/injection path is not established from source; it also requires a victim browser to load a crafted bootstrap URL. Open redirect/service-URL hijack remains a plausible weaker lead."
+    },
+    {
+      "lead": "Static file / webjar / OSGi resource serving path traversal (StaticFileServer.java:109-162, WebJarServer.java:100-150, VaadinBundleTracker.java:89-101, PwaHandler.java:136-178).",
+      "reason": "Rejected: HandlerHelper.isPathUnsafe decodes and rejects parent-directory segments, PwaHandler strips '/' from the user-supplied suffix, and ServletContext.getResource normalization is an additional layer; no source-level bypass was found."
+    },
+    {
+      "lead": "Denial of service via unbounded UIDL body read in ServerRpcHandler.getMessage (ServerRpcHandler.java:421-435) or via stream upload buffering in StreamReceiverHandler.",
+      "reason": "Rejected: these are resource-consumption concerns bounded by container request limits and require a valid session/security key for the stream path; not a distinct strong source-supported vulnerability."
+    },
+    {
+      "lead": "Dev-mode webpack proxy in DevModeHandler.serveDevModeRequest (DevModeHandler.java:314-385) copying request/response headers and proxying /VAADIN paths.",
+      "reason": "Rejected: dev-mode-only configuration, target host is hard-coded to localhost, and path traversal/dot-dot is blocked by HandlerHelper.isPathUnsafe; not a production-reachable issue."
+    }
+  ],
+  "summary": "This is the Vaadin Flow 2.6-SNAPSHOT (Vaadin 14.6 line, early 2021) monorepo. Coverage focused on the runtime request-handling surface of flow-server (bootstrap, UIDL/RPC, static/webjar/stream serving, push, dev-mode, frontend/stats plumbing) because that is where untrusted HTTP input meets sensitive operations. Static-file path traversal, CSRF/push-id/timing comparisons, disabled-component property updates, RPC value decoding, and web-component tag parsing all have plausible-looking protections in this snapshot, so I did not submit them. The strongest source-supported issue I found is the server-side HTTP fetch performed when the \"external stats file\" mode is enabled: the URL host is taken from the attacker-controllable Host header (and a \"scheme\" pseudo-header), giving an unauthenticated SSRF primitive and enabling application-wide poisoning of the cached stats.json that Flow later consumes for chunk/template resolution. No runtime verification was performed; this is a source-evidence lead, not a confirmed exploit."
+}

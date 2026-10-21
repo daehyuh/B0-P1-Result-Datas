@@ -1,0 +1,95 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The registering client controls name, healthUrl, managementUrl, serviceUrl and metadata of a POST /instances request (JSON deserialized by RegistrationDeserializer, which also allows a legacy 'url' field that is expanded to a health URL). Service names are enumerable from the unauthenticated read APIs/UI (GET /applications, GET /instances) and from the journal. Attacker-controlled values later become: the URL of server-initiated health/index/info requests; the credential identity (serviceMap/default lookup by registration name); and the set of endpoint URLs (arbitrary absolute hrefs from the attacker's own actuator index response) that the admin proxy forwards requests to with caller-chosen method, path, query and body.",
+      "confidence": "medium",
+      "counterevidence_checked": "Structural checks: the only consumer of the service map is BasicAuthHttpHeaderProvider (name-keyed lookup at line 71); there is no host allowlist/denylist for registered URLs anywhere in the tree (searched for allowedHosts/allowlist); Registration.checkUrl only tests URI.isAbsolute(); QueryIndexEndpointStrategy.alignWithManagementUrl only normalizes http->https when the management URL is https and does not validate the href origin; HttpHeaderFilter and the default instance-proxy ignored headers (Cookie/Set-Cookie/Authorization) strip the admin user's own headers, so the credential exposure comes from the server's configured instance credentials, not from the caller's session. Documented counterargument (partially mitigating): the project's docs/samples expect operators to protect /instances with Spring Security, so on a hardened deployment the attacker must first obtain the shared registration credential; however, even an authorized registrar (or any single compromised monitored app) can claim an arbitrary service name and cause other services' credentials to be sent to a URL it chooses, so the identity/credential binding defect remains. I found no source-level check that ties a registration to the service it claims.",
+      "id": "case-108-1",
+      "impact": "Disclosure of the admin server's configured per-service/default Basic-auth credentials to an attacker-chosen origin (those credentials normally unlock the protected actuator endpoints of the impersonated monitored services, so the attacker can pivot to those services). Additionally, the admin server can be used as an SSRF pivot from its own network position: its monitoring loop performs GET/OPTIONS requests to attacker-specified hosts, and the proxy path allows arbitrary methods, paths, queries and request bodies to attacker-supplied absolute URLs, enabling internal port scanning and access to services reachable only from the admin server (including cloud metadata endpoints).",
+      "locations": [
+        {
+          "end_line": 85,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/web/InstancesController.java",
+          "start_line": 76
+        },
+        {
+          "end_line": 72,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/domain/values/Registration.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 99,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/domain/values/Registration.java",
+          "start_line": 91
+        },
+        {
+          "end_line": 87,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/web/client/BasicAuthHttpHeaderProvider.java",
+          "start_line": 65
+        },
+        {
+          "end_line": 73,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/web/client/InstanceExchangeFilterFunctions.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 112,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/web/client/InstanceExchangeFilterFunctions.java",
+          "start_line": 75
+        },
+        {
+          "end_line": 79,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/services/StatusUpdater.java",
+          "start_line": 69
+        },
+        {
+          "end_line": 118,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/services/endpoints/QueryIndexEndpointStrategy.java",
+          "start_line": 113
+        },
+        {
+          "end_line": 121,
+          "path": "spring-boot-admin-server/src/main/java/de/codecentric/boot/admin/server/web/InstanceWebProxy.java",
+          "start_line": 91
+        }
+      ],
+      "prerequisites": "Ability to reach POST /instances (SBA ships with no built-in authorization for its API; the reference docs and samples tell operators to secure it, and the sample's 'secure' profile does so) or a malicious/compromised application that is already allowed to register. For credential disclosure, the deployment must have configured spring.boot.admin.instance-auth default credentials or service-map entries (the documented way to let the server call secured actuator endpoints); the attacker simply omits user.name/user.password metadata so the name-keyed/default lookup is used. For arbitrary-host proxying, the attacker registers an instance whose management URL serves an actuator index with hrefs pointing at the target internal service.",
+      "root_cause": "The server derives the outbound destination and the credential identity from data that the registering client fully controls, without any authorization or binding between the two. Registration (name/healthUrl/managementUrl/metadata) is accepted by POST /instances with only a syntactic check (Registration.checkUrl requires merely uri.isAbsolute()), the registration is keyed only by SHA-1 of the client-supplied healthUrl (HashingInstanceUrlIdGenerator), and StatusUpdater/InfoUpdater/QueryIndexEndpointStrategy then issue HTTP requests to those client-supplied URLs. In addition, BasicAuthHttpHeaderProvider.getHeaders selects credentials with serviceMap.get(instance.getRegistration().getName()) or the configured default credentials, i.e. the client-claimed service name, and the addHeaders filter attaches the resulting Authorization header to every request made for that instance. Actuator-index hrefs are adopted verbatim (QueryIndexEndpointStrategy.convertResponse; alignWithManagementUrl only rewrites http->https, never checks origin), and InstanceExchangeFilterFunctions.rewriteEndpointUrl/rewriteUrl plus InstanceWebProxy then forward caller-controlled method/path/query/body/headers to those URLs.",
+      "title": "Client-supplied registration identity and URLs are trusted for outbound requests and instance-credential selection (SSRF + Basic-credential disclosure)",
+      "trace": "POST /instances (InstancesController.register, lines 76-85) -> Registration validation only checks absolute URI syntax (Registration lines 56-72, 91-99) -> InstanceRegistry.register stores it with an id derived from the client's healthUrl and Instance.register replaces/sets the registration (no check that the client owns that name). Triggers then act on the stored data: StatusUpdateTrigger -> StatusUpdater.doUpdateStatus does instanceWebClient.instance(instance).get().uri(Endpoint.HEALTH) (line 75), which resolves through the instance endpoint map to the registration's health URL; EndpointDetectionTrigger -> QueryIndexEndpointStrategy.detectEndpoints issues GET to the registration's managementUrl (line 64) and adopts every returned href as an Endpoint (lines 113-118); InfoUpdater does the same for 'info'. For every such request the addHeaders filter (InstanceExchangeFilterFunctions lines 67-73) calls BasicAuthHttpHeaderProvider.getHeaders, which looks up serviceMap.get(registration.getName()) and falls back to the configured default credentials (lines 65-87), adding Authorization: Basic ... to the request destined for the attacker's URL. Caller-controlled proxy traffic takes the same route: InstancesProxyController -> InstanceWebProxy.forward (lines 91-121) -> rewriteEndpointUrl/rewriteUrl (lines 75-112) builds the target as the client-supplied endpoint href plus the caller's remaining path segments and query, and sends the caller's method/body/headers there.",
+      "unverified": "Not runtime-confirmed (no code executed, no requests sent). Deployment-dependent: whether /instances is reachable by the attacker, whether spring.boot.admin.instance-auth credentials are configured, and whether the target actuator index is actually consumed (it is only queried when the registration's managementUrl differs from its serviceUrl and the instance is reachable/UP). I could not verify which exact requests carry the Authorization header first (health is the earliest and requires only an absolute healthUrl). The absolute-URL branch of rewriteEndpointUrl is exercised by server-generated requests (health/management URL); the caller-facing proxy path uses relative URIs and client-supplied endpoint hrefs.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery; CWE-522 credential disclosure to an attacker-controlled destination"
+    }
+  ],
+  "coverage_summary": "Reviewed all 204 Java files listed in the snapshot (names and content for all server/client/cloud/UI/samples classes; deep reads of the web, services, web.client, notify, config, domain and eventstore packages), plus root/child pom.xml files, configuration metadata, and the frontend files present (services, utils, login/index, templates). The P1 relation index was used for navigation only (204 Java files parsed, 0 parse errors; no control/data flow, no semantic resolution, no runtime reachability). No code, tests, or scanners were executed. One source file is absent from the index and many UI implementation files are absent from the snapshot entirely (e.g. views/instances/*/index.js and component implementations, shell sources, spring-boot-admin-server/src/main/resources/META-INF/spring.factories, docs .adoc, UI resource templates); those omissions limit the frontend/static-resource analysis.",
+  "limitations": [
+    "No execution, dynamic analysis, or dependency scanning was performed; all conclusions are static and are leads, not confirmed vulnerabilities.",
+    "The snapshot is incomplete: UI view/component sources, some resources (spring.factories, templates), the docs module, and all tests are not present, so frontend XSS/rendering and build-time behavior could not be assessed and the relation index has no record for those areas.",
+    "The P1 index provides syntactic navigation candidates only (no data/control flow, no semantic resolution, no reachability), so the credential/SSRF trace was reconstructed by reading source text and could not be validated at runtime.",
+    "Exploitability of the submitted candidate depends on deployment choices (registration endpoint exposure, instance-auth configuration, egress controls) that are outside the snapshot; the product's documentation explicitly instructs operators to secure the registration endpoint, which is the main counterargument.",
+    "Version context: revision is 2.6.6-SNAPSHOT while pinned Spring Boot is 2.6.11, so the tree may include later maintenance changes; no patch/CVE metadata was consulted per instructions."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal / scheme confusion in the proxy URL builder (InstancesProxyController.createForwardRequest -> UriComponentsBuilder.fromPath(...).build(true) -> InstanceExchangeFilterFunctions.rewriteUrl)",
+      "reason": "AntPathMatcher.extractPathWithinPattern tokenizes on '/' with empty-token suppression and Spring's UrlPathHelper also collapses '//', so a request cannot produce a '//host' authority; a crafted path can at most yield a scheme-like opaque URI (e.g. 'http:/path') whose host resolution by Reactor Netty could not be verified from source, and any '..' segments only affect the path on the already-managed instance host. Left as unconfirmed rather than submitted."
+    },
+    {
+      "lead": "XSS by rendering a managed instance's proxied response (attacker-controlled Content-Type/body) under the admin server's origin",
+      "reason": "Plausible same-origin content-injection class, but the response templates/view components that would show how proxied content is consumed are missing from this snapshot, and HomepageForwardingFilter forwards Accept: text/html navigations (except heapdump/logfile) to the SPA index, which mitigates the default case; not verifiable here."
+    },
+    {
+      "lead": "Missing authorization/CSRF protection on library endpoints (POST /instances, DELETE /instances/{id}, /notifications/filters, the actuator proxy)",
+      "reason": "Spring Boot Admin intentionally ships without authentication and documents that /instances and the API must be secured by the application; the samples show the expected Spring Security configuration. Reported as a prerequisite/counterargument rather than as the finding."
+    },
+    {
+      "lead": "Notification filter management abuse (unauthenticated add/delete, negative ttl creates non-expiring filters, predictable 'F-n' ids)",
+      "reason": "Real but low impact (suppression/noise of notifications) and again gated entirely by deployment security; not competitive with the credential/SSRF chain."
+    },
+    {
+      "lead": "Unbounded request-body caching in the /applications/{name}/actuator/** proxy (DataBufferUtils...cache()) and unbounded in-memory maps (client attempts, notifier lastStatuses, cookie store)",
+      "reason": "Possible resource-exhaustion/DoS leads; sizes/impact cannot be established from source alone and the endpoints are expected to sit behind the application's own security."
+    }
+  ],
+  "summary": "Reviewed the spring-boot-admin 2.6.x snapshot (643 files; 204 Java files parsed by the P1 index; version 2.6.6-SNAPSHOT, Spring Boot 2.6.11). I focused on the server control paths that accept HTTP input and then make outbound requests: instance registration (InstancesController, Registration), the monitoring loop (StatusUpdater, InfoUpdater, EndpointDetector/QueryIndexEndpointStrategy/ProbeEndpointsStrategy), the actuator proxy (servlet/reactive InstancesProxyController, InstanceWebProxy, InstanceExchangeFilterFunctions), credential/header handling (BasicAuthHttpHeaderProvider, HttpHeaderFilter, cookie store), notifiers, notification filters, cloud discovery and the UI server-side classes. The strongest source-evidenced issue is a trust-boundary violation in how the server turns client-supplied registration data into (a) outbound HTTP requests and (b) the identity used to select instance credentials. A rogue registration (or a compromised/malicious monitored application) can claim any service name and any absolute URL; the server then sends the Basic credentials configured for that name to the attacker-chosen URL and uses attacker-supplied actuator-index hrefs as proxy targets, forwarding arbitrary methods/bodies/headers. No code was executed; exploitability depends on deployment (registration endpoint reachability) and on optional instance-auth configuration, and no runtime verification was performed."
+}

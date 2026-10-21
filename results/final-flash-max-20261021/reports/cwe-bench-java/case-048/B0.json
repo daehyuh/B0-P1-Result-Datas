@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the raw HTTP request target (remote, unauthenticated). Crafted URIs using encoded characters, `;` matrix/path parameters and `..`/`.` segments (e.g. variants of `/public/..;/admin/...` or `/%2e%2e/...`) can be resolved differently by Shiro's filter-chain path derivation and by the framework dispatcher that later routes the request.",
+      "confidence": "medium",
+      "counterevidence_checked": "Mitigations that reduce, but do not eliminate, reachability were found and considered: (1) `ShiroEnvironmentPostProcessor` (spring-boot-starter, lines 30-33) adds `spring.mvc.pathmatch.matching-strategy=ant_path_matcher` first in the environment, which keeps Spring MVC using `ShiroUrlPathHelper` under the Boot starter — so the simplest PathPatternParser mismatch is mitigated for starter users; the mismatch remains for configurations where that property/import does not apply (plain shiro-spring + Spring MVC, custom handler mappings, `alwaysUseFullPath`/2-arg `getPathWithinServletMapping` code paths, other frameworks/APIs routing on non-normalized URIs). (2) `InvalidRequestFilter` (blocks `;`, `%3b`, backslash and non-ASCII; default global filter in the Boot starter) blocks many, but not all, encoded/dot variants (`%2e`/`%2f` are not rejected), so the bypass must use sequences it does not catch. (3) `ShiroRequestMappingConfig` + `ShiroUrlPathHelper` show a deliberate alignment effort, i.e. the code is not accidentally unprotected in the AntPathMatcher case. (4) Container-level rejection of `..` above the context root limits some payloads. No runtime verification was performed.",
+      "id": "shiro-path-resolution-mismatch-filter-bypass",
+      "impact": "Authentication/authorization bypass: unauthenticated or insufficiently privileged users can reach handlers protected by Shiro filter chains (admin/account pages, API endpoints), i.e. the security filter is simply not applied to the routed request. In the Spring Boot case this is the documented 1.11.0-era path-traversal bypass (fixed in 1.11.1 / later path-handling hardening).",
+      "locations": [
+        {
+          "end_line": 115,
+          "path": "web/src/main/java/org/apache/shiro/web/util/WebUtils.java",
+          "start_line": 113
+        },
+        {
+          "end_line": 252,
+          "path": "web/src/main/java/org/apache/shiro/web/util/WebUtils.java",
+          "start_line": 244
+        },
+        {
+          "end_line": 135,
+          "path": "web/src/main/java/org/apache/shiro/web/filter/mgt/PathMatchingFilterChainResolver.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 432,
+          "path": "web/src/main/java/org/apache/shiro/web/servlet/AbstractShiroFilter.java",
+          "start_line": 414
+        },
+        {
+          "end_line": 41,
+          "path": "support/spring/src/main/java/org/apache/shiro/spring/web/ShiroUrlPathHelper.java",
+          "start_line": 30
+        },
+        {
+          "end_line": 31,
+          "path": "support/spring/src/main/java/org/apache/shiro/spring/web/config/ShiroRequestMappingConfig.java",
+          "start_line": 25
+        }
+      ],
+      "prerequisites": "Deployment uses Shiro's URL filter-chain (`PathMatchingFilterChainResolver` via ShiroFilter/`ShiroFilterFactoryBean`) in front of a framework whose handler mapping does not share Shiro's exact path derivation — notably Spring MVC with `PathPatternParser` (default in Spring Boot >= 2.6, unless the Shiro Boot starter's environment post-processor forces `ant_path_matcher`), a non-AntPathMatcher configuration, a custom/2-arg `UrlPathHelper` code path, or another framework/API that routes on `getRequestURI()`/non-normalized paths. Some filter-chain definition must map the Shiro-resolved path to a permissive/absent chain (typical `anon`/`logout` patterns, or a `/**` catch-all when the truncated path unexpectedly matches an earlier pattern in iteration order). The container must deliver a URI whose `servletPath`/`pathInfo` (after `;`-truncation/normalization) differs from the path the downstream router uses.",
+      "root_cause": "Shiro's security decision is made on a path derived by `WebUtils.getPathWithinApplication()` = `normalize(removeSemicolon(getServletPath(request) + getPathInfo(request)))`. This string (a) is the container-decoded/normalized servlet path plus path-info and (b) is silently truncated at the first `;` anywhere in the path (`removeSemicolon`, lines 249-252) and then has `/./`, `/../`, `//` collapsed (`normalize`, lines 183-234). The downstream handler mapping can resolve the *same* request to a different path: Spring MVC's `RequestMappingHandlerMapping` ignores the installed `ShiroUrlPathHelper` whenever it is configured with `PathPatternParser` (Spring Boot 2.6+ default), using request-URI/ServletRequestPathUtils-based resolution instead, and other frameworks/APIs that route on the non-normalized `getRequestURI()` behave similarly. `support/spring/.../ShiroUrlPathHelper` only overrides `getPathWithinApplication`/`getPathWithinServletMapping` (lines 32-40) and `ShiroRequestMappingConfig` only sets that helper (line 29); neither forces the handler mapping onto Shiro's path logic (e.g. by disabling the pattern parser or overriding all path-derivation methods). Consequently the filter-chain resolver can select a public/permissive pattern (or none, in which case `AbstractShiroFilter.getExecutionChain` falls through to the original, unfiltered chain) while the request is still routed to a protected controller.",
+      "title": "Filter-chain path resolution can diverge from Spring MVC/other routers' path resolution, allowing protection bypass",
+      "trace": "Request → `AbstractShiroFilter.doFilterInternal/executeChain` (web servlet) → `getExecutionChain` → `PathMatchingFilterChainResolver.getChain`: `requestURI = WebUtils.getPathWithinApplication(request)` (line 103) = `normalize(removeSemicolon(servletPath + pathInfo))`; each configured chain pattern is compared with that string (lines 108-131); on a permissive match the corresponding filter list is proxied, on no match `null` is returned and `AbstractShiroFilter` executes the container's original chain with no Shiro access-control filters (lines 424-432). Meanwhile Spring MVC/Boot builds its own lookup path: `ShiroRequestMappingConfig` installs a `ShiroUrlPathHelper` that implements only two methods, and with `PathPatternParser` (Boot 2.6+ default) the `UrlPathHelper` is not used at all — the handler mapping uses request-URI-based resolution that does not truncate at `;` and does not collapse `..` the same way. A URI engineered so that Shiro sees a public pattern while Spring (or another router) resolves the protected path reaches the protected handler without the authc/authz filter running.",
+      "unverified": "The exact request URI that survives the servlet container's own decoding/normalization and still diverges between the two resolvers was not executed or confirmed; the precise 1.11.1 fix location (whether `WebUtils`, `ShiroUrlPathHelper`, or `ShiroRequestMappingConfig`) could not be confirmed from this snapshot. `spring.factories`/auto-configuration imports are absent from the visible tree, so the effective registration of `ShiroEnvironmentPostProcessor`/`ShiroWebMvcAutoConfiguration` could not be verified. Severity depends on the deployed chain definitions and on which path-resolution configuration (PathPatternParser vs AntPathMatcher, non-starter Spring MVC, other frameworks) is in use.",
+      "weakness_type": "Authentication/authorization bypass via inconsistent path normalization (path traversal / non-normalized URI handling) — CWE-436/CWE-22 class"
+    }
+  ],
+  "coverage_summary": "Reviewed the web request/security path end-to-end: `AbstractShiroFilter` → `PathMatchingFilterChainResolver`/`PathMatchingFilter` → `WebUtils` path utilities; the Spring integration (`ShiroUrlPathHelper`, `ShiroRequestMappingConfig`, `ShiroWebMvcAutoConfiguration`, `ShiroEnvironmentPostProcessor`, `ShiroWebFilterConfiguration`, `ShiroFilterFactoryBean`, `AbstractShiroWebFilterConfiguration`); web session/cookie handling (`DefaultWebSessionManager`, `SimpleCookie`, `ShiroHttpServletRequest`); RememberMe (CookieRememberMeManager/AbstractRememberMeManager); credential matching (Simple/HashedCredentialsMatcher, PasswordMatcher paths); crypto defaults (AesCipherService/DefaultBlockCipherService/JcaCipherService, SecureRandom usage); authorization primitives (WildcardPermission, ModularRealmAuthorizer callers); JdbcRealm query construction; and representative core/config classes. Test sources are absent, and extension-less resources (spring.factories / *.imports) are missing from the visible tree, so auto-configuration wiring was inferred from Java sources only. Not exhaustively reviewed: LDAP realm string handling, full INI/ReflectionBuilder semantics, Quartz/Hazelcast/CAS/Guice modules, samples and integration-test apps.",
+  "limitations": [
+    "No dynamic verification: container (Tomcat/Jetty) decoding/normalization behavior and Spring 5.3.x UrlPathHelper/PathPatternParser internals were reasoned about from source and framework knowledge, not executed.",
+    "The exact fix commit/version for the 1.11.0 snapshot could not be resolved offline; the candidate is anchored to the documented 1.11.1-era path-traversal/Spring-Boot bypass class rather than a verified diff.",
+    "Test sources and extension-less resource files (spring.factories, AutoConfiguration.imports) are not present in the snapshot, so registration of the environment post-processor and auto-configurations could not be confirmed.",
+    "Line ranges refer to the current snapshot; several findings depend on deployment configuration (filter-chain definitions, matching-strategy, servlet mapping) that is not part of the repository."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "RememberMe cookie deserialization RCE (CookieRememberMeManager → AbstractRememberMeManager.deserialize, DefaultSerializer/ObjectInputStream)",
+      "reason": "In this tree the AES key is generated per instance at startup (`setCipherKey(cipherService.generateNewKey().getEncoded())`, AbstractRememberMeManager lines 95-100), not a hard-coded default, and AES-GCM is used; an attacker cannot produce a decryptable, valid serialized payload without knowing/controlling the key. Not a source-supported exploitable finding here (the pre-1.2.5 hard-coded-key issue is already fixed)."
+    },
+    {
+      "lead": "Open redirect via `WebUtils.redirectToSavedRequest`/`RedirectView` (success URL from SavedRequest with contextRelative=false)",
+      "reason": "Source shows the mechanism (`SavedRequest.getRequestUrl()` = requestURI + query, redirect issued absolute), but exploitation requires a container/framework to preserve a request URI starting with `//` (or an absolute-form request target) so the redirect leaves the application; this is container-dependent and is a lower-confidence fit for this 1.11.0-era snapshot than the path-resolution bypass, so it was not selected."
+    },
+    {
+      "lead": "Default session-ID handling / session fixation in `DefaultWebSessionManager` (cookie/URL session id accepted from request)",
+      "reason": "Behavior matches upstream design; no source-level flaw (e.g. missing validation) could be traced to a concrete bypass without runtime/container assumptions beyond the selected candidate."
+    },
+    {
+      "lead": "Configuration-time code execution / bean creation via `Ini` + `ReflectionBuilder` (config/ogdl)",
+      "reason": "Requires control of the application's INI configuration, which is trusted deployment data, not remote attacker input; no trust-boundary crossing identified."
+    },
+    {
+      "lead": "JdbcRealm / LDAP realm injection from usernames",
+      "reason": "JdbcRealm uses PreparedStatement parameter binding (`ps.setString(1, username)`); LDAP string construction areas were not exhaustively reviewed, but no concrete injection path with attacker-controlled input was established within the evidence threshold."
+    }
+  ],
+  "summary": "Snapshot is an Apache Shiro 1.x tree (root pom `1.11.0`, Dec-2022/Jan-2023 dependency set) covering core, web, spring, spring-boot-starter, config, crypto and samples; test sources, `spring.factories` and `AutoConfiguration.imports` resources are absent from the visible tree. I traced the request→filter-chain resolution path, the Spring/Boot path-helper integration, RememberMe serialization, cookie handling, credential matching, crypto defaults and JDBC/LDAP realms. The strongest source-supported lead is the known class of authentication/authorization bypass caused by inconsistent path resolution between Shiro's URL filter-chain matching and the downstream framework's handler mapping: Shiro decides on a container-normalized `servletPath + pathInfo` string truncated at the first `;`, while Spring MVC / other routers may route the same request using a different (non-normalized/raw request-URI) value; Shiro's own Spring alignment (`ShiroUrlPathHelper` overriding only two methods, `ShiroRequestMappingConfig` setting only `UrlPathHelper`) is incomplete for path-pattern based matching. If the two resolutions diverge, a request can be dispatched to a protected handler while Shiro matched a permissive pattern or no pattern at all (falling through to the unfiltered original chain). This matches the path-traversal/Spring-Boot bypass fixed immediately after 1.11.0 (1.11.1). It is submitted as one candidate, confidence medium-low, with prerequisites and mitigations stated."
+}

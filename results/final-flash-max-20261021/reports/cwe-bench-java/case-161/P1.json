@@ -1,0 +1,99 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Unauthenticated POST /jwt_auth with a JSON body: {\"provider\":\"oauth2\", \"appid\":\"<existing non-root app id>\", \"token\":\"arbitrary:arbitrary:<forged-JWT>\"}. The attacker fully controls all three request fields and the forged-JWT payload (e.g. {\"sub\":\"x\",\"email\":\"victim@example.com\",\"name\":\"...\"}); the middle base64 segment is decoded and trusted. No access key, signature, JWT, session or CSRF token is required.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified there is no signature/claims validation of the idToken anywhere in this path: MACVerifier/isValidJWToken is used for Para's own tokens and for the passwordless flow, but not for the generic OAuth2 id_token; no HttpOnly/CSRF/session precondition exists because the endpoint is exempt as an *_auth path; the endpoint rejects only the root app (App.isRoot) and returns 400 for missing provider/appid/token, none of which blocks the attack; the profile fetch failure is explicitly only logged (lines 328-333), and no exception is rethrown; app-level OAuth2 settings are not required because of the config defaults. I also considered that in the browser-redirect flow the idToken legitimately comes from the IDP's token endpoint, but the same helper is fed from the client-supplied token in the /jwt_auth flow, which is the flaw. No runtime validation of filter ordering or search plugin behavior was possible.",
+      "id": "para-generic-oauth2-unverified-idtoken",
+      "impact": "Unauthenticated authentication bypass/account takeover: an attacker can (a) create accounts with arbitrary attacker-chosen identifiers/e-mails/names, and (b) obtain a valid Para JWT for any existing active user whose IDP account id or e-mail address they know, giving them that user's data and permissions (users with groups=admins obtain full app access via RestAuthFilter.hasPermission). Because generateJWToken resets the user's token secret when security.one_session_per_user is \"true\" (default), the victim's existing tokens are also invalidated. The same forged profile can trigger the optional avatar downloader (SSRF-ish fetch to an attacker-chosen picture URL) when download_avatars is enabled.",
+      "locations": [
+        {
+          "end_line": 341,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/filters/GenericOAuth2Filter.java",
+          "start_line": 303
+        },
+        {
+          "end_line": 173,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/filters/GenericOAuth2Filter.java",
+          "start_line": 155
+        },
+        {
+          "end_line": 222,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/filters/GenericOAuth2Filter.java",
+          "start_line": 183
+        },
+        {
+          "end_line": 191,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/JWTRestfulAuthFilter.java",
+          "start_line": 143
+        },
+        {
+          "end_line": 329,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/JWTRestfulAuthFilter.java",
+          "start_line": 293
+        },
+        {
+          "end_line": 704,
+          "path": "para-core/src/main/java/com/erudika/para/core/User.java",
+          "start_line": 656
+        },
+        {
+          "end_line": 101,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/SecurityConfig.java",
+          "start_line": 99
+        },
+        {
+          "end_line": 54,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/CsrfProtectionRequestMatcher.java",
+          "start_line": 37
+        }
+      ],
+      "prerequisites": "- The target app must exist, be non-root, and its appid must be known to the attacker (app ids are client-side routing identifiers). - The user account must be active (SecurityUtils.checkIfActive). - For takeover of an existing account: the attacker must know either the account's IDP \"sub\" value or (with the default parameters.id=\"sub\") its e-mail address; the e-mail branch additionally needs a real search implementation for User.readUserForIdentifier()'s findTerms() call (the shipped para-jar defaults to LuceneSearch per para-jar/src/main/resources/reference.conf; MockSearch throws UnsupportedOperationException). - No app-level OAuth2 settings are strictly required, because ParaConfig.getSettingForApp() falls back to defaults (\"sub\", \"email\") for non-root apps. - Default security config permits /jwt_auth (SecurityConfig permits /** before RestRequestMatcher; CSRF is exempted for /\\w+_auth endpoints).",
+      "root_cause": "GenericOAuth2Filter.fetchProfileFromIDP() decodes the payload of a client-supplied ID token (idToken.split-by-'.' + Utils.base64dec + Jackson readValue) and puts those claims into the trusted profile map without verifying the token's signature, issuer or audience. The only validation of the supplied tokens is a best-effort HTTP GET to the app's configured profile_url with the supplied access token; all exceptions/HTTP error responses are swallowed, the idToken-derived claims remain, and the method returns a non-empty profile on which getOrCreateUser() bases the user identifier (default claim \"sub\"), e-mail, name and picture. JWTRestfulAuthFilter then issues a normal Para JWT for the resulting user.",
+      "title": "Generic OAuth2 login trusts unsigned client-supplied id_token claims, allowing unauthenticated account takeover via POST /jwt_auth",
+      "trace": "1) POST /jwt_auth is handled by JWTRestfulAuthFilter.doFilter() -> newTokenHandler() (JWTRestfulAuthFilter.java:112-121, 144-191); the body's provider/appid/token are read directly and the app is loaded for a non-root appid. 2) provider \"oauth2\" dispatches to oauth2Auth.getOrCreateUser(app, accessToken) (JWTRestfulAuthFilter.java:311-312), i.e. GenericOAuth2Filter.getOrCreateUser(app, token) (line 143) -> getOrCreateUser(app, token, null) (line 155). 3) The client string is split on the app separator \":\" (line 159): tokens[0]=access token, tokens[1]=refresh token, tokens[2]=idToken. 4) fetchProfileFromIDP(app, accessToken, idToken, alias) (line 173) runs: if the idToken contains \".\", the middle segment is Base64-decoded and parsed as JSON into profile (lines 305-308) with no signature check; the profile_url HTTP call uses the supplied access token (lines 310-336) and is wrapped in try/catch that only logs, so a bogus token still leaves the attacker's claims in profile. 5) getOrCreateUser then reads accountIdParam (default \"sub\") and e-mail from that map (lines 175-186), builds identifier oauthPrefix+accountId (line 193), sets the e-mail (line 194) and calls User.readUserForIdentifier (line 195). 6) User.readUserForIdentifier first reads the identifier Sysprop, and if not found searches users by e-mail within the app (User.java:664-687), links a new identifier and even rewrites the found user's main identifier (User.java:693-699), returning the victim's User object. 7) getOrCreateUser returns UserAuthentication for that user (lines 216-222); newTokenHandler obtains the user, calls SecurityUtils.generateJWToken(user, app) and returns the JWT plus the user object (JWTRestfulAuthFilter.java:161-168, 245-263).",
+      "unverified": "Not runtime-confirmed; no tests or server were run. The reachability of the e-mail-linking takeover branch depends on a real Search implementation being deployed (LuceneSearch/Elasticsearch) because MockSearch.findTerms() throws UnsupportedOperationException; the identifier-based branch depends on the app's security.oauth.parameters.id configuration. Whether upstream considers the id_token merge intentional for the token-delegation feature is not determinable from this snapshot; the code nevertheless accepts unauthenticated, unverified identity claims. I could not execute any request to confirm the exact HTTP error path when profile_url is blank (Read of HttpGet/execute behavior is from source/API knowledge only).",
+      "weakness_type": "Authentication bypass / improper verification of cryptographic signature (CWE-347, CWE-290): untrusted JWT claims accepted as an identity-provider profile"
+    }
+  ],
+  "coverage_summary": "Scope of the assigned tree: 199 files (163 Java) under para-core, para-server, para-client, para-jar plus build/deploy files. The P1 relation index covers 193 files (6 source files missing from the index; index status \\\"partial\\\"; parse errors 0; semantic resolution, control flow and data flow are not implemented, and Spring annotation edges are unverified). I read the full security package (SecurityConfig, SecurityModule, JWTRestfulAuthFilter, RestAuthFilter, SecurityUtils, JWT/LDAP providers, CSRF/ignored/rest request matchers, success/failure/entry-point handlers, Password/Passwordless/LDAP/OAuth1/OAuth2/SAML/social auth filters), the REST layer (Api1, RestUtils), core models and mapping (App, User, Webhook, ParaObjectUtils, ValidationUtils, Config/ParaConfig/Para, Utils), persistence/storage/queues (AWSDynamoDAO, AWSDynamoUtils spot-checked, LocalFileStore, AWSFileStore), utility filters (CORSFilter, FieldFilter, ErrorFilter, HttpUtils) and ParaServer bootstrap. Not deeply reviewed: para-client/ParaClient, email/metrics modules, most of AWSDynamoUtils and AWSQueueUtils/River/LocalQueue internals, Linker/Vote/Tag/Translation/Address, GZip filters, and plugin implementations that are not part of this snapshot (search/DAO plugins).",
+  "limitations": [
+    "No code was executed and no tests were run; all statements are source-level observations, not runtime confirmations.",
+    "The P1 index is partial (193/199 files indexed, 6 files absent) and provides only syntactic/navigation candidates with no control-flow, data-flow, semantic resolution or exploitability proof; every claim above was re-verified against the source text.",
+    "Which Search/DAO/FileStore implementations are deployed (e.g. LuceneSearch vs MockSearch) and whether app-level OAuth2 settings exist could not be verified from the snapshot; this affects which sub-branch of the takeover (identifier lookup vs e-mail linking) works.",
+    "Spring Security filter ordering and DI wiring were inferred from source; the actual runtime chain was not observed.",
+    "The /jwt_auth HTTP behavior when profile_url is blank (exception type/location in Apache HttpClient 5) was reasoned from API semantics, not executed.",
+    "Files listed as not deeply reviewed above were only skimmed or not inspected, so additional issues there cannot be excluded."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "User creation allows setting the @Locked 'groups' field (POST /v1/users and _batch use ParaObjectUtils.setAnnotatedFields without the Locked.class filter, and User.create() keeps a non-blank groups value) so a self-registering client could store groups=admins.",
+      "reason": "Real asymmetry vs. the update path (which filters @Locked), but exploitation needs a second step: the REST create path drops the transient 'password' field, so the attacker must later authenticate as that account through an IDP whose identifier matches, i.e. it depends on additional app configuration. Weaker/less direct than the submitted candidate; not counted as a second candidate."
+    },
+    {
+      "lead": "Api1.meHandler parses a caller-supplied Bearer JWT and returns another app's credentials when the token contains a 'getCredentials' claim (Api1.java:477-493) without verifying the JWT in that block.",
+      "reason": "The surrounding code requires app.isRootApp(), i.e. an AppAuthentication principal that in the default filter chain can only be established by a JWT whose signature was already verified against the root app secret by JWTAuthenticationProvider, or by a valid app request signature; a user JWT cannot reach it. No escalation found."
+    },
+    {
+      "lead": "CORSFilter reflects any Origin with Access-Control-Allow-Credentials: true (default cors.allowed.origins=* plus cors.support.credentials=true in ParaServer.java:274-289).",
+      "reason": "Para authenticates via Authorization headers/query parameters rather than automatically attached credentials/session cookies, so the classic credentialed cross-origin read is not directly exploitable; treated as hardening, not a finding."
+    },
+    {
+      "lead": "LocalFileStore concatenates folder+path without normalization (path traversal), and GenericOAuth2Filter/MicrosoftAuthFilter derive avatar file names/extensions from IDP responses.",
+      "reason": "The stored paths are composed from app id, user id and the remote Content-Type subtype; no request parameter reaches FileStore directly, so attacker control is indirect and conditional (download_avatars=true plus forged profile claims). Unconfirmed."
+    },
+    {
+      "lead": "SecurityUtils.isValidSignature compares HMAC signatures with StringUtils.equals (non-constant time) and mutates the header map during reconstruction.",
+      "reason": "A timing side channel on a 64-hex signature is impractical and no functional bypass was identified by reading Signer.sign(); low impact/hardening only."
+    },
+    {
+      "lead": "Open-redirect surface in SimpleAuthenticationSuccessHandler/SecurityUtils.getRedirectUrl (honoring X-Forwarded-Proto, host_url and the returnTo cookie).",
+      "reason": "host_url is only used after an alias-list or prefix check against the configured custom URI, and the returnTo value comes from a server-set cookie; no unvalidated redirect target was confirmed. Lower impact than the submitted candidate."
+    },
+    {
+      "lead": "Public /v1/_setup creates the root app and returns its credentials when the root app does not exist yet (Api1.java:818-837; HealthUtils.onInitialize normally performs setup at startup).",
+      "reason": "Race-window/first-run concern only; once the root app exists, setup() returns no credentials and the appid form requires root authentication."
+    }
+  ],
+  "summary": "This review targeted the strongest plausible server-side issue in the Para 1.50.8-SNAPSHOT tree. The single submitted candidate is an authentication-bypass/account-takeover chain in the generic OAuth2 login path: the unauthenticated POST /jwt_auth endpoint accepts a client-supplied \"token\" string for provider=oauth2, splits it on \":\" and treats the third segment as an ID token, whose payload is Base64-decoded and merged into a trusted profile map without any signature/issuer/audience verification and without requiring the IDP profile fetch to succeed. The resulting claims are then used to set the user's identifier/e-mail/name and to issue a Para JWT. This is reachable without credentials and can bind a forged claim (sub or e-mail) to an existing account via User.readUserForIdentifier()'s identifier/e-mail lookup. App-level OAuth2 configuration is not actually required to reach the vulnerable code, since the default claim parameter names (\"sub\"/\"email\") are used when the app has no settings. I found no equally strong second candidate; other suspicious areas are listed as rejected leads."
+}

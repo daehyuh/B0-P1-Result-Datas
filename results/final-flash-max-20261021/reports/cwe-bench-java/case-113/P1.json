@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remote, unauthenticated request to GET /resources/{version}/{themeType}/{themeName}/{path:.*}. The '{path:.*}' segment is fully attacker-controlled and is passed to GzipResourceEncodingProvider.getEncodedStream together with themType and themeName (ThemeResource.java line 69). Sending 'Accept-Encoding: gzip' selects the gzip provider (ResourceEncodingHelper lines 7-24) when theme caching is enabled. The required {version} value is Version.RESOURCES_VERSION, which is publicly exposed in generated resource URLs.",
+      "confidence": "medium",
+      "counterevidence_checked": "I verified that the canonical check still rejects plain '../..' escapes to unrelated absolute paths, that ThemeResource requires a valid {version} and a resolvable theme, that the producer (theme.getResourceAsStream) normally returns null for traversal paths so the write branch is hard to abuse, and that FolderTheme/FolderThemeProvider use the stricter 'canonicalPath + File.separator' idiom while this provider does not. I could not verify at runtime whether the HTTP layer preserves encoded dot-segments in the {path:.*} parameter or whether a prefix-matching sibling directory with sensitive '.gz' files exists in a default installation.",
+      "id": "gzip-cache-path-confinement",
+      "impact": "Path traversal outside the intended per-version gzip cache directory, limited to directories whose absolute path shares the cache-dir string prefix. Read disclosure of '.gz' files in such locations (confidentiality), and in the producer-write branch possible creation/replacement of a '.gz' file at a path in such a location (integrity). Ordinary traversal to arbitrary files (e.g. ../../etc/passwd) is still blocked by the canonical check, so this should not be described as unrestricted arbitrary-file read.",
+      "locations": [
+        {
+          "end_line": 43,
+          "path": "services/src/main/java/org/keycloak/encoding/GzipResourceEncodingProvider.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 78,
+          "path": "services/src/main/java/org/keycloak/encoding/GzipResourceEncodingProvider.java",
+          "start_line": 45
+        },
+        {
+          "end_line": 72,
+          "path": "services/src/main/java/org/keycloak/services/resources/ThemeResource.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 91,
+          "path": "services/src/main/java/org/keycloak/encoding/GzipResourceEncodingProviderFactory.java",
+          "start_line": 65
+        }
+      ],
+      "prerequisites": "Theme caching enabled (DefaultThemeManagerFactory line 37 defaults cacheThemes to true); gzip ResourceEncodingProvider active; attacker can supply a path whose canonicalized form lands in a directory whose absolute path string begins with the gzip cache directory string (e.g. a sibling cache directory such as '<tmp>/kc-gzip-cache*') and can reference an existing '.gz' file there, or can survive HTTP path normalization with encoded dot-segments; a valid theme name/type for the realm.",
+      "root_cause": "GzipResourceEncodingProvider.getEncodedStream builds a cache file path by concatenating cacheDir + the caller-supplied path segments and then authorizes it with encodedFile.getCanonicalPath().startsWith(cacheDir.getCanonicalPath()) (line 41). No separator/Path boundary is required, so a canonical path that merely shares the cache directory string as a prefix (e.g. a sibling directory such as '<tmp>/kc-gzip-cacheX/...' reached through '..') passes confinement. The same check in FolderTheme (services/.../theme/FolderTheme.java line 96) and FolderThemeProvider (line 89) appends File.separator, showing the intended stricter form; this call site omits it. The resulting File is then opened for reading at line 78, and, when the producer returns data, is used as a write target at lines 45-76 (parent.mkdirs() + move).",
+      "title": "Gzip resource-cache path confinement uses a bare string prefix, letting attacker-influenced theme resource paths escape the cache directory",
+      "trace": "HTTP GET /resources/... -> ThemeResource.getResource (line 57-69) -> encodingProvider.getEncodedStream(producer, themType, themeName, path) -> GzipResourceEncodingProvider.getEncodedStream (line 28) concatenates cacheDir + path segments (lines 29-37) -> confinement test at line 41 accepts any canonical path that starts with the cacheDir string -> line 78 returns new FileInputStream(encodedFile) when the file exists, disclosing the compressed file, or lines 45-76 create directories and move a temp file to that path if the theme producer returns a stream. The read happens before producer verification, so an existing file under a prefix-matching sibling directory bypasses the theme lookup as a control.",
+      "unverified": "Runtime reachability of a traversal string through path normalization, availability of an exploitable prefix-matching sibling target, and whether this exact call site corresponds to the repository's intended vulnerability. No code was executed; the finding is source-level only.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory (Path Traversal)"
+    }
+  ],
+  "coverage_summary": "Review was performed on main (non-test) sources only: the scope exposes 6546 of 6547 files, excludes test trees (no src/test sources), excludes 1 file by sensitive-name/path policy, and the P1 index reports partial coverage (76 source files missing from the index; no control-flow/data-flow/semantic analyses). I inspected the theme/resource serving and encoding path (ThemeResource, GzipResourceEncodingProvider(+Factory), FolderTheme/FolderThemeProvider, ClassLoaderTheme, WelcomeResource), RedirectUtils and callers (AuthorizationEndpointChecker, LogoutEndpoint, AccountConsole), JOSE/token handling (DefaultTokenManager, ClientRegistrationTokenUtils), SAML processing (SAMLEndpoint, SamlService, SamlProtocolUtils, SAML2Signature/XMLSignatureUtil, AssertionUtil), CryptoIntegration/X509 validation, and adapter HTTP/SSL code, plus targeted pattern searches (canonical-path checks, startsWith decisions, deserialization, script engines, command execution). The P1 relation index was used only for navigation; every cited location was re-verified against source text. No tests, builds, or scanners were run.",
+  "limitations": [
+    "Unit and integration test sources are excluded from the snapshot, so fix-revealing tests could not be inspected.",
+    "The P1 index is partial: 76 source files are absent from it and it provides no data-flow, control-flow, or semantic-resolution evidence; index facts are not vulnerability verdicts.",
+    "No runtime execution, HTTP path-normalization behavior, or filesystem layout of a real deployment could be verified, so exploit preconditions for the gzip-cache traversal remain unproven.",
+    "Long-tail modules (operator/Go, most JS UI code, model-map-file storage, federation) were only spot-checked, not exhaustively reviewed.",
+    "The candidate is a lead based on source evidence, not a runtime-confirmed vulnerability; the repository may contain stronger issues in areas not covered above."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SAML broker assertion signature handling: PostBinding.verifySignature returns without document-level verification when no ds:Signature is visible and the response contains assertions (services/src/main/java/org/keycloak/broker/saml/SAMLEndpoint.java lines 727-739), while handleLoginResponse lines 482-492 accept an unsigned assertion whenever any signature exists anywhere in the document (containsUnencryptedSignature).",
+      "reason": "Plausible signature-wrapping/auth-bypass class (CWE-347), but a concrete bypass requires chaining unverifiable conditions (replaying a valid signature over a copied element, encrypted-assertion decryption with realm public key, validateSignature=true with wantAssertionsSigned=false) and depends on parser/DOM behavior I could not confirm from source alone. Left as unconfirmed rather than submitted."
+    },
+    {
+      "lead": "RedirectUtils redirect_uri handling (decodeRedirectUri/getNormalizedRedirectUri/matchesRedirects, services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java lines 92-249) potentially permitting wildcard/parser-differential open redirects.",
+      "reason": "The snapshot already contains multi-pass decoding, normalization, host lowercasing and encoded-form exact-match hardening; I could not construct a byte-level bypass from the source, so the suspicion remained unconfirmed."
+    },
+    {
+      "lead": "Prefix-only classpath resource checks in ClassLoaderTheme (line 121) and ClasspathThemeResourceProviderFactory (line 56) that omit a separator after the root path.",
+      "reason": "Same prefix-check pattern, but classpath resource lookup with '..' typically does not resolve inside jars, so exploitation evidence is weaker than for the gzip cache path; different call sites, not elevated."
+    },
+    {
+      "lead": "ClientRegistrationAuth.init splits the Authorization header and dereferences split[1] without a length check (services/.../clientregistration/ClientRegistrationAuth.java lines 85-90).",
+      "reason": "At most a malformed-input exception/DoS, not a strong memory-safety or authorization issue; no concrete security impact established."
+    }
+  ],
+  "summary": "Keycloak 21.1.1 source snapshot (Java server, adapters, themes, JS). I traced request input through the public theme-resource endpoint to the gzip resource-encoding cache, where path confinement is enforced with a bare canonical-path string prefix instead of a path-boundary check. This is the single strongest source-backed candidate: the flaw is objective, reachable from an unauthenticated endpoint, and inconsistent with the corrected form of the same check in two sibling theme classes. Other reviewed leads (SAML broker signature handling, redirect_uri wildcard handling, classpath theme prefix checks) were not elevated because their exploitation could not be established from source text alone."
+}

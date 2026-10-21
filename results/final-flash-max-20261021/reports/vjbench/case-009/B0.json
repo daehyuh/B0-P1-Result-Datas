@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The content of the XML document handed to the processor. Reachable from public entry points with externally supplied XML: `processStreamAndScheduleJobs(InputStream, String, Scheduler)` (line 471) and `processFileAndScheduleJobs(String, ...)` (lines 829-844); additionally `XMLSchedulingDataProcessorPlugin` loads configured `fileNames` and can re-parse them on a scan interval (lines 306-326), so anyone able to place/alter a file in a watched path controls the parsed document. Parsed element text (job/trigger names, descriptions, job-class names, job-data values) is consumed by XPath helpers and persisted/logged.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked for any mitigation elsewhere: repo-wide searches for `disallow-doctype-decl`, `FEATURE_SECURE_PROCESSING`, `external-general-entities`, `ACCESS_EXTERNAL`, `setFeature`, and alternative parsers all returned nothing; this is the only `DocumentBuilderFactory` use. Schema validation (`setValidating(true)` + schema attributes) does not disable DOCTYPE processing or entity expansion, so it is not a countermeasure. The plugin's default file names are application-controlled configuration, which limits exposure for users who only load trusted classpath files; the public stream API and writable/scan-watched files are the attacker-influenced paths. No runtime test was performed and no tests exist in the snapshot.",
+      "id": "quartz-xxe-xmlschedulingdataprocessor",
+      "impact": "Confidentiality (reading files accessible to the scheduler process), SSRF/port probing of internal services, and availability impact via entity expansion, whenever XML parsed by this class is attacker-influenced. The defect is unconditional in code; actual exploitability depends on whether a deployment feeds it untrusted XML.",
+      "locations": [
+        {
+          "end_line": 177,
+          "path": "quartz-core/src/main/java/org/quartz/xml/XMLSchedulingDataProcessor.java",
+          "start_line": 166
+        },
+        {
+          "end_line": 494,
+          "path": "quartz-core/src/main/java/org/quartz/xml/XMLSchedulingDataProcessor.java",
+          "start_line": 471
+        },
+        {
+          "end_line": 460,
+          "path": "quartz-core/src/main/java/org/quartz/xml/XMLSchedulingDataProcessor.java",
+          "start_line": 445
+        },
+        {
+          "end_line": 326,
+          "path": "quartz-plugins/src/main/java/org/quartz/plugins/xml/XMLSchedulingDataProcessorPlugin.java",
+          "start_line": 306
+        }
+      ],
+      "prerequisites": "The deployment parses XML whose content is attacker-influenced (application accepting scheduling XML via the public stream/file API, or a plugin file path writable by a less-trusted party), and the JVM's JAXP implementation keeps the default permissive external-access behavior (target JDK 8; no security manager or JAXP access-restriction property is configured in this project). No code change is needed by the attacker.",
+      "root_cause": "`initDocumentParser()` builds a default `DocumentBuilderFactory` and only enables namespace awareness, validation and XSD schema attributes (lines 168-177). It never enables `XMLConstants.FEATURE_SECURE_PROCESSING`, never sets `http://apache.org/xml/features/disallow-doctype-decl`, and never disables `external-general-entities`, `external-parameter-entities` or `load-external-dtd`. `process(InputSource)` then calls `docBuilder.parse(is)` (line 494) on XML taken from files/streams, so JAXP default behavior resolves DOCTYPE/system identifiers and expands external entities into the DOM. A repo-wide search confirms there is no `setFeature`, `FEATURE_SECURE_PROCESSING`, `ACCESS_EXTERNAL_DTD`/`ACCESS_EXTERNAL_SCHEMA` or equivalent hardening anywhere in the snapshot, and this is the only XML parser in the tree.",
+      "title": "XXE: external entities resolved while parsing job-scheduling XML (XMLSchedulingDataProcessor)",
+      "trace": "Untrusted XML -> XMLSchedulingDataProcessor.process(InputSource) -> docBuilder.parse(is) (line 494) -> parser resolves DOCTYPE/external entities with default JAXP settings (no doctype/entity restrictions set in initDocumentParser, lines 166-177) -> expanded content lands in the DOM -> getTrimmedToNullString/getBoolean/XPath extraction and subsequent scheduling/logging consume it. Because there is no restriction, `SYSTEM` identifiers can point at `file://` or `http(s)://` resources, giving local-file disclosure, server-side request forgery against internal endpoints, and entity-expansion denial of service; the same parsed document also names classes loaded via `classLoadHelper.loadClass(...)` (line 608) and values persisted via the scheduler.",
+      "unverified": "Not runtime-confirmed: I could not execute the parser or a deployment. Whether an attacker can supply the XML depends on the consuming application (public API callers or write access to a plugin-watched file). The exact JAXP external-access defaults depend on the target JDK/vendor and any container-level `javax.xml.accessExternalDTD`/`accessExternalSchema` settings; none are set by this project. The bundled XSD resource referenced at line 102 is not present in this snapshot, so schema resolution falls back to the remote URL at line 100 when the parser initializes; this neither fixes nor prevents the XXE.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference"
+    }
+  ],
+  "coverage_summary": "Read-only review of the 457-file snapshot (no tests present). Modules covered at least at file/class-inventory level: quartz-core (core scheduler, triggers, calendars, RAM/JDBC job stores, XML scheduling, servlet/JTA/JMX helpers, utils/connection providers), quartz-jobs, quartz-plugins, quartz-commonj, quartz-oracle/weblogic/jboss/stubs, terracotta bootstrap, management modules, distribution/examples/docs and Maven descriptors. I searched for and inspected XML parsing, Java deserialization, reflection/bean population, command/JMX/EJB/JNDI execution, SQL construction in the delegate layer, class loading, randomness, servlets and REST endpoints, configuration parsing, and file/URL handling. Deepest reads were on the XML scheduling pipeline, the JDBC delegates, the job classes, and the job-factory/config reflection helpers.",
+  "limitations": [
+    "No build, execution, tests, scanners or runtime verification were performed (none are permitted); the finding is source-evidence only.",
+    "The snapshot contains no test sources and no VCS history, so I could not diff against upstream or confirm whether hardening was removed versus never added.",
+    "Several very large files were reviewed with targeted searches/read ranges rather than line-by-line: JobStoreSupport (~152 KB), StdJDBCDelegate (~110 KB), QuartzScheduler (~83 KB), RAMJobStore (~63 KB), CronExpression (~61 KB), StdSchedulerFactory (~65 KB).",
+    "Third-party/library code (JAXP implementation, Terracotta toolkit, javax.mail, JMX) is not in the snapshot; its default behavior is inferred.",
+    "Terracotta cluster stores and the management REST transport depend on external artifacts that are absent, so those paths could only be partially assessed.",
+    "The XML schema resource referenced by the processor is missing from the snapshot, and there is no evidence one way or another about deployment-specific JAXP external-access properties."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Java deserialization of JobDataMap/Calendar BLOBs in the JDBC job store (`StdJDBCDelegate.getObjectFromBlob` ~line 3199, plus HSQLDB/MSSQL/PostgreSQL/Pointbase/CacheDelegate/WebLogic/Oracle equivalents use `new ObjectInputStream(...).readObject()`).",
+      "reason": "Requires control over rows in Quartz's persistence database, i.e., a separate trusted boundary; the code path (useProperties=false / blob persistence) is documented design. No source evidence that untrusted remote input reaches the BLOB columns, so it was not selected."
+    },
+    {
+      "lead": "quartz-jobs classes execute or route attacker-nominated operations from the JobDataMap: `NativeJob` `Runtime.getRuntime().exec` (line 174), `JMXInvokerJob` arbitrary MBean invoke (line 180), `EJBInvokerJob`/`EJB3InvokerJob` and SendQueue/Topic/DestinationMessageJob JNDI lookups, `SendMailJob` arbitrary `mail.smtp.*` properties.",
+      "reason": "JobDataMap contents are supplied by the application that schedules the job (trusted configuration) and there is no source-evidenced untrusted input path into these keys. These are intended capabilities of the job classes, not confused-deputy bugs in this snapshot."
+    },
+    {
+      "lead": "`QuartzScheduler.newTriggerId()` uses non-cryptographic `java.util.Random` (line 172/1134) for fire-instance IDs, and `QuartzSchedulerThread` seeds Random from the clock.",
+      "reason": "Trigger IDs are not used for authentication/authorization or secret generation; predictability has no concrete security impact identified here."
+    },
+    {
+      "lead": "`Util.getJobNameKey`/`getTriggerNameKey` call `String.intern()` on job/trigger group+name strings (lines 82-99), potentially allowing memory pressure with many attacker-nominated names.",
+      "reason": "No demonstrated exploit path; the names are normally scheduler-controlled, and the pattern is long-standing upstream behavior rather than a concrete injection or privilege issue."
+    },
+    {
+      "lead": "Management REST stubs (`management-quartz`, `management-quartz-impl`) show disabled validation (`// validator.validateSafe(info)`) and `UnsupportedOperationException(\"Bitrot happened here!\")`.",
+      "reason": "No reachable sensitive operation or attacker-controlled action was found in the snapshot; the REST transport lives in external Terracotta artifacts not included here, so any finding would be speculative."
+    },
+    {
+      "lead": "`PropertySettingJobFactory`/`Util.setBeanProps` invoke bean setters named from JobDataMap keys.",
+      "reason": "Keys come from scheduler-owned job data, the target object is the job instance itself, and only single-argument property setters on that class are invoked; no attacker-controlled flow to a dangerous setter was established."
+    }
+  ],
+  "summary": "Quartz Scheduler 2.4.0-SNAPSHOT snapshot (457 readable files across quartz-core, quartz-jobs, quartz-plugins, quartz-commonj, quartz-oracle/weblogic/jboss, terracotta, management, distribution and docs). I reviewed the main trust boundaries: XML/job-schedule ingestion, Java deserialization in the JDBC job stores, reflection/bean-population helpers, JobDataMap-driven jobs (Runtime.exec / JMX / EJB / JNDI), scheduler configuration parsing, servlet/initializer endpoints, the management REST stubs, and SQL construction in the delegate layer. The single strongest source-evidenced issue is a classic XXE-prone XML parser in `XMLSchedulingDataProcessor`: the `DocumentBuilderFactory` is created with defaults plus schema validation, and no DTD/external-entity restrictions are set anywhere in the repository, while a public API and the XML-scheduling plugin feed files/streams into `docBuilder.parse(...)`. All other leads I traced were either gated behind trusted configuration/DB/JMX boundaries or had no concrete attacker-controlled flow, so no additional candidates are submitted."
+}

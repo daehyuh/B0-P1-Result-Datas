@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Arguments to the public JDBC API DatabaseMetaData.getTablePrivileges(catalog, schemaPattern, tableNamePattern). These are client-supplied pattern strings; database tools, schema-diff/permission viewers and applications commonly derive them from user input (table name search / catalog browsing), so an application that forwards untrusted text here hands the attacker the SQL text that is concatenated verbatim.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified that other metadata methods in the same file do escape patterns (escapeSingleQuoteForLikeCommand for LIKE, escapeSqlQuotes for double-quoted identifiers), so this is an inconsistent omission rather than a global design choice; verified unescapeChars/escapeSqlQuotes implementations show single quotes are never escaped; verified the sink really executes the concatenated string (statement.executeQuery); verified the method is public/reachable and not gated by a session flag; considered that the caller (not the driver) usually owns the input, which limits exploitability; considered that multi-statement execution is not supported by the driver/API, capping impact.",
+      "id": "cand-1",
+      "impact": "SQL injection inside a SELECT executed with the connection's privileges. An injected quote lets the caller alter the WHERE clause (e.g., bypass the intended table/schema scoping and read other rows of table_privileges) or append set operations/subqueries to read other tables the session can access, i.e., metadata/data disclosure beyond the intended lookup. Because Snowflake's query API does not accept multiple statements in one call, the practical impact is single-statement read manipulation rather than arbitrary DDL/DML or privilege escalation.",
+      "locations": [
+        {
+          "end_line": 2001,
+          "path": "src/main/java/net/snowflake/client/jdbc/SnowflakeDatabaseMetaData.java",
+          "start_line": 1985
+        },
+        {
+          "end_line": 2016,
+          "path": "src/main/java/net/snowflake/client/jdbc/SnowflakeDatabaseMetaData.java",
+          "start_line": 2008
+        },
+        {
+          "end_line": 250,
+          "path": "src/main/java/net/snowflake/client/jdbc/SnowflakeDatabaseMetaData.java",
+          "start_line": 238
+        },
+        {
+          "end_line": 3665,
+          "path": "src/main/java/net/snowflake/client/jdbc/SnowflakeDatabaseMetaData.java",
+          "start_line": 3657
+        }
+      ],
+      "prerequisites": "An established Snowflake connection (any authenticated role), and an application/tool that passes attacker-influenced text as tableNamePattern (or schemaPattern) to getTablePrivileges. tableNamePattern must be non-null/non-'%' to reach the concatenation (line 1985-1990).",
+      "root_cause": "getTablePrivileges builds a SELECT against information_schema.table_privileges by direct string concatenation. tableNamePattern is interpolated raw inside a single-quoted literal (line 1989: \" where table_name = '\" + tableNamePattern + \"'\"), and schemaPattern is passed through unescapeChars (lines 1997/1999), but unescapeChars only unescapes LIKE wildcards and then calls escapeSqlQuotes, which doubles double quotes (lines 238-250) — it does not escape single quotes. Both values therefore terminate the '...' string literal. The resulting SQL is executed unchanged by executeAndReturnEmptyResultIfNotFound -> statement.executeQuery(sql) (lines 3657-3665). This is inconsistent with sibling methods in the same file that escape user-supplied patterns (escapeSingleQuoteForLikeCommand, escapeSqlQuotes in identifier contexts).",
+      "title": "SQL injection via unescaped table/schema patterns in SnowflakeDatabaseMetaData.getTablePrivileges",
+      "trace": "caller -> SnowflakeDatabaseMetaData.getTablePrivileges (line 1956, @Override public) -> string building at line 1989 (raw tableNamePattern in single quotes) and lines 1997/1999 (schemaPattern after unescapeChars, which only escapes double quotes) -> executeAndReturnEmptyResultIfNotFound (line 2008-2009) -> statement.executeQuery(showView) at line 3665 -> Snowflake executes the altered SELECT with the session's privileges.",
+      "unverified": "No build/run or dynamic test was performed, so exploitability of a concrete payload and the exact Snowflake grammar behavior were not runtime-confirmed. Whether callers in practice pass untrusted input to this JDBC method is application-dependent. Whether this file region differs from the released upstream 3.21.1 source could not be checked (no network/git history available).",
+      "weakness_type": "CWE-89 Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+    }
+  ],
+  "coverage_summary": "Scope: 345 visible source files (283 Java under src/main, plus build/CI/pom files); no test sources were present. get_source_scope reports no exclusions/symlink trimming and a 5 MiB per-file text limit (none hit). The P1 relation index is partial: 319 files indexed, only 37 parsed for symbols/calls, 26 source files absent from the index, 18,373 call rows/17,289 edges, and it explicitly does not implement control/data-flow, semantic resolution, runtime reachability, or exploitability; I used it only for navigation and verified every cited location in source text. I read in depth the metadata layer (SnowflakeDatabaseMetaData, DBMetadataResultSetMetadata, ResultSet wrappers), auth/login (SessionUtil, SessionUtilExternalBrowser, SessionUtilKeyPair, SFSession*, auth package), TLS/OCSP (SFTrustManager, SFSSLConnectionSocketFactory, diagnostic checks), HTTP/retry (HttpUtil, RestRequest, StmtUtil), credential/cache/storage (SecureStorage*Manager, FileCacheManager, SecretDetector), file transfer and cloud storage clients (SnowflakeFileTransferAgent, S3/GCS/Azure clients, EncryptionProvider/GcmEncryptionProvider), result/chunk parsing (SnowflakeChunkDownloader, ResultJsonParserV2, Arrow converters), and the loader package. Remaining Java files (notably parts of SnowflakeDatabaseMetaData 3.6k lines, SnowflakeFileTransferAgent 3.4k lines, SFStatement/SFSession and some Arrow/decimal converters) were only sampled/searched, not exhaustively line-reviewed.",
+  "limitations": [
+    "No compilation, test execution, scanner run, or dynamic confirmation was performed; findings are static source reasoning only.",
+    "The relation index is partial (37/283 Java files parsed for symbols, 26 files missing) and provides no data-flow or reachability proof; index 'security_call' and other facts are name-based hints only.",
+    "No git history, release artifacts, or external advisories/CVE data were available (and not permitted), so I could not confirm whether the cited code matches the released upstream 3.21.1 source or which fix commit the snapshot precedes.",
+    "Exploitability of the candidate depends on application behavior (passing untrusted strings to DatabaseMetaData.getTablePrivileges) and on Snowflake SQL grammar for injected single statements; neither was runtime-verified.",
+    "Dependency-level issues (parent-pom dependency versions) and generated/vendored artifacts were not assessed as vulnerabilities.",
+    "Build/CI scripts, FIPS packaging files, and the javadoc licenses page were not security-reviewed in depth."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SnowflakeDatabaseMetaData.escapeSingleQuoteForLikeCommand (lines 258-274): the helper skips quotes immediately preceded by a backslash, so a pattern containing an even number of backslashes before a quote (e.g. \"x\\\\'\") can terminate the LIKE literal used by getTables/getColumns/getSchemas/getProcedures/getStreams.",
+      "reason": "Real-looking edge case, but exploitation needs a specific backslash sequence and the injected text must still fit the SHOW ... LIKE grammar; the raw interpolation in getTablePrivileges is a clearer, unconditional omission, so I kept one candidate."
+    },
+    {
+      "lead": "SnowflakeConnectionV1.setCatalog (line 441) and setSchema (lines 758-760) concatenate catalog/schema names into \"use database\" / \"use schema\" quoted identifiers without escaping embedded double quotes.",
+      "reason": "Identifiers are double-quoted and inputs normally come from pool/config rather than untrusted data; impact limited to the USE grammar. Possible injection anti-pattern, not selected as the strongest evidence."
+    },
+    {
+      "lead": "SnowflakeConnectionV1.downloadStream (lines 1016-1049) wraps a stage path in single quotes for special characters but never escapes embedded single quotes, and embeds Pattern.quote(fileName) inside a double-quoted PATTERN option where '\"' is not neutralized, before the GET command is parsed/executed via SFStatement.executeHelper.",
+      "reason": "Plausible command/SQL injection through a public API, but it depends on the caller passing attacker-influenced file names (e.g. git-stage content) and on GS GET-command grammar; less directly evidenced than cand-1."
+    },
+    {
+      "lead": "SnowflakeBasicDataSource.readObject/readObjectHelper (lines 60-86) deserialize seven fields with ObjectInputStream and no ObjectInputFilter; the class is Serializable and holds credentials.",
+      "reason": "Unsafe only if an application deserializes attacker-supplied bytes into this class; the driver itself never deserializes untrusted data, so no in-library exploit path is visible."
+    },
+    {
+      "lead": "SessionUtilExternalBrowser.DefaultAuthExternalBrowserHandlers.openBrowser (lines 71-94) uses Runtime.exec(\"open \" + ssoUrl) / exec(\"xdg-open \" + ssoUrl).",
+      "reason": "ssoUrl is validated by URLUtil.isValidURL against a restrictive regex (no shell metacharacters/whitespace) and Runtime.exec(String) does not invoke a shell, so command injection is not demonstrated."
+    },
+    {
+      "lead": "FileTransferAgent download path builds local files as localLocation + separator + server-provided basename (manifest FileMetadata.destFileName, SnowflakeS3Client/SnowflakeGCSClient download), with no canonical-path check.",
+      "reason": "destFileName is reduced to the substring after the last '/' so ordinary traversal is stripped; a Windows-only backslash traversal via malicious server data is conceivable but is not verifiable here and was kept out of the top candidate."
+    },
+    {
+      "lead": "SecureStorageLinuxManager/FileCacheManager store OAuth/ID tokens in a plaintext JSON file without explicit 0600 permissions; SFClientConfigParser only warns (TODO SNOW-1503722) when a config/token file is group/other-writable.",
+      "reason": "Design-level hardening gaps noted in the code itself (warnings/TODOs), not a demonstrated exploitable vulnerability in this snapshot."
+    }
+  ],
+  "summary": "Reviewed the assigned snowflake-jdbc 3.21.1-SNAPSHOT source snapshot (345 visible files, 283 Java files under src/main plus build/CI files) as a defensive source review. I traced attacker-controlled input through authentication (SessionUtil/SessionUtilExternalBrowser/SessionUtilKeyPair), TLS/OCSP validation (SFTrustManager, SFSSLConnectionSocketFactory), HTTP plumbing (HttpUtil, RestRequest), credential/caching (SecureStorage*, FileCacheManager, SecretDetector), file transfer (SnowflakeFileTransferAgent and cloud storage clients), result/chunk handling, and the JDBC metadata layer. The strongest, most concrete source-level issue is in SnowflakeDatabaseMetaData.getTablePrivileges: unlike its sibling metadata methods, it concatenates the caller-supplied table and schema patterns into a single-quoted SQL literal without neutralizing single quotes, then executes the string via statement.executeQuery. Other suspicious spots (Runtime.exec of the SSO URL, Java serialization in SnowflakeBasicDataSource, unescaped identifiers in setCatalog/setSchema and downloadStream, the backslash edge case in escapeSingleQuoteForLikeCommand) were examined and are weaker or plausibly mitigated; they are listed only as rejected leads. No code was executed and no runtime verification was performed; all conclusions are from source text plus index navigation hints."
+}

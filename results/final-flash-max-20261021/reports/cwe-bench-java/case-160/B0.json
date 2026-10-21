@@ -1,0 +1,78 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote HTTP client controls the presence/validity of the Authorization header and the requested path/method. Sending a request with no credentials (or invalid credentials) is enough to reach the wrapped routes when the deployment uses the Java DSL authenticator.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the parallel scaladsl branch (line 191-192) which does enforce authentication, so the bypass is specific to the javadsl path; checked all four destructive loglevel PUT handlers and the cluster-http route provider for readOnly enforcement, which are correct; checked that no auth wrapper is skipped for other branches (the (Some,Some) case throws); checked the docs, which present Java `withAuth` as the way to enable Basic Authentication and warn that an unsecured endpoint allows log-level DoS; noted that the default `route-providers-read-only = true` limits impact on destructive routes. Uncertain: the `.optional` semantics are taken from the akka-http API contract (library sources not in this snapshot) and were not runtime-verified; it is conceivable (though inconsistent with the docs and the scaladsl branch) that the upstream author chose optional authentication for the Java API.",
+      "id": "akka-management-javadsl-auth-optional",
+      "impact": "Authentication bypass / broken access control on the management HTTP endpoint for Java-DSL deployments. Read endpoints (cluster members/leader detail, shard stats, health state, bootstrap seed nodes) become readable without credentials despite configured auth, and when `route-providers-read-only=false` an unauthenticated attacker can leave/down cluster members, force the node to join an attacker-supplied address, prepare a full cluster shutdown, and change/disable log levels (documented DoS vector). This defeats the operator's intended mitigation against the documented risks of the unsecured management endpoint.",
+      "locations": [
+        {
+          "end_line": 205,
+          "path": "management/src/main/scala/akka/management/scaladsl/AkkaManagement.scala",
+          "start_line": 185
+        },
+        {
+          "end_line": 200,
+          "path": "management/src/main/scala/akka/management/scaladsl/AkkaManagement.scala",
+          "start_line": 194
+        },
+        {
+          "end_line": 44,
+          "path": "management/src/main/scala/akka/management/javadsl/ManagementRouteProviderSettings.scala",
+          "start_line": 40
+        },
+        {
+          "end_line": 61,
+          "path": "management/src/main/scala/akka/management/javadsl/AkkaManagement.scala",
+          "start_line": 52
+        }
+      ],
+      "prerequisites": "The application uses the Java DSL to secure the management endpoint, i.e. calls akka.management.javadsl.AkkaManagement.start/getRoutes with a transformSettings function that calls `withAuth` (javadsl ManagementRouteProviderSettings). The management HTTP port must be reachable by the attacker (management endpoints are commonly exposed in-cluster/behind ingress). Destructive operations additionally require the non-default `akka.management.http.route-providers-read-only = false`; read-only endpoints are exposed regardless.",
+      "root_cause": "In AkkaManagement.prepareCombinedRoutes, the javadsl authenticator branch builds Akka HTTP's authenticateBasicAsync directive and then calls `.optional` before `.apply(_ => inner)`. `AuthenticationDirective.optional` turns both CredentialsMissing and CredentialsRejected results into a provided `None` instead of rejecting with AuthenticationFailedRejection, and the resulting Option is thrown away by `_ => inner`. Consequently the inner management routes are always executed, whether or not the Java authenticator supplied by withAuth returns a principal. The scaladsl branch, by contrast, calls `authenticateBasicAsync[...](_ => inner)` and does reject unauthenticated requests, so the two documented APIs have different security semantics.",
+      "title": "Java DSL basic authentication is not enforced: authenticateBasicAsync(...).optional discards the authentication result",
+      "trace": "1) Java user calls AkkaManagement.get(system).start(settings -> settings.withAuth(javaAuthenticator)) (javadsl/AkkaManagement.scala:72, javadsl/ManagementRouteProviderSettings.scala:76-78). 2) javadsl.AkkaManagement.convertSettingsTransformation (javadsl/AkkaManagement.scala:52-61) converts the transformed settings to scaladsl.ManagementRouteProviderSettingsImpl, carrying the authenticator in the `javadslAuth` field. 3) scaladsl.AkkaManagement.prepareCombinedRoutes -> wrapWithAuthenticatorIfPresent matches `(None, Some(auth))` (scaladsl/AkkaManagement.scala:185-205). 4) The branch builds `authenticateBasicAsync(realm = \"secured\", c => auth.apply(credsToJava(c)).asScala.map(_.toScala)).optional` and then applies `_ => inner` (lines 194-200). 5) Because of `.optional`, a request without/invalid credentials is not rejected; the directive provides None and `inner` (health checks, cluster HTTP management routes, loglevel routes, cluster-bootstrap seed-node route) is executed as if authenticated. 6) For example, with read-only disabled an unauthenticated client can invoke the member down/leave/join and cluster-shutdown-preparation endpoints and the loglevel PUT endpoints that the operator explicitly believed were protected by the configured basic auth.",
+      "unverified": "No code execution or tests were run; akka-http (the library defining AuthenticationDirective.optional and authenticateBasicAsync) is not part of the snapshot, so the rejection-swallowing behavior of `.optional` is argued from the Akka HTTP API contract rather than observed. It is also unverified whether upstream intends Java-DSL auth to be optional; the snapshot contains no tests and no git history. No exploit payload was constructed and no target was contacted.",
+      "weakness_type": "Improper Authentication (CWE-287) / Missing Authentication for Critical Function (CWE-306)"
+    }
+  ],
+  "coverage_summary": "Scope report: 238 repository-relative files exposed, 0 excluded for size/sensitive names/symlinks, no binary-skipped files encountered. Read/reviewed all main source files of management, cluster-http, cluster-bootstrap, loglevels-logback, loglevels-log4j2, lease-kubernetes, rolling-update-kubernetes, discovery-kubernetes-api, discovery-azure-api, discovery-aws-api, discovery-aws-api-async, discovery-marathon-api, management-pki, plus reference.conf files, docs, samples/integration-test demo apps, build files and .github workflows; searched for HTTP parameter/form handling, auth wrappers, read-only enforcement, URI/path construction, process/file/TLS APIs, reflection, regex, and dependency versions. The snapshot contains no src/test trees, so test evidence was unavailable.",
+  "limitations": [
+    "No runtime execution, tests, or scanners were used; every conclusion is static source reasoning.",
+    "The akka-http library sources are not part of the snapshot, so the rejection-swallowing behavior of AuthenticationDirective.optional and the javadsl authenticateBasicAsync contract are argued from the Akka HTTP API rather than verified in code.",
+    "No tests and no git history are present in the snapshot, so it cannot be verified whether the `.optional` call is intended behavior or whether it was addressed by a later fix.",
+    "Coverage of docs/samples/integration-test scripts and project build files was targeted at security-relevant content; non-parseable or binary assets (images are referenced but not present as text) were not reviewed line-by-line.",
+    "The vulnerability judgment depends on a deployment that actually uses the Java DSL withAuth path; Scala-DSL and unauthenticated deployments are unaffected by this root cause."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Management endpoints (health checks, cluster HTTP read/destructive routes, loglevel routes, cluster-bootstrap seed nodes) are unauthenticated by default",
+      "reason": "This is documented intended behavior (`akka.management.http.route-providers-read-only = true` by default, explicit docs note that the module provides no security by default); no missing check was found in the route providers themselves."
+    },
+    {
+      "lead": "Log injection / log-level DoS via /loglevel/logback and /loglevel/log4j2 (logger name interpolated into log messages; TRACE can be set)",
+      "reason": "Levels are whitelisted, logger names are config/request scoped and only affect logging; PUT is rejected with 403 unless read-only is disabled, and the DoS risk of enabling it is explicitly documented. Lower impact and weaker evidence than the authentication bypass."
+    },
+    {
+      "lead": "Unbounded response handling in HttpContactPointBootstrap.handleResponse (entity.toStrict + spray-json unmarshal of a contact point reply)",
+      "reason": "A malicious peer would have to be a discovered contact point; no size limit is enforced but the 1s strict timeout and the fact that the address comes from the configured discovery mechanism make this a hardening concern, not a demonstrated vulnerability."
+    },
+    {
+      "lead": "Kubernetes lease/CR name normalization (makeDNS1039Compatible) causing truncated/colliding resource names",
+      "reason": "Truncation is off by default with an explicit opt-in flag, and collisions lead to contention on the same Kubernetes Lease object (liveness), not to a bypass of the lease protocol; no security-relevant ownership check is missing in LeaseActor."
+    },
+    {
+      "lead": "Cloud discovery implementations (EC2/ECS/Azure/Kubernetes) building URIs or paths from configuration/environment",
+      "reason": "Hosts, ports, tokens and namespaces come from trusted environment/config sources (KUBERNETES_SERVICE_HOST, ECS metadata URI, Azure workload identity); no attacker-controlled network input reaches URL/path construction. Unresolved `${AZURE_CLIENT_ID}`-style substitutions are a startup robustness issue, not an attacker-triggered vulnerability."
+    },
+    {
+      "lead": "Pod/lease path construction without sanitization in rolling-update KubernetesApiImpl (podName, replicaSet name)",
+      "reason": "Values come from HOSTNAME/KUBERNETES_POD_NAME and from Kubernetes API responses (ownerReferences); the pod-cost CR name path is sanitized, and the remaining values are not attacker-controlled from the network."
+    },
+    {
+      "lead": "CI shell scripts using unquoted environment variables / eval (minikube docker-env)",
+      "reason": "Integration-test scripts run with repository-controlled CI variables, are not shipped product code, and the eval target is minikube output; no practical attacker-controlled input path was established."
+    }
+  ],
+  "summary": "Reviewed the akka-management snapshot (238 visible files; all module main sources, reference.conf, docs, build files, and CI workflows; no test sources are present in the snapshot). The single strongest source-backed issue is in the Java-DSL authentication path of the management HTTP endpoint: when a Java user configures basic auth via ManagementRouteProviderSettings.withAuth, the combined routes are wrapped with authenticateBasicAsync(...).optional.apply(_ => inner). The optional directive converts missing/invalid-credential rejections into a provided None value instead of an AuthenticationFailedRejection, and the provided value is discarded, so every request reaches the management routes regardless of the authentication result, contradicting the documented \"enable Basic Authentication\" behavior. The Scala-DSL branch immediately above correctly rejects. Impact ranges from disclosure of cluster/health/seed-node data to unauthenticated member leave/down/join, full-cluster-shutdown preparation, and log-level manipulation when the (non-default) read-only flag is disabled. All other candidate leads (default-unsecured endpoints, loglevel log injection/DoS, unbounded probe response bodies, lease name normalization, cloud discovery) were weaker or documented behavior. No runtime execution was performed; akka-http library sources are not in this snapshot, so the `optional` semantics rest on the akka-http API contract."
+}

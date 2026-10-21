@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A user with only content-edit (or comment) rights can place a link such as [[x>>http://internal-host:port/path]] in a page, comment, or any content rendered with transformations. The URL is fully attacker-controlled (host, port, path, query). No script or programming rights are required, and the attacker does not need to be the viewer: queuing happens whenever the content is rendered, and the fetch then runs asynchronously on the server.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that this is not an accident of missing context: the transformation is deliberately asynchronous and processes links from ordinary rendered content (documented 'checks external URLs'). Verified the exclusion mechanism cannot be used as a workaround: LinkCheckerTransformationConfiguration.getExcludedReferencePatterns() is documented as 'list of document references' (interface lines 46-50) and DefaultLinkCheckerThread only matches it against queueItem.getContentReference(); the link URL itself is never filtered. Verified the HTTP client is not configured with any host restriction (DefaultHTTPChecker.initialize, lines 61-83: only pooling, system properties, static User-Agent, cookie spec). Considered that an administrator can remove 'linkchecker' from the transformation list, but that is a deployment-wide workaround, not an input-validation control in this code, and the module has no per-URL allow/deny mechanism. Also considered that response bodies are not returned to the attacker, which reduces (but does not eliminate) impact.",
+      "id": "CAND-1",
+      "impact": "Blind (for plain viewers) server-side request forgery: the XWiki server can be made to issue requests to loopback, link-local, private, or otherwise internal HTTP(S) endpoints on behalf of an unprivileged content author, enabling internal port scanning and interaction with internal/unauthenticated HTTP services (including state-changing GET endpoints, cloud metadata endpoints reachable from the server, etc.). Because the HTTP response code is recorded in the LinkStateManager and exposed through the script API, actors able to evaluate scripts also get an SSRF oracle (reachability/status of internal hosts). Requests are sent without the attacker's credentials and with cookies ignored, so impact is that of an unauthenticated internal HTTP client rather than response-body exfiltration.",
+      "locations": [
+        {
+          "end_line": 113,
+          "path": "xwiki-rendering-transformations/xwiki-rendering-transformation-linkchecker/src/main/java/org/xwiki/rendering/internal/transformation/linkchecker/DefaultHTTPChecker.java",
+          "start_line": 85
+        },
+        {
+          "end_line": 122,
+          "path": "xwiki-rendering-transformations/xwiki-rendering-transformation-linkchecker/src/main/java/org/xwiki/rendering/internal/transformation/linkchecker/LinkCheckerTransformation.java",
+          "start_line": 96
+        },
+        {
+          "end_line": 190,
+          "path": "xwiki-rendering-transformations/xwiki-rendering-transformation-linkchecker/src/main/java/org/xwiki/rendering/internal/transformation/linkchecker/DefaultLinkCheckerThread.java",
+          "start_line": 145
+        },
+        {
+          "end_line": 134,
+          "path": "xwiki-rendering-transformations/xwiki-rendering-transformation-linkchecker/src/main/java/org/xwiki/rendering/internal/transformation/linkchecker/DefaultLinkCheckerTransformationConfiguration.java",
+          "start_line": 110
+        }
+      ],
+      "prerequisites": "The linkchecker rendering transformation must be active in the target deployment (it is shipped as a standard transformation, registered by components.txt, and enabled by adding it to the rendering.transformations configuration; XWiki bundles it). The attacker needs the ability to add a document/comment link (ordinary edit rights) and the link must be of ResourceType.URL so that LinkCheckerTransformation queues it (line ~109). Each rendering pass queues at most MAX_LINKS_IN_QUEUE=10 links, which is sufficient for scanning/targeting.",
+      "root_cause": "The linkchecker transformation takes every external link found in rendered content and, instead of validating the target, enqueues it unchanged (LinkCheckerTransformation.transform, only checking reference.getType() == ResourceType.URL). A background thread dequeues items and hands the raw link reference to DefaultHTTPChecker.check(), which does new HttpGet(url) and httpClient.execute(httpGet) with no host/scheme/address validation. The only configured exclusion (rendering.transformation.linkchecker.excludedReferencePatterns) is matched exclusively against the source content reference (DefaultLinkCheckerThread.isExcluded is called with queueItem.getContentReference()), and the configuration interface documents the patterns as document references only, so there is no supported way to prevent requests to internal hosts; the check is not tied to the requesting user, is unauthenticated (cookies explicitly ignored, user agent \"XWikiLinkChecker\"), and is performed for any URL exposed in any rendered document.",
+      "title": "Server-Side Request Forgery in the Link Checker transformation (unvalidated server-side GET to attacker-supplied URLs)",
+      "trace": "1) Author-controlled wiki/HTML content is parsed to an XDOM containing a LinkBlock whose ResourceReference type is URL; the URL string is taken verbatim from the source (LinkCheckerTransformation.java:109-119). 2) When the XDOM is transformed, LinkCheckerTransformation queues a LinkQueueItem(linkReference, contentReference, contextData). 3) DefaultLinkCheckerThread.processLinkQueue() only filters on the *content* reference (isExcluded(queueItem.getContentReference(), excludedReferencePatterns), lines 156-163 and 180-190), so no URL-based filtering exists, then calls checkLink(queueItem) (line 175-177). 4) DefaultLinkCheckerThread.checkLink() calls this.httpChecker.check(queueItem.getLinkReference()) (lines 197-199). 5) DefaultHTTPChecker.check() executes an HTTP GET against that exact URL server-side (lines 92-93) and stores the response status code in LinkStateManager (lines 201-208), which is exposed to scripts via LinkCheckerScriptService.getLinkStates().",
+      "unverified": "Not runtime-confirmed. Whether the linkchecker transformation is active by default in a given XWiki deployment is configuration-dependent (out of this snapshot); the finding assumes the documented, supported configuration in which it runs. The exact anti-flood behavior (10 queued links per rendering pass) and the cadence of the background thread were read from source only. No CVE/advisory identifiers were consulted or assumed.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery (SSRF)"
+    }
+  ],
+  "coverage_summary": "Scope: 764 files / 602 Java files in the assigned xwiki-rendering snapshot (14.10.3), main sources only (the snapshot contains no src/test sources, and no symlinks/binary or sensitive-name files were excluded per get_source_scope). I read in full or in part: the whole linkchecker transformation module (HTTPChecker, DefaultHTTPChecker, LinkCheckerTransformation, DefaultLinkCheckerThread, LinkCheckerTransformationConfiguration, DefaultLinkCheckerTransformationConfiguration, LinkStateManager/ScriptService); the HTML macro module (HTMLMacro, HTMLMacroParameters, HTMLMacro*Renderer*, AbstractHTMLMacroRenderer, HTMLMacroChainingRenderer); the macro transformation/raw-block filtering (MacroTransformation, MacroErrorManager, DefaultMacroContentParser, raw/HTML RawBlockFilters, RawBlockFilterParameters, RawBlocks in RawMacro/HTMLMacro); the XHTML renderers/printers and sanitizer wiring (XHTMLChainingRenderer, XHTMLWikiPrinter, XMLWikiPrinter, XHTMLWriter, HTML5/Annotated renderers, link and image type renderers); the XHTML/XHTML5 parsers and wikimodel handlers (XMusicCommentHandler, XWikiMacroHandler, XWikiSpan/Div/Reference/Image tag handlers, XhtmlHandler, TagStack, TagContext); the XWiki 2.x syntax renderer/escaping (XWikiSyntaxChainingRenderer, XWikiSyntaxEscapeHandler/EscapeWikiPrinter, XWikiSyntaxMacroRenderer, XWikiSyntaxResourceRenderer, reference serializers); macro modules (box/message/content/raw/id/figure/toc/ctsreport) at least at entry-point level; transformations icon/wikiword; rendering context and store (DefaultRenderingContext, RenderingContextStore, TransformationContext); conversion API; XML parser base classes; resource reference parsers; POMs and build/security-related config. Not exhaustively reviewed: every method of every syntax module (creole/apt/docbook/doxia/jspwiki/twiki/event/plain/xdomxml), the full wikimodel scanner internals (InternalWikiScannerContext, WikiScannerUtil), HtmlEntityUtil/ImageUtil, and the Doxia sink/listener.",
+  "limitations": [
+    "No code was executed and no scanner was run; all conclusions are static, source-level, and not runtime-confirmed.",
+    "The snapshot omits test sources and out-of-repo dependencies (xwiki-commons, notably HTMLElementSanitizer, HTMLCleaner, XMLUtils, LocalEntityResolver), so the exact allow/deny behavior of sanitization and cleaning helpers could not be verified here.",
+    "Whether the linkchecker transformation is enabled in a default XWiki deployment is a platform configuration question outside this repository; that assumption is the main limit on the candidate's reachability.",
+    "I could not consult JIRA/CVE/commit metadata (prohibited in this run), so the candidate is derived only from source evidence and is not asserted to correspond to any specific advisory.",
+    "Coverage of the 602-file snapshot is broad but not exhaustive; modules listed as not exhaustively reviewed may still contain unreviewed issues."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HTML macro / raw-block cleaning bypass (HTMLMacro + HTMLRawBlockFilter, xwiki-rendering-transformation-macro/.../HTMLRawBlockFilter.java:68-86) leading to stored XSS",
+      "reason": "I could not construct a concrete bypass from source: cleaning happens whenever the RawBlock syntax is in HTML_FAMILY_TYPES and clean=true, or whenever the transformation context is restricted, and HTMLMacro/RawMacro are the only producers here. Raw content emitted by XHTMLChainingRenderer.onRawText goes through XHTMLWikiPrinter.printRaw, which also neutralizes {{/html}} injection. No reachable unvalidated path identified, so this remains an unconfirmed lead rather than a candidate."
+    },
+    {
+      "lead": "RenderingContextStore.restore() defaulting the restricted flag to false (xwiki-rendering-api/.../internal/transformation/RenderingContextStore.java:109-117), potentially disabling HTML-macro cleaning during asynchronous rendering",
+      "reason": "Security-relevant default (get(contextStore, PROP_RESTRICTED, false)), but reachability is not demonstrable from this repository: save() stores the flag when the entry is requested, the async context-entry configuration lives in xwiki-platform/xwiki.properties, and the API/resources indicate 'rendering.restricted' is a first-class async entry. Without the caller-side configuration this is speculative."
+    },
+    {
+      "lead": "XWiki-syntax serialization of IdBlock without escaping the name (XWikiSyntaxChainingRenderer.onId, xwiki-rendering-syntax-xwiki20/.../XWikiSyntaxChainingRenderer.java:519-523: print(\"{{id name=\\\"\" + name + \"\\\"/}}\"))",
+      "reason": "Real-looking unescaped value in a syntax serializer, but the reachable round-trip paths are largely self-inflicted (the author controls the source) and macro results are rendered inside MacroMarkerBlocks whose begin/end handlers redirect inner output to VoidWikiPrinter, so executing macros wrap (and discard) the emitted IdBlock. No cross-user privilege boundary could be established."
+    },
+    {
+      "lead": "Generic rendering API constructing an unrestricted TransformationContext (TransformationContext(XDOM, Syntax) defaults restricted=false; DefaultConverter.convert uses it, DefaultConverter.java:83)",
+      "reason": "Plausible hardening gap, but the Converter API is a generic library entry point whose callers (CLI, script service for script-rights users) are outside this snapshot; no attacker-controlled call path with a privilege boundary was identified here."
+    },
+    {
+      "lead": "XXE in XML/HTML parsers (AbstractStreamParser, XhtmlParser)",
+      "reason": "Counterevidence found: both SAX paths enable XMLConstants.FEATURE_SECURE_PROCESSING and install LocalEntityResolver implementations; no insecure SAXParserFactory/classloader usage found elsewhere. Rejected as the primary candidate."
+    },
+    {
+      "lead": "Link/image reference parameter and label escaping in the XWiki 2.x serializer (XWikiSyntaxResourceRenderer, ParametersPrinter, ESCAPE_LABEL)",
+      "reason": "Escaping of quotes, ~, ||, ]], >> and label characters is present; I did not find a concrete breaking sequence, and any residual gap would again primarily affect the author's own content round-trip."
+    }
+  ],
+  "summary": "This snapshot is the XWiki Rendering 14.10.3 tree (602 Java files, no test sources; only main code, POMs, resources). I traced the rendering pipeline: XWiki/XHTML/HTML5 syntax parsers and renderers, the XWiki 2.x serializer and its escaping, the HTML macro and its raw-block cleaning path, the macro transformation/context handling, XML parsing, and the bundled transformations (macro, icon, wikiword, linkchecker). The strongest, most concretely evidenced issue is a server-side request forgery (CWE-918) in the bundled Link Checker transformation: it queues arbitrary, content-author-controlled HTTP(S) URLs and a background thread performs unauthenticated server-side GETs to them, with no validation of host, scheme, or IP address and no way to exclude internal URLs via configuration (exclusion patterns are matched only against the source page reference, not the link URL). I found no concrete bypass in the HTML-macro sanitization path (it is gated on the restricted flag), no reachable injection in the XWiki-syntax serializer paths I could trace, and the XML parsers already enable FEATURE_SECURE_PROCESSING and a local entity resolver."
+}

@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A YARN application submitter (or an ApplicationMaster the submitter controls) supplies ContainerLaunchContext LocalResources: the resource URL/name, resource type (ARCHIVE), visibility, size and timestamp. HDFS file names may contain `'`, `;`, `$`, `>`, `|` (only `/` and NUL are disallowed), so the LocalResource URL can include a crafted name such as `x';id>/tmp/pwn;'.tar.gz`. No layer between the API and the sink validates the name: ContainerManagerImpl.startContainers only null-checks resource/type/visibility (lines 1061-1073), ResourceLocalizationService submits FSDownload directly (line 896), and FSDownload uses the URL file name verbatim for the temp and final local paths.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that `unTarUsingJava` (no shell) is used only when Shell.WINDOWS is true, so the injection applies to Linux/Unix NMs (FileUtil.java:640-651). Verified `Path.getName()` returns the decoded URI path (Path.java:412-416 with `uri.getPath()`), so `'` (a legal unencoded URI character) is preserved, and confirmed there is no resource-name validation in ContainerManagerImpl (null checks only), LocalResourcesTrackerImpl, or FSDownload. Confirmed the only production callers of `FileUtil.unTar` are FSDownload (lines 283 and 316) plus tests, narrowing the reachable path. Noted that the codebase already has `Shell.bashQuote` used for other user-influenced shell arguments (Shell.java:134-135, 212-214), so the missing escaping in unTar/makeShellPath is an inconsistent omission rather than an intentional quoting convention. On the other hand, the shell command is only reachable through ARCHIVE localization and the crafted name must be accepted by HDFS and the localizer; Windows NMs are unaffected.",
+      "id": "hadoop-untar-command-injection",
+      "impact": "Arbitrary OS command execution as the NodeManager service account (commonly `yarn`) on every node that localizes the crafted resource. This crosses the YARN tenant boundary: the attacker can read/modify other tenants' localized files and container data, access NM-local credentials/tokens and logs, alter or replace localized artifacts used by other applications, and use the NM account as a foothold for lateral movement on cluster hosts.",
+      "locations": [
+        {
+          "end_line": 673,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileUtil.java",
+          "start_line": 653
+        },
+        {
+          "end_line": 516,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileUtil.java",
+          "start_line": 514
+        },
+        {
+          "end_line": 369,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/FSDownload.java",
+          "start_line": 345
+        },
+        {
+          "end_line": 283,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/FSDownload.java",
+          "start_line": 272
+        },
+        {
+          "end_line": 1074,
+          "path": "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java",
+          "start_line": 1059
+        }
+      ],
+      "prerequisites": "Non-Windows NodeManager (Shell.WINDOWS selects the Java-only unTarUsingJava path); an authenticated user allowed to submit applications/AMs and localize ARCHIVE resources; a resource whose file name contains a single quote and ends in .tar.gz/.tgz/.tar; the localized file's size/timestamp must match the declared LocalResource; YARN archive localizations must be permitted by deployment policy.",
+      "root_cause": "FileUtil.unTarUsingTar() builds a shell command string (` gzip -dc '<in>' | (cd '<dir>' ; tar -xf ... )`) and executes it via `{\"bash\",\"-c\",...}` using makeShellPath(), which simply returns the file/directory name without shell escaping (FileUtil.java:514-516). Only single quotes are added around the names, so a `'` inside a name terminates the quoted string and the remainder is interpreted as shell syntax. The attacker-controlled component is the file name taken from a YARN LocalResource URL: FSDownload.call() derives both the final destination (`dst_work/<name>`) and the temp copy (`tmp_<name>`) from `resource.getResource().toPath().getName()`, and dispatches to FileUtil.unTar() when that name ends in .tar.gz/.tgz/.tar.",
+      "title": "Unescaped archive file name interpolated into `bash -c` in FileUtil.unTar allows OS command execution during YARN resource localization",
+      "trace": "1) Attacker submits an app with a LocalResource whose URL path is `/path/x';id>/tmp/pwn;'.tar.gz`, type ARCHIVE. 2) ContainerManagerImpl.startContainers null-checks only; the resource is handed to ResourceLocalizationService, which creates `new FSDownload(..., resource, ...)` (ResourceLocalizationService.java:896). 3) FSDownload.call() (346-392): `sCopy = resource.getResource().toPath()`; `dFinal = dst_work/<sCopy.getName()>` (line 361) and `copy()` builds `dCopy = <dst_work>/tmp_<sCopy.getName()>` (lines 250-253); unpack() selects `FileUtil.unTar(localrsrc, dst)` because the destination name ends with `.tar.gz` (lines 280-283, also 311-316). 4) Path.getName() returns the percent-decoded final URI segment (Path.java:412-416 uses `uri.getPath()`), so the quote and shell metacharacters survive into the local File names. 5) On the NodeManager, FileUtil.unTar() sees a name ending in `gz` and takes the gzipped branch of unTarUsingTar() (lines 653-673), producing ` gzip -dc '<tmp_x';id>/tmp/pwn;'.tar.gz>' | (cd '<...>' ; tar -xf  -)` and executing it with `{\"bash\",\"-c\",...}`. The injected `id>/tmp/pwn` (or any command) runs as the NodeManager service account; localization then reports an error, which does not undo the executed command.",
+      "unverified": "No build, test, or exploit was executed (prohibited). The reachability chain and Java URI/Path decoding were reasoned from source text, not runtime-verified; whether a particular deployment permits arbitrary names/localizes ARCHIVE resources for unprivileged users is deployment-specific; actual command executed depends on the environment (e.g., available shell builtins/binaries) and the file name characters HDFS accepts.",
+      "weakness_type": "OS command injection (CWE-78): improper neutralization of special elements used in an OS command"
+    }
+  ],
+  "coverage_summary": "The assigned snapshot contains 6,927 files, all present in the P1 index (index_status complete; no missing files or hash mismatches). I could not review every file. I triaged by searching for command-execution sinks (Runtime.exec, ProcessBuilder, bash -c), deserialization (ObjectInputStream.readObject), shell-path construction (makeShellPath, bashQuote, unTar/unZip/unJar), and authorization checks, then traced the strongest candidates into callers. Areas actually inspected include hadoop-common FileUtil/Shell/RunJar, the hadoop-auth Signer, SaslPlainServer, impersonation/ACL code, KMS server (KMS.java, KMSACLs), YARN localization (FSDownload, ResourceLocalizationService, ContainerManagerImpl), ShellBasedIdMapping, and the WebHDFS client redirect logic. The P1 relation index was used only for navigation (config_file/security_call hints) and was verified against source text; no SAST, build, test, or runtime execution was performed.",
+  "limitations": [
+    "No code was executed and no build/tests/scanners were run, so none of the findings are runtime-confirmed.",
+    "The POM declares version 3.0.1 while the tree contains hadoop-client-modules and other artifacts whose exact upstream introduction I could not verify offline; version/release-line attribution is therefore uncertain and was not used as primary evidence.",
+    "Large parts of the repository (HDFS NameNode/DataNode internals, MapReduce internals, native C code such as container-executor, HTTP/REST servers, S3A/Azure connectors) were sampled or searched but not read line-by-line; a different vulnerability in unreviewed code remains possible.",
+    "The reachability of the unTar sink depends on HDFS permitting the crafted file name and on the localizer accepting the resource; this was reasoned from source (no name validation found between the API and the sink) but not verified at runtime.",
+    "The relation index provides syntactic/navigation candidates only and cannot prove data flow, reachability, or exploitability; every cited edge/line was re-checked in source."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ZKConfigurationStore deserialization of ZooKeeper-stored bytes with a raw ObjectInputStream (ZKConfigurationStore.java:230-234, reached from retrieve() at 196-198, used when yarn.resourcemanager.store.class=ZKConfigurationStore)",
+      "reason": "Real insecure-deserialization pattern and a known Hadoop issue, but exploitability requires write access to the ResourceManager's ZooKeeper state-store path (normally admin/RM-restricted) plus a usable gadget chain on the RM classpath, so attacker control and preconditions are weaker than the chosen unTar injection."
+    },
+    {
+      "lead": "Archive-entry path traversal / Zip-Slip: FileUtil.unZip (lines 585-621), unpackEntries for tar (lines 704-745) and RunJar.unJar (lines 108-134) build paths from entry names without canonical-path checks",
+      "reason": "Entry names are attacker-controlled only when an attacker-supplied archive is extracted (e.g., via YARN localization), giving arbitrary file writes as the extracting user; plausible but secondary/share overlapping impact, and no single confirmed remote entry point was traced as cleanly as the unTar path, so it was left unselected (one-candidate cap)."
+    },
+    {
+      "lead": "WebHDFS client redirect handling in WebHdfsFileSystem.AbstractRunner.connect (WebHdfsFileSystem.java:680-724): the Location header is followed to an arbitrary host with credentials/delegation tokens attached and no host allowlist",
+      "reason": "Potentially a credential/token-exposure or SSRF primitive, but exploitation requires a malicious or compromised/misconfigured NameNode/proxy and version-specific behavior analysis; not confirmed from this snapshot and not the strongest evidence-backed candidate."
+    },
+    {
+      "lead": "ShellBasedIdMapping.updateMapInternal executes `bash -c <command>` (ShellBasedIdMapping.java:222-223)",
+      "reason": "The command strings are fixed constants supplied by internal callers (e.g., getent/dscl invocations), not attacker-controlled input, so no injection taint path was found."
+    },
+    {
+      "lead": "Authentication/authorization helpers reviewed (Signer.verifyAndExtract, SaslPlainServer, DefaultImpersonationProvider/ProxyUsers, KMS assertAccess paths)",
+      "reason": "Checks matched expected Hadoop semantics in the reviewed regions; no missing verification or inverted condition was evident. Not exhaustively reviewed, so this is a negative-result note rather than a clean bill of health."
+    }
+  ],
+  "summary": "Apache Hadoop snapshot (6,927 source files; POM version 3.0.1, 2018-era dependencies such as guava 11.0.2, jetty 9.3.19, htrace-based hadoop-client-modules). After broad triage of the security-sensitive surfaces (authentication/ACL, deserialization, archive extraction, KMS, WebHDFS, shell/command execution, YARN localization), the strongest single candidate is an OS command injection in FileUtil.unTarUsingTar: file/directory names are concatenated into a `bash -c` string wrapped only in single quotes, and makeShellPath() performs no escaping. Attacker-influenced names originate from YARN LocalResource URLs and reach the sink during NodeManager resource localization in FSDownload. A single quote in the resource file name terminates the quoting and injects shell commands executed as the NodeManager account. Other real issues found (ZKConfigurationStore Java deserialization, archive-entry path traversal/Zip-Slip) are weaker or secondary and are listed as rejected/ unconfirmed leads."
+}

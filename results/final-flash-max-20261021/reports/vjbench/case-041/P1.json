@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The XML text is fully attacker-controlled image file content: PSD image resource ID 0x0424 (PSDXMPData stores the raw resource and feeds it to XMPReader at PSDXMPData.java:64), or the WebP `XMP ` chunk fed directly from the stream at WebPImageReader.java:638. (The TIFF tag 700 XMP path exists too but is inside a DEBUG-only block at TIFFImageReader.java:206-224.)",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched the whole tree for FEATURE_SECURE_PROCESSING, disallow-doctype-decl and ACCESS_EXTERNAL_DTD: zero matches, so no hardening elsewhere compensates. Confirmed the PSD/WebP XMP call sites are on normal metadata paths (not DEBUG-only, unlike TIFFImageReader.java:206-224). Confirmed XMPReader installs only a no-op DefaultHandler error handler, no resolver. Confirmed XMPScanner (a separate public scanner) is not used by any in-repo reader, so it is not needed for this issue. Checked that the surrounding code does not sanitize/escape the XML before parsing. Accepted caveats: JAXP defaults are environment-dependent and can be globally overridden; plain `read()` in PSD/WebP does not necessarily parse XMP (metadata APIs do); no tests exist in the snapshot; the issue was not executed or reproduced.",
+      "id": "xmpreader-unhardened-dom-parse",
+      "impact": "Confidentiality and integrity of the host: external entity expansion can read local files (reflected into parsed metadata where the entity is used in an attribute/text node, or blind via parser error messages) and can trigger outbound HTTP(S) requests from the parsing host (SSRF). Entity expansion also enables denial of service (e.g. billion-laughs). Impact is bounded by the caller's exposure of parsed metadata, but XMP payloads can be crafted to place entity content directly in values returned to the application.",
+      "locations": [
+        {
+          "end_line": 97,
+          "path": "imageio/imageio-metadata/src/main/java/com/twelvemonkeys/imageio/metadata/xmp/XMPReader.java",
+          "start_line": 66
+        },
+        {
+          "end_line": 65,
+          "path": "imageio/imageio-psd/src/main/java/com/twelvemonkeys/imageio/plugins/psd/PSDXMPData.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 1195,
+          "path": "imageio/imageio-psd/src/main/java/com/twelvemonkeys/imageio/plugins/psd/PSDImageReader.java",
+          "start_line": 1170
+        },
+        {
+          "end_line": 644,
+          "path": "imageio/imageio-webp/src/main/java/com/twelvemonkeys/imageio/plugins/webp/WebPImageReader.java",
+          "start_line": 588
+        }
+      ],
+      "prerequisites": "An application uses the TwelveMonkeys PSD or WebP plugin and calls a metadata API (e.g. ImageReader.getImageMetadata) on untrusted input; the JAXP parser in use retains default external-entity/DTD settings (stock JDKs do; a deployment could override globally via jaxp.properties or a hardened factory wrapper); the process may read files/fetch URLs from the parser context.",
+      "root_cause": "XMPReader.read() creates a DOM parser with only `setNamespaceAware(true)` and parses the XMP document directly (`DocumentBuilderFactory.newInstance()` ... `builder.parse(new InputSource(IIOUtil.createStreamAdapter(input)))`, lines 70-80). DOCTYPE declarations, external general/parameter entities, external DTD loading and XInclude are never disabled, no `FEATURE_SECURE_PROCESSING` is enabled, and no EntityResolver/LSResourceResolver is installed. A repository-wide search for XMLConstants.FEATURE_SECURE_PROCESSING, disallow-doctype-decl and ACCESS_EXTERNAL_DTD returns no hits, so the library never restricts this parser. Any XMP document embedded in an image is therefore handed to a JAXP parser that resolves external entities and DTDs under default JDK settings.",
+      "title": "XXE via unhardened DOM parsing of attacker-controlled XMP metadata (XMPReader)",
+      "trace": "ImageIO reader selection -> PSDImageReader.getImageMetadata(0) [PSDImageReader.java:1170] -> readImageResources(true) [1173] -> initDirectory() on each PSDDirectoryResource [1188-1190] -> PSDDirectoryResource.initDirectory -> PSDXMPData.parseDirectory [PSDXMPData.java:55-64] -> XMPReader.read [XMPReader.java:66-97] -> DocumentBuilderFactory.newInstance(); setNamespaceAware(true); builder.parse(InputSource) [70-80] -> parser resolves a `<!DOCTYPE ... SYSTEM ...>` / external entity in the XMP. WebP route: WebPImageReader.getImageMetadata [581-586] -> readMeta [588] -> case WebP.CHUNK_XMP_ [637-638] -> XMPReader.read. Entity-expanded values can surface in the returned XMPDirectory entries because attribute and child text values are read out of the DOM (XMPReader.java:160, 195-212, 215-257).",
+      "unverified": "Whether the target JDK/parser configuration actually resolves external entities (stock JDK defaults do, but global jaxp.properties, security manager/JDK flags, or an application-level factory override would change this); whether entity content is observable in the caller's returned metadata in a given application; exact exploitation chain (blind vs reflected) and whether SSRF is possible in a locked-down network. Static review only - not runtime-confirmed.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Scope: 757 visible source files (668 Java parsed by the P1 index, 4 omitted; no test sources are present in the snapshot). Reviewed module layout (common-io/common-lang/common-image, imageio-core and all imageio-* format plugins, contrib, servlet, excluded sandbox). Inspected at source level: XML parsing paths (XMPReader, XMLSerializer/DOMSerializer, SVG reader external-resource handling), metadata readers (TIFFReader, IPTC/EXIF/PSD readers), core streams (SubImageInputStream, IIOInputStreamAdapter, ByteArrayImageInputStream, cached seekable streams, DecoderStream), OLE2/CompoundDocument and Win32Lnk, several format decoders (BMP RLE4/8, PCX, TGA, SGI, PSD channel decoding, JPEG segment/Huffman/quantization tables, WebP lossless/VP8 entry points), command-exec sites, and the deprecated servlet cache/upload code. Not exhaustive: very large readers (TIFFImageReader ~143 KB, PICTImageReader ~113 KB, PSDImageReader ~67 KB, JPEGImageReader ~66 KB, VP8 loop filter/macroblock code) were sampled rather than line-by-line audited. The P1 relation index provided only syntax-level navigation hints (calls/containment/config hints) and no data-flow or reachability proof, so every candidate was verified against source text.",
+  "limitations": [
+    "No tests, runnable harness, or ground-truth data are present, and code was not executed; exploitability (including JAXP external-entity behavior in the target runtime) is inferred from source and documented defaults, not runtime-confirmed.",
+    "The P1 relation index is partial and syntax-level: it cannot confirm control/data flow or reachability, and 4 files are omitted/unsupported by the index.",
+    "Large format readers (TIFF, PICT, VP8, parts of PSD/JPEG) were not audited exhaustively; additional memory-safety/DoS defects may exist there.",
+    "Whether the XMP parse is actually reached in a given application depends on which ImageReader APIs the application calls (getImageMetadata paths) and on any global JAXP hardening the application may apply.",
+    "The servlet module is legacy/@Deprecated and was only lightly reviewed; findings there were not prioritized."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CompoundDocument.getSIdChain follows SAT pointers without cycle detection (`while (sid != END_OF_CHAIN_SID && sid != FREE_SID) { chain.addSID(sid); sid = sat[sid]; }`, common/common-io/src/main/java/com/twelvemonkeys/io/ole2/CompoundDocument.java:416-428)",
+      "reason": "A cyclic/self-referencing sector chain in a crafted OLE2/Thumbs.db file could spin/OOM, but the loop is only reachable through the OLE2/ThumbsDB path, cycle feasibility was not verified against the header validation, and impact is availability-only. Not selected."
+    },
+    {
+      "lead": "HuffmanTable last dimension sized 200 while a malformed DHT segment can declare up to 255 codes per length (`v = new short[4][2][16][200]`, write at `table.v[t][c][i][j]`, imageio/imageio-jpeg/src/main/java/com/twelvemonkeys/imageio/plugins/jpeg/HuffmanTable.java:45 and 159-166)",
+      "reason": "Produces an unchecked ArrayIndexOutOfBoundsException (crash/DoS) on crafted JPEG DHT data; availability-only, and I could not exclude a shadowing validation. Not selected as the single candidate."
+    },
+    {
+      "lead": "Legacy servlet HTTP cache builds filesystem paths from the decoded request URI and from request parameters that are not fully sanitized (`new File(tempDir, \"./\" + pCacheURI ...)`, servlet/src/main/java/com/twelvemonkeys/servlet/cache/HTTPCache.java:521-527, 650-673, 717-722)",
+      "reason": "Potential path traversal/arbitrary file write, but the module is @Deprecated, most containers normalize/reject encoded dot-segments before the filter, and exploitation is container-dependent. Not selected."
+    },
+    {
+      "lead": "Win32FileSystem invokes CMD.EXE with an application-supplied path (`exec(new String[]{\"CMD.EXE\", \"/C\", \"DIR\", \"/-C\", pPath.getAbsolutePath()})`, common/common-io/src/main/java/com/twelvemonkeys/io/Win32FileSystem.java:48) and SipsJP2Reader execs /usr/bin/sips on a temp file",
+      "reason": "cmd.exe argument-injection is conceivable on Windows if an application passes attacker-controlled path text to FileUtil.getFreeSpace, but the library's own flows pass trusted paths, so attacker control was not established. Not selected."
+    },
+    {
+      "lead": "XMPScanner.scanForXMPPacket can compute a negative length and then loop on reader EOF (`while (reader.read() != '>') {}`, imageio/imageio-metadata/src/main/java/com/twelvemonkeys/imageio/metadata/xmp/XMPScanner.java:151-166)",
+      "reason": "A negative length is rejected by IIOInputStreamAdapter's Validate check, and no in-repo reader calls XMPScanner, so reachability/exploitability is unproven. Not selected."
+    }
+  ],
+  "summary": "TwelveMonkeys ImageIO 3.8.0-SNAPSHOT (757 visible files; 668 Java files parsed by the relation index, 4 omitted). Most of the attack surface is image/metadata parsing of untrusted files. After tracing attacker-controlled input through readers, metadata parsers, stream wrappers, OLE2 helpers, and the legacy servlet module, the single strongest source-evidenced lead is an XXE-style issue: `XMPReader` parses attacker-controlled XMP payloads with a default `DocumentBuilderFactory` and no DTD/entity/XInclude hardening or EntityResolver, and this parser is reachable from ordinary metadata calls in the PSD and WebP plugins. Rejected secondary leads (availability-only crashes, container-dependent path handling, app-supplied-path command execution) are listed below. The candidate is a lead, not a runtime-confirmed vulnerability; no code was executed and no exploit was tested."
+}

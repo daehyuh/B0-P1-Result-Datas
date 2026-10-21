@@ -1,0 +1,86 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Unauthenticated remote HTTP request body (JSON `username`/`password` fields on `POST /api/v1/auth/login`). The username must be the configured console user (default `seata`, shipped in `server/src/main/resources/application.yml`); the password is fully attacker-controlled and may be any value. The front end/other clients use the same endpoint (`console-fe/src/service/login.ts`; `RaftRegistryServiceImpl.refreshToken` posts to `http://<tcAddress>/api/v1/auth/login`).",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified in source that `CustomUserDetailsServiceImpl.loadUserByUsername` rejects unknown usernames and stores a BCrypt hash (so `password.equals(hash)` is practically never true); verified `supports` returns true for the exact token type used by AuthController; verified only one `AuthenticationProvider` bean and one `UserDetailsService` bean exist in the repo, and `WebSecurityConfig.authenticationManagerBean()` is the only AuthenticationManager bean definition; verified `BadCredentialsException` thrown by a Dao provider does not abort ProviderManager's provider loop (only AccountStatusException/InternalAuthenticationServiceException are rethrown), so a later provider can still succeed; verified the shipped `application.yml` keeps `/api/v1/auth/login` in the ignore list while requiring JWT for other endpoints, and that seata-server packages the console classes. Counter-consideration: if Spring did not register the `AuthenticationProvider` bean into the manager used by the controller, the Dao provider would reject wrong passwords and no bypass would occur; this DI wiring is standard Spring Security behavior but was not runtime-verified (index explicitly does not resolve DI). Also, the shipped default password is `seata`, so default deployments are already weak independently of this flaw.",
+      "id": "seata-console-auth-provider-inverted-check",
+      "impact": "Authentication bypass. An unauthenticated attacker who knows only the console username (default `seata`) obtains a valid, secret-signed JWT without the password, defeating password change/rotation. The token grants access to JWT-protected management APIs, e.g. `GET /api/v1/console/globalSession/query` and `GET /api/v1/console/globalLock/query` (transaction/lock metadata disclosure) and the state-changing `POST /metadata/v1/changeCluster?raftClusterStr=...` (Raft cluster reconfiguration) in the default server configuration, i.e. administrative control of the Seata console/coordination server.",
+      "locations": [
+        {
+          "end_line": 48,
+          "path": "console/src/main/java/org/apache/seata/console/security/CustomAuthenticationProvider.java",
+          "start_line": 37
+        },
+        {
+          "end_line": 78,
+          "path": "console/src/main/java/org/apache/seata/console/controller/AuthController.java",
+          "start_line": 57
+        },
+        {
+          "end_line": 91,
+          "path": "console/src/main/java/org/apache/seata/console/config/WebSecurityConfig.java",
+          "start_line": 82
+        },
+        {
+          "end_line": 60,
+          "path": "console/src/main/java/org/apache/seata/console/security/CustomUserDetailsServiceImpl.java",
+          "start_line": 46
+        },
+        {
+          "end_line": 57,
+          "path": "server/src/main/resources/application.yml",
+          "start_line": 36
+        },
+        {
+          "end_line": 211,
+          "path": "server/pom.xml",
+          "start_line": 207
+        },
+        {
+          "end_line": 31,
+          "path": "server/src/main/java/org/apache/seata/server/ServerApplication.java",
+          "start_line": 26
+        }
+      ],
+      "prerequisites": "1) The console/auth classes are active in the deployment: the `seata-server` module depends on `seata-console` (server/pom.xml:207-211) and `ServerApplication` scans `org.apache.seata` (ServerApplication.java:26), so `WebSecurityConfig`, `AuthController` and `CustomAuthenticationProvider` run inside the TC web port; the same applies to the standalone console app. 2) The admin username is known (default `seata` is shipped and documented). 3) `console.user.*` and `seata.security.*` properties are configured (they are in the shipped application.yml); `seata.security.ignore.urls` keeps `/api/v1/auth/login` reachable without a token (application.yml:57) and protects the remaining endpoints with the JWT filter.",
+      "root_cause": "`CustomAuthenticationProvider.authenticate` inverts both branches of the credential decision: on mismatch (`!password.equals(userDetails.getPassword())`) it returns `new UsernamePasswordAuthenticationToken(username, null, null)`, which Spring Security treats as a successful authentication, and on a literal match it returns `null` (\"no decision\"). The provider is annotated `@Component` and unconditionally supports `UsernamePasswordAuthenticationToken`, so the `AuthenticationManager` injected into `AuthController` (the bean exposed by `WebSecurityConfig.authenticationManagerBean()`, which is backed by Spring Security's global builder populated from `AuthenticationProvider`/`UserDetailsService` beans) contains it. Any non-mailformed password therefore authenticates the configured console user.",
+      "title": "Console login authentication bypass: CustomAuthenticationProvider succeeds on password mismatch",
+      "trace": "1) Attacker sends POST /api/v1/auth/login with `{\"username\":\"seata\",\"password\":\"not-the-password\"}`. 2) AuthController (lines 59-64) builds `UsernamePasswordAuthenticationToken(username, password)` and calls `authenticationManager.authenticate(...)`. 3) The `AuthenticationManager` bean is the one exposed by WebSecurityConfig.authenticationManagerBean() (lines 82-86); Spring Security's global ProviderManager iterates the `AuthenticationProvider` beans, which includes the sole `CustomAuthenticationProvider` (`@Component`, line 31). 4) `authenticate` loads `CustomUserDetails` (stored password is a BCrypt hash, CustomUserDetailsServiceImpl lines 46-52) and evaluates `!password.equals(userDetails.getPassword())`; for any normal submitted password this is true, so line 45 returns a `UsernamePasswordAuthenticationToken` whose authenticated flag is true. 5) ProviderManager treats the non-null result as success and returns it (a preceding DaoAuthenticationProvider may throw BadCredentialsException first, but ProviderManager catches AuthenticationException and continues to the next provider). 6) AuthController calls `jwtTokenUtils.createToken(authentication)` and returns a valid `Bearer` JWT; the JWT filter later accepts it for every non-ignored endpoint. The literal-hash path (line 47) returns null and falls through to the Dao provider, but that path is not needed for the bypass.",
+      "unverified": "Runtime confirmation was not performed (no code execution). The exact Spring Security 5.7 `AuthenticationConfiguration` wiring that feeds the `CustomAuthenticationProvider` bean into the manager exposed by `authenticationManagerBean()` is inferred from framework conventions and annotations, not executed; the P1 index reports Spring DI/enforcement as unverified. The provider's ordering relative to the Dao provider is not runtime-verified, though either order still yields the bypass. No test in the snapshot exercises this login path.",
+      "weakness_type": "CWE-287 Improper Authentication (inverted credential check / authentication bypass)"
+    }
+  ],
+  "coverage_summary": "Source scope: 1,825 files under the assigned root (1,480 Java), 0 excluded by sensitive-name/path or symlink filters; binary-like files are refused/skipped by the NUL-byte policy. P1 relation scope: index status partial — 1,802 files indexed with 23 source files missing, 19 omitted files, 0 parse errors, 28,713 symbols, 53,681 call sites and 45,301 edges, but 41,705 calls unresolved; capabilities explicitly exclude control flow, data flow and semantic resolution, and Spring annotation/DI, profiles and security enforcement are unverified. I traced the console/server authentication path end-to-end from HTTP controller -> AuthenticationManager/ProviderManager -> provider -> UserDetailsService -> JWT issuance -> JWT filter, checking the server dependency and component-scan wiring and the shipped/default configuration, and sampled other security-relevant areas (namingserver, raft serializers, serializers/whitelists, rm-datasource undo parsers, saga expression/script handling, DB console services for SQL parameterization). Review was targeted, not exhaustive over all 1,825 files; unindexed files were not claimed as reviewed.",
+  "limitations": [
+    "P1 index is navigation-only: no control-flow/data-flow, no semantic resolution, 41,705 unresolved calls, 23 source files missing, 19 omitted files; Spring bean wiring is inferred from annotations and framework conventions.",
+    "No code, tests, scanners or exploits were executed; the finding is a source-evidence lead, not a runtime-confirmed vulnerability.",
+    "Runtime provider-ordering and DI registration in Spring Security 5.7 were not executed, which is the main uncertainty for exploitability.",
+    "Coverage was targeted rather than exhaustive; large modules (rm-datasource, sqlparser, saga engine, storage/redis, integrations) were only sampled.",
+    "No access to commit history, patches, advisories or ground-truth data, so it cannot be determined whether the inverted logic is upstream code or a mutation.",
+    "External network services, host credentials and sibling runs were not consulted, per the review constraints."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "WebSecurityConfig.configure(WebSecurity) defaults `seata.security.ignore.urls` to `/**`, which would disable all URL security if the property is absent (console/src/main/java/org/apache/seata/console/config/WebSecurityConfig.java:95).",
+      "reason": "Insecure-default hardening concern, not the selected finding. All shipped configurations (server/src/main/resources/application.yml:57, application.example.yml:227-228, application.raft.example.yml) set the property explicitly, and the console's required `console.user.*`/`seata.security.*` properties must also be supplied for startup, so the fallback is only reachable in misconfigured standalone deployments."
+    },
+    {
+      "lead": "Unauthenticated state-changing endpoints `GET /vgroup/v1/addVGroup` and `/vgroup/v1/removeVGroup` (server/src/main/java/org/apache/seata/server/controller/VGroupMappingController.java:45-78), explicitly listed in the default ignore URLs.",
+      "reason": "Appears to be an intentional internal API: the namingserver calls these URLs (`NamingServerConstants.HTTP_ADD_GROUP_SUFFIX`/`HTTP_REMOVE_GROUP_SUFFIX`, used by NamingManager's addGroup/changeGroup flow), and the endpoint is deliberately excluded from JWT enforcement in the shipped config. Exposure depends on network placement; no evidence of an injected defect."
+    },
+    {
+      "lead": "`server.enableCheckAuth` is effectively a no-op: the only `RegisterCheckAuthHandler` implementation in the snapshot, `DefaultCheckAuthHandler`, always returns true, while clients build an ak/digest/timestamp signature (`TmNettyRemotingClient.getExtraData`, RegisterTMRequest.UDATA_DIGEST) that no server-side handler verifies.",
+      "reason": "Intent is ambiguous — the SPI is a custom-extension point whose default implementation is 'allow', and no removed verifier can be shown from source alone. Not enough evidence to prefer it over the console authentication flaw."
+    },
+    {
+      "lead": "Deserialization of attacker-influenced type names/autoType in Raft and undo-log paths: `CustomDeserializer` does `Class.forName(className)` for Jackson-serialized Raft messages (server/src/main/java/org/apache/seata/server/cluster/raft/serializer/CustomDeserializer.java:33-38), and `Fastjson2UndoLogParser` enables `JSONReader.Feature.SupportAutoType` without an explicit filter (rm-datasource/src/main/java/org/apache/seata/rm/datasource/undo/parser/Fastjson2UndoLogParser.java:35-44).",
+      "reason": "Requires access to the internal Raft port / tampered DB undo-log rows respectively; the index provides no reachability or attacker-control evidence, and both patterns match upstream hardening-related code. Kept as an unconfirmed lead, not the selected candidate."
+    },
+    {
+      "lead": "Saga state-machine JSON parsing with polymorphic typing (`JacksonJsonParser.enableDefaultTypingAsProperty(DefaultTyping.NON_FINAL, \"@type\")`, saga/seata-saga-statelang/.../JacksonJsonParser.java:39-42).",
+      "reason": "State-machine definitions are trusted configuration loaded by the application, not external attacker input in this snapshot; no concrete untrusted entry point identified."
+    }
+  ],
+  "summary": "Reviewed the Apache Seata source snapshot (1,825 files; 1,480 Java) with the P1 syntax-relation index used only for navigation. The strongest single issue is an authentication-logic flaw in the Seata console/server login path: `CustomAuthenticationProvider.authenticate` returns an authenticated `UsernamePasswordAuthenticationToken` when the supplied password does NOT equal the stored credential and returns `null` (no decision) when it does. Because the provider is a `@Component` and `AuthController` calls the `AuthenticationManager` exposed by `WebSecurityConfig`, a wrong password for a valid console username produces a valid JWT instead of a failure. The shipped `seata-server` configuration (server depends on seata-console; `ServerApplication` scans `org.apache.seata`; `application.yml` defines console user + security properties and leaves `/api/v1/auth/login` reachable) makes this a server-facing authentication bypass. Other suspected issues (default `/**` URL-ignore fallback, unauthenticated namingserver endpoints, missing server-side registration signature verification, raft/undo-log deserialization) were checked but are config-dependent, plausibly by design, or lack evidence of external attacker control, and are listed as rejected leads."
+}

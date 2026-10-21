@@ -1,0 +1,98 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remote, typically unauthenticated HTTP client controls the `tags` query parameter and/or the tag path segment (`/system/health/<tags>.json`, `<tags>.<format>`) of the HealthCheckExecutorServlet, and also `names`, `hcDebug`, `httpStatus`, `timeout`, `combineTagsWithOr`. Only `tags` reaches the filter unescaped. Example-shaped values containing filter metacharacters such as a closing/opening parenthesis plus `objectClass=*` keep the generated filter syntactically valid while adding clauses; a deliberately malformed value makes createFilter throw and the code silently return zero service references.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that `names` is escaped via escapeOsgiFilterLiteral (lines 119/122) and that the helper only escapes `*`, `(`, `)` (backslash is not escaped), which limits the `names` path but not the raw `tags` path. Verified that tag values genuinely come from the request (doGet lines 286-302) and are not sanitized downstream. Verified that the tag-selector feature itself is intentional, and that `disable_request_configuration=true` (config line 79-80) is the designed mitigation; defaults leave it false. Verified the reflective legacy-wrapper path actually calls `execute()` on non-HealthCheck objects and catches reflective failures. Verified zero-result executions are reported OK (CombinedExecutionResult lines 38-48). Considered that the servlet requires an explicit configuration to be active and that its default registration is in the unauthenticated default whiteboard context (line 256-258 of the servlet). No runtime test was executed, so exploitability in a specific deployment was not confirmed.",
+      "id": "healthcheck-tags-filter-injection",
+      "impact": "Unauthenticated boundary violation on a public health endpoint: (a) selection of arbitrary OSGi services instead of HealthCheck services, causing getService()/ungetService() and reflective invocation of public no-arg `execute()` methods on unrelated services - unintended side effects/DoS against services that happen to expose such a method; (b) spoofing of the health signal (empty/injected selection yields overall OK/200, or selectively executes only benign checks) so load balancers/orchestrators can keep routing traffic to an unhealthy instance; (c) information disclosure of service class names/messages and, with `hcDebug=true`, debug/exception details for selected services. The same file's `names` handling shows the intended escaping pattern, making the omission in `tags` the defect.",
+      "locations": [
+        {
+          "end_line": 109,
+          "path": "healthcheck/core/src/main/java/org/apache/felix/hc/core/impl/util/HealthCheckFilter.java",
+          "start_line": 90
+        },
+        {
+          "end_line": 146,
+          "path": "healthcheck/core/src/main/java/org/apache/felix/hc/core/impl/util/HealthCheckFilter.java",
+          "start_line": 144
+        },
+        {
+          "end_line": 126,
+          "path": "healthcheck/core/src/main/java/org/apache/felix/hc/core/impl/util/HealthCheckFilter.java",
+          "start_line": 111
+        },
+        {
+          "end_line": 302,
+          "path": "healthcheck/core/src/main/java/org/apache/felix/hc/core/impl/servlet/HealthCheckExecutorServlet.java",
+          "start_line": 286
+        },
+        {
+          "end_line": 83,
+          "path": "healthcheck/core/src/main/java/org/apache/felix/hc/core/impl/executor/HealthCheckFuture.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 147,
+          "path": "healthcheck/core/src/main/java/org/apache/felix/hc/core/impl/executor/HealthCheckFuture.java",
+          "start_line": 121
+        },
+        {
+          "end_line": 48,
+          "path": "healthcheck/core/src/main/java/org/apache/felix/hc/core/impl/executor/CombinedExecutionResult.java",
+          "start_line": 35
+        },
+        {
+          "end_line": 80,
+          "path": "healthcheck/core/src/main/java/org/apache/felix/hc/core/impl/servlet/HealthCheckExecutorServletConfiguration.java",
+          "start_line": 65
+        }
+      ],
+      "prerequisites": "(1) The HealthCheckExecutorServlet component is activated by an explicit configuration (ConfigurationPolicy.REQUIRE; factory metatype with defaults) - it is a widely used health-probe endpoint. (2) The request-based configuration is left at its default (`disable_request_configuration=false`). (3) The servlet is registered in the default HTTP whiteboard context (no `servletContextName` configured), i.e. not protected by an authentication handler. (4) For the reflective invocation impact, some matched service must expose a public no-arg `execute()` method (the legacy-HC wrapper calls it by reflection); for the status-spoofing/DoS impact no such service is needed.",
+      "root_cause": "In HealthCheckFilter.getServiceFilter the `names` selector values are passed through escapeOsgiFilterLiteral(), but the `tags` selector values are concatenated raw into the OSGi filter string `(healthcheck.tags=<tag>)` (lines 98, 102, 104). The filter is then handed to BundleContext.getServiceReferences(null, filterString) (line 64). Tags arrive unauthenticated from the HTTP request (query parameter `tags` or path tokens) in HealthCheckExecutorServlet.doGet (lines 286-302) and flow through HealthCheckSelector.withTags() into the raw concatenation, so filter metacharacters `*`, `(`, `)` supplied by the client change the structure of the filter (no neutralization).",
+      "title": "Unauthenticated OSGi filter injection via Health Check `tags` parameter (arbitrary service selection and reflective execute())",
+      "trace": "HTTP GET /system/health.json?tags=<crafted> -> HealthCheckExecutorServlet.doGet(request,response,pathTokensStr,format) splits path tokens/params and builds HealthCheckSelector.withTags(tags) (lines 286-302) -> HealthCheckExecutorImpl.execute(selector, options) (lines 172-182) -> HealthCheckFilter.getServiceFilter concatenates each tag raw into `(healthcheck.tags=<tag>)` inside the overall `(&(|(objectClass=HealthCheck)...)(|...))` filter (lines 91-109) -> BundleContext.getServiceReferences((String) null, filterString) (line 64) returns services selected by the injected filter -> HealthCheckExecutorImpl creates futures -> HealthCheckFuture.call() calls bundleContext.getService(ref) and, because the object is not a HealthCheck, wraps it in LegacyHealthCheckWrapper (lines 67-74), whose execute() reflectively looks up and invokes a public no-arg `execute()` method on the unrelated service and then tries to read private fields `resultLog`/`entries` (lines 121-147). Separately, if the injected filter is syntactically invalid, getServiceReferences is skipped/caught (lines 72-76) and an empty reference list flows into CombinedExecutionResult, which reports overall OK for zero results (lines 38-48), so a failing instance's endpoint can answer OK/200.",
+      "unverified": "No runtime verification: the exact filter string produced by a crafted `tags` value, whether a target deployment has the servlet enabled with request-based configuration, and whether reachable non-HealthCheck services expose a side-effecting no-arg `execute()` were reasoned from source only. Whether upstream considers client-selected tags trusted is also not documented beyond the `disable_request_configuration` option.",
+      "weakness_type": "CWE-90 / CWE-74: OSGi (LDAP-style) filter injection due to missing escaping of untrusted input"
+    }
+  ],
+  "coverage_summary": "Reviewed the felix-dev snapshot as exposed by the tool filter (3154 readable text files; test sources are not present in the snapshot - no `**/src/test/**` files were listed, which limits confirmation of intended behavior/regression tests). Focused on externally reachable/runtime modules: healthcheck (core, webconsole plugin, generalchecks), webconsole and webconsole-plugins, http (base/jetty/sslfilter/wrappers/plugins), configurator, configadmin + cm.json + interpolation plugin, fileinstall, bundlerepository/OBR, framework/framework.security, systemready, inventory, utils, gogo, and tools/maven-bundle-plugin. Used manual text search for request-parameter sinks, file/path handling, filter construction, XML parsing, deserialization, reflection, and output encoding. No tools beyond list/search/read were available (B0 condition: no source-relation index), and no code, tests, or scanners were executed.",
+  "limitations": [
+    "The snapshot excludes test sources, so intended behavior/regression expectations could not be cross-checked.",
+    "No runtime execution or exploit reproduction was performed; all conclusions are source-level and some are deployment-dependent (e.g., whether the HealthCheckExecutorServlet is enabled, in which context it is registered, and whether request-based configuration is disabled).",
+    "I could not determine which snapshot commit/version is the benchmark's ground truth; module changelogs are stale relative to pom versions (e.g., webconsole 5.0.9-SNAPSHOT vs README notes ending at 5.0.2), so fix-follow-up code could not be compared.",
+    "Large modules were sampled rather than exhaustively reviewed line-by-line (dependencymanager, ipojo, eventadmin, coordinator, metatype, log, coordinator, connect, main, examples, gogo internals, and parts of framework/http), so additional vulnerabilities may exist outside the reviewed paths.",
+    "Severity/likelihood judgments for the chosen candidate rely on reasoning about OSGi service selection and health-probe deployment practice, not on executed proof."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "JSONP callback injection in the health check servlet: HealthCheckExecutorServlet.java lines 350-352 take the request parameter `callback` unvalidated and ResultJsonSerializer.java lines 67-69 concatenate it into a response served as `application/javascript` (line 405-408), with JSONP in the default allowed formats (HealthCheckExecutorServletConfiguration.java lines 65-71).",
+      "reason": "Real missing-validation issue, but the injected script executes mainly in the browsing context of a page that includes the endpoint as a script; a direct victim-origin XSS on navigation is not established (browsers render `application/javascript` responses as text), so the security impact is weaker and more debatable than the tag filter-injection candidate. Kept as unconfirmed lead."
+    },
+    {
+      "lead": "webconsole licenses servlet: `boolean isLicense` is computed from the LICENSE_FILES allowlist but never used to gate sendResource (LicenseServlet.java lines 251-260), so any bundle resource (not only license files) can be requested.",
+      "reason": "Reading non-license entries stays inside the requested bundle (framework DirectoryContent enforces a canonical-root check, JarContent cannot match `..`), so impact is an admin-only intra-bundle information disclosure, well below the chosen candidate."
+    },
+    {
+      "lead": "webconsole memory-usage plugin: getDumpFile rejects only '/' in the requested dump name (MemoryUsageSupport.java lines 512-527) and doGet/doDelete pass the path label through; on Windows a `..\\` or drive-absolute name can read/delete files outside the dump directory.",
+      "reason": "OS-specific and requires an authenticated web console administrator who already has bundle-install/RCE capability; impact is marginal relative to the chosen candidate."
+    },
+    {
+      "lead": "Configadmin interpolation plugin secrets lookup uses File.getAbsolutePath() prefix matching instead of canonical paths (InterpolationConfigurationPlugin.java lines 260-278), allowing symlink/prefix escapes of the configured secrets directory.",
+      "reason": "Requires attacker control of files/symlinks in the secrets directory or of configuration values; the `..` and absolute-path checks are present, so exploitation conditions are narrower and unverified."
+    },
+    {
+      "lead": "Configurator BinaryManager dereferences `provider` inside its own `provider == null` branch (BinaryManager.java lines 52-57), an obvious NPE when reading binary values from the framework-property-provided initial configuration.",
+      "reason": "Robustness/availability bug reachable only through operator-controlled `felix.configurator.initial` input; no attacker control demonstrated."
+    },
+    {
+      "lead": "Health check HTML serializer writes exception stack traces inside an unescaped HTML comment (`<!--` ... `-->`, ResultHtmlSerializer.java lines 112-115), which could break out if a health check exception message contains `-->`.",
+      "reason": "Requires attacker influence over an exception message produced by a configured health check; purely speculative from source."
+    },
+    {
+      "lead": "webconsole ConfigurationUtil.isAllowedPid permits LDAP filter metacharacters `(`, `)`, `*`, `\\` that are concatenated into `ConfigurationAdmin.listConfigurations` filters (ConfigurationUtil.java lines 47, 86-94).",
+      "reason": "The affected plugin is behind web console authentication and the user is already an administrator; impact (selecting another configuration) is low."
+    }
+  ],
+  "summary": "Repository-wide source review of the assigned felix-dev snapshot (3154 files; tests excluded by the source filter). I traced the highest-value unauthenticated input flow I could substantiate: the Felix Health Check Executor Servlet accepts a client-supplied `tags` value and concatenates it unescaped into an OSGi service filter, while the sibling `names` value is escaped. Because the servlet is a public HTTP whiteboard endpoint (default context, no authentication) and is designed for load balancers, a remote, unauthenticated request can alter which services are selected and executed: the executor's legacy-compatibility path then reflectively invokes `execute()` on non-HealthCheck service objects, and an invalid injected filter degrades to an empty result set that is reported as OK/200 (health-check bypass). One candidate is submitted; several lower-severity/less-certain leads are listed as rejected. No code was executed and no runtime confirmation was attempted."
+}

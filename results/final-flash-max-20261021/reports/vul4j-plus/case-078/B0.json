@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Full control of the XML document (or reader/input stream) handed to XStream.fromXML/unmarshal, e.g. data received over HTTP/JMS/file upload. The attacker chooses the element names, the 'class'/'resolves-to' system attributes, and nested field values, thereby selecting which class names the mapper resolves and which converters instantiate them.",
+      "confidence": "medium",
+      "counterevidence_checked": "The repository documents the insecure default: faq.html:709-725 ('XStream deserializes arbitrary objects! ... it is possible to adjust the processed XML manually to inject arbitrary objects') and faq.html:728-734 (warning + setupDefaultSecurity), and XStream.unmarshal prints 'Security framework of XStream not initialized, XStream is probably vulnerable.' (XStream.java:1484). That documentation is why confidence is medium rather than high. However, the same docs state EventHandler is no longer handled automatically (faq.html:701-706; changes.html:287), and the InternalBlackList exists precisely to enforce that for an uninitialized instance (its unmarshal throws 'Security alert. Unmarshalling rejected.', XStream.java:2553-2555) - the flag ordering defeats that stated protection. If the application calls XStream.setupDefaultSecurity() or addPermission(NoTypePermission.NONE) + a whitelist, SecurityMapper throws ForbiddenClassException and the attack path is closed. Converter lookup results are also cached per type name (core/DefaultConverterLookup.java:65, 76-77), so a first benign lookup does not restore the block.",
+      "id": "xstream-default-security-blacklist-bypass",
+      "impact": "Unauthenticated remote code execution in applications that deserialize untrusted XML with a default XStream instance (the behavior the project's own CVE-2013-7285 documentation warns about: EventHandler/ProcessBuilder chain). Weaker but still serious variants allowed by the same root cause include arbitrary object instantiation and gadget-driven side effects (network access, file operations) via any type available on the classpath. The permissive default is the documented 'not initialized' mode, but the internal blacklist that is supposed to stop known exploit types is provably inert during unmarshalling, which is the concrete source-level defect.",
+      "locations": [
+        {
+          "end_line": 700,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 693
+        },
+        {
+          "end_line": 1485,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 1480
+        },
+        {
+          "end_line": 2546,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 2537
+        },
+        {
+          "end_line": 964,
+          "path": "xstream/src/java/com/thoughtworks/xstream/XStream.java",
+          "start_line": 958
+        },
+        {
+          "end_line": 78,
+          "path": "xstream/src/java/com/thoughtworks/xstream/mapper/SecurityMapper.java",
+          "start_line": 70
+        },
+        {
+          "end_line": 23,
+          "path": "xstream/src/java/com/thoughtworks/xstream/security/AnyTypePermission.java",
+          "start_line": 21
+        }
+      ],
+      "prerequisites": "The application uses a default-constructed XStream instance without initializing permissions (no XStream.setupDefaultSecurity(xstream) and no addPermission(NoTypePermission.NONE)/whitelist), and processes attacker-influenced XML. A suitable gadget type must be on the classpath; java.beans.EventHandler (java.desktop module) is present in typical JDK 8/11 runtimes. If the application instead sets up the whitelist, the attack fails because SecurityMapper throws ForbiddenClassException.",
+      "root_cause": "XStream's built-in protection for a default (uninitialized-security) instance is self-defeating. (1) setupSecurity() registers AnyTypePermission.ANY for every new XStream instance and only raises the insecureWarning flag (XStream.java:693-700). (2) SecurityMapper.realClass then returns any class resolved from element names/class attributes (SecurityMapper.java:70-78), because AnyTypePermission.allows always returns true (AnyTypePermission.java:21-23). (3) The converter that is supposed to block the known exploit types, InternalBlackList, only reports those types when insecureWarning is true (XStream.java:2539-2546), but XStream.unmarshal() sets insecureWarning=false at the start of the call, before the marshalling strategy performs any conversion or converter lookup (XStream.java:1480-1485). Consequently the EventHandler/$LazyIterator/javax.crypto.* block is never in effect while parsing untrusted input, and ReflectionConverter (registered at PRIORITY_VERY_LOW, XStream.java:958-959) instantiates the attacker-chosen type. The same flag also drives the 'framework not initialized' warning, so gating a security control on it is logically wrong.",
+      "title": "Default XStream configuration deserializes arbitrary attacker-specified types: internal blacklist is disabled during unmarshalling",
+      "trace": "XStream.fromXML -> XStream.unmarshal (XStream.java:1480) clears insecureWarning (line 1483) before parsing -> TreeMarshallingStrategy/TreeUnmarshaller.start (core/TreeUnmarshaller.java:131-137) -> HierarchicalStreams.readClassType (core/util/HierarchicalStreams.java:25-34) -> SecurityMapper.realClass (mapper/SecurityMapper.java:70-78) returns the attacker-named class because AnyTypePermission.ANY is registered (XStream.java:698; AnyTypePermission.allows:21-23) -> TreeUnmarshaller.convertAnother -> DefaultConverterLookup.lookupConverterForType (core/DefaultConverterLookup.java:64-86) -> InternalBlackList.canConvert (XStream.java:2539-2546) returns false because insecureWarning is already false -> ReflectionConverter is selected and instantiates the attacker-specified type, including java.beans.EventHandler; nested target/action fields make the proxy handler invoke a chosen method (e.g. ProcessBuilder.start) at invocation time.",
+      "unverified": "No code was executed and no payload was run, so exploitability is source-inferred, not runtime-confirmed. The exact upstream release/fix mapping (the snapshot declares 1.4.11-SNAPSHOT and no CVE text for this issue is present in the tree) is an inference; the fix for the 1.4.11 security release may have been either removing the insecureWarning condition on the blacklist or making the whitelist the default (both are covered by the locations above). Whether real deployments leave the default security framework uninitialized, the JDK/gadget availability (java.beans.EventHandler), and the effect of any application-level converter registrations were not verified.",
+      "weakness_type": "Unsafe deserialization of untrusted data (CWE-502) with an ineffective protection mechanism (CWE-693)"
+    }
+  ],
+  "coverage_summary": "481 model-visible files were inventoried: the xstream main sources (XStream.java, mapper chain incl. SecurityMapper/MapperWrapper/CachingMapper, all security permissions, core unmarshalling, reflection/serialization converters, Java reflection converters, XML drivers, XStreamer), plus xstream-hibernate, xstream-jmh/xstream-benchmark, build files and xstream-distribution documentation/HTML. Deep reading focused on the unmarshalling trust boundary: type resolution (HierarchicalStreams/DefaultMapper/SecurityMapper), converter registration and lookup priorities, the internal blacklist, permission flag logic, deserialization entry points (fromXML/unmarshal/createObjectInputStream), XML parser hardening, and helpers that load classes. No test sources are present in the snapshot (pom.xml references xstream/src/test, but no test files were provided), so behavioral expectations could only be checked against source and documentation.",
+  "limitations": [
+    "No execution, tests, or scanners were run; the finding is source-inferred and not runtime-confirmed.",
+    "Test suites are excluded from the snapshot, so the intended semantics of the insecureWarning flag and the presence/absence of regression tests for the EventHandler block could not be verified.",
+    "The snapshot declares version 1.4.11-SNAPSHOT; mapping to a specific upstream release/CVE (e.g. the 1.4.11 security fix) is an inference from version, docs and code state, not from repository history (no git metadata was available).",
+    "Only a subset of the 481 files was read line-by-line; the rest were inventoried and searched for security-relevant patterns (class loading, XXE flags, permission checks, dangerous operations), so a flaw in a lightly inspected area cannot be fully excluded.",
+    "Exploitability depends on deployment details not visible here: whether applications initialize XStream permissions, the JDK version (java.beans.EventHandler availability), and the classpath/gadget availability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "JavaClassConverter/JavaMethodConverter/JavaFieldConverter resolve class names with their own DefaultMapper and ClassLoaderReference, not the XStream mapper (XStream.java:1002-1005; converters/extended/JavaClassConverter.java:38-73; JavaFieldConverter.java:41-101; JavaMethodConverter.java:43-120), so the security framework's whitelist is bypassed for the class-name text.",
+      "reason": "Real gap, but it only loads classes (DefaultMapper.realClass uses Class.forName(..., initialize=false) for non-XStream names, mapper/DefaultMapper.java:65-83) and builds Field/Method/Constructor objects; no instantiation or invocation is reachable from that path alone, and it requires the whitelist to already be enabled. Weaker impact and less certain to be the intended issue than the blacklist/default finding."
+    },
+    {
+      "lead": "BEAStaxDriver and XomDriver remain XXE-vulnerable (io/xml/BEAStaxDriver.java:64-70; io/xml/XomDriver.java), as the project's own FAQ table states (xstream-distribution/src/content/faq.html:747-771).",
+      "reason": "Documented, pre-existing limitation acknowledged by the maintainers rather than the security change this snapshot predates; this snapshot is 1.4.11-SNAPSHOT, where the 1.4.9 XXE fixes for the other drivers are already present (DomDriver.java:143-160, Dom4JDriver.java:156-163, JDomDriver.java:118-122, JDom2Driver.java:110-114, StaxDriver.java:240-244)."
+    },
+    {
+      "lead": "XStreamer.fromXML deserializes a complete XStream object graph with a permissive internal permission list (XStreamer.java:54-71, 121-...) and CustomObjectInputStream.resolveClass loads class descriptors via Class.forName without consulting SecurityMapper (core/util/CustomObjectInputStream.java:108-116).",
+      "reason": "Special-purpose API for streams that embed their own XStream instance; the permission list is deliberately curated, the impact path is speculative without a concrete gadget, and it is not the default fromXML entry point most applications expose. Mentioned as an unconfirmed secondary lead only."
+    },
+    {
+      "lead": "DynamicProxyConverter reads the handler type through mapper.realClass (converters/extended/DynamicProxyConverter.java:100-120), and Serializable/Externalizable emulation reads nested types through HierarchicalStreams.readClassType (SerializableConverter.java:322-328, 428-444; ExternalizableConverter.java:141-147).",
+      "reason": "Checked as part of the same trust boundary and found to go through SecurityMapper, so these are not independent bypasses."
+    }
+  ],
+  "summary": "The snapshot is XStream 1.4.11-SNAPSHOT (pre-release; docs still describe the 1.4.10 security model). Review focused on the deserialization trust boundary: the mapper/security chain, converter registration/lookup, the internal blacklist, the XML drivers, and helper APIs that load classes. The strongest source-evidenced weakness is that a default-constructed XStream instance imposes no effective type restriction on attacker-controlled XML: setupSecurity() grants AnyTypePermission.ANY, and the one built-in safeguard (InternalBlackList) is gated on a flag that XStream.unmarshal() clears before any conversion occurs, so it never blocks known-dangerous types (java.beans.EventHandler, javax.crypto.*, $LazyIterator) during unmarshalling. That enables the classic deserialization gadget path to arbitrary code execution. Other leads (class-loading paths in JavaClass/JavaMethod/JavaField converters, XXE in BEAStaxDriver/XomDriver, XStreamer's self-deserialization) were examined and are listed as rejected/unconfirmed because their impact or preconditions are weaker. This is a source-level lead, not a runtime-confirmed exploit."
+}

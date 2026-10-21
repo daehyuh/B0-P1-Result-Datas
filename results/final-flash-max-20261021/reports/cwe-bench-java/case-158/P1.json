@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Fully unauthenticated remote input. The attacker POSTs JSON to the public /jwt_auth endpoint with provider=oauth2, an existing (non-root) appid, and a token string of the form \"<garbage>:<garbage>:<forgeable JWS>\"; the third segment is used verbatim as the id_token. Its payload (base64url JSON) is attacker-chosen and contains \"sub\", \"email\", \"name\", \"picture\". The attacker can also craft the claim types/values and choose oauth2/oAuth2second/oAuth2third aliases.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the id_token is ever validated elsewhere: SecurityUtils.isValidJWToken (HS256 MAC over app secret + user token secret) exists and is used for Para-issued JWTs, but it is never applied to this id_token; no JWKS/issuer/audience/nonce verification exists anywhere in this class. Checked that the IDP profile response, when it succeeds, would overwrite forged claims (profile.putAll at line 323) - however an invalid attacker-chosen access token makes that request fail or return non-200 while the claims remain, so the bypass does not require the IDP to answer. Checked that the other providers (Facebook/Google/LinkedIn/Twitter/Microsoft/Amazon/Slack) authenticate only via server-side calls to the provider with the access token and do not trust client-side token claims. Checked that NewTokenHandler rejects the root appid and requires app existence but performs no other authorization on the provider token. Considered that JWT-auth clients may legitimately send an id_token; even so, identity selection from unverified claims is not safe (and User.readUserForIdentifier's email-based account linking amplifies it).",
+      "id": "para-oauth2-idtoken-unverified",
+      "impact": "Authentication bypass/account takeover: an unauthenticated attacker can obtain a valid Para JWT for an existing user of any non-root app (if the victim's OAuth2 sub is known, or the victim's email when search is enabled), and can also create arbitrary users with attacker-chosen identity fields (identifier, email, name, picture) that are then trusted by account-linking logic. The issued token is accepted by RestAuthFilter/JWTAuthenticationProvider and grants the victim's API permissions. Depending on app configuration this exposes private data and write operations.",
+      "locations": [
+        {
+          "end_line": 341,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/filters/GenericOAuth2Filter.java",
+          "start_line": 303
+        },
+        {
+          "end_line": 230,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/filters/GenericOAuth2Filter.java",
+          "start_line": 155
+        },
+        {
+          "end_line": 191,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/JWTRestfulAuthFilter.java",
+          "start_line": 143
+        },
+        {
+          "end_line": 316,
+          "path": "para-server/src/main/java/com/erudika/para/server/security/JWTRestfulAuthFilter.java",
+          "start_line": 311
+        },
+        {
+          "end_line": 704,
+          "path": "para-core/src/main/java/com/erudika/para/core/User.java",
+          "start_line": 656
+        }
+      ],
+      "prerequisites": "The server is reachable (default) and the targeted app exists and is active (any non-root app; no OAuth2 settings are strictly required because the IDP profile request fails/returns empty and the catch block returns the claims-derived profile). For direct takeover the attacker must know the victim's provider subject (“sub”, the stored identifier is \"oa2:<sub>\") or, alternatively, the victim's email plus a configured search backend so User.readUserForIdentifier() can find and re-link the account by email. No credentials, cookies, or signature keys are needed.",
+      "root_cause": "GenericOAuth2Filter.fetchProfileFromIDP() decodes the payload of a caller-supplied id_token with Utils.base64dec()/Jackson and merges its claims into the user profile without verifying the JWS signature, issuer, audience, expiry or nonce (lines 303-308). GenericOAuth2Filter.getOrCreateUser() then treats those unverified claims as authoritative: the account id is read from the configured id parameter (default \"sub\") and the local user is selected/created via User.readUserForIdentifier() with identifier prefix \"oa2:\" (lines 173-222). Because JWTRestfulAuthFilter.newTokenHandler() passes the raw client-supplied \"token\" string straight into oauth2Auth.getOrCreateUser() (JWTRestfulAuthFilter lines 143-191, dispatch at 311-312), an unauthenticated caller controls the entire id_token. User.readUserForIdentifier() also falls back to linking an existing account by the (equally unverified) email claim (User.java 672-687), so no knowledge of a password or provider signature is needed.",
+      "title": "Unsigned id_token claims trusted in generic OAuth2 login (POST /jwt_auth) allow account takeover",
+      "trace": "1) POST /jwt_auth -> JWTRestfulAuthFilter.doFilter (line 112, path matches \"/jwt_auth\") -> newTokenHandler (line 144) reads the JSON body and gets provider/appid/token from the caller (lines 152-154). 2) getOrCreateUser(app, provider, token) dispatches provider \"oauth2\" to oauth2Auth.getOrCreateUser(app, token) (lines 311-312). 3) GenericOAuth2Filter.getOrCreateUser splits the token on \":\" and assigns tokens[2] to idToken (lines 158-170), then calls fetchProfileFromIDP(app, accessToken, idToken, alias) (line 173). 4) fetchProfileFromIDP sees a \".\" in idToken, base64-decodes the middle segment and merges its JSON claims into the profile map without any signature check (lines 305-308); the subsequent HTTP profile call uses a bogus access token and its failure/exception path still returns the claims-based profile (lines 317-340). 5) The profile's \"sub\" (accountIdParam default) is used to compute the identifier \"oa2:<sub>\" (lines 175, 193) and User.readUserForIdentifier() reads or creates that account (lines 195-221; User.java 656-704). 6) If the identifier/email matches an existing user, that user object is returned and, after checkIfActive(), JWTRestfulAuthFilter.succesHandler issues a real Para JWT for it (lines 163-169, 245-259).",
+      "unverified": "No code was executed and no runtime/HTTP verification was performed; reachability relies on reading the filter/injection wiring (JwtConfigurer.addFilterBefore, Guice member injection of oauth2Auth). It was not verified whether the upstream project intends this id_token trust (i.e., whether this code is original or a regression), and whether GenericOAuth2Filter may be disabled by configuration in typical deployments. The account-link-by-email path additionally depends on a non-mock Search implementation; the sub-based takeover path does not.",
+      "weakness_type": "Improper Verification of Cryptographic Signature (CWE-347) leading to Authentication Bypass / Account Takeover (CWE-287)"
+    }
+  ],
+  "coverage_summary": "Coverage: get_source_scope reports 199 model-visible files (no binary/sensitive/symlink exclusions); get_relation_scope reports 193 indexed files, 163 Java files parsed with 0 parse errors, 6 source files missing from the index, and no control-flow/data-flow/semantic-resolution analyses. I read the SecurityConfig/filters (RestAuthFilter, JWTRestfulAuthFilter, JwtConfigurer, SecurityModule, SimpleAuth handlers, Csrf/Ajax/Ignored/Rest matchers), SecurityUtils, the OAuth/LDAP/SAML/password/passwordless filters, RestUtils and Api1 handlers (CRUD, batch, _me, _settings, _permissions, _export/_import, links, search), App/User permission and account-linking code, storage/queue/metrics plugins, HealthUtils, CORS/GZip/Field/Error filters, and portions of ParaClient, AWSDynamoDAO/Utils, and core utils. The 6 index-omitted files were not identified individually and were not claimed as reviewed. No code, tests, or scanners were executed.",
+  "limitations": [
+    "No execution, runtime reachability proof, or exploit attempt was performed; all conclusions are source-level.",
+    "The P1 index is syntax/navigation only (no data flow, no semantic resolution); 8,453 of 12,068 calls are unresolved, so some cross-file flows may not be represented.",
+    "6 source files are absent from the relation index and were not individually audited.",
+    "No tests exist in this snapshot, so intended behavior could not be checked against test expectations.",
+    "Spring Security rule-ordering semantics and the framework wiring (Guice/Spring filter order, abstract processing filter behavior) were reasoned from source, not verified at runtime.",
+    "It could not be determined whether the id_token trust is original upstream behavior or a regression in this snapshot; the candidate is a lead, not a confirmed vulnerability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SecurityConfig.filterChain() declares requestMatchers(\"/**\").permitAll() before the RestRequestMatcher authenticated() rule and parseProtectedResources() (SecurityConfig.java:99-103). If Spring Security evaluates accumulated rules first-match-wins, the later rules (and configured security.protected paths) would be dead.",
+      "reason": "Framework ordering semantics were not executed/confirmed, and Para's own RestAuthFilter (registered via JwtConfigurer) independently enforces API authentication for /v1/** requests, so exploitability is unclear and the line may be intentional upstream behavior. Unconfirmed lead."
+    },
+    {
+      "lead": "User.create() accepts a client-supplied \"groups\" value and only forces ADMINS for the configured admin identifier, while groups is @Locked for updates (User.java:318-326, 71); an app that permits user creation could let a caller create an \"admins\" user (isAdmin() grants unlimited access in RestAuthFilter.hasPermission).",
+      "reason": "Looks like long-standing upstream design (groups is intentionally settable at creation, admins are expected to control the users-create permission), and the snapshot contains no code that strips groups on create or update. Plausible but weaker/ambiguous; not submitted."
+    },
+    {
+      "lead": "SAMLAuthFilter defaults SECURITY_WANT_ASSERTIONS_SIGNED / WANT_MESSAGES_SIGNED to false (SAMLAuthFilter.java:332-334), so SAML responses may be accepted without signature validation unless the app configures it.",
+      "reason": "Requires SAML to be configured and is an explicit, documented configuration default rather than a missing check in this snapshot; upstream-style behavior. Unconfirmed."
+    },
+    {
+      "lead": "CORSFilter defaults to all origins with cors.support.credentials=true (ParaServer.java:278) and reflects the caller Origin with Access-Control-Allow-Credentials (CORSFilter.java:237-266).",
+      "reason": "Reflects origin only when credentials are supported; Para's REST API primarily authenticates via Authorization headers, and this appears to be the stock third-party filter plus upstream configuration. Unconfirmed/defense-in-depth."
+    },
+    {
+      "lead": "Server-side outbound requests driven by app settings / object payloads: webhook targetUrl (River.java:177-226), Graphite host/port (MetricsUtils.java:349-364), OAuth2 profile_url/avatar download (GenericOAuth2Filter.java:310, 442-461), SAML metadata URL (SAMLAuthFilter.java:122-127).",
+      "reason": "These are features whose targets are configured by an app administrator; the privilege boundary is weaker than the submitted issue, and no clear external-attacker control was found. Rejected as the single strongest candidate."
+    },
+    {
+      "lead": "LocalFileStore/AWSFileStore concatenate paths without rejecting \"..\" (LocalFileStore.java:65-118; AWSFileStore.java:63-124), and HealthUtils reads/writes the root-credentials config file through FileStore.load/store (HealthUtils.java:126-163).",
+      "reason": "FileStore.load/store is only called internally with a config-derived path in this snapshot (HealthUtils), not from request parameters, so no attacker-controlled traversal sink was identified."
+    }
+  ],
+  "summary": "Reviewed the Para 1.50.8-SNAPSHOT tree (199 files; 163 Java files parsed by the P1 index, 6 files not indexed, no tests in the snapshot). I traced the authentication/authorization paths around SecurityConfig, the JWT/REST/OAuth/LDAP/SAML filters, RestUtils/Api1 CRUD and batch handlers, App/User permission and account-linking logic, storage/queue/metrics plugins. The single strongest issue is in the generic OAuth2 login path: the server extracts identity claims (sub/email/name/picture) from a client-supplied, unsigned \"id_token\" and uses them to look up or create the local user, and this path is reachable from the public POST /jwt_auth endpoint. This permits unauthenticated account creation and, given a victim's OAuth2 subject id or email, login as that user (account takeover), after which the server issues a valid Para JWT for the victim."
+}

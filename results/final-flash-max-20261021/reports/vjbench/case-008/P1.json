@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any value that application code passes as the annotated `@Path` argument, when that value originates from a remote/attacker-influenced source (user id, resource or file name, slug, redirect target, etc.). The library exposes no restriction on the string; `ParameterHandler.Path.apply` (ParameterHandler.java:94-100) only rejects null and forwards the converted string. With the default `encoded=false` the dot characters needed to climb segments survive canonicalization; with `encoded=true` (http/Path.java:58-62) raw `/`, `//`, and `%2e` sequences also survive, widening the reachable path rewrite.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked and ruled out adjacent injection leads: (1) `@Query`/`@QueryMap`/`@QueryName`, `@Field`, and header values are handed to OkHttp's typed `HttpUrl`/`Headers` builders, which re-encode/validate reserved and CRLF characters, so parameter/header injection was not evidenced; (2) `@Url` accepting absolute URLs is documented behavior (http/Url.java), requires the app to pass an untrusted URL, and is not a library defect; (3) `Platform.Java8.invokeDefaultMethod`'s `setAccessible(true)` on `MethodHandles.Lookup` is upstream behavior with no attacker-controlled input; (4) `OkHttpCall` callback catch blocks that swallow `Throwable`/`Error` (OkHttpCall.java:123-127, 134-139, missing `throwIfFatal`) is a robustness concern with no demonstrated attacker-controlled security impact, and its relation to the shipped 2.4.0 changelog entry could not be confirmed from this snapshot; (5) scan for exec/deserialization/file/secret patterns found nothing. For the candidate itself I verified that the dot characters are genuinely absent from every encode set in `canonicalizeForPath`, that no traversal guard exists anywhere, and that the placeholder-presence check in `validatePathName` prevents the developer, not the attacker, from controlling the template.",
+      "id": "retrofit-path-traversal",
+      "impact": "Request-path escape from the annotated segment on the same origin. Concrete consequences: reaching unintended endpoint paths on the API host (path/routing confusion), bypassing server- or gateway-side path-prefix based authorization/rate-limit rules that assume the literal interface path, and target-path rewriting that can amount to request smuggling-style access to another resource. When `encoded=true` allows raw `/` and `//`, and the placeholder starts the relative URL, the value class also permits a network-path reference that OkHttp resolves to a different host — this broader SSRF-style variant is inferred from documented OkHttp resolution semantics and was not verifiable because OkHttp is not part of the snapshot. The defect is in the client library, but its security impact materializes on the server that receives the rewritten path; classification as CWE-22 reflects the missing dot-segment neutralization.",
+      "locations": [
+        {
+          "end_line": 95,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 89
+        },
+        {
+          "end_line": 144,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 202,
+          "path": "retrofit/src/main/java/retrofit2/RequestBuilder.java",
+          "start_line": 189
+        },
+        {
+          "end_line": 101,
+          "path": "retrofit/src/main/java/retrofit2/ParameterHandler.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 405,
+          "path": "retrofit/src/main/java/retrofit2/ServiceMethod.java",
+          "start_line": 388
+        },
+        {
+          "end_line": 51,
+          "path": "retrofit/src/main/java/retrofit2/http/Path.java",
+          "start_line": 28
+        }
+      ],
+      "prerequisites": "A Retrofit service interface declaring a path template containing a `{name}` placeholder (validated only by `ServiceMethod.Builder.validatePathName`, ServiceMethod.java:725-734) whose argument is supplied, directly or indirectly, by an untrusted party; the request is then built with `RequestBuilder.build()` and resolved against the application's base URL. Exploit strength increases if the interface uses `@Path(encoded=true)` and the placeholder appears at or near the start of the relative URL. No elevated privileges, authentication, or special configuration inside Retrofit itself is required.",
+      "root_cause": "`RequestBuilder.addPathParam(name, value, encoded)` substitutes the converted `@Path` value into the relative URL with `relativeUrl.replace(\"{\" + name + \"}\", canonicalizeForPath(value, encoded))` (RequestBuilder.java:89-95). `canonicalizeForPath` (RequestBuilder.java:97-144) only percent-encodes characters below 0x20/above 0x7f, the special set ` \\\"<>^`{}|\\?#`, and — only when `alreadyEncoded == false` — `/` and `%`. The path-legal characters `.`, `..` and, when `encoded=true`, `/` and already-percent-encoded sequences are passed through unchanged. Nothing downstream re-validates dot segments: `build()` hands the assembled string to `baseUrl.resolve(relativeUrl)` or `baseUrl.newBuilder(relativeUrl)` (RequestBuilder.java:189-202), and OkHttp applies RFC 3986 dot-segment removal, so a value of `.`/`..` (or `%2e` forms when encoded=true) changes the effective request path instead of remaining inside the annotated segment. No `PATH_TRAVERSAL`-style guard exists anywhere in the snapshot, and the `@Path` javadoc (http/Path.java:28-51) promises only a 'Named replacement in a URL path segment', so callers are not put on notice that the value can rewrite the path.",
+      "title": "Path traversal via @Path parameter values in RequestBuilder.addPathParam",
+      "trace": "ServiceMethod.toCall(...) (ServiceMethod.java:96-114) constructs RequestBuilder and invokes each parameter handler; ParameterHandler.Path.apply (ParameterHandler.java:94-100) converts the value and calls RequestBuilder.addPathParam; addPathParam (RequestBuilder.java:89-95) calls canonicalizeForPath, which leaves `.`/`..` (and `/`, `%2e` when encoded=true) intact, and splices the result into `relativeUrl`; the placeholder must exist in the template or ServiceMethod rejects the declaration earlier; RequestBuilder.build() (RequestBuilder.java:189-202) resolves the now-modified relative URL against `baseUrl` via `HttpUrl.resolve`/`HttpUrl.newBuilder`, where RFC 3986 dot-segment normalization is applied by OkHttp before the Request is handed to the call factory (OkHttpCall.createRawCall, OkHttpCall.java:184-190). Result: the wire request targets a different path than the one written in the service interface.",
+      "unverified": "OkHttp (3.10) source is an external dependency and is not in the snapshot, so the exact dot-segment normalization performed by `HttpUrl.resolve(String)`/`HttpUrl.newBuilder(String)` and the network-path-reference behavior are taken from documented OkHttp/RFC 3986 semantics rather than inspected code; the `//host` host-override variant is inference, not source-verified. Also unverified: whether any given consumer passes untrusted data to a `@Path` parameter, whether the deployment's server/gateway normalizes the resulting path the same way, and whether `encoded=true` is used in practice. `Retrofit.java` (base-URL validation and factory wiring) is absent from the snapshot and could not be inspected. No execution or runtime testing was performed.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') / CWE-20 insufficient input validation"
+    }
+  ],
+  "coverage_summary": "Read the full core `retrofit2` package (Call/CallAdapter/Callback/Converter/factories/BuiltInConverters/OkHttpCall/ParameterHandler/Platform/RequestBuilder/Response/ServiceMethod/Utils and all `http` annotations), the rxjava/rxjava2/guava/scala adapters, all converter modules, the mock module, and the samples; scanned for exec/deserialization/file/secret/TLS patterns (none found), and used the P1 relation index to confirm the `ParameterHandler.Path.apply -> RequestBuilder.addPathParam -> canonicalizeForPath -> build` call chain. Not inspected: `Retrofit.java` (absent from this snapshot), all test sources (absent), external dependencies (okhttp/okio/gson/moshi/etc.), vendored website JS/CSS, and build/pom metadata beyond version/dependency lines. The index reports complete parsing of the 124 Java files with no parse errors, but it explicitly implements no control-flow, data-flow, semantic resolution, or reachability analysis, so all conclusions here are source-text based.",
+  "limitations": [
+    "`Retrofit.java` (base-URL handling, factory lists, `create()` and `baseUrl()` validation) is not present in the model-visible snapshot, so the top-level configuration surface could not be reviewed.",
+    "No test sources are present; repository intent/expected behavior could not be corroborated from tests.",
+    "okhttp3/okio sources are external dependencies; URL canonicalization/dot-segment normalization and network-path-reference behavior are inferred from documented semantics, not inspected code.",
+    "The P1 index provides syntactic navigation candidates only (no data/control flow, no semantic resolution, spaCy-level Spring annotation hints, 1401 unresolved calls), so no reachability or exploitability claim is confirmed.",
+    "No code was executed, no tests/scanners were run, and no network interaction was performed; impact analysis is limited to safe, conceptual description."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Header injection through `@Header`/`@HeaderMap` into `RequestBuilder.addHeader`",
+      "reason": "Values flow into OkHttp's `Request.Builder.addHeader`/`Headers.Builder`, which validates names/values and rejects CR/LF/NUL; no source evidence of a bypass in this snapshot."
+    },
+    {
+      "lead": "Query/field parameter injection via `encoded=true` on `@Query`/`@QueryMap`/`@Field`/`@FieldMap`",
+      "reason": "These paths delegate to OkHttp `HttpUrl.addEncodedQueryParameter`/`FormBody.Builder.addEncoded`, which still encode reserved separators irrespective of the already-encoded flag; no source-visible injection."
+    },
+    {
+      "lead": "SSRF via `@Url` accepting absolute URLs (`ParameterHandler.RelativeUrl` -> `RequestBuilder.setRelativeUrl`)",
+      "reason": "Documented feature (http/Url.java) intended to let callers supply the full URL; abuse requires the application to pass an untrusted URL. Not a library-level defect on this evidence."
+    },
+    {
+      "lead": "`Platform.Java8.invokeDefaultMethod` enables `setAccessible(true)` on the private `MethodHandles.Lookup` constructor",
+      "reason": "Matches upstream design for invoking interface default methods; no attacker-controlled input reaches this code path in the snapshot."
+    },
+    {
+      "lead": "Errors thrown by user callbacks are swallowed in `OkHttpCall.enqueue` (catch `Throwable` -> `printStackTrace`, no `throwIfFatal`)",
+      "reason": "Robustness/availability nuance; no attacker-controlled route to a concrete security impact established, and this may simply predate the upstream cleanup rather than being a distinct flaw."
+    }
+  ],
+  "summary": "Review of the Retrofit 2.4.1-SNAPSHOT source tree (182 model-visible files; P1 index covers 124 parsed Java files, 0 parse errors, complete, but with no control-/data-flow semantics). The strongest source-evidenced issue is in the core request-building path: `@Path` argument values are spliced into the URL path without any dot-segment validation, so a value such as \"..\" (or, with `encoded=true`, values containing raw `/`, `//` and `%2e`) is inserted verbatim into the relative URL and then normalized by OkHttp's RFC 3986 resolution/builder, causing the request to target a different path than the API declaration intended. This is a library-level missing-validation defect (CWE-22) affecting every consumer that passes attacker-influenced data to a `@Path` parameter. Query/field/header injection leads and the `@Url` absolute-URL behavior were checked and rejected as documented OkHttp-validated or app-responsibility behaviors."
+}

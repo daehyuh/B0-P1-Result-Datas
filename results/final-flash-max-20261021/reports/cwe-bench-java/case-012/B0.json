@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A malicious ZIP archive controls every `ZipEntry.getName()` (e.g. `../../../../home/user/.ssh/authorized_keys`, `../../etc/cron.d/x`, or backslash variants on Windows) and the entry payload bytes. Applications that extract untrusted uploads/archives with `ZipUtil.unpack(...)` or `Zips...unpack()` process these names verbatim; the default `IdentityNameMapper` returns the name unchanged and a custom NameMapper can also be a pass-through.",
+      "confidence": "high",
+      "counterevidence_checked": "Searched the whole snapshot for containment/sanitization logic: no `normalize`, `getCanonicalPath`, `isValid`, `ZipEntryValidator`, or 'Slip' checks exist in any extraction path (canonical-path comparisons exist only in embedded commons-io copy/move helpers in FileUtilsV2_2.java). The default IdentityNameMapper is a pass-through and mapper output is also used unsanitized. `new File(parent, child)` does not let a Unix-style absolute child escape parent, so the practical vector is `..` segments (plus backslash separators on Windows), not leading '/'; `Zips.addFile` only strips a leading '/' when creating archives, which does not protect extraction. Java's `java.util.zip.ZipFile`/`ZipInputStream` do not filter traversal names. No tests are present in the snapshot to contradict this.",
+      "id": "zipslip-ztzip-1.12",
+      "impact": "Arbitrary creation/overwrite of files writable by the extracting process outside the intended extraction directory (config files, shell profiles, cron/systemd/startup scripts, other users' home directories). Depending on how the extracted content is subsequently used or executed, this can escalate to code execution or privilege escalation; at minimum it is a high-integrity compromise. Parent directories are also created (`forceMkdir`), so the attacker can create directory structures outside the target as well. Extracted ASi extra-field permissions (ZipUtil.java:1166-1168) can additionally mark attacker-written files executable.",
+      "locations": [
+        {
+          "end_line": 1171,
+          "path": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+          "start_line": 1149
+        },
+        {
+          "end_line": 1229,
+          "path": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+          "start_line": 1195
+        },
+        {
+          "end_line": 1273,
+          "path": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+          "start_line": 1249
+        },
+        {
+          "end_line": 699,
+          "path": "src/main/java/org/zeroturnaround/zip/Zips.java",
+          "start_line": 675
+        },
+        {
+          "end_line": 61,
+          "path": "src/main/java/org/zeroturnaround/zip/commons/FileUtils.java",
+          "start_line": 53
+        }
+      ],
+      "prerequisites": "The application calls a public extraction API (e.g. `ZipUtil.unpack(File, File)` at ZipUtil.java:938/957/975 or `unpack(InputStream, ...)` at 1044/1060/1076/1094, or the `Zips` fluent `unpack()` API which routes to `UnpackingCallback`) on an archive whose entry names/payloads are attacker-influenced, and the JVM process has write permission to the paths the traversal targets. A pre-validating caller-provided NameMapper would avoid it, but this is not enforced or documented as required.",
+      "root_cause": "Extraction callbacks build destination paths as `new File(outputDir, zipEntry.getName())` (or the mapper output / unrooted name) and write entry contents there without verifying that the resolved path stays inside outputDir. Entry names containing `..` path segments (and, on Windows, backslash separators) escape the intended directory. No canonicalization/containment check or `..` rejection exists in the repository.",
+      "title": "Zip Slip: unvalidated ZIP entry names allow arbitrary file write outside the extraction directory",
+      "trace": "ZipUtil.unpack(File zip, File outputDir) -> unpack(...) -> iterate(zip, new Unpacker(outputDir, mapper), charset) (ZipUtil.java:977) -> iterate() enumerates `ZipFile.entries()` and calls action.process(is, e) (ZipUtil.java:502-508) -> Unpacker.process reads `zipEntry.getName()`, passes it through the mapper unchanged (IdentityNameMapper.java:31-33), builds `File file = new File(outputDir, name)` (ZipUtil.java:1152), creates parent directories (`FileUtils.forceMkdir(file.getParentFile())`, line 1157) and writes the entry via `FileUtils.copy(in, file)` (line 1163) -> commons/FileUtils.copy opens `new FileOutputStream(file)` (FileUtils.java:54). Because `../` segments are not removed and the result is never compared against the canonical outputDir, the write lands outside outputDir. The same sink pattern exists in BackslashUnpacker (lines 1210-1226), Unwraper (1260/1271) and Zips.UnpackingCallback (Zips.java:683/689/695).",
+      "unverified": "Not runtime-confirmed: no archive was executed and no filesystem writes were performed. Exact exploitability depends on the calling application, the charset/mapper used, OS path semantics, and the extracting process's permissions; OS-specific behaviors (Windows drive/UNC names, symlink targets that may already exist under outputDir) were reasoned about from source but not tested. The repository contains only main sources (no test suite) in this snapshot.",
+      "weakness_type": "Path traversal / Zip Slip (CWE-22) leading to arbitrary file overwrite"
+    }
+  ],
+  "coverage_summary": "All 54 files in the assigned snapshot were listed; the extraction and file-writing paths were read in depth (ZipUtil unpack/iterate/unpackEntry callbacks, Zips.UnpackingCallback/process, commons/FileUtils.copy, FileUtilsV2_2 forceMkdir/copy helpers, ZipEntryUtil permissions handling, ExtraFieldUtils/AsiExtraField parsing, IdentityNameMapper, pom.xml/Changelog version confirmation, README usage examples). Text searches covered sanitization (`normalize`, `getCanonicalPath`, `isValid`, 'Slip'), command execution, deserialization, and symlink creation; none exist in the runtime library. Large utility files (ZipUtil.java ~3300 lines, FileUtilsV2_2.java ~1200 lines) were sampled rather than read line-by-line outside the extraction-relevant regions.",
+  "limitations": [
+    "No code was executed and no tests are included in the snapshot; findings are source-evidence based, not runtime-confirmed.",
+    "ZipUtil.java (100 KB) and FileUtilsV2_2.java (41 KB) were not read exhaustively; unread regions could contain additional issues, but the extraction path relevant to the candidate was fully traced.",
+    "Exploitability depends on caller behavior (whether untrusted archives are extracted and with what process privileges) and OS path semantics, which are outside this snapshot.",
+    "The candidate consolidates one root cause (unvalidated entry-name-to-path resolution). The BackslashUnpacker and Unwraper variants are treated as the same root cause rather than separate candidates per the one-candidate limit."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Attacker-controlled 'ASi Unix' (0x756e) extra field causes runtime exceptions during unpack: ExtraFieldUtils.parse accepts field lengths < 4 (ExtraFieldUtils.java:120-143), then AsiExtraField.parseFromLocalFileData does `new byte[length - WORD]` (AsiExtraField.java:373) and multiple fixed-offset reads (ZipLong/ZipShort), so malformed extra data can throw NegativeArraySizeException/ArrayIndexOutOfBoundsException; ZipEntryUtil.getZTFilePermissions only catches java.util.zip.ZipException (ZipEntryUtil.java:190-203).",
+      "reason": "Plausible malformed-input DoS/uncaught-exception path, but impact is limited to aborting extraction (caught or propagated runtime exception) and it is a separate root cause from the path traversal; it was not selected as the single candidate. Not confirmed at runtime."
+    },
+    {
+      "lead": "Attacker-controlled permissions: unpacking applies POSIX mode bits taken from the ASi extra field to the written file (ZipUtil.java:196-197, 1166-1168), which can set executable/world-writable bits.",
+      "reason": "It amplifies the impact of the zip-slip/arbitrary-write candidate but is a weaker standalone finding (bounded to 0777 bits, no setuid/setgid handling visible) and shares the same attacker-controlled archive entry surface; left out of the one-candidate limit."
+    },
+    {
+      "lead": "Release shell scripts (get_release_commands.sh, oss-release.sh) and .travis.yml contain build/release command sequences.",
+      "reason": "Maintainer-side tooling, not reachable from library runtime and not exposed to attacker-controlled input; no evidence of an exploitable trust boundary."
+    }
+  ],
+  "summary": "The snapshot is the pre-1.13 zt-zip library (pom.xml version 1.12). Every archive-extraction path resolves attacker-controlled ZIP entry names directly against the caller-supplied output directory with no `..`/containment validation, producing a classic Zip Slip arbitrary-file-write issue (CWE-22). The strongest candidate is this single root cause, present in ZipUtil.Unpacker, ZipUtil.BackslashUnpacker, ZipUtil.Unwraper, and Zips.UnpackingCallback, all reachable from public `unpack(...)` APIs documented in README. No sanitization, canonical-path check, or name validation exists anywhere in the extraction code."
+}

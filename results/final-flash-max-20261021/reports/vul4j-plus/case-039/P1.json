@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The 'form_redirect_uri' HTTP parameter is fully attacker-controlled. It is accepted by UaaSavedRequestCache from any unauthenticated POST whose path falls in the UI security chain (e.g. /login/idp_discovery, /oauth/**), stored in the session, rendered into the login form as a hidden field, and finally read back by the success handler as the redirect target. No allow-list, same-origin check, or registration lookup is applied at any step.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the login HTML template (hidden field is populated from the saved request), the security XML (custom-filter clientRedirectStateCache before FORM_LOGIN_FILTER, request-cache ref clientRedirectStateCache; CSRF matcher covers only /login.do, /oauth/authorize POST, /profile POST), and found no validation of form_redirect_uri or of the saved redirect target in Java code, templates, or Spring configuration. Also confirmed the saved request is session-scoped and is re-posted by the form rather than re-read from the session by the handler, so a valid CSRF token on /login.do does not mitigate it. The tree contains no tests to confirm intended behavior.",
+      "id": "uaa-open-redirect-form-redirect-uri",
+      "impact": "Post-authentication open redirect: a victim who successfully authenticates is silently sent to an attacker-controlled site, enabling credential/2FA phishing that appears to originate from a trusted login flow, and leaking any sensitive parameters appended by the flow. It can also be used as a redirect primitive in reset-password/invitation flows that share this success handler. No token value is exposed by the redirect itself.",
+      "locations": [
+        {
+          "end_line": 46,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/web/UaaSavedRequestAwareAuthenticationSuccessHandler.java",
+          "start_line": 34
+        },
+        {
+          "end_line": 101,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/web/UaaSavedRequestCache.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 190,
+          "path": "server/src/main/java/org/cloudfoundry/identity/uaa/web/UaaSavedRequestCache.java",
+          "start_line": 122
+        },
+        {
+          "end_line": 27,
+          "path": "server/src/main/resources/templates/web/login.html",
+          "start_line": 19
+        }
+      ],
+      "prerequisites": "Victim must have (or obtain) a UAA session seeded with the attacker URL (e.g. by an auto-submitted cross-site form carrying form_redirect_uri to a UI-chain POST endpoint) and then authenticate through the normal login form (or reset-password/invitation success handler path). The login page must be able to read the seeded saved request; the victim's browser then posts the hidden field. No UAA privileges are required.",
+      "root_cause": "The login success handler trusts the request parameter 'form_redirect_uri' verbatim as the post-authentication redirect target. UaaSavedRequestAwareAuthenticationSuccessHandler.determineTargetUrl() (lines 34-46) returns request.getParameter(FORM_REDIRECT_PARAMETER) without validating that the value is the current host/saved request or a client-registered redirect URI. The value can be planted in the victim's session because UaaSavedRequestCache.doFilter()/saveRequest()/saveClientRedirect() (lines 55-101) store ANY unauthenticated POST's 'form_redirect_uri' parameter as the session saved request (ClientRedirectSavedRequest, lines 122-190) with no same-origin or whitelist check, and login.html (lines 19-27) echoes that saved redirectUrl back as a hidden field posted to /login.do. The form POST is then trusted without re-validation.",
+      "title": "Open redirect after login via unvalidated 'form_redirect_uri' parameter/saved request",
+      "trace": "Attacker sends victim a page that POSTs 'form_redirect_uri=https://attacker.example/' to a UI-chain endpoint (e.g. /login/idp_discovery, which is not covered by the /login.do, /oauth/authorize, /profile CSRF matcher). UaaSavedRequestCache.doFilter -> shouldSaveFormRedirectParameter (POST + non-empty param + no existing saved request) -> saveClientRedirect stores ClientRedirectSavedRequest(redirectUrl = attacker URL) in the session without validating the URL. On GET /login, login.html renders th:value=\"${session.SPRING_SECURITY_SAVED_REQUEST.redirectUrl}\" into the hidden form_redirect_uri field. Victim submits credentials to /login.do; UaaSavedRequestAwareAuthenticationSuccessHandler.determineTargetUrl reads form_redirect_uri and returns it unchanged; Spring's RedirectStrategy issues a 302 Location: https://attacker.example/ after successful authentication.",
+      "unverified": "Exploitability was not runtime-confirmed and depends on the attacker being able to create/seed the victim's UAA session (cross-site auto-POST acceptance in the target browser and UI-chain matching of the chosen endpoint). Whether the parameter should be constrained to same-origin/client-registered redirect URIs (and thus whether the missing check is the intended vulnerability) cannot be proven from this snapshot alone.",
+      "weakness_type": "CWE-601 URL Redirection to Untrusted Site ('Open Redirect')"
+    }
+  ],
+  "coverage_summary": "Scope: all 980 source files reported by get_source_scope (root-configured Gradle UAA project: model, server, client-lib, uaa webapp/WEB-INF Spring XML, samples, docs, scripts). The P1 relation index reports 'complete' coverage of the same 980 files (no missing files, no hash mismatches) and only syntactic navigation data; verification was done against source text. I inspected the OAuth token/authorization endpoints and token services, SCIM endpoints and their Spring Security XML rules, password-reset/email-change/invitation/autologin code stores and filters, SAML/OIDC/LDAP providers, zone/multitenancy filters, client-admin endpoints and validators, CSRF/session/CORS/security-header filters, and the login UI templates and filter chains. Binary-like files are skipped by the tools; no tests are present in the snapshot, and no code, build, or scanner was executed.",
+  "limitations": [
+    "No build, test, or runtime execution was performed; the client-visible file set contains no test sources, so intended behavior could not be confirmed against tests.",
+    "The P1 index contains only syntactic navigation candidates; all claims were re-verified in source, but reachability of filter chains depends on runtime XML/wiring order that was not executed.",
+    "Exploitability of the reported redirect depends on browser/session-seeding behavior (cross-site POST acceptance, saved-request lifetime) that cannot be validated statically.",
+    "Detection was driven by targeted source review; I did not exhaustively audit every one of the 980 files (e.g., some DB migration helpers, sample apps, and doc/slate assets were only skimmed).",
+    "The 'form_redirect_uri' parameter is not re-validated in any code path found, but I could not compare against the upstream fixed revision to confirm this is the dataset's intended vulnerability rather than long-standing design."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "LoginSAMLAuthenticationFailureHandler (server/.../provider/saml/LoginSAMLAuthenticationFailureHandler.java lines 40-57) redirects to the unvalidated 'redirect_uri' stored in the saved /oauth/authorize request when SAML login fails (LoginSAMLException).",
+      "reason": "Plausible second open-redirect instance with attacker-controlled redirect_uri and no client/registration lookup, but it is restricted to the SAML failure path (shadow account missing and auto-create disabled) and no clientDetailsService is available in the current bean wiring; not selected because the login-form handler path is broader and better evidenced."
+    },
+    {
+      "lead": "ResetPasswordController.resetPassword POST handler (server/.../account/ResetPasswordController.java lines 210-221) is an empty void method while the successHandler field is unused.",
+      "reason": "Looks like removed/dead logic, but POST /reset_password.do is actually processed by ResetPasswordAuthenticationFilter earlier in the chain (login-ui.xml lines 138-155), so the stub is most likely vestigial; no security impact could be demonstrated."
+    },
+    {
+      "lead": "UaaResetPasswordService.changePasswordCodeAuthenticated (server/.../account/UaaResetPasswordService.java lines 101-147) does not check the ExpiringCode intent before reusing its JSON payload as a PasswordChange.",
+      "reason": "Cross-intent code reuse is blocked in practice: registration/email/invitation/autologin payloads contain keys (email, origin, userId) that make Jackson deserialization into PasswordChange fail (FAIL_ON_UNKNOWN_PROPERTIES), and the endpoint requires oauth.login or a zone-admin scope; no exploitable path found."
+    },
+    {
+      "lead": "PasswordChangeEndpoint.checkPasswordChangeIsAllowed (server/.../account/PasswordChangeEndpoint.java lines 124-158) lets any authenticated client with the password.write scope change another user's password without the old password.",
+      "reason": "Matches upstream UAA's documented 'trusted client' behavior and requires an administrator to have provisioned a client with the password.write scope; not a boundary violation in this codebase's model."
+    }
+  ],
+  "summary": "Reviewed the UAA 4.5.5-SNAPSHOT source tree (980 files; P1 relation index reports complete coverage of the same 980 files, no tests present in the snapshot). I traced the login/session/redirect flows, token issuance/validation, SCIM authorization rules, SAML/OIDC federation, LDAP, password-reset/email-change/invitation code flows, zone handling and the Spring Security XML chains. The strongest source-evidenced issue is an unvalidated post-authentication redirect: the login success handler returns the raw 'form_redirect_uri' request parameter as the redirect target, and UaaSavedRequestCache stores any POST-supplied 'form_redirect_uri' value into the session's saved request, which the login page then re-posts. No origin/whitelist check is applied anywhere on this parameter, yielding a CWE-601 open redirect after a successful login (phishing/token-relay primitive). Other suspicious areas (SAML failure-handler redirect, empty ResetPasswordController.reset_password handler, password-reset code intent handling) were inspected but not selected; details are listed as rejected leads."
+}

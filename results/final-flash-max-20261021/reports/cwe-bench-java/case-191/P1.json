@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The URL string is fully attacker-chosen by any party able to influence the job's build-step configuration (Job/Configure), by JCasC, or by a pipeline invocation that passes a build parameter/env value into the `testPlanUrl` argument of `zohoQEngineTestPlanExecution(...)`; none of these values is validated beyond the `https://` prefix and segment count. The host component (resourceSplit[0]) and the portal segment (resourceSplit[1]) are otherwise unvalidated; projectID/testPlanID are only checked with extractLongValue() but the checked local variables are discarded and the original (possibly `+`- or zero-prefixed) strings are used in the URL path.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked and accounted for: (a) the plugin enforces `https://` and requires exactly 6 path segments, so malformed or multi-slash URLs are rejected and no attacker-chosen string with a slash can be smuggled into a segment; (b) `extractLongValue` rejects non-numeric/<=0 project and test-plan IDs; (c) Java's HttpClient (ProxyConfiguration.newHttpClient()) does not follow redirects by default, so the key is not leaked via redirect to a third host; (d) the API key and the URL are normally supplied by the same configurer, which reduces the privilege boundary (a Job/Configure holder can replace the key anyway) — this is the main argument against treating it as a vulnerability rather than hardening, so the finding is submitted as a lead with medium confidence; (e) no test code, no Jelly config, and no documentation exist in the snapshot that would constrain the URL to a Zoho domain or demonstrate a lower-privileged input path to testPlanUrl.",
+      "id": "zoho-qengine-unvalidated-url-secret-forwarding",
+      "impact": "Two concrete effects from the controller JVM: (1) SSRF — the Jenkins controller issues HTTPS PATCH/GET requests (with attacker-shaped path and JSON body) to any host/port reachable from the controller, including internal-only services, with the response body parsed and partially echoed to the build log; (2) credential exposure — the stored QEngine API key is transmitted as a bearer token to the unvalidated destination, so anyone who can point the step's URL at a server they control receives the secret in cleartext (subject to the prerequisites), and a single mis-typed/malicious URL silently leaks the key with no allowlist or host check to prevent it. The plugin's own form validation has the same 6-segment-only check (lines 63-75), so the misconfiguration is never surfaced.",
+      "locations": [
+        {
+          "end_line": 123,
+          "path": "src/main/java/io/jenkins/plugins/zohoqengine/QEnginePluginBuilder.java",
+          "start_line": 111
+        },
+        {
+          "end_line": 157,
+          "path": "src/main/java/io/jenkins/plugins/zohoqengine/QEnginePluginBuilder.java",
+          "start_line": 156
+        },
+        {
+          "end_line": 59,
+          "path": "src/main/java/io/jenkins/plugins/zohoqengine/CommonUtils.java",
+          "start_line": 52
+        },
+        {
+          "end_line": 130,
+          "path": "src/main/java/io/jenkins/plugins/zohoqengine/CommonUtils.java",
+          "start_line": 114
+        }
+      ],
+      "prerequisites": "Attacker can set or influence the build step's testPlanUrl for a job that has a stored QEngine API key (or can induce such a build). The Jenkins controller must be able to reach the attacker-controlled/internal HTTPS endpoint. No permission check, host allowlist, or redirect check exists in the plugin to stop this.",
+      "root_cause": "QEnginePluginBuilder.perform() derives the API base URL by splitting the configured testPlanUrl on \"//\" and \"/\" and accepts any value where the string starts with \"https://\" and the post-authority portion contains exactly 6 slash-separated segments; the host/port is never constrained (no Zoho domain allowlist, no URI re-parsing/authority comparison). The derived authority and path segments are concatenated into request URLs in CommonUtils.executeTestPlan()/getTestPlanStatus(), where the job's API key is attached verbatim: `httpRequest.setHeader(AUTHORIZATION, API_TOKEN + apiKey.getPlainText().trim())`, i.e. `Authorization: Bearer <plaintext secret>` is sent to whatever host the configuration string designates, and the controller (not an agent) makes the request via ProxyConfiguration.newHttpClient().",
+      "title": "Stored API key is forwarded to an arbitrary, unvalidated HTTPS host derived from the job-configured testPlanUrl (SSRF / credential exfiltration)",
+      "trace": "perform() (QEnginePluginBuilder.java:108-140) reads testPlanUrl -> startsWith(\"https://\") (line 111) -> split(\"//\") (line 114) -> split(\"/\") with resourceSplit.length==6 (lines 115-122) -> requestUrl = protocolSplit[0]+\"//\"+resourceSplit[0] (line 118) -> CommonUtils.executeTestPlan(apiKey, requestUrl, portalName, projectID, testPlanID, ...) (line 156) -> executeUrl = requestUrl + \"/api/v1/integration/\" + portalName + \"/projects/\" + projectID + \"/testplans/\" + testPlanID + \"/execute\" (CommonUtils.java:52-53) -> `new URI(executeUrl)` + setHeader(\"Authorization\", \"Bearer \" + apiKey.getPlainText().trim()) (lines 57-59) -> httpClient.send(PATCH) (line 74). The same pattern repeats for the polling GET in getTestPlanStatus() (CommonUtils.java:114-138). The server's JSON response fields (`message`, `scheduleexecution.status`) are then printed into the build console and used to set the build result (QEnginePluginBuilder.java:159-168), so the response is partially observable to the log reader.",
+      "unverified": "Not verified at runtime: whether real deployments expose testPlanUrl to lower-privileged actors (build parameters/pipeline `params.`), and whether the Jenkins threat model for this instance treats Job/Configure as trusted for the job's stored secret. The absence of a host allowlist and of any permission check is verified by source text; the concrete exfiltration scenario depends on deployment configuration not present in the snapshot.",
+      "weakness_type": "SSRF with sensitive credential disclosure (CWE-918; CWE-522/CWE-441 pattern)"
+    }
+  ],
+  "coverage_summary": "Source scope reports 14 model-visible files, 0 excluded/oversized/symlinked files, with the same filters applied to B0 and P1. I read both Java files in full (CommonUtils.java 262 lines; QEnginePluginBuilder.java 229 lines), pom.xml, README.md, both GitHub workflows, .mvn/extensions.xml, .github/dependabot.yml, and all four help-*.html resources; .gitignore and LICENSE.md were not read (no security relevance). The P1 relation scope reports 14/14 files indexed, 2 Java files parsed with 0 parse errors, 33 symbols, 127 calls / 37 edges / 3 facts, but with data-flow and control-flow \"not_implemented\", semantic resolution \"not_implemented\", 121 unresolved calls, Spring/annotation handling unverified and no test facts — so the index was used only for navigation and every index candidate (the call edges perform->executeTestPlan/getTestPlanStatus/extractLongValue, the constructor's Secret.fromString call site) was re-verified against source text. No builds, tests, or scanners were executed, and no runtime/reachability behavior is claimed.",
+  "limitations": [
+    "Only two Java source files exist; the review is limited to their source-level behavior. No tests, no Jelly/UI configuration in the snapshot, so form binding and rendering behavior (e.g. how the Secret field is displayed/round-tripped) could not be verified from source.",
+    "The relation index provides syntax-only call/containment candidates with no data flow, control flow, or semantic resolution (121 unresolved calls), so data-flow paths into the HTTP sinks were established by manual reading, not by the index.",
+    "Whether testPlanUrl can be supplied by a lower-privileged actor (build parameter, pipeline env/params, JCasC) is a deployment choice outside the snapshot; the selected candidate's impact therefore depends on configuration not visible here.",
+    "External semantics of the QEngine API (statuses such as failed/aborted, the meaning of HTTP 202, expected URL format) are not documented in the repository, so the fail-open status handling could not be resolved.",
+    "No runtime confirmation, exploitation, or scanner run was performed; all findings remain source-level leads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Missing permission checks on the four @POST form-validation methods (QEnginePluginBuilder.java:61-97; doCheckTestPlanUrl even carries @SuppressWarnings(\"lgtm[jenkins/no-permission-check]\"), and repo-wide search finds no checkPermission/Jenkins.get().checkPermission call).",
+      "reason": "Explicit anti-pattern with a real tell, but no demonstrable impact: these methods only inspect the submitted string and return constant FormValidation messages; they perform no network I/O, read no files/secrets, and leak nothing, so per the review standard this is a hardening gap rather than an evidence-backed vulnerability. @POST (org.kohsuke.stapler.verb.POST) is present, so the CSRF angle is also covered."
+    },
+    {
+      "lead": "Integer overflow in `long pollingInterval = (maxWaitTime * 60) / (pollCount - 1) * 1000;` (CommonUtils.java:124) can produce a huge positive interval (e.g. maxWaitTime=1e9 overflows to ~1,974,202,368 ms ≈ 22.8 days of Thread.sleep at line 195), plus doCheckMaxWaitTime only requires maxWaitTime > 0 and perform only replaces negative values with 180 (QEnginePluginBuilder.java:86-90, 146-148).",
+      "reason": "Real arithmetic bug, but the value is job-config-supplied: a configurer who can set it can already occupy an executor with an ordinary build step, so the incremental attacker capability/impact is weak. Also several overflow outcomes are negative and simply raise IllegalArgumentException (caught -> FAILURE)."
+    },
+    {
+      "lead": "getTestPlanStatus() returns true (build SUCCESS) in the `default` branch for any unrecognized scheduleexecution status (CommonUtils.java:184-189), so a failed-but-unrecognized test-plan state can be reported as a passing gate.",
+      "reason": "Plausible integrity weakness in the gate, but it is an explicit developer choice, the set of real QEngine statuses is not derivable from the snapshot (no docs/tests), and the status originates from the configured server rather than from a clearly lower-privileged attacker. Too uncertain to prefer over the selected candidate."
+    },
+    {
+      "lead": "Unvalidated buildName is printed to the build console and appended to the JSON body (QEnginePluginBuilder.java:150-154, CommonUtils.java:66-73), allowing log-line/ANSI injection via newlines/escape sequences.",
+      "reason": "Low impact and requires configuration input; JSON body construction is properly escaped by JSONObject. Not a credential or trust-boundary issue."
+    },
+    {
+      "lead": "CommonUtils.readContents() allocates a fixed 500 KB char buffer and is dead code in this snapshot.",
+      "reason": "No caller exists, fixed-size buffer (not unbounded), and no security-relevant behavior; no finding."
+    },
+    {
+      "lead": "CI/CD workflow supply chain (.github/workflows/cd.yaml, jenkins-security-scan.yml use reusable workflows pinned to moving tags @v1/@v2 rather than commit SHAs).",
+      "reason": "Standard Jenkins plugin templates; no untrusted checkout/execution of fork code (no pull_request_target with secrets exposure), and this is a repository-hardening observation rather than a source vulnerability in the shipped plugin."
+    }
+  ],
+  "summary": "Reviewed the complete Zoho QEngine Jenkins plugin snapshot (14 files; 2 Java files, both read end-to-end). The build step accepts a user-supplied \"test plan URL\" from job configuration, validates it only by an `https://` prefix test and a hard-coded segment count, then concatenates the derived authority/path into API URLs and sends the stored QEngine API key as an `Authorization: Bearer <plaintext>` header from the Jenkins controller JVM. I found no host allowlist and no permission checks anywhere in the code (search for `checkPermission`/`RequirePOST` returns zero hits). The strongest evidence-backed lead is the unconstrained-host credential/SSRF path (CWE-918/CWE-522 pattern); other candidate leads (missing permission checks on the `@POST` form-validation methods, an int-overflow that can produce a ~23-day `Thread.sleep`, and a fail-open `default` branch in the status switch) were rejected as unsupported or lower-impact and are listed below. No runtime testing was performed; all statements are source-level."
+}

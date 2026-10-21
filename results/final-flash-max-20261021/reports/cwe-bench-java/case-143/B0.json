@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated network attacker who can reach the server HTTP port (default 7091) controls the Authorization header or `access_token` query parameter, and can construct a JWT (HS256, exp in the future, any subject) signed with the key derived from the public constant `SeataSecretKey0c382ef121d778043159209298fd40bf3850a017`. The token value is fully attacker-controlled; no server-side state or prior login is needed. (Alternatively, the same file also ships default console credentials seata/seata, which the attacker can use to obtain a legitimate token when unchanged.)",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked the apparent sign/verify asymmetry: createToken BASE64-decodes the string while validateToken passes the string to jjwt; jjwt 0.10.5 `setSigningKey(String)` also BASE64-decodes, so both use the same bytes and token verification is not broken by the mismatch (the constant is valid Base64 and yields a 256-bit-plus HMAC key). Checked that the login endpoint itself is in the ignore list but that does not matter because the forged token bypasses login entirely. Checked CSRF: it is deliberately enabled, which blocks only cookieless cross-site POSTs; forged-token GETs are unaffected and all of `/metadata/v1/**` is explicitly CSRF-exempt (`csrf-ignore-urls`), so the state-changing changeCluster/watch endpoints are reachable with the token alone. Checked the default-credentials angle: console.user.username/password default to seata/seata in the same file; that is a related but distinct root cause and is not claimed as a second candidate. Checked that the value is also present in both example configs, so this is not a single stale line; no code enforces rotation, and no comment warns operators. Also considered whether the ignore-URL default `/**` applies: it does not, because application.yml sets `seata.security.ignore.urls` explicitly.",
+      "id": "seata-console-hardcoded-jwt-key",
+      "impact": "Authentication bypass of the Seata console/management HTTP API. Concrete effects: unauthorized disclosure of global/branch transaction and lock data (DB/file/redis/raft console query services) and cluster metadata; in raft mode, unauthorized raft membership manipulation via `/metadata/v1/changeCluster` (add/remove peers, redirect replication) and unbounded watcher registration (resource exhaustion); this can disrupt or take over transaction coordination and is a stepping stone for further attacks on internal metadata/endpoints. If the operator left the default console account, login with seata/seata yields the same access without forging a token.",
+      "locations": [
+        {
+          "end_line": 57,
+          "path": "server/src/main/resources/application.yml",
+          "start_line": 52
+        },
+        {
+          "end_line": 228,
+          "path": "server/src/main/resources/application.example.yml",
+          "start_line": 223
+        },
+        {
+          "end_line": 57,
+          "path": "console/src/main/java/org/apache/seata/console/utils/JwtTokenUtils.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 89,
+          "path": "console/src/main/java/org/apache/seata/console/utils/JwtTokenUtils.java",
+          "start_line": 83
+        },
+        {
+          "end_line": 109,
+          "path": "console/src/main/java/org/apache/seata/console/utils/JwtTokenUtils.java",
+          "start_line": 98
+        },
+        {
+          "end_line": 68,
+          "path": "console/src/main/java/org/apache/seata/console/filter/JwtAuthenticationTokenFilter.java",
+          "start_line": 50
+        },
+        {
+          "end_line": 115,
+          "path": "console/src/main/java/org/apache/seata/console/config/WebSecurityConfig.java",
+          "start_line": 101
+        }
+      ],
+      "prerequisites": "Deployment uses the shipped default `seata.security.secretKey` (it is packaged in the server jar's application.yml, and both example configs carry the same value, so copying the example does not fix it); attacker can reach the management/console HTTP port (Spring Boot default binds it on the network, default port 7091); no need for raft mode for data disclosure. For the highest-impact POST endpoint (`/metadata/v1/changeCluster`) raft store mode must be active and the raft cluster path exercised; that path is not blocked by CSRF because `seata.security.csrf-ignore-urls` is `/metadata/v1/**`.",
+      "root_cause": "The server's default configuration ships a fixed, publicly known HMAC key: server/src/main/resources/application.yml sets `seata.security.secretKey: SeataSecretKey0c382ef121d778043159209298fd40bf3850a017` (the same constant is also in application.example.yml and application.raft.example.yml). JwtTokenUtils uses this value as the sole key for issuing and validating console JWTs: createToken signs with `new SecretKeySpec(Decoders.BASE64.decode(secretKey), \"HmacSHA256\")` and validateToken/getAuthentication verify with `Jwts.parser().setSigningKey(secretKey)` (jjwt 0.10.5 also BASE64-decodes this string, so both sides use the same key bytes, which are derivable from the public repository). There is no startup generation, rotation, or enforcement that the operator changed the value, and @Value(\"${seata.security.secretKey}\") has no safer fallback. Because WebSecurityConfig only requires `anyRequest().authenticated()` and JwtAuthenticationTokenFilter installs an Authentication whenever the token signature verifies (subject and empty authorities are irrelevant), a token forged with the known key is accepted on every non-ignored endpoint.",
+      "title": "Console/management API authentication bypass via hard-coded default JWT signing key",
+      "trace": "1) Config: application.yml lines 52-57 bind `seata.security.secretKey` to a fixed public constant and list ignored URLs; login is at `/api/v1/auth/login` and all other requests fall through to `anyRequest().authenticated()` (WebSecurityConfig lines 102-115). 2) Token check: JwtAuthenticationTokenFilter.resolveToken (lines 74-84) takes the `Authorization: Bearer ...` header or `?access_token=`; validateToken (JwtTokenUtils lines 117-137) accepts a JWS whose HMAC-SHA256 signature matches the key derived from the constant; getAuthentication (lines 98-109) then puts a UsernamePasswordAuthenticationToken (authenticated=true, empty authorities) into the SecurityContext. 3) Access: authenticated GETs such as `/api/v1/console/globalSession/query`, `/api/v1/console/globalLock/query`, `/api/v1/overview/getData`, `/metadata/v1/cluster` return transaction/branch/lock and cluster metadata; POST `/metadata/v1/changeCluster` (ClusterController lines 76-90) parses an attacker-supplied raft configuration and calls `changePeers`, and POST `/metadata/v1/watch` registers long-lived watchers; both are exempt from CSRF by configuration. 4) Net effect: authentication is controlled entirely by a value published in the repository, so the console/management API is effectively unauthenticated.",
+      "unverified": "No runtime test was performed (no execution allowed). I could not confirm how any particular deployment overrides `seata.security.secretKey` (an operator can rotate it, which would defeat the forgery path but not the shipped default), nor the exact network exposure/port binding in a given environment. The console port is not verified at runtime. I did not have access to the fix/patch history, so I cannot state whether this constant was later changed upstream; the finding is based on the snapshot alone.",
+      "weakness_type": "CWE-798/CWE-321 (hard-coded credential/cryptographic key) leading to CWE-287 (improper authentication)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 1,825-file snapshot (main sources only; no test sources and no build/pom.xml are present). Depth: console/server Spring Security (WebSecurityConfig, JwtTokenUtils, JWT filter, AuthController, CustomAuthenticationProvider/CustomUserDetailsServiceImpl), server controllers (ClusterController, VGroupMappingController, HealthController) and console controllers, console DB services (parameterized SQL verified), PageUtil, RPC encoder/decoder and serializer registry (seata/protobuf/kryo/hessian/fastjson2/Jackson/native whitelists), raft server/serializers/snapshot, namingserver controller and manager, discovery registry services (raft/namingserver), config processors (ProcessorYaml SafeConstructor), and saga statelang JSON/expression handling. Breadth checks with literal searches for execution, class loading, native deserialization, ObjectMapper/autotype, SQL construction, file/path use, URL/HTTP clients, and credential/token handling. No runtime, build, or scanner execution was performed.",
+  "limitations": [
+    "No runtime verification: all conclusions are static source reading; token forgery/endpoint reachability were not executed.",
+    "Test sources, build/pom.xml, and dependency jars are absent from the snapshot, so Spring Security provider-chain behavior (local vs global AuthenticationManager) and exact jjwt/Spring behaviors had to be reasoned about, not verified.",
+    "Version identification relies on changes/*.md (2.3.0-SNAPSHOT); no fix/patch or CVE metadata is available in the snapshot, so I cannot state which issue upstream later repaired.",
+    "Deployment-specific configuration (operator-changed secret key, bind address, port exposure, whether default credentials/secrets are used) cannot be confirmed from the snapshot.",
+    "Modules reviewed mainly via targeted searches (rm-datasource, saga engine, integrations, spring autoconfigure) may contain additional issues not inspected line-by-line."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CustomAuthenticationProvider.authenticate (console/src/main/java/org/apache/seata/console/security/CustomAuthenticationProvider.java lines 38-47) returns a UsernamePasswordAuthenticationToken (which Spring marks authenticated=true) whenever the supplied password does NOT equal the stored BCrypt hash, and returns null when it does — i.e. an inverted credential check with no password-encoder use.",
+      "reason": "Strong-looking auth bypass but reachability is unconfirmed: WebSecurityConfig.configure(AuthenticationManagerBuilder) registers a local DaoAuthenticationProvider (CustomUserDetailsServiceImpl + BCryptPasswordEncoder), and Spring bean-defined AuthenticationProvider instances are normally wired into the global manager rather than that local one, so this @Component provider is plausibly dead code. Even if a global parent chain were consulted, the global UserDetailsService-based provider would likely fail first for the same principal. Without runtime verification I did not submit it."
+    },
+    {
+      "lead": "Jackson-based raft serialization accepts an attacker-chosen class: JacksonBoltSerializer is registered on the raft Bolt RPC server (RaftServerManager line 157) and delegates to JacksonSerializer.decode (JacksonSerializer lines 51-57), which reads a JsonInfo wrapper whose `clz` field is resolved by CustomDeserializer via Class.forName and then bound with ObjectMapper.readValue(obj, clz).",
+      "reason": "Real unsafe-deserialization sink, but it requires raft store mode plus network access to the raft peer port (not the console port), and successful RCE additionally needs a usable gadget class whose properties can be set by plain Jackson binding; I could not confirm that chain from source alone, so it is a secondary lead only."
+    },
+    {
+      "lead": "Fastjson2UndoLogParser.decode (rm-datasource lines 33-75) enables JSONReader.Feature.SupportAutoType together with FieldBased/UseNativeObject but passes no auto-type filter, unlike the RPC Fastjson2Serializer which does pass SerializerSecurityRegistry's filter; the parser name is also selectable from the undo_log `context` column in AbstractUndoLogManager.",
+      "reason": "Genuine CWE-502 pattern, but exploitation requires write access to the undo_log table (or a malicious client/DB) to plant `@type` payloads, the fastjson2 parser is opt-in (default is jackson, which itself enables default typing), and the rollback path must be triggered; attacker control is materially weaker than the submitted candidate."
+    },
+    {
+      "lead": "Unauthenticated state-changing endpoints: `/vgroup/v1/addVGroup` and `/vgroup/v1/removeVGroup` are in `seata.security.ignore.urls`, and the namingserver (`/naming/v1/register`, `/unregister`, `/addGroup`, `/changeGroup`) has no security layer at all; registered node control hosts are later used by NamingManager.createGroup/removeGroup to issue server-side HTTP GETs (SSRF via attacker-supplied host/port) and registry data drives client lookups.",
+      "reason": "Appears to be intentional server-to-namingserver integration rather than an accidental defect; impact is service-registry poisoning/vgroup remapping/blind SSRF on an auxiliary component, and I could not establish which defaults are deployed. Kept as a lower-confidence lead."
+    },
+    {
+      "lead": "GrpcDecoder.onDataRead (core/.../grpc/GrpcDecoder.java lines 52-113) computes body length from attacker bytes with no bounds check before System.arraycopy and selects the serializer from an unvalidated codec header, allowing NegativeArraySize/ArrayIndexOutOfBounds/OOM and arbitrary registered-serializer selection.",
+      "reason": "At most a DoS/robustness issue under an optional (gRPC) transport, with the serializers themselves whitelisted; not submitted as the top candidate."
+    },
+    {
+      "lead": "Default console account `console.user.username: seata` / `console.user.password: seata` shipped in server/src/main/resources/application.yml lines 36-39 (and both example configs).",
+      "reason": "Real insecure-default weakness with the same impact path as the submitted candidate, but it is a distinct root cause (guessable credentials rather than key forgery) and the one-candidate cap requires choosing only the strongest issue; noted here instead of being split out."
+    }
+  ],
+  "summary": "Repository is Apache Seata (2.3.0-SNAPSHOT, 1,825 model-visible files; tests and build/pom.xml absent). I reviewed the console/server HTTP security stack (Spring Security config, JWT issuing/validation, login provider chain), RPC and raft serializers/whitelists (seata, protobuf, kryo, hessian, fastjson2, Jackson, native Java), raft server/bootstrap, namingserver controllers/managers, console DB query services, config processors, and saga JSON/expression handling, plus broad sink searches (exec, Class.forName, readObject, readValue, parseObject, SQL string building, file paths, SSRF, randomness). The single strongest source-evidenced issue is that the shipped server configuration hard-codes the JWT signing key that is the only protection on the Seata console/management HTTP API, so a remote attacker can mint a valid HMAC-SHA256 token and reach authenticated endpoints; the same file also ships default console credentials (seata/seata), a related but distinct default-credential weakness that I did not submit separately under the one-candidate cap. Other plausible leads (broken `CustomAuthenticationProvider` password check, unguarded Jackson class selection on the raft Bolt port, fastjson2 undo-log auto-type, unauthenticated vgroup/namingserver APIs, gRPC decoder validation) are listed as rejected/unconfirmed below."
+}

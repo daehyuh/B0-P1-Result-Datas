@@ -1,0 +1,95 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An attacker who can reach the Conductor REST API controls the full expression text and evaluator selection: `POST /api/metadata/workflow` or `PUT /api/metadata/workflow` with `tasks[].type=SWITCH`, `evaluatorType=python` (or `javascript`), and arbitrary `expression`; the same for `DECISION.caseExpression` and `DO_WHILE.loopCondition`; `inputParameters.evaluatorType`/`expression` on an `INLINE` system task; `scriptExpression` on a `LAMBDA` task; and `POST /api/event` with an event-handler `condition`/`evaluatorType`. An inline `WorkflowDef` can also be supplied in `StartWorkflowRequest.workflowDef`. The OSS server in this snapshot has no authentication/authorization (no Spring Security dependency, no auth filter or handler interceptor found), so these are unauthenticated by default; only an external gateway/network boundary would restrict access.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether script evaluation is intentional and gated: docs (switch-task.md, inline-task.md, do-while-task.md) document javascript/value-param evaluators and event-handler conditions, i.e. JavaScript evaluation is a product feature — however no sandbox/class filter or evaluator allow-list exists for it, and the python evaluator is undocumented and unlisted. Verified there is no configuration property or feature flag gating evaluators (searched ConductorProperties and config docs); verified no Spring Security dependency, SecurityFilterChain, HandlerInterceptor, or Principal usage exists in the repository snapshot; verified the evaluator map is populated by Spring `Map<String, Evaluator>` injection keyed by bean names (PythonEvaluator.NAME=\"python\"); verified the evaluator is not rejected by validation (only \"javascript\" switch expressions are script-validated) and that SwitchTaskMapper passes the raw expression; verified DECISION/SWITCH script evaluation happens inside the bean-validation path (WorkflowTaskTypeConstraint.java lines 174-198). Considered that hardened deployments front the API with an authenticating gateway, which would reduce (not eliminate) exposure, and that PythonEvaluator's Context/eval cannot be runtime-confirmed here.",
+      "id": "conductor-workflow-expression-eval-rce",
+      "impact": "Remote code execution with the privileges of the Conductor server process: read/write files and credentials available to the container, access instance metadata or environment secrets, spawn processes or make outbound network connections, and tamper with or destroy workflow data. The registration-time path executes during a single metadata API call (no workflow execution required) for DECISION/SWITCH-javascript tasks, while the python/INLINE/event-handler paths execute as soon as a crafted workflow or event condition is processed.",
+      "locations": [
+        {
+          "end_line": 69,
+          "path": "core/src/main/java/com/netflix/conductor/core/execution/evaluators/PythonEvaluator.java",
+          "start_line": 30
+        },
+        {
+          "end_line": 69,
+          "path": "core/src/main/java/com/netflix/conductor/core/events/ScriptEvaluator.java",
+          "start_line": 50
+        },
+        {
+          "end_line": 90,
+          "path": "core/src/main/java/com/netflix/conductor/core/execution/mapper/SwitchTaskMapper.java",
+          "start_line": 79
+        },
+        {
+          "end_line": 82,
+          "path": "core/src/main/java/com/netflix/conductor/core/execution/tasks/Inline.java",
+          "start_line": 72
+        },
+        {
+          "end_line": 198,
+          "path": "core/src/main/java/com/netflix/conductor/validations/WorkflowTaskTypeConstraint.java",
+          "start_line": 174
+        },
+        {
+          "end_line": 178,
+          "path": "core/src/main/java/com/netflix/conductor/core/events/DefaultEventProcessor.java",
+          "start_line": 165
+        },
+        {
+          "end_line": 64,
+          "path": "rest/src/main/java/com/netflix/conductor/rest/controllers/MetadataResource.java",
+          "start_line": 48
+        },
+        {
+          "end_line": 64,
+          "path": "rest/src/main/java/com/netflix/conductor/rest/controllers/WorkflowResource.java",
+          "start_line": 58
+        },
+        {
+          "end_line": 54,
+          "path": "rest/src/main/java/com/netflix/conductor/rest/controllers/EventResource.java",
+          "start_line": 44
+        }
+      ],
+      "prerequisites": "Network reachability to the Conductor REST API and permission to register metadata/start a workflow (no authorization checks exist in this snapshot). The Python path requires the bundled GraalPy Python language runtime (core/build.gradle declares org.graalvm.polyglot:python:24.1.0). No configuration property was found that disables evaluator execution or restricts evaluator types; the switch-task/inline-task docs list only value-param and javascript, i.e. the python evaluator is not documented but is registered as a Spring bean (`@Component(PythonEvaluator.NAME)` -> map key \"python\" injected into SwitchTaskMapper/Inline/DefaultEventProcessor).",
+      "root_cause": "Workflow-definition strings are executed as code by the server in language runtimes configured with unrestricted host access. `PythonEvaluator.evaluate` creates `Context.newBuilder(\"python\").allowAllAccess(true)` and evals the caller-supplied `expression` (combined with caller-supplied input keys appended into the generated Python source). `ScriptEvaluator.eval` evals caller-supplied scripts on a Nashorn engine created with default options (`new ScriptEngineManager().getEngineByName(\"Nashorn\")` or `NashornScriptEngineFactory().getScriptEngine(\"--language=es6\")`) — no ClassFilter and no `--no-java`, so Java interop (e.g. `Java.type('java.lang.Runtime')`) is available. The expression strings come from workflow metadata (`SWITCH.expression`/`evaluatorType`, `INLINE.inputParameters`, `LAMBDA.scriptExpression`, `DO_WHILE.loopCondition`, `DECISION.caseExpression`) and event-handler `condition`/`evaluatorType`, with no trusted-author check, no allow-list of evaluators, and no configuration flag to disable evaluation. For DECISION/SWITCH-javascript tasks the script is additionally executed eagerly inside bean validation (`WorkflowTaskTypeConstraint.validateScriptExpression` -> `ScriptEvaluator.eval`) when a workflow definition is registered/validated.",
+      "title": "Server-side code execution via workflow-defined expressions (GraalPy python evaluator with allowAllAccess(true) and unsandboxed Nashorn JavaScript evaluator)",
+      "trace": "Registration-time (JS path): HTTP POST/PUT /api/metadata/workflow -> MetadataResource.create/update -> MetadataService.registerWorkflowDef/updateWorkflowDef (@Valid WorkflowDef; @Valid cascade on tasks) -> Hibernate Validator applies WorkflowTaskTypeConstraint (XML class-level mapping in core/src/main/resources/META-INF/validation/constraints.xml) -> WorkflowTaskValidator.isDecisionTaskValid/isSwitchTaskValid -> validateScriptExpression -> ScriptEvaluator.eval(expression, inputParameters) -> Nashorn engine with default Java interop -> arbitrary code executes during the HTTP request. Execution-time (python/JS paths): HTTP POST /api/workflow/{name} or /api/workflow with inline def -> WorkflowExecutorOps.startWorkflow -> DeciderService -> SwitchTaskMapper.getMappedTasks reads workflowTask.getEvaluatorType()/getExpression() and calls evaluators.get(evaluatorType).evaluate(expression, taskInput) -> for \"python\", PythonEvaluator.evaluate -> Context.newBuilder(\"python\").allowAllAccess(true) -> context.eval(\"python\", wrappedExpression) containing the attacker expression -> arbitrary Python with host access. The same evaluator map is reached from Inline.execute using task-input-supplied evaluatorType/expression, and from DefaultEventProcessor.executeEvent using the event handler condition/evaluatorType.",
+      "unverified": "No code was executed (no build/tests/runtime); reachability and impact are inferred from source. GraalPy `allowAllAccess(true)` host/native access semantics and Nashorn Java interop under the bundled org.openjdk.nashorn:nashorn-core:15.4 were not runtime-tested. Whether a given deployment exposes the REST API without an authenticating gateway, and whether the python evaluator path is blocked by any deployment-specific policy, is unverified. The P1 relation index has no data-flow/control-flow analysis and 7 files are unindexed, so no complete taint/reachability proof is claimed.",
+      "weakness_type": "CWE-94 Code Injection / CWE-95 Eval Injection (unconfined script-engine host access; missing trust check on expression source)"
+    }
+  ],
+  "coverage_summary": "Coverage followed get_source_scope: 1,124 model-visible source files (no senstive-name/symlink/oversize exclusions; binary-like files unreadable), of which 1,117 are indexed by the P1 relation index and 7 are missing; 769 Java files parsed with no parse errors, 20,023 unresolved calls, and no control-flow, data-flow, or semantic-resolution support (syntactic navigation candidates only). I inspected in depth: all REST controllers (Workflow/Task/Metadata/Event/Admin/QueueAdmin/HealthCheck), core execution classes (WorkflowExecutorOps, DeciderService, SwitchTaskMapper, Inline/Lambda/DoWhile/Event/SubWorkflow, evaluators and ScriptEvaluator), validation constraints, external payload storage (S3, Azure, Postgres, Dummy) and ExecutionDAOFacade, plus spot checks of ES6/ES7/OS DAOs, SQLite/Postgres query builders and index buildres, client SDK modules (conductor-client v4/v3, orkes-client), configuration classes and docs. Not reviewed line-by-line: NATS/AMQP/Kafka/Cassandra/Redis modules, gRPC proto mapping internals, UI JavaScript bundles, gradle/CI configuration.",
+  "limitations": [
+    "No code, build, tests, or scanners were executed; all conclusions are static source-level inference, and the candidate is a lead, not a confirmed vulnerability.",
+    "The P1 relation index is partial (1,117/1,124 files; 7 missing) and supports no data-flow, control-flow, or semantic resolution, so indexed edges were used only for navigation and every cited edge was re-verified in source text.",
+    "The snapshot contains no test sources, which removes an independent source of behavioral evidence.",
+    "Reachability/impact for the selected candidate depends on deployment posture that cannot be verified from the snapshot (presence of an authenticating gateway, process-level OS restrictions, whether GraalPy python runtime loads successfully).",
+    "Several service modules (nats, amqp, kafka, cassandra, redis persistence/lock, grpc, ui) were only spot-checked; unknown issues may exist there."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "External payload storage path handling can be abused (DummyPayloadStorage path traversal on download; S3PayloadStorage/AzureBlobPayloadStorage return locations for arbitrary user-supplied object keys; StartWorkflowRequest.externalInputPayloadStoragePath and TaskResult.externalOutputPayloadStoragePath are accepted server-side although the Java client rejects them)",
+      "reason": "Plausible but not selected: with the default DummyPayloadStorage the server-side read is constrained to files that parse as a JSON map (and to the temp payload dir or traversed paths), and the S3/Azure/Postgres variants return locations/objects only for deployments that configure external storage. Evidence is source-level but impact is bounded/configuration-dependent compared with the eval-injection candidate."
+    },
+    {
+      "lead": "Elasticsearch/OpenSearch structured-query interpolation (e.g. ElasticSearchRestDAOV7.getTaskExecutionLogs uses boolQueryBuilder(\"taskId='\" + taskId + \"'\", \"*\") and getTask/workflow-and-task lookups use String.format(\"(taskId='%s') AND (workflowId='%s')\", ...))",
+      "reason": "Query-language injection into the custom Expression parser is plausible, but the observable impact is limited to widening search scope (other tasks' logs/results) in an unauthenticated single-tenant OSS deployment; no RCE/credential impact shown."
+    },
+    {
+      "lead": "GET /api/admin/config (AdminResource.getAllConfig -> AdminServiceImpl -> properties.getAll()) returns the full server configuration map",
+      "reason": "Could disclose credentials embedded in configuration (e.g. Redis/DB hosts and passwords) but the endpoint is an intentional admin API and disclosure depends entirely on deployment configuration; weaker and less certain than the selected candidate."
+    },
+    {
+      "lead": "Example/default configuration disables name validation (conductor.app.workflow.name-validation.enabled=false in server application.properties; ValidNameConstraint short-circuits when disabled)",
+      "reason": "Hardening weakness only; no concrete injection/exploit path was traced from unvalidated workflow/task names in this snapshot."
+    },
+    {
+      "lead": "conductor-client ConductorClient.unsafeClient disables TLS certificate and hostname verification",
+      "reason": "Opt-in dev feature reached only when Builder.verifyingSsl(false) is set; the default is true, so this is not an exploitable vulnerability by itself."
+    }
+  ],
+  "summary": "Reviewed the assigned conductor-oss snapshot (1,124 source files; 769 Java). The REST layer, core execution/decider/evaluator paths, external payload storage implementations (S3/Azure/Postgres/default Dummy), persistence query builders (ES6/ES7/OS/SQLite/Postgres spot checks), client SDK modules and configuration/properties were inspected. The strongest source-evidenced issue is server-side code execution via workflow-defined expression evaluation: the `python` evaluator builds a GraalPy context with `allowAllAccess(true)` and evaluates workflow-supplied Python, and the JavaScript path evaluates workflow-supplied scripts on a Nashorn engine created without class filtering or `--no-java` (Java interop available); in some paths the script is evaluated during workflow-definition validation itself. The repository contains no built-in authentication/authorization in this snapshot (no Spring Security dependency, no security filter/interceptor), so the metadata/event/start-workflow APIs that carry these expressions are reachable by any network client in a default deployment."
+}

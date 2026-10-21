@@ -1,0 +1,72 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The value is the role pattern stored in the authorization strategy (Role.pattern). It is set through the Manage Roles submission path (RoleBasedAuthorizationStrategy.DescriptorImpl.doRolesSubmit/newInstance/readRoles, RoleBasedAuthorizationStrategy.java lines 786-941, pattern read at lines 915-928) or the REST doAddRole (lines 309-339), and it is persisted in config.xml. All of these paths call checkAdminPerm()/checkPermission(Jenkins.ADMINISTER), so storing the payload requires Overall/Administer (or direct JCasC/config.xml write). It is rendered back on the admin-only role management page and re-inserted into HTML by the client-side JS.",
+      "confidence": "low",
+      "counterevidence_checked": "Checked whether non-admin users can set role patterns: all pattern-writing paths (doRolesSubmit, doAddRole, JCasC, config.xml) require Overall/Administer, so this is not a privilege-escalation vector for regular users. Checked other JS sinks: role name uses textContent/escapeHTML (lines 176-180) and tooltips use doubleEscapeHTML (line 108, 186), so the attribute interpolation at lines 66/89 is the only raw HTML construction found; table.js and assignFilters.js use textContent only. Checked Java-side escaping (ValidationUtil used with Functions.escape at RoleBasedAuthorizationStrategy.java 1077/1123) and found no equivalent Java XSS sink that is non-admin reachable. The Jelly views that render the same table server-side are not part of the snapshot, so a server-side sibling issue cannot be confirmed or excluded.",
+      "id": "role-strategy-xss-tablemanage-pattern",
+      "impact": "Script execution in the browser of a user viewing the role management page (with Overall/Administer or the page's required permission), enabling theft/abuse of the admin session (CSRF tokens, role/permission manipulation). Impact is constrained because the payload can only be stored by an already-privileged user or a config-writing actor; the sink itself is nonetheless an unescaped, attacker-influenced value in a security-configuration UI.",
+      "locations": [
+        {
+          "end_line": 73,
+          "path": "src/main/webapp/js/tableManage.js",
+          "start_line": 62
+        },
+        {
+          "end_line": 100,
+          "path": "src/main/webapp/js/tableManage.js",
+          "start_line": 86
+        },
+        {
+          "end_line": 89,
+          "path": "src/main/webapp/js/table.js",
+          "start_line": 70
+        }
+      ],
+      "prerequisites": "Attacker (or someone able to write the role configuration) can store a project/agent role whose pattern contains a quote plus HTML/script, e.g. a pattern beginning with '\"><img src=x onerror=...>'; a victim with access to the Manage and Assign Roles page then interacts with/renders the pattern edit control (pencil icon) on the row. No lower-privileged attacker path to set patterns was found in the visible code.",
+      "root_cause": "src/main/webapp/js/tableManage.js builds markup by string concatenation with innerHTML and interpolates the stored role pattern into a double-quoted attribute without HTML-escaping. In endPatternInput (line 89) the pattern is escaped only for the anchor text ('&quot;' + pattern.escapeHTML() + '&quot;') but is appended raw into the hidden input: name=\"[pattern]\" value=\"' + pattern + '\". The same raw interpolation occurs in the pencil-icon click handler (line 66): '... value=\"' + inputNode.childNodes[1].value + '\"'. A pattern containing a double quote breaks out of the value attribute and injects arbitrary markup/event handlers, which are then parsed and executed by the admin's browser when the pattern edit control is activated/rendered. The helper escapeHTML/doubleEscapeHTML exists in src/main/webapp/js/table.js (lines 70-89) and is used elsewhere in the same file (e.g. line 176/179/186), showing the escaping was intended but omitted at these sinks.",
+      "title": "Unescaped stored role pattern inserted into HTML via innerHTML on role management page (stored/DOM XSS)",
+      "trace": "Stored pattern (RoleBasedAuthorizationStrategy.newInstance/readRoles -> Role(roleName, pattern, permissions) -> persisted via ConverterImpl.marshal, lines 899-941, 622-667) -> server renders the Manage Roles table row containing <input class=\"patternEdit\" ... value=\"<pattern>\"> -> admin clicks img.icon-pencil -> tableManage.js line 62-70 reads inputNode.childNodes[1].value (raw stored string) and assigns innerHTML with value=\"' + value + '\" (attribute breakout) -> alternatively, ending an edit calls endPatternInput (line 86-89) which writes the raw pattern into the value attribute -> injected markup/JS is parsed in the admin's browser session.",
+      "unverified": "Not runtime-confirmed; no browser execution was performed. The exact client flow that reaches the sinks depends on Jelly-rendered markup (absent from the snapshot) and on the role-management page's required permission (RoleStrategyConfig.getRequiredPermission() is Jenkins.SYSTEM_READ at lines 85-87, which may widen who can view the page while mutating endpoints still require ADMINISTER). Upstream comparison was not possible offline, so whether .escapeHTML() was present at these two sinks in the original code is unverified. Severity would be higher if the same pattern value is displayed to non-admin viewers elsewhere.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation (stored/DOM cross-site scripting)"
+    }
+  ],
+  "coverage_summary": "All 60 model-visible files were accounted for (get_source_scope reports 60 files, no binary/symlink/sensitive exclusions). Read in full or in security-relevant part: all Java sources under com/michelin/..., com/synopsys/..., and org/jenkinsci/... (authorization strategy, RoleMap/Role, naming strategy, macros, PermissionHelper, CasC configurators, Settings, ValidationUtil, administrative monitor), all three webapp JS files, pom.xml, .mvn/extensions.xml, .github workflows/dependabot, docs, and the resource/message/help properties. Principal limitation: Jelly views and test sources are not present in the snapshot, so UI-side rendering and test-expressed expectations could not be inspected; no dependency sources (Jenkins core/matrix-auth) were available for cross-checking helper semantics such as Functions.escape or PermissionGroup IDs.",
+  "limitations": [
+    "Jelly views (manage-roles/assign-roles) and src/test sources are absent from the snapshot, so server-side rendering/escaping and any non-admin viewing path could not be verified.",
+    "No runtime, scanner, or browser execution was performed; the XSS lead relies on static reading of the JS sinks and the persisted pattern value.",
+    "Offline review could not diff against upstream role-strategy code, so it cannot be stated whether lines 66/89 of tableManage.js regressed from a previously escaped version.",
+    "Jenkins core semantics used in the analysis (SidACL inheritance, Permission.impliedBy chains, descriptor validation reachability, ManagementLink permission handling) were reasoned from the imported APIs and comments, not from the core source."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Missing permission check on RoleBasedAuthorizationStrategy.DescriptorImpl.doCheckPattern (lines 1053-1062): any user who can invoke descriptor form validation can force Pattern.compile() on an arbitrary regex.",
+      "reason": "Validation endpoint only compiles (does not match) the regex and returns the syntax error; no data exposure or authorization impact was traced, so this is at most a hardening/resource-consumption gap, not a demonstrated vulnerability."
+    },
+    {
+      "lead": "RoleStrategyConfig.getRequiredPermission() returns Jenkins.SYSTEM_READ (lines 85-87), potentially letting non-admin Overall/SystemRead users open the role-strategy management pages.",
+      "reason": "All mutating endpoints independently enforce Jenkins.ADMINISTER, and the table-rendering Jelly views are outside the snapshot, so data exposure to SystemRead users could not be evidenced; unverified whether this is the upstream value."
+    },
+    {
+      "lead": "doCheckName returns raw, unescaped v in the UserMayOrMayNotExistException2 (group) branch (RoleBasedAuthorizationStrategy.java line 1114).",
+      "reason": "Reachable only after the Jenkins.ADMINISTER check at line 1079 (non-admins get the escaped ev), so it is at most admin self-XSS with no cross-user attack path shown."
+    },
+    {
+      "lead": "RoleMacroExtension.getMacro stores null into a ConcurrentHashMap on parse failure (RoleMacroExtension.java lines 44, 69), which throws NullPointerException for malformed '@...' role names during permission evaluation.",
+      "reason": "Only reachable for roles already present in the authorization configuration (created by an admin or config writer); results in an error/availability problem, not an authorization bypass, and may be upstream behavior."
+    },
+    {
+      "lead": "RoleMap.AclImpl parent-permission check and the Item.CREATE fallback (RoleMap.java lines 555-588) could weaken/strengthen item permissions if the READ/DISCOVER restriction or the naming-strategy condition were wrong.",
+      "reason": "Logic is internally consistent with its comments and the inheriting-ACL design; no concrete bypass was traced, so rejected as an unconfirmed lead."
+    },
+    {
+      "lead": "Settings.TREAT_USER_AUTHORITIES_AS_ROLES matching security-realm authorities against role names (RoleMap.java lines 154-174, Settings.java line 86).",
+      "reason": "Opt-in system property, disabled by default, and documented behavior; not attacker-controllable in this snapshot."
+    },
+    {
+      "lead": "RoleBasedProjectNamingStrategy.checkName pattern enforcement (lines 74-140) potentially allowing creation outside a role pattern via CLI/folder parent-name resolution.",
+      "reason": "Walked the create-job flow: the loop enforces pattern matching against fullName for non-macro Item.CREATE roles, and the empty-parent-name CLI path still applies the pattern; no bypass found."
+    }
+  ],
+  "summary": "Reviewed the 60 model-visible files of the Jenkins Role-based Authorization Strategy plugin snapshot (role-strategy ~3.4-era, baseline Jenkins 2.361.4). Coverage: all main Java sources (RoleBasedAuthorizationStrategy, RoleMap, Role, RoleStrategyConfig, RoleBasedProjectNamingStrategy, PermissionHelper, Macro/RoleMacroExtension/macro implementations, CasC configurators, Settings, ValidationUtil), all webapp JS/CSS, resource property/help files, pom.xml, .mvn, .github workflows, and docs. The Java authorization core is well hardened: every state-changing or data-returning strategy endpoint (doAddRole/doGetRole/doRemoveRoles/doAssignRole/doDeleteSid/doUnassignRole/doGetAllRoles/doGetMatchingJobs/doGetMatchingAgents/doRolesSubmit/doAssignSubmit) has @RequirePOST plus checkAdminPerm(), dangerous permissions (RUN_SCRIPTS, CONFIGURE_UPDATECENTER, UPLOAD_PLUGINS) are filtered/neutralized, and the FORM-validation doCheckName is admin-gated to prevent user enumeration. The one concrete code-level missing-escape sink I could evidence is a DOM/stored XSS in the role-management JavaScript: a stored role pattern is interpolated unescaped into an HTML attribute via innerHTML while the adjacent text is escaped. Its reachability is limited to the admin-facing Manage Roles page, so I submit it as a single low-confidence lead rather than a confirmed vulnerability, and list the weaker leads that were rejected."
+}

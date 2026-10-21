@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The href attribute of a <xop:Include xmlns:xop=\"http://www.w3.org/2004/08/xop/include\" href=\"...\"/> element inside the request body (base64Binary/xmime field for JAXB, or an Aegis MTOM type). The value is fully attacker-chosen, e.g. an internal host ('http://169.254.169.254/...', 'http://127.0.0.1:PORT/...'), a 'file:///...' path, or a large/slow URL. The request must be multipart (content type multipart/related), which the attacker controls, so that message.getAttachments() is non-null.",
+      "confidence": "medium",
+      "counterevidence_checked": "cid:-prefixed hrefs and scheme-less ids go to loadDataSource() (attachment lookup, which throws if the id is missing), so the URL branch only triggers on strings containing '://'. JAXBAttachmentUnmarshaller.isXOPPackage() returns false when attachments == null, so non-multipart requests do not reach the sink. AttachmentDeserializer already limits attachment count/header size, but that does not affect the URL fetch. Other CXF code shows the expected safe pattern (e.g. rt/ws/security/.../STSStaxTokenValidator.java:560 only accepts hrefs starting with 'cid:' before resolving). The DataHandler is lazy, so the request is only made when the value is read. Available schemes depend on JRE URL handlers. The comment 'Is this right? - DD' indicates the URL fallback is long-standing behavior that may have been intentional for interoperability, which is why this is a lead rather than a runtime-confirmed vulnerability.",
+      "id": "cxf-xop-href-url-deref-ssrf",
+      "impact": "Blind SSRF from the CXF server into internal networks/cloud metadata endpoints; local file disclosure when a file: URL is used (the fetched bytes can become the field value returned to the caller or be processed further); server-side resource consumption by fetching large or slow URLs. The core path is reachable through the common JAX-WS/JAXB (and JAX-RS JAXB) MTOM handling, so exposure is broad for MTOM-enabled or base64Binary-bearing services.",
+      "locations": [
+        {
+          "end_line": 544,
+          "path": "core/src/main/java/org/apache/cxf/attachment/AttachmentUtil.java",
+          "start_line": 525
+        },
+        {
+          "end_line": 78,
+          "path": "rt/databinding/aegis/src/main/java/org/apache/cxf/aegis/type/mtom/AttachmentUtil.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 65,
+          "path": "rt/databinding/jaxb/src/main/java/org/apache/cxf/jaxb/attachment/JAXBAttachmentUnmarshaller.java",
+          "start_line": 47
+        },
+        {
+          "end_line": 140,
+          "path": "rt/databinding/aegis/src/main/java/org/apache/cxf/aegis/type/mtom/AbstractXOPType.java",
+          "start_line": 125
+        },
+        {
+          "end_line": 62,
+          "path": "core/src/main/java/org/apache/cxf/interceptor/AttachmentInInterceptor.java",
+          "start_line": 45
+        },
+        {
+          "end_line": 91,
+          "path": "core/src/main/java/org/apache/cxf/interceptor/AbstractInDatabindingInterceptor.java",
+          "start_line": 83
+        }
+      ],
+      "prerequisites": "Endpoint uses JAXB databinding (default JAX-WS) or Aegis databinding; incoming request is multipart/related so AttachmentInInterceptor populates attachments; the target element is base64Binary/xmime (JAXB) or an MTOM-mapped Aegis type; attacker can send a request to the endpoint. No authentication requirement beyond whatever the service itself enforces (the sink is in the databinding layer, before/independent of business authorization).",
+      "root_cause": "Attachment resolution trusts the raw MTOM/XOP href as a URL instead of restricting it to the message's own attachments. In core AttachmentUtil.getAttachmentDataSource, any href containing '://' is turned into new URLDataSource(new URL(contentId)) (AttachmentUtil.java:534-541), so the server opens it. The Aegis variant does the same after failing an ID lookup: new URLDataSource(new URL(id)) (aegis AttachmentUtil.java:71-77).",
+      "title": "Attacker-controlled xop:Include href is fetched as an arbitrary URL (SSRF / local file disclosure) during MTOM attachment resolution",
+      "trace": "1) Multipart/related request: AttachmentInInterceptor.handleMessage (core/.../AttachmentInInterceptor.java:45-62) -> AttachmentDeserializer.initializeAttachments() sets a non-null LazyAttachmentCollection. 2) AbstractInDatabindingInterceptor.getDataReader (core/.../AbstractInDatabindingInterceptor.java:87) calls dataReader.setAttachments(message.getAttachments()). 3) DataReaderImpl.createUnmarshaller (rt/databinding/jaxb/.../DataReaderImpl.java:131) installs JAXBAttachmentUnmarshaller (JAXBDataBase.java:87-89); the JAX-RS JAXB provider does the same (rt/frontend/jaxrs/.../JAXBElementProvider.java:527-532). 4) While unmarshalling a base64Binary element containing xop:Include, JAXB invokes AttachmentUnmarshaller.getAttachmentAsDataHandler/getAttachmentAsByteArray with the raw href; CXF forwards it to AttachmentUtil.getAttachmentDataSource (rt/databinding/jaxb/.../JAXBAttachmentUnmarshaller.java:49,56; same in rt/frontend/jaxrs/.../JAXBAttachmentUnmarshaller.java:49,56). 5) Because the href contains '://', core AttachmentUtil returns new URLDataSource(new URL(contentId)) (line 538) instead of looking up attachments; reading the attachment opens the attacker URL server-side. 6) Aegis path: Base64Type/AbstractXOPType.readMtoM -> readInclude (AbstractXOPType.java:125-140) -> Aegis AttachmentUtil.getAttachment(href,...) -> URL fallback at line 73.",
+      "unverified": "No code was executed. It is inferred (from the JAXB AttachmentUnmarshaller contract and CXF wiring, not observed) that the JAXB RI forwards the raw xop:Include href to CXF. The exact required service configuration (MTOM enabled vs. merely a base64Binary field in a multipart request) was not runtime-verified, nor was the Aegis path (requires Aegis databinding). Whether upstream regards remote-URL loading as intended functionality is unknown; the sink is nevertheless reachable from untrusted input in this snapshot.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery (untrusted URL dereference; secondary local file disclosure)"
+    }
+  ],
+  "coverage_summary": "P1 index covers 4,865 of 4,922 source files (57 files missing, 5 parse errors); it provides only syntax-level name/type/arity call, containment and inheritance candidates, with no control-flow, data-flow, semantic resolution, Spring DI/profile or security-enforcement verification (per get_relation_scope). I used it for navigation and verified all reported edges against source text. Manual review focused on: core attachment handling and interceptors (AttachmentDeserializer, LazyAttachmentCollection, AttachmentUtil, AttachmentInInterceptor, AbstractInDatabindingInterceptor), JAXB and Aegis databinding attachment paths, JAX-RS request preprocessing/URI handling, HTTP transport TLS/hostname-verification, CORS filter, OAuth2/OIDC/JWT/SAML/JOSE code, WADL/service-list writers, and broad text searches for common sink patterns (process execution, deserialization, SQL, URL/file handling, XML parser factories). Not exhaustively reviewed: the ~4,900-file tree as a whole, including distribution samples, tools and Maven plugins, OSGi/blueprint wiring, netty/undertow/websocket transports, JMX, JMS and CORBA modules.",
+  "limitations": [
+    "Static review only: no code, tests, scanners or payloads were executed; no exploit was attempted and no target was contacted.",
+    "The relation index is partial (57 files absent, 5 parse errors, 103,461 unresolved calls) and is explicitly not SAST; absence of an indexed edge does not mean a code path is absent or safe.",
+    "Runtime reachability of the JAXB RI -> AttachmentUnmarshaller href forwarding and the required MTOM/service configuration were not verified.",
+    "Only a small subset of the 4,922 files was read in depth; unread modules may contain stronger issues.",
+    "No ground-truth, CVE mapping or patch data was consulted; the candidate is an evidence-based lead, not a confirmed vulnerability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Attachment-count limit bypass: LazyAttachmentCollection enforces maxAttachmentCount only in loadAll() (core/.../LazyAttachmentCollection.java:52-67), while iterator()/hasNext(true) (lines 75-129) add attachments without the check, so a multipart message with very many parts can still exhaust memory.",
+      "reason": "DoS-only impact, and the constructor/limit code present in the snapshot indicates an existing (if incomplete) protection; could not establish that the missing iterator check is the intended change vs. upstream behavior."
+    },
+    {
+      "lead": "Unbounded OAuth2 scope parsing: OAuthUtils.parseScope (rt/rs/security/oauth-parent/oauth2/.../OAuthUtils.java:260-267) splits an attacker-supplied scope string with no limit.",
+      "reason": "Denial-of-service only and no in-repo evidence of a bound being removed; weaker impact than the SSRF candidate."
+    },
+    {
+      "lead": "OidcClaimsValidator.validateSelfIssuedProvider has an empty body (rt/rs/security/sso/oidc/.../OidcClaimsValidator.java:113-114), so aud/exp/nbf/subject claims are not validated in the self-issued provider branch.",
+      "reason": "Requires supportSelfIssuedProvider=true and issuerId==null (non-default opt-in), and it is unclear whether the empty body is an upstream stub or a regression; signature is still bound to the token's sub_jwk/sub thumbprint. Left unconfirmed."
+    },
+    {
+      "lead": "FormattedServiceListWriter writes endpoint addresses and basePath-derived URLs unescaped into HTML (rt/transports/http/.../FormattedServiceListWriter.java:104-125, 168-225).",
+      "reason": "Could not verify that the basePath/absolute URL is attacker-controlled and reflected to a victim (request URL is normally percent-encoded); no confirmed injection vector."
+    },
+    {
+      "lead": "Redirect URI validation uses startsWith on the registered application URI (rt/rs/security/oauth-parent/oauth2/.../RedirectionBasedGrantService.java:490-495; also ClientCodeRequestFilter.java:87-93).",
+      "reason": "Weak allow-list pattern that appears to be upstream behavior; exploitation depends on registered-URI configuration and was not traced to a concrete open-redirect/code-leak impact."
+    }
+  ],
+  "summary": "Apache CXF 3.2.11 snapshot. Strongest source-evidenced issue: attacker-controlled XOP/MTOM attachment hrefs are dereferenced as URLs (SSRF / local file disclosure / resource exhaustion) in the attachment-resolution utilities, with a direct sink at core AttachmentUtil.getAttachmentDataSource and a second sink in the Aegis binding's AttachmentUtil. The rest of the time was spent checking and ruling out weaker leads (attachment-count DoS bypass, OAuth2 scope-count DoS, empty OIDC self-issued validation, service-list HTML escaping, redirect_uri prefix checks). No runtime execution was performed; findings are source-level leads only."
+}

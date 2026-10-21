@@ -1,0 +1,101 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Unauthenticated remote HTTP client controls the request URI. AbstractResourceHandler.getResource(HttpServletRequest) reads request.getServletPath()/getPathInfo() (AbstractResourceHandler.java:40-58), which become the 'path' argument flowing into the handlers via StaticFilesConfiguration.consume -> consumeWithFileResourceHandlers -> staticResourceHandler.getResource(httpRequest) (StaticFilesConfiguration.java:85-111). No authentication or route registration is required when staticFileLocation()/externalStaticFileLocation() is enabled.",
+      "confidence": "medium",
+      "counterevidence_checked": "UriPath.canonical does eliminate normal '/'+exact '..' traversal and returns null when '..' would escape the servlet root, so the simple Unix '/../' vector is blocked and leading '..' yields null (then addPaths falls back to the base folder, serving only the welcome file). DirectoryTraversal does exist in this snapshot (an earlier hardening), and Jetty 9.4 commonly rejects ambiguous URIs containing %2e/%2f/%5c, which blocks many payloads on the default embedded server. The prefix-boundary weakness alone requires a sibling path sharing the configured folder prefix. I found no runtime evidence that a specific payload reaches FileInputStream, so the exact exploit string is unverified; the divergence between the checked string and the resolved path is the evidence-backed defect.",
+      "id": "cand-1",
+      "impact": "Remote file disclosure outside the configured static root: sibling directories whose names begin with the configured folder name (any platform), and on Windows backslash traversal from the static root to arbitrary readable files (e.g. configuration/credential files), served with attacker-specified path; the classpath variant can similarly expose non-static classpath resources. Requires static file serving to be enabled and the container/OS conditions above.",
+      "locations": [
+        {
+          "end_line": 23,
+          "path": "src/main/java/spark/staticfiles/DirectoryTraversal.java",
+          "start_line": 12
+        },
+        {
+          "end_line": 29,
+          "path": "src/main/java/spark/staticfiles/StaticFilesFolder.java",
+          "start_line": 19
+        },
+        {
+          "end_line": 83,
+          "path": "src/main/java/spark/resource/ExternalResourceHandler.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 84,
+          "path": "src/main/java/spark/resource/ClassPathResourceHandler.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 161,
+          "path": "src/main/java/spark/resource/UriPath.java",
+          "start_line": 32
+        },
+        {
+          "end_line": 266,
+          "path": "src/main/java/spark/utils/StringUtils.java",
+          "start_line": 218
+        },
+        {
+          "end_line": 406,
+          "path": "src/main/java/spark/utils/StringUtils.java",
+          "start_line": 393
+        },
+        {
+          "end_line": 40,
+          "path": "src/main/java/spark/resource/ExternalResource.java",
+          "start_line": 39
+        },
+        {
+          "end_line": 68,
+          "path": "src/main/java/spark/resource/ExternalResource.java",
+          "start_line": 66
+        },
+        {
+          "end_line": 60,
+          "path": "src/main/java/spark/resource/AbstractResourceHandler.java",
+          "start_line": 40
+        },
+        {
+          "end_line": 111,
+          "path": "src/main/java/spark/staticfiles/StaticFilesConfiguration.java",
+          "start_line": 67
+        }
+      ],
+      "prerequisites": "Application has enabled Spark static file serving (staticFileLocation and/or externalStaticFileLocation). For the clearest bypass: container passes '\\' (e.g. %5c) or a non-boundary sibling path through in getPathInfo() and the OS treats '\\' as a separator (Windows; Jetty/Tomcat on other platforms may reject ambiguous URIs), and/or a directory exists whose name begins with the configured folder name (e.g. /srv/app/public and /srv/app/public-secret, classpath 'public' and 'public-extra').",
+      "root_cause": "The static-resource handlers construct the file/resource path first and only afterwards call DirectoryTraversal.protectAgainstForExternal/protectAgainstInClassPath, which validate with String.startsWith against the configured folder string with no path-separator boundary. StaticFilesFolder stores the configured folder as a bare string (only one leading/trailing slash stripped), and the attacker-derived path is normalized by two separate, weaker routines: UriPath.canonical recognizes only '/' as a separator and only exact '.'/'..' segments, while StringUtils.cleanPath later replaces '\\' with '/' and collapses '..' (retaining a URL/drive ':' prefix, which can prevent collapsing). Thus the string checked by the guard (resource.getPath()) and the path opened by FileInputStream / ClassLoader can diverge, and so can the guard's prefix vs. the real directory boundary (e.g. 'public-secret' does not equal 'public' + separator).",
+      "title": "Static-file directory-traversal guard bypass: prefix string check without path boundary + separator-canonicalization gap",
+      "trace": "1) MatcherFilter.doFilter calls staticFiles.consume(httpRequest,httpResponse) before routing (MatcherFilter.java:94). 2) StaticFilesConfiguration.consumeWithFileResourceHandlers iterates handlers and calls getResource(httpRequest) (StaticFilesConfiguration.java:91). 3) ExternalResourceHandler.getResource(path) (or ClassPathResourceHandler.getResource) takes the container-provided path, calls UriPath.canonical(path) (ExternalResourceHandler.java:66 / ClassPathResourceHandler.java:67) -- UriPath only splits on '/', so a segment such as '..\\public-secret' or a backslash-joined traversal is not recognized as '..' and is left intact. 4) addPaths(baseResource, path) concatenates the configured folder and attacker path (ExternalResourceHandler.java:68). 5) new ExternalResource(addedPath) calls new File(StringUtils.cleanPath(path)) (ExternalResource.java:40); cleanPath replaces '\\' with '/' and collapses '..', so the File/ClassPathResource in the object can point outside the configured root (e.g. C:\\app\\public-secret\\secret.txt from base C:\\app\\public). 6) Only after the resource is materialized and found to exist does the handler call DirectoryTraversal.protectAgainstForExternal(resource.getPath()) / protectAgainstInClassPath(resource.getPath()) (ExternalResourceHandler.java:81-83 / ClassPathResourceHandler.java:82-84). 7) The checks compare removeLeadingAndTrailingSlashesFrom(path).startsWith(StaticFilesFolder.external()/local()) (DirectoryTraversal.java:12-23), where StaticFilesFolder holds the folder as an unanchored string (StaticFilesFolder.java:19-29) -- so 'C:/app/public-secret/secret.txt' or 'public-secret/secret.txt' passes startsWith('C:/app/public' / 'public'). 8) The resource is returned; StaticFilesConfiguration opens resource.getInputStream() and copies it to the response (StaticFilesConfiguration.java:100-105), disclosing the file.",
+      "unverified": "Not runtime-confirmed and not reproduced. Whether a concrete container configuration (Jetty version/config or external container) forwards '\\' or a sibling-prefix path into getPathInfo() was not tested. The colon/prefix behavior in StringUtils.cleanPath was analyzed but no practical separator-free traversal through it was demonstrated. Classpath traversal additionally depends on the classloader resolving paths outside the root.",
+      "weakness_type": "CWE-22 Path Traversal (insufficient path canonicalization / improper prefix comparison)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 105-file source scope reported by get_source_scope (all enumerable files are under src/main/java; no test sources are present). Focused trace across the static-file and resource pipeline: StaticFilesConfiguration, StaticFilesFolder, DirectoryTraversal, ClassPathResourceHandler, ExternalResourceHandler, ClassPathResource, ExternalResource, AbstractResourceHandler, AbstractFileResolvingResource, UriPath, StringUtils, MatcherFilter, SparkFilter, FilterTools, plus spot checks of Service/Response/Spark entry points. P1 relation index: 104/105 files indexed (1 file missing), 99 Java files parsed, 1144 symbols, calls/containment relations only; control flow, data flow and semantic resolution are explicitly not implemented, and Spring/annotation facts are unverified, so no index edge was treated as proof. Omitted/uninspected areas: embeddedservers/jetty internals (SocketConnectorFactory, WebSocket*), ssl/SslStores, serialization package, Routable/QueryParamsMap/Request/Response in full depth, and all files without indexed security-relevant hits.",
+  "limitations": [
+    "No runtime execution, tests, scanners, or exploit payloads were run; all conclusions are static source reading.",
+    "P1 index does not provide data flow/reachability; the candidate is a source-evidence lead, not a confirmed vulnerability.",
+    "The exact request encoding needed to deliver '\\' or a sibling-prefix path into getServletPath()/getPathInfo() depends on the servlet container/Jetty version, which was not inspected (Jetty is an external dependency in pom.xml).",
+    "One source file is missing from the P1 index; 6 test sources and any non-Java resources are absent from the snapshot, so historical regression tests could not corroborate the bypass.",
+    "StringUtils.cleanPath colon-prefix and above-root '..' edge cases were reasoned manually; no automated path-normalization differential was performed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "StaticFilesConfiguration.consume writes 'Bad request' with status 400 on DirectoryTraversalDetection but then returns false (StaticFilesConfiguration.java:74-81), letting MatcherFilter continue into rout/responses.",
+      "reason": "Affects error handling after a detected bypass attempt, not an independent file-read or injection primitive; the guard already fired. Secondary defense-in-depth note, not a separate vulnerability."
+    },
+    {
+      "lead": "Response.redirect / Response header handling (Response.java:122 region flagged by index) may allow open redirect / header injection.",
+      "reason": "Location value is supplied by the application code, not by request input; no attacker-controlled source reaches it in framework code. Not evidence-supported."
+    },
+    {
+      "lead": "Process/SQL-ish index hints in Service.java (lines 411, 481-513) and EmbeddedJettyServer.java:149.",
+      "reason": "These are navigation hints for class loading / server start / IOUtils copy, not attacker-controlled sinks; no tainted input or dangerous API misuse found in source."
+    },
+    {
+      "lead": "FilterTools.getRelativePath URL-decodes the request path again (FilterTools.java:54-58), creating potential double-decoding in external-container mode.",
+      "reason": "The decoded value is only used for the routing RequestWrapper, while static-file consumption uses the raw HttpServletRequest path; no concrete path-traversal consequence could be traced from this alone."
+    }
+  ],
+  "summary": "Spark Java web framework 2.7.1 (pre-2.7.2) source snapshot (105 files, all under src/main/java). The strongest source-evidenced issue is in the static-file serving path: the directory-traversal guard is a raw string prefix comparison without a path-separator boundary, and the path that is actually opened is produced by separate, weaker transformations (UriPath.canonical handles only '/' separators and exact '.'/'..' segments; StringUtils.cleanPath converts '\\' to '/' and collapses '..' with a URL-prefix exception). As a result the guard can approve a file path that resolves outside the configured static root (e.g. a sibling folder whose name starts with the configured folder name, reached on Windows via backslash traversal that UriPath.canonical does not normalize). This matches the affected 2.7.1 version's known static-file traversal class of defect. Not runtime-confirmed; container behavior (Jetty ambiguity rejection, Windows-only backslash semantics) is a prerequisite."
+}

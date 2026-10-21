@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote peer sends the HTTP/1 byte stream: the header-line bytes are fully attacker-controlled (e.g. `Content-Length : 5`, `Transfer Encoding: chunked`, `TE : chunked`, LF-only terminators, bare CR bytes, fold lines).",
+      "confidence": "low",
+      "counterevidence_checked": "I verified that decoded values themselves cannot contain CR/LF through this decoder (CR bytes are skipped and LF terminates the line), so plain decoder-to-encoder round-trips do not split; DefaultHttpHeaders also rejects many malformed names/values. The issue requires a parser disagreement (or app-level re-emission of decoded values), and I found no test or runtime evidence confirming exploitability. Some tolerance (LF-only lines, obs-fold) may be intentional legacy behavior for RFC 2616 compatibility, which reduces confidence that a maintainer would treat this exact code as the vulnerability.",
+      "id": "netty-http1-fieldline-grammar-bypass",
+      "impact": "HTTP request/response smuggling between Netty and an adjoining HTTP parser, cache poisoning, security-control bypass, and header/response splitting when decoded content is re-encoded. Denial of service is also possible where the mismatch desynchronizes the connection.",
+      "locations": [
+        {
+          "end_line": 705,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 674
+        },
+        {
+          "end_line": 572,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 520
+        },
+        {
+          "end_line": 788,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 737
+        },
+        {
+          "end_line": 135,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpHeaderUtil.java",
+          "start_line": 120
+        },
+        {
+          "end_line": 226,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpHeaderUtil.java",
+          "start_line": 224
+        }
+      ],
+      "prerequisites": "An application uses Netty's HttpRequestDecoder/HttpResponseDecoder (or HttpServerCodec/HttpClientCodec) in a chain where another HTTP processor/proxy or backend parses the same traffic (or where decoded values are re-emitted into another HTTP message). Both sides must make different field-line/header decisions.",
+      "root_cause": "HttpObjectDecoder.splitHeader() derives the field-name by stopping at the first whitespace character and then searching forward for ':' instead of requiring the colon to immediately follow the field-name (or rejecting the line). readHeaders() feeds the resulting name/value pair to the HttpHeaders without validating the original wire grammar, and the line parser additionally accepts bare-LF terminators and drops bare CR bytes. Framing-relevant headers (Content-Length, Transfer-Encoding) are therefore computed from a normalized view that can differ from strict HTTP parsers.",
+      "title": "HTTP/1 field-line parser silently rewrites malformed header syntax (whitespace before/in field-name), enabling header interpretation mismatches and smuggling/splitting",
+      "trace": "1) splitHeader() takes line `Transfer Encoding: chunked`: nameStart=0; nameEnd stops at the space (index 8); colonEnd then scans forward to ':' and consumes it; name=substring(0,8)=\"Transfer\", value=\"chunked\" (lines 682-704) - the 'Encoding' token is discarded instead of the line being rejected. 2) `Content-Length : 5` becomes name=\"Content-Length\" (lines 683-697), so contentLength() (lines 574-579) and HttpHeaderUtil.getContentLength (lines 120-135) treat it as a real Content-Length even if the peer's other parser does not. 3) The HeaderParser skips any CR byte and terminates on LF only (lines 764-782), so bare CR/LF-only framing is accepted. 4) readHeaders() adds the rewritten pairs (lines 538-554) and selects READ_CHUNK_SIZE vs READ_FIXED_LENGTH_CONTENT from the rewritten view (lines 561-570). A front-end/back-end (or proxy/origin) that parses these bytes differently derives a different body framing, leaving attacker bytes to be interpreted as the next request/response (smuggling) or, where decoded header content is re-emitted, to break out of a header line (splitting).",
+      "unverified": "No runtime reproduction was performed. I could not determine which single grammar deviation (whitespace-before-colon, whitespace inside name, LF-only termination, bare-CR skipping, or duplicate/combined Content-Length/Transfer-Encoding handling) the repository's historical fix targets; the candidate is a lead spanning that parser, not a confirmed exploit.",
+      "weakness_type": "Improper input validation / HTTP request smuggling (CWE-444) leading to header injection"
+    }
+  ],
+  "coverage_summary": "Reviewed the HTTP/1 codec in depth (HttpObjectDecoder/Encoder, HttpHeaderUtil, DefaultHttpHeaders, DefaultLastHttpContent, HttpClientCodec, HttpContentEncoder, HttpClientUpgradeHandler) plus cookies (both the deprecated io.netty.handler.codec.http classes and the new cookie package), websocket frame decoders, SPDY frame/header decoders, HTTP/2 frame reader/decoder, MQTT, HAProxy, memcache binary decoder, DNS record decoder, LengthFieldBasedFrameDecoder, and parts of the compression package, bio/common(AsciiString/ObjectUtil) and ssl package listings. Not exhaustively inspected: most of handler/, resolver-dns, transport*, codec-xml, codec-socks, codec-stomp, example, and the full multipart decoders/encoders including HttpPostRequestEncoder/HttpPostMultipartRequestDecoder internals; no tests exist in the snapshot and nothing was executed.",
+  "limitations": [
+    "No runtime execution, tests, or scanners were run; all conclusions are source-level.",
+    "No external/vendor data, CVE text, or patch information was consulted; the mapping of this snapshot to any specific historical fix is inference only.",
+    "Two files that upstream Netty of this era should contain (io/netty/handler/codec/http/CookieEncoderUtil.java and CookieHeaderNames.java) are absent from the snapshot although callers reference them, which indicates the provided tree is incomplete or mid-refactor and prevents validating cookie-encoding behavior.",
+    "Only one candidate is allowed, so several plausible but weaker leads (listed as rejected) were not investigated to conclusion.",
+    "The repository's version string (4.1.0.Beta5-SNAPSHOT) and the presence/absence of surrounding APIs were used only as weak dating hints; the actual fix targeted by this case could not be identified with confidence."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Legacy cookie encoders (io.netty.handler.codec.http.ServerCookieEncoder/ClientCookieEncoder) serialize cookie value/path/domain via an unused-validation 'addUnquoted' helper; io.netty.handler.codec.http.CookieUtil validation helpers are never called and DefaultCookie.setValue does not validate.",
+      "reason": "Suggestive (and two legacy helper files, CookieEncoderUtil.java/CookieHeaderNames.java, are absent from this snapshot while callers still reference them), but the actual append/quote implementation is not in the tree, so I cannot show that CR/LF escapes into the encoded header value. Also DefaultHttpHeaders validation would normally reject CR/LF when the encoded string is put into a real header, so exploitability depends on app-level behavior."
+    },
+    {
+      "lead": "DefaultHttpHeaders.validateValueChar permits CR/LF when followed by SP/HT (obs-fold) while HttpHeadersEncoder writes values verbatim, so a CRLF+space can enter a header value.",
+      "reason": "Real validation gap, but it is a permissive-by-design obs-fold allowance; it requires an application to place untrusted data directly into a header value and a lenient downstream parser to treat the folded line as a new header. Not independently demonstrable from this snapshot, and likely a different (later) hardening item than the decade-old header grammar issue."
+    },
+    {
+      "lead": "DefaultHttp2FrameReader.readHeadersFrame computes readSlice(payload.readableBytes() - padding) without checking padding against the remaining payload length (IllegalArgumentException on a crafted padded HEADERS/CONTINUATION frame).",
+      "reason": "Only a runtime exception on one connection (connection teardown DoS), not memory corruption or cross-boundary impact; retry semantics would close the connection anyway, so impact is weak."
+    },
+    {
+      "lead": "HttpPostRequestDecoder.splitHeaderContentType() calls sb.charAt(aEnd - 1) after indexOf(';'), so a Content-Type value beginning with ';' triggers StringIndexOutOfBoundsException when constructing HttpPostRequestDecoder.",
+      "reason": "Uncaught-exception DoS only, reachable solely in applications that construct the multipart decoder from an attacker-controlled Content-Type; low security impact and unconfirmed in context."
+    },
+    {
+      "lead": "HttpClientCodec.Decoder.isContentAlwaysEmpty() dereferences queue.poll() (method.name()) without a null check, so an unsolicited response can throw NPE.",
+      "reason": "Client-side robustness bug with DoS-at-most impact; attacker must be the remote server, and no security-relevant trust boundary is crossed."
+    }
+  ],
+  "summary": "Netty 4.1.0.Beta5-SNAPSHOT (1398 model-visible files; tests excluded). I focused on network-facing decoders/encoders (HTTP/1 codec, cookies, websockets, SPDY, HTTP/2 frame reader, MQTT, HAProxy, memcache, DNS, compression, SOCKS). The strongest single issue I can evidence in the assigned sources is in the HTTP/1 field-line parser: `HttpObjectDecoder.splitHeader` does not enforce RFC 7230 field-line grammar. It stops the field-name at the first whitespace and then scans forward to the next ':' , so lines such as `Content-Length : 5` and `Transfer Encoding: chunked` are silently reinterpreted by Netty (as `Content-Length: 5` / `Transfer: chunked`) rather than rejected, and the decoder also accepts bare-LF line endings, skips bare CR bytes, and folds continuation lines. Because `HttpHeaderUtil.getContentLength`/`isTransferEncodingChunked` then derive framing from this rewritten view, a peer that parses the same bytes differently can disagree about message boundaries (request smuggling) and, when decoded header data is re-emitted, header/response splitting. I could not confirm any runtime exploit; this is a source-level lead, not a confirmed vulnerability."
+}

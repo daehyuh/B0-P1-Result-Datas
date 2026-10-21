@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote client fully controls the JSON request body of a PATCH request whose Content-Type is `application/json-patch+json`. `JsonPatchPatchConverter.convert` reads the `path` element of every operation and the `from` element of copy/move operations as raw strings (JsonPatchPatchConverter.java:63-81) and passes them into the `PatchOperation` hierarchy, so the attacker determines the exact text that is concatenated into the SpEL expression. No escaping, allow-list or normalization is applied anywhere between JSON parsing and expression compilation.",
+      "confidence": "high",
+      "counterevidence_checked": "Searched for mitigations in the patch package and elsewhere: no regex/allow-list/escaping of path nodes (`pathNodesToSpEL` appends raw segments; only the numeric and \"-\" cases are special-cased), no use of `EvaluationContext`/`SimpleEvaluationContext` anywhere in the repository (search for 'EvaluationContext' returns no matches), a single plain `SpelExpressionParser` instance with no parser configuration, and no other `parseExpression` call sites besides this class. `JsonPatchHandler` forwards the parsed tree without validation, and the argument resolver is registered by default in `RepositoryRestMvcConfiguration.defaultMethodArgumentResolvers()` (line 842) so no opt-in is required. Checked that the JSON Patch media type path is reachable only for PATCH requests (`IncomingRequest.isJsonPatchRequest`, IncomingRequest.java:55-66) and that the resolver first loads the entity by id, which bounds the target but not the expression text. Also checked the sort translator and Jackson module for comparable sinks: sort inputs are validated against `PersistentProperty` names (`JacksonMappingAwareSortTranslator.mapPropertyPath`) and no default/polymorphic Jackson typing is enabled in library code.",
+      "id": "json-patch-spel-injection",
+      "impact": "Expression-language injection with a fully permissive evaluation context: server-side evaluation of attacker-composed SpEL can resolve arbitrary types, invoke constructors/methods and reach JDK APIs, i.e. remote code execution under the privileges of the application's JVM, plus arbitrary in-process data access and modification of the targeted entity. Because evaluation happens while the request payload is being resolved, it occurs before the controller's ETag check and before any application save logic.",
+      "locations": [
+        {
+          "end_line": 43,
+          "path": "spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/PathToSpEL.java",
+          "start_line": 42
+        },
+        {
+          "end_line": 113,
+          "path": "spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/PathToSpEL.java",
+          "start_line": 66
+        },
+        {
+          "end_line": 67,
+          "path": "spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/PatchOperation.java",
+          "start_line": 61
+        },
+        {
+          "end_line": 181,
+          "path": "spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/PatchOperation.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 88,
+          "path": "spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/json/patch/JsonPatchPatchConverter.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 117,
+          "path": "spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/config/JsonPatchHandler.java",
+          "start_line": 82
+        },
+        {
+          "end_line": 210,
+          "path": "spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/config/PersistentEntityResourceHandlerMethodArgumentResolver.java",
+          "start_line": 169
+        },
+        {
+          "end_line": 399,
+          "path": "spring-data-rest-webmvc/src/main/java/org/springframework/data/rest/webmvc/RepositoryEntityController.java",
+          "start_line": 385
+        }
+      ],
+      "prerequisites": "An application shipping this library with an exported Spring Data REST repository whose item resource supports PATCH (default for CrudRepository-derived repositories), and an existing entity for the `{id}` in the URL (the argument resolver only invokes the patch path when `invokeFindById(id)` returns an entity; otherwise it raises ResourceNotFound). No credentials are built into Spring Data REST itself, so reachability depends on the application's own security configuration; the candidate requires only that the attacker is allowed to reach the PATCH endpoint (e.g. an unauthenticated or low-privileged user allowed to update the entity). The ETag/If-Match verification is performed in the controller method body (`eTag.verify`, RepositoryEntityController.java:395), i.e. after the `PersistentEntityResource` payload argument - and therefore the patch/expression evaluation - has already been resolved, so an If-Match policy does not block evaluation.",
+      "root_cause": "`PathToSpEL.pathNodesToSpEL()` splits the untrusted JSON Patch `path` (and `from`) on \"/\" and appends every non-numeric segment verbatim into a SpEL expression string (PathToSpEL.java:70-113). `pathToExpression()`/`spelToExpression()` compile that string with a plain `SpelExpressionParser` (PathToSpEL.java:33, 42-43, 52-53) and never restrict the evaluation context. `PatchOperation` compiles the attacker path in its constructor (PatchOperation.java:66) and later evaluates it against the domain object as root via `Expression#getValue(Object)`/`setValue(Object,Object)` (PatchOperation.java:100-118, 131-155, 164-181; subclasses such as CopyOperation.java:60, MoveOperation.java:51, ReplaceOperation.java:40-42, TestOperation.java:51-54). These APIs use the default `StandardEvaluationContext`, so SpEL type references, constructors and reflective method invocation in the attacker-supplied path segment are executed with the application's JVM privileges.",
+      "title": "Client-controlled JSON Patch path/from compiled and evaluated as unrestricted SpEL (expression injection / RCE)",
+      "trace": "PATCH /{repository}/{id} (RepositoryEntityController.patchItemResource, RepositoryEntityController.java:385-399) -> PersistentEntityResourceHandlerMethodArgumentResolver.resolveArgument/read/readPatch (PersistentEntityResourceHandlerMethodArgumentResolver.java:110-133, 172-181, 195-210) -> JsonPatchHandler.apply/applyPatch/getPatchOperations (JsonPatchHandler.java:76-92, 109-117) -> JsonPatchPatchConverter.convert reads attacker `path`/`from` (JsonPatchPatchConverter.java:59-88) -> new Replace/Add/Remove/Test/Copy/Move operation -> PatchOperation constructor builds `pathToExpression(path)` (PatchOperation.java:66) -> PathToSpEL splits and concatenates raw nodes then parses them as SpEL (PathToSpEL.java:42-43, 66-113) -> Patch.apply performs the operations against the loaded entity -> getValue/setValue evaluate the compiled expression with the entity as root (PatchOperation.java:100-118, 131-155, 164-181), executing any SpEL constructs embedded in the path/from text.",
+      "unverified": "No code was executed and no runtime confirmation was performed. The exact Spring Framework version is not pinned in-tree (parent `spring-data-parent` 2.0.0.BUILD-SNAPSHOT), so the permissive default evaluation context of `SpelExpressionParser#parseExpression` + `Expression#getValue(Object)/setValue(Object,Object)` was reasoned from the API contract rather than verified against the resolved dependency; a deployment that adds a custom parser/context or wraps the endpoint with strict authorization could reduce or eliminate reachability. Exact payload reliability across every operation type and JVM was not tested, and the snapshot's position relative to any upstream fix was not checked against external sources (not permitted in this run).",
+      "weakness_type": "Expression language injection (SpEL) leading to remote code execution — CWE-917/CWE-94 class"
+    }
+  ],
+  "coverage_summary": "Scope filter reports 247 model-visible files, no binary/symlink/sensitive-name exclusions. I read the full JSON Patch package (all 15 files), the JSON/Jackson modules, the main controllers and argument resolvers, patch/payload handling, handler mappings, HAL-browser controller and JS, core config/mapping/support classes, and the test-domain classes, and ran targeted literal searches for dangerous sinks (`parseExpression`, `EvaluationContext`, `SpelExpressionParser`, `Class.forName`, `Runtime`, `ProcessBuilder`, `ScriptEngine`, `ObjectInputStream`, `setAccessible`, `enableDefaultTyping`, `innerHTML`, `eval(`). Not exhaustively line-by-line: Alps/JsonSchema converters, full DomainObjectReader and PersistentEntityJackson2Module logic, some core mapping classes, and build files (formatter.xml, poms). No tests were executed (none were run or available in this snapshot beyond sample domain classes).",
+  "limitations": [
+    "Read-only source inspection; no compilation, dependency resolution, tests or runtime verification, so the finding is a source-evidence lead, not a confirmed vulnerability.",
+    "The resolved Spring Framework version is not present in-tree (snapshot parent POM), so default evaluation-context semantics were inferred from API behavior rather than from the actual dependency source.",
+    "The snapshot appears to be a single commit around 3.0.0.RC2; I could not diff against upstream or later fixes to confirm whether any in-tree mitigation was intentionally omitted.",
+    "Application-level security (authentication/authorization) around the PATCH endpoint is outside the repository, so real-world exploitability depends on deployment configuration.",
+    "Large files (e.g. RepositoryRestMvcConfiguration 39 KB, PersistentEntityJackson2Module 30 KB, DomainObjectReader 23 KB) were reviewed selectively rather than exhaustively, leaving residual uncertainty about additional lower-severity issues."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "UriToEntityConverter converts association URIs by taking only the last path segment and looking it up in the repository of the target property type, ignoring the repository segment of the supplied URI (spring-data-rest-core/.../UriToEntityConverter.java:118-126).",
+      "reason": "The target type is still constrained by the association property being bound, so this is at most association-binding ambiguity/cross-repository id reuse; no concrete integrity or authorization violation is demonstrable from source alone."
+    },
+    {
+      "lead": "RepositoryPropertyReferenceController.loadPropertyValue() likewise extracts only the trailing id from an incoming `text/uri-list` link and finds it in the property type's repository (RepositoryPropertyReferenceController.java:391-399).",
+      "reason": "Same class of concern as above; the resulting object must still be assignable to the association property, and no source-level bypass of an SDR check was identified."
+    },
+    {
+      "lead": "Sort parameters could be an injection vector (JacksonMappingAwareSortTranslator).",
+      "reason": "`mapPropertyPath` resolves each path segment against Jackson/persistent property metadata and drops non-matching fields; no expression/query construction sink found."
+    },
+    {
+      "lead": "DomainObjectReader / PersistentEntityJackson2Module JSON merge handling as a mass-assignment or polymorphic-deserialization risk.",
+      "reason": "No default typing or class-name-driven instantiation was found in library code, and identifier restoration is applied after patch (PersistentEntityResourceHandlerMethodArgumentResolver.java:140-150); the merge logic was only partially reviewed, and no concrete issue was established."
+    },
+    {
+      "lead": "HalBrowser redirect controller and bundled HAL-browser JavaScript.",
+      "reason": "Redirect target is built from a server-normalized request path plus fixed segments; the reviewed JS posts form data via the HAL client without an obvious DOM-injection sink (`innerHTML`/`eval` searches returned no matches)."
+    }
+  ],
+  "summary": "Reviewed the Spring Data REST snapshot (parent version 3.0.0.BUILD-SNAPSHOT, changelog through 3.0.0.RC2) across all 247 text-readable files: spring-data-rest-core, spring-data-rest-webmvc, spring-data-rest-hal-browser, and the test-domain modules, with targeted searches for injection/evaluation sinks. One strong candidate: client-controlled JSON Patch `path`/`from` values are concatenated verbatim into a SpEL expression that is compiled and evaluated against the target domain object with the default (unrestricted) evaluation context, giving an expression-injection/RCE primitive on PATCH /{repository}/{id} with `application/json-patch+json`. No other source-evident issue of comparable impact was found; weaker leads are listed as rejected."
+}

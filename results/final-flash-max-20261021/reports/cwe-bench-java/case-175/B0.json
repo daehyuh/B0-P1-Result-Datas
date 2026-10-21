@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the bearer token (any authenticated account in the realm, or a master-realm admin) and the `{member-id}` path segment, which is an arbitrary user id. No organization or realm-management role is required.",
+      "confidence": "medium",
+      "counterevidence_checked": "Confirmed there is no global admin-REST authorization filter: no ContainerRequestFilter/PreMatching auth filter in the admin package; AdminRoot authenticates only, and each endpoint is expected to check permissions itself. Confirmed the method has no indirect check: it passes organization=null and never touches `auth`; the delegate's getUser() only does a null check. Confirmed sibling methods in the same class (create/search/get) do call requireManageRealm, so the omission is inconsistent with the class's own policy. I could not run the server, so reachability is established from JAX-RS path/source structure only, not runtime.",
+      "id": "org-member-organizations-missing-authz",
+      "impact": "Authorization bypass / information disclosure: any authenticated realm user can enumerate which organizations an arbitrary user belongs to and read organization metadata (name, alias, description, enabled state, verified email domains, redirect URL). In multi-tenant/organization setups this leaks tenant membership and configuration that the admin REST API otherwise restricts to realm management.",
+      "locations": [
+        {
+          "end_line": 201,
+          "path": "services/src/main/java/org/keycloak/organization/admin/resource/OrganizationsResource.java",
+          "start_line": 189
+        },
+        {
+          "end_line": 252,
+          "path": "services/src/main/java/org/keycloak/organization/admin/resource/OrganizationMemberResource.java",
+          "start_line": 244
+        },
+        {
+          "end_line": 216,
+          "path": "services/src/main/java/org/keycloak/services/resources/admin/RealmsAdminResource.java",
+          "start_line": 200
+        },
+        {
+          "end_line": 239,
+          "path": "services/src/main/java/org/keycloak/services/resources/admin/AdminRoot.java",
+          "start_line": 217
+        }
+      ],
+      "prerequisites": "Organizations feature enabled and at least one organization present; attacker holds any valid access token issued by the target realm (or by the master realm for cross-realm access). Admin REST API enabled (default).",
+      "root_cause": "OrganizationsResource.getOrganizations() exposes the path `members/{member-id}/organizations` but never calls `auth.realm().requireManageRealm()` (or any other permission check), unlike create/search/get in the same class and all other organization sub-resources. It directly delegates to OrganizationMemberResource.getOrganizations(), which (with organization == null) only resolves the target user by id and returns provider.getByMember(user) with ModelToRepresentation.toRepresentation(org) (id, name, alias, enabled, redirectUrl, description, domains). No authorization check exists anywhere on this path.",
+      "title": "Missing authorization on admin endpoint listing a user's organizations",
+      "trace": "Request GET /admin/realms/{realm}/organizations/members/{userId}/organizations -> AdminRoot.getRealmsAdmin() only performs bearer-token authentication (AdminRoot.authenticateRealmAdminRequest, lines 169-201) and RealmsAdminResource.getRealmAdmin() only enforces same-realm/master-realm (lines 200-215) -> RealmAdminResource.organizations() returns OrganizationsResource (RealmAdminResource.java lines 622-625, also unchecked at that point) -> JAX-RS matches the literal `members` segment ahead of the `{org-id}` template, so OrganizationsResource.getOrganizations (no check) is invoked -> new OrganizationMemberResource(session, null, adminEvent).getOrganizations(member-id) -> getUser() calls session.users().getUserById(realm, id) with no permission check -> provider.getByMember(user) is streamed back as OrganizationRepresentation objects. By contrast, create/search/get in the same class call auth.realm().requireManageRealm() (lines 100, 154, 171), as do the organization member/IdP invitation endpoints via their parent.",
+      "unverified": "Not runtime-confirmed. It is possible (though inconsistent with the rest of the class) that exposing user organization membership to any authenticated user was intended; if so this is a hardening issue rather than a vulnerability. The exact CVE/fix for the benchmarked case could not be confirmed from source alone.",
+      "weakness_type": "CWE-862 Missing Authorization / CWE-639 Authorization Bypass Through User-Controlled Key"
+    }
+  ],
+  "coverage_summary": "Read the raw snapshot through list/search/read tools: 5,866 model-visible files (binary files refused; no name/symlink exclusions reported). Java src/test trees are empty and .adoc/.ftl/.tsx are absent, so Java unit tests, docs and templates were not reviewable; JavaScript .ts/.json resources were only spot-checked. I inspected, in whole or relevant part: OIDC AuthorizationEndpoint/Checker/RedirectUtils/WebOriginsUtils, TokenEndpoint-adjacent grant and token-exchange providers (V1/V2), LogoutEndpoint, PAR/device/CIBA, SAML broker SAMLEndpoint/SamlService/DocumentUtil signature and destination handling, action-token handlers (execute-actions/verify-email/update-email/invite-org/idp-verify), AuthenticationManager/session-code checks, admin REST plumbing (AdminRoot, RealmsAdminResource, RealmAdminResource), Organizations admin resources, FGAP v1/v2 permission evaluators (MgmtPermissions(V2), Role/User/Group/ClientPermissions(V2), FGAPDecision/FGAPEvaluation/PartialEvaluator), LDAP query escaping, account REST resources, DefaultCors, locale handling, and assorted utilities. Most of the repository (adapters, operator, distribution, testsuite, remaining admin resources) was not read line-by-line; no runtime, build, or exploit execution was performed.",
+  "limitations": [
+    "The finding is a static source lead; I did not execute the server, so reachability/authorization behavior is inferred from JAX-RS mapping and the absence of a global admin auth filter, not runtime-confirmed.",
+    "Java tests were removed from the snapshot, so I could not check expected authorization behavior or identify the benchmarked fix via tests.",
+    "No ground-truth CVE/patch metadata was consulted (per instructions); the mapping from this issue to a specific CVE is unverified.",
+    "Feature flags matter: the Organizations feature must be enabled and at least one organization must exist for the endpoint to return data.",
+    "Large parts of the monorepo (adapters, operator, distribution, federation, most other admin resources) were sampled rather than exhaustively reviewed; a higher-impact Java issue may exist in unread areas.",
+    "Whether the missing permission check is the intended behavior (a low-privilege read endpoint) or a vulnerability could not be resolved from source alone; the inconsistency with sibling methods is the main evidence."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "InviteOrgActionTokenHandler uses token.getRedirectUri() (from organization.getRedirectUrl()) without RedirectUtils.verifyRedirectUri, unlike ExecuteActions/VerifyEmail/UpdateEmail handlers",
+      "reason": "Real divergence from sibling handlers, but the redirect value is embedded in a signed action token created only through the admin organization-invitation resource from an admin-configured organization redirect URL; attacker control is weak (requires organization/admin configuration) and browsers generally ignore javascript: in a 302 Location, so impact/control is too uncertain to prefer over the missing-authz candidate."
+    },
+    {
+      "lead": "StandardTokenExchangeProvider.validateAudience() does not call ClientPermissions.canExchangeTo() for requested audiences (V1 AbstractTokenExchangeProvider does)",
+      "reason": "The `audience` parameter only adds audience entries to a token still issued for the requester, and the standard (RFC 8693) provider intentionally relies on the subject-token audience check; also ClientPermissionsV2.canExchangeTo throws UnsupportedOperationException, so the omission looks deliberate for the V2 feature. No concrete privilege gain could be established."
+    },
+    {
+      "lead": "RolePermissionsV2.canMapRole()/canMapComposite() return true via ClientPermissionsV2.canMapRoles/canMapCompositeRoles without checkAdminRoles()",
+      "reason": "Counterevidence found: V1 RolePermissions.canMapRole (line 313-315) and canMapComposite (line 403-405) contain the identical per-client shortcut without checkAdminRoles; the V2 code mirrors V1 semantics, so this is not a regression."
+    },
+    {
+      "lead": "WebAuthn AttestationStatementSerializationContainer uses Jackson @JsonTypeInfo(Id.NAME) with an attacker-influenced fmt value",
+      "reason": "The companion AttestationStatementConverter is dead code in this snapshot (no callers; credentials store only attestationStatementFormat), and webauthn4j only produces known AttestationStatement subtypes for known formats, so the unsafe polymorphic read is not reachable here."
+    },
+    {
+      "lead": "Misc: DefaultCors preflight echoes any Origin; OrganizationsResource.create/update validate redirectUrl only with a generic URI validator; various V2 permission helpers rely on hasPermission()",
+      "reason": "Preflight reflection does not expose data (real requests are still checked), URI validation is admin-only input, and no concrete authorization bypass could be demonstrated; kept only as rejected leads."
+    }
+  ],
+  "summary": "I reviewed the assigned Keycloak (999.0.0-SNAPSHOT, ~26.2-era: Quarkus 3.20.0, jpa-changelog-26.2.0 only, JS deps from April 2025) Java server code as a defensive source review, focusing on OIDC endpoints (authorization/redirect, token, logout, PAR, device, CIBA, token exchange), SAML broker verification, admin REST authorization (incl. Organizations and the new FGAP v2 permission evaluators), action-token handlers, account REST, LDAP, CORS and cookie/redirect handling. One concrete, source-verifiable authorization omission stands out: the admin REST endpoint `GET /admin/realms/{realm}/organizations/members/{member-id}/organizations` performs no permission check at all, while every sibling method in the same class requires `auth.realm().requireManageRealm()`. Because `AdminRoot.getRealmsAdmin`/`RealmsAdminResource` only authenticate a bearer token and check same/master realm (no admin-role filter), any authenticated user of the realm can invoke it and read arbitrary users' organization membership together with organization metadata (name/alias/domains/redirect URL/description). I submitted this single candidate. Other plausible-looking spots were checked and rejected or remain unconfirmed (listed below)."
+}

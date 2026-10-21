@@ -1,0 +1,77 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker sends STOMP frames over the WebSocket sub-protocol. Arbitrary header names/values are accepted by StompDecoder.readHeaders (line 232 addNativeHeader) and NativeMessageHeaderAccessor has no name filtering, so a SUBSCRIBE frame with header `selector` (the default selectorHeaderName, line 72) carries an attacker-chosen SpEL string into addSubscriptionInternal. The attacker also controls the SEND frame that triggers evaluation, i.e. the root object contents the expression is evaluated against.",
+      "confidence": "high",
+      "counterevidence_checked": "Verified there is no restricted evaluation context on this path: a repository-wide search for `SimpleEvaluationContext` matches only its own class file, so it is unused; the parser is `new SpelExpressionParser()` with no SpelParserConfiguration limits; StandardEvaluationContext.getTypeLocator() lazily returns a StandardTypeLocator (java.lang package prefix), enabling T(...) type references; no MethodFilter is registered. Checked header transport: StompDecoder line 232 and NativeMessageHeaderAccessor.addNativeHeader accept arbitrary names/values, StompSubProtocolHandler does not strip `selector`, and AbstractSubscriptionRegistry forwards the message unchanged. Checked trigger condition: selectorHeaderInUse is set merely by a selector-bearing subscription (line 148) and SimpleBrokerMessageHandler subscribes to the client inbound channel (AbstractBrokerMessageHandler lines 159-160), so a client can self-trigger evaluation with its own SEND. Checked that the feature is on by default: selectorHeaderName = \"selector\" (line 72) and the only knob is setSelectorHeaderName, called nowhere in the tree. Adjacent 4.3.15-era hardening appears already applied elsewhere (ResourceHttpRequestHandler.isInvalidEncodedPath lines 519-524/604-625; StandardServletMultipartResolver POST check lines 69-76), which does not mitigate this messaging path.",
+      "id": "CAND-1",
+      "impact": "Remote code execution in the JVM hosting the application: with a StandardTypeLocator and reflective resolvers, a selector such as a type-reference plus method-invocation expression can reach process/OS-level APIs and execute commands as the application user, in addition to arbitrary method invocation and data access on objects reachable from the evaluation context. In a broker used for multi-user messaging this is a full server-side compromise (confidentiality, integrity and availability), not merely a filter bypass.",
+      "locations": [
+        {
+          "end_line": 147,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/DefaultSubscriptionRegistry.java",
+          "start_line": 144
+        },
+        {
+          "end_line": 216,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/DefaultSubscriptionRegistry.java",
+          "start_line": 211
+        },
+        {
+          "end_line": 231,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/DefaultSubscriptionRegistry.java",
+          "start_line": 188
+        },
+        {
+          "end_line": 299,
+          "path": "spring-websocket/src/main/java/org/springframework/web/socket/messaging/StompSubProtocolHandler.java",
+          "start_line": 231
+        },
+        {
+          "end_line": 288,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/SimpleBrokerMessageHandler.java",
+          "start_line": 261
+        },
+        {
+          "end_line": 238,
+          "path": "spring-messaging/src/main/java/org/springframework/messaging/simp/stomp/StompDecoder.java",
+          "start_line": 219
+        }
+      ],
+      "prerequisites": "Application exposes a STOMP endpoint backed by the built-in simple broker with DefaultSubscriptionRegistry: typical `@EnableWebSocketMessageBroker` + `configureMessageBroker(...).enableSimpleBroker(...)`; note MessageBrokerRegistry.getSimpleBroker (lines 191-194) auto-enables the simple broker if none is configured, and SimpleBrokerMessageHandler defaults to `new DefaultSubscriptionRegistry()` (line 83). Destination must match a broker prefix (default `/topic`, `/queue` when auto-enabled). The attacker needs a session able to send SUBSCRIBE/SEND frames (no authentication by default; Spring Security may add a session requirement) and then a message routed to the subscribed destination (the attacker can send it himself).",
+      "root_cause": "DefaultSubscriptionRegistry reads the `selector` value from the STOMP SUBSCRIBE frame's native headers (line 144) and parses it with a default-configured SpelExpressionParser (line 147, field at line 76) without any syntax restriction. When a message is later routed to that destination, filterSubscriptions builds `new StandardEvaluationContext(message)` (line 212) and calls `expression.getValue(context, boolean.class)` (line 216). StandardEvaluationContext supplies a default StandardTypeLocator (java.lang prefix, so `T(...)` type references resolve), reflective property/method resolvers, and no method filter, so the selector can reference arbitrary Java types and invoke methods/constructors. The restricted `SimpleEvaluationContext` class shipped in this same snapshot (spring-expression, @since 4.3.15) is referenced nowhere else in the tree, so no restricted context or method filter is applied to this evaluation.",
+      "title": "Unrestricted SpEL evaluation of attacker-controlled STOMP `selector` header in DefaultSubscriptionRegistry (remote code execution via simple broker)",
+      "trace": "1) StompSubProtocolHandler.handleMessageFromClient decodes the WebSocket frame via BufferingStompDecoder/StompDecoder and forwards the message to the client inbound channel (lines 231-299); StompDecoder stores every wire header as a native header (lines 219-238). 2) SimpleBrokerMessageHandler.handleMessageInternal handles SUBSCRIBE by calling subscriptionRegistry.registerSubscription(message) (lines 285-288) and handles SimpMessageType.MESSAGE by calling sendMessageToSubscribers (lines 261-263). 3) AbstractSubscriptionRegistry.registerSubscription passes the original message to DefaultSubscriptionRegistry.addSubscriptionInternal, which reads the `selector` native header, parses it as SpEL and stores the Expression (lines 144-159). 4) On the later SEND, AbstractSubscriptionRegistry.findSubscriptions (lines 111-128) -> DefaultSubscriptionRegistry.findSubscriptionsInternal (lines 182-186) -> filterSubscriptions (lines 188-231); for each stored selector the code creates `new StandardEvaluationContext(message)`, adds SimpMessageHeaderPropertyAccessor, and evaluates `expression.getValue(context, boolean.class)` (lines 211-216). Evaluation side effects occur before result conversion; SpelEvaluationException/Throwable are only logged afterwards (lines 220-227).",
+      "unverified": "No code was executed and no exploit was attempted, so this is not runtime-confirmed. Whether a specific deployment exposes a reachable STOMP endpoint with the simple broker, and whether authentication (e.g. Spring Security) is required before sending STOMP frames, is application configuration that cannot be established from this snapshot. The exact upstream remediation was not inspected or compared (no patch/ground-truth data is used); the conclusion is based solely on the source in this snapshot.",
+      "weakness_type": "Expression language injection (Spring Expression Language evaluated in an unrestricted context over attacker-controlled input)"
+    }
+  ],
+  "coverage_summary": "Scope: 3897 main-source files across the 27 Spring Framework modules in the snapshot; the P1 relation index reports all 3897 files indexed with 0 missing and no unparsed-file gaps, though it is syntactic-navigation only (43,807 symbols, 83,066 calls). No test sources exist in the snapshot (e.g. spring-web/src/test, spring-webmvc/src/test, spring-messaging/src/test are empty), so no test-based evidence was available. I read the full STOMP/simple-broker path end to end (StompDecoder, StompSubProtocolHandler, AbstractSubscriptionRegistry, DefaultSubscriptionRegistry, SimpleBrokerMessageHandler, MessageBrokerRegistry/AbstractMessageBrokerConfiguration), Spring MVC's ResourceHttpRequestHandler, multipart resolvers/delegates, the spring-expression evaluation-context classes, and the in-repo SpEL usage sites, plus targeted searches for `selector`, `SimpleEvaluationContext`, `StandardEvaluationContext`, `SpelExpressionParser`, `isMultipart`, and `isInvalidPath`/`isInvalidEncodedPath`. The relation index was used only to navigate (e.g. the CONTAINS/CALLS edges around DefaultSubscriptionRegistry), and every navigated edge used in the finding was verified against the source text. Files outside these paths were not individually read line-by-line.",
+  "limitations": [
+    "Runtime behavior, reachability and exploitability were not executed or confirmed; the candidate is a source-evidence lead only.",
+    "The snapshot contains only main sources (no src/test code, no deployment descriptors), so application-level exposure of a STOMP endpoint/simple broker and any authentication requirement cannot be verified from the tree.",
+    "Spring Security or a custom SubscriptionRegistry/selectorHeaderName could change exploitability in a given deployment; SimpleBrokerMessageHandler.setSubscriptionRegistry and DefaultSubscriptionRegistry.setSelectorHeaderName make such overrides possible.",
+    "The P1 relation index is syntactic and incomplete by design (no data-flow, runtime or semantic guarantees); it was used for navigation and its edges were checked against source.",
+    "The upstream fix/patch for this code path was not inspected (per review constraints); the comparison with a 'fixed' state rests on the in-repo, unused SimpleEvaluationContext class and adjacent hardening observed in the same snapshot.",
+    "Not every one of the 3897 files was read individually; review concentrated on externally reachable web/messaging paths rather than an exhaustive audit of all modules (e.g. spring-jdbc, spring-orm, spring-jms internals)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Spring MVC static-resource path traversal (ResourceHttpRequestHandler / Windows encoded paths)",
+      "reason": "The snapshot already contains the relevant hardening: path processing and validation (processPath, isInvalidPath, isInvalidEncodedPath) at lines 505-535, 550-625, 643-663 reject WEB-INF/META-INF, URL-style paths, `../` after cleanPath, and invalid encoded escapes both before and after processing. No bypass was identified in the reviewed code, so this was not selected."
+    },
+    {
+      "lead": "Multipart content-type handling (MultipartResolutionDelegate.isMultipartContent does not check the HTTP method, lines 64-67)",
+      "reason": "StandardServletMultipartResolver.isMultipart already requires POST (lines 69-76) and is the component DispatcherServlet/MultipartFilter use; the delegate path only performs default resolution for @RequestPart-style arguments and no concrete externally-triggered security impact was demonstrated. Unconfirmed and lower severity than the selected candidate."
+    },
+    {
+      "lead": "Unbounded multi-range HTTP Range processing (ResourceHttpRequestHandler lines 483-501, HttpRange.toResourceRegions lines 173-182 allocate one region per requested range with no cap)",
+      "reason": "Plausible denial-of-service only, requires a static resource handler to be configured, and no range-count limit exists in this snapshot. Lower impact and less certain than the selected candidate; not submitted."
+    },
+    {
+      "lead": "Other SpEL evaluation sites: EvalTag (spring-webmvc lines 59-74), StandardBeanExpressionResolver (spring-context lines 89-141), CachedExpressionEvaluator (spring-context lines 55-62)",
+      "reason": "The expression strings at these sites come from JSP pages, bean definitions, or annotations (developer/deployment controlled), not from remote request data, so they do not meet the attacker-control threshold used here."
+    }
+  ],
+  "summary": "Reviewed the 4.3.15.BUILD-SNAPSHOT Spring Framework source tree (3897 main-source files; no test sources present) with emphasis on externally reachable paths: the STOMP/WebSocket simple-broker stack (spring-websocket + spring-messaging), Spring MVC static-resource handling, the multipart resolvers/delegates, and every in-repo SpEL evaluation site. The single strongest candidate is an expression-language injection in the STOMP subscription path: a client-supplied `selector` header is parsed as SpEL and evaluated with an unrestricted `StandardEvaluationContext`, giving a remote client code execution capability wherever the built-in simple broker is exposed. The snapshot also contains the restricted `SimpleEvaluationContext` class added in this release, but nothing in the tree uses it, so the restriction was never applied to this path. Other leads (resource-handler traversal, multipart handling, multi-range processing, developer-controlled SpEL sites) were judged lower-impact or appear already mitigated and are recorded as rejected/unconfirmed."
+}

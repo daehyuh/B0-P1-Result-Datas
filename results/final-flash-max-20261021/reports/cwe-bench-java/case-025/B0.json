@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An attacker who can get a malicious archive scanned by dependency-check. Scanning third-party/untrusted artifacts is the tool's normal use (CLI `--scan`, Maven/Ant/Jenkins plugins, CI pipelines): zip/ear/war/jar/sar/apk/nupkg/tar and, via the Python analyzer, .whl/.egg/.zip files. The attacker controls entry names inside the archive, including names containing `../` sequences (and directory entries, which are created with `mkdirs()` unconditionally, before any filter is applied).",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the only gate before the write is name/extension based (engine.accept -> analyzer file filters, and ExtractionUtil's FilenameFilter), which cannot block `../`; verified there is no canonical-path containment check, no `..` rejection, and no use of ZipArchiveEntry sanitization in the three extraction paths (grep for getCanonicalPath shows it is not used in extraction). Checked that the XML/deserialization/SQL areas are otherwise hardened, so this is not duplicated elsewhere. Did not execute any archive or test; exploitability of specific target names depends on which leaf names the enabled analyzers accept and on process permissions.",
+      "id": "zip-slip-archive-extraction",
+      "impact": "Arbitrary file creation/overwrite outside the intended temp directory with the privileges of the dependency-check process. Because accepted leaf names include build-relevant names (e.g. `configure`, `package.json`, `composer.lock`, `Gemfile.lock`, `*.gemspec`, `*.jar`, `*.zip`), an attacker-supplied archive can clobber files in the workspace, data directory or other writable locations to influence a subsequent build (potential code execution via overwritten build scripts/configs) or destroy/corrupt files, in addition to corrupting the scan result.",
+      "locations": [
+        {
+          "end_line": 531,
+          "path": "core/src/main/java/org/owasp/dependencycheck/analyzer/ArchiveAnalyzer.java",
+          "start_line": 512
+        },
+        {
+          "end_line": 558,
+          "path": "core/src/main/java/org/owasp/dependencycheck/analyzer/ArchiveAnalyzer.java",
+          "start_line": 540
+        },
+        {
+          "end_line": 216,
+          "path": "core/src/main/java/org/owasp/dependencycheck/utils/ExtractionUtil.java",
+          "start_line": 161
+        },
+        {
+          "end_line": 123,
+          "path": "core/src/main/java/org/owasp/dependencycheck/utils/ExtractionUtil.java",
+          "start_line": 85
+        },
+        {
+          "end_line": 221,
+          "path": "core/src/main/java/org/owasp/dependencycheck/analyzer/PythonDistributionAnalyzer.java",
+          "start_line": 210
+        }
+      ],
+      "prerequisites": "Archive Analyzer enabled (default, analyzer.archive.enabled=true in dependencycheck.properties), the malicious archive is included in the scan, and the process has filesystem write permission to the location the traversal resolves to. For regular files the leaf name must additionally pass engine.accept (extension/name filter) or the metadata filename filter; directory entries require no filter. No authentication or elevated role is required beyond the scan itself.",
+      "root_cause": "Archive entry names are trusted. Both ArchiveAnalyzer.extractArchive and ExtractionUtil.extractArchive/extractFile build the output path with `new File(destination, entry.getName())` and then call `mkdirs()`/`new FileOutputStream(file)` without verifying that the resolved (canonical) path stays inside `destination`. The only gating is filename/extension-based (`engine.accept(file)` in ArchiveAnalyzer, `metadataFilter` in ExtractionUtil), which inspects the leaf name, not the path, so `../` segments are not rejected. No canonical-path or `..` validation exists anywhere on these paths (a search for getCanonicalPath in extraction code finds none).",
+      "title": "Zip Slip: archive entries can traverse out of the extraction directory and write arbitrary files",
+      "trace": "Engine.scan -> ArchiveAnalyzer.analyzeDependency -> extractAndAnalyze (lines 247-250) -> extractFiles (lines 380-406) -> extractArchive (lines 512-525): `final File file = new File(destination, entry.getName())`; directory entries are mkdirs'ed at line 518; file entries passing engine.accept(file) reach extractAcceptedFile (lines 540-558), where `new FileOutputStream(file)` writes to the resolved path (e.g. `destination/../../<target>`). Independently, PythonDistributionAnalyzer.collectMetadataFromArchiveFormat (lines 210-221) calls ExtractionUtil.extractFilesUsingFilter -> extractArchive (lines 161-184) -> extractFile (lines 197-216), which again resolves `new File(destination, entry.getName())` and writes it with FileOutputStream. ExtractionUtil.extractFiles (lines 85-123) contains the same pattern.",
+      "unverified": "No runtime reproduction was performed (per policy). The exact set of accepted leaf names for a successful overwrite depends on enabled analyzers/settings, and the final impact (e.g. code execution) depends on what consumes the overwritten file; only the traversal write itself is directly evidenced by the source.",
+      "weakness_type": "CWE-22 Path Traversal (Zip Slip)"
+    }
+  ],
+  "coverage_summary": "Covered the non-test source snapshot (412 files) across core, utils, cli, maven and ant modules: archive extraction (ArchiveAnalyzer, ExtractionUtil, PythonDistributionAnalyzer, JarAnalyzer), XML parsing (XmlUtils, PomParser, SuppressionParser, HintParser, XPathNuspecParser, NVD handlers), networking/download (Downloader, URLConnectionFactory, SSLSocketFactoryEx, suppression/hint downloads), persistence (CveDB/ConnectionFactory/DriverLoader, parameterized SQL), deserialization (CweDB, ExpectedObjectInputStream), command execution (AssemblyAnalyzer, RubyBundleAuditAnalyzer), report generation (ReportGenerator/EscapeTool), CLI path handling (App/CliParser) and configuration (Settings, dependencycheck.properties). Tests, .vsl report templates, .xsd schemas and binary resources are not in the snapshot, so report-escaping and schema-validation behavior could not be fully verified.",
+  "limitations": [
+    "Unit/integration test sources are absent from the snapshot, so intended behaviors and any regression tests for extraction/parsing could not be consulted.",
+    "Velocity report templates (*.vsl) and XML schemas (*.xsd) are not present; report-layer escaping (possible XSS) and schema-validation details could not be reviewed.",
+    "Binary resources (e.g. data/cwe.hashmap.serialized, jar/zip fixtures) are not readable, so the deserialization data format could not be inspected.",
+    "No code was executed and no dependency versions were checked against CVE data; findings are source-level only and not runtime-confirmed.",
+    "Whether the exact zip-slip behavior was later fixed upstream and which leaf names are ultimately accepted depends on runtime analyzer configuration that was not executed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unrestricted Java deserialization in core/.../data/cwe/CweDB.java loadData() (lines 60-73): `new ObjectInputStream(input).readObject()` on `data/cwe.hashmap.serialized`, while the repository ships an unused restricting wrapper (utils/.../ExpectedObjectInputStream.java, lines 51-71) and uses no`ExpectedObjectInputStream` anywhere.",
+      "reason": "Real hardening gap, but the deserialized stream is a resource bundled inside the dependency-check artifact and loaded through FileUtils.class.getClassLoader().getResourceAsStream(); there is no attacker-controlled input path in normal CLI/Maven/Ant/Jenkins use (only an attacker who already controls the tool classpath). Reported only as a lead, not a candidate."
+    },
+    {
+      "lead": "Path traversal in core/.../analyzer/NodePackageAnalyzer.java line 223: `Paths.get(baseDir.getPath(), \"node_modules\", name)` uses a dependency name from an untrusted package-lock.json/npm-shrinkwrap.json, allowing `../` to escape the node_modules directory.",
+      "reason": "Impact is read-only and restricted to files named package.json (plus content included as evidence in reports); no write primitive was identified, so impact is substantially weaker than the archive-extraction issue."
+    },
+    {
+      "lead": "utils/.../SSLSocketFactoryEx.java default protocol list includes TLSv1/TLSv1.1 and no explicit cipher restriction.",
+      "reason": "The protocol list is configuration-controlled (downloader.tls.protocols), the factory still uses the default trust manager and hostname verification, and no concrete exploitation path from attacker-controlled input was identified."
+    },
+    {
+      "lead": "Potential XSS/escaping issues in HTML/XML/JSON/CSV report generation (core/.../reporting/ReportGenerator.java, EscapeTool.java).",
+      "reason": "The Velocity report templates (*.vsl) are not present in the snapshot, so escaping at the output sites could not be inspected; EscapeTool provides html/xml/json/javascript/csv escapers and no unescaped sink could be confirmed in the visible Java code."
+    }
+  ],
+  "summary": "Reviewed the dependency-check 3.1.2 snapshot (412 files: core, utils, cli, maven, ant; tests excluded). The XML parsing layer is consistently hardened via XmlUtils (DOCTYPE disallowed, external entities disabled), SQL is parameterized, and command execution uses argument lists rather than shells. The strongest source-supported issue is a path-traversal (\"Zip Slip\") flaw in archive extraction: archive entry names are joined to the extraction directory and written without canonical-path containment checks, so a crafted archive that dependency-check scans can write files outside the temp extraction directory. A second, weaker lead (unrestricted ObjectInputStream in CweDB) is noted as rejected because its input is an internal classpath resource with no realistic attacker control in normal deployments."
+}

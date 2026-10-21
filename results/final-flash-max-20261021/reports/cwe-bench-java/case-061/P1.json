@@ -1,0 +1,81 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The bucketName and objectName strings of the buckets HTTP API (e.g. GET/DELETE object under a bucket) and of FileTransferApi.createTransfer (lines 113-116: bucketName/objectName taken from the request and passed to bucket I/O). Route parameters are attacker-controlled and percent-decoded after regex matching, so '../..' or an absolute '/etc/passwd' can be delivered URL-encoded. In the default configuration (no security.yaml) SecurityStore treats the request as the built-in guest user, which is active and superuser by default, so no credentials are required.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that putObject DOES perform a getCanonicalPath().startsWith(root) check (lines 145-149), proving containment is intended for bucket I/O and that its absence in getObject/findObject/deleteObject is an omission rather than a documented design choice; checked that upload-side validation (verifyObjectName/OBJ_NAME_REGEXP) does not block '..' or absolute names, so it is not a compensating control; checked that RdbBucket stores names as database keys (no filesystem path), so only file-system-backed buckets are affected; checked that the API enforces ReadBucket/ManageBucket or ManageAnyBucket unless security is disabled; checked that RouteContext.getRouteParam URL-decodes route values after matching (so encoded separators are not rejected earlier).",
+      "id": "case-061-bucket-object-traversal",
+      "impact": "Disclosure of arbitrary files readable by the Yamcs process (server configuration including secretKey/credentials, security directory data, TLS keys, operating-system files) and arbitrary deletion of files writable by that process, i.e. loss of confidentiality and integrity of the host. When security is disabled (default examples/no security.yaml) the read is unauthenticated; otherwise any account with access to a file-system-backed bucket qualifies. A related read path is exposed through the file-transfer API, which could also stage an outbound exfiltration of the traversed file.",
+      "locations": [
+        {
+          "end_line": 218,
+          "path": "yamcs-core/src/main/java/org/yamcs/yarch/FileSystemBucket.java",
+          "start_line": 193
+        },
+        {
+          "end_line": 149,
+          "path": "yamcs-core/src/main/java/org/yamcs/yarch/FileSystemBucket.java",
+          "start_line": 140
+        },
+        {
+          "end_line": 162,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/api/BucketsApi.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 265,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/api/BucketsApi.java",
+          "start_line": 246
+        },
+        {
+          "end_line": 334,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/api/BucketsApi.java",
+          "start_line": 327
+        },
+        {
+          "end_line": 155,
+          "path": "yamcs-core/src/main/java/org/yamcs/http/RouteContext.java",
+          "start_line": 146
+        }
+      ],
+      "prerequisites": "(1) The target bucket must be backed by FileSystemBucket: either mapped in yamcs.yaml via 'buckets: - name: X  path: ...' (the shipped simulation example maps the 'displays' and 'stacks' buckets to directories) or a directory present under <dataDir>/<instance>/fsbuckets. RocksDB-backed buckets (default bucketDatabase) are unaffected. (2) In secured deployments the caller needs ReadBucket/ManageBucket on that bucket (or ManageAnyBucket); if security is disabled - the default when no security.yaml exists - any unauthenticated network client qualifies. (3) Direct access to the HTTP port (contextPath may be empty or non-empty; the objectName route parameter is decoded either way).",
+      "root_cause": "FileSystemBucket resolves user-supplied object names directly against the bucket root in getObject/findObject/deleteObject without any containment check (no normalize()/getCanonicalPath()/startsWith(root) verification), even though putObject explicitly contains a 'Prevent directory traversal' canonical-path check. BucketsApi does not compensate: getObject (lines 137-162) and deleteObject (lines 246-265) never call verifyObjectName(), and uploadObject's validation (line 181, verifyObjectName lines 327-334) is not a traversal defense anyway because OBJ_NAME_REGEXP = \"[ \\\\w\\\\s\\\\-\\\\./]+\" (line 52) permits '.' and '/' including '..' sequences. In addition, Path.resolve() returns the argument unchanged when it is absolute, so an object name such as '/etc/passwd' also escapes the root. Since objectName is a route parameter that is URL-decoded after route matching (RouteContext.getRouteParam, lines 146-155; HttpTranscoder, lines 69-72), percent-encoded '..' and '/' characters reach these methods intact.",
+      "title": "Path traversal via bucket object names allows arbitrary file read/delete outside the bucket root",
+      "trace": "HTTP request -> HttpRequestHandler routes the API path -> generated AbstractBucketsApi dispatch -> BucketsApi.getObject: request.getBucketName()/getObjectName() -> checkReadBucketPrivilege(bucketName) returns true for a user bucket or a privileged/superuser caller -> verifyAndGetBucket -> YarchDatabaseInstance.getBucket -> FileSystemBucketDatabase.getBucket returns a FileSystemBucket when the directory exists/mapped -> bucket.findObject(objName) (line 211: root.resolve(objName), Files.readAttributes) -> bucket.getObject(objName) (line 195-197: root.resolve(objName), Files.readAllBytes) returns the bytes of a file outside the bucket root to the caller. The DELETE variant reaches BucketsApi.deleteObject -> FileSystemBucket.deleteObject (line 205-206: Files.delete(path)), deleting files outside the root. Absolute object names exploit the same Path.resolve semantics. FileTransferApi.createTransfer/CFDP startUpload (CfdpService line 846: bucket.getObject(objectName)) can additionally exfiltrate a traversed file over the space link.",
+      "unverified": "The exact generated HTTP route templates (AbstractBucketsApi and the yamcs protobuf descriptors) are not present in this snapshot, so the precise URL form and parameter decoding for {objectName} were inferred from RouteContext/HttpTranscoder/BucketsApi rather than read from generated code. No runtime execution, exploit attempt, or test was performed (no test sources are present in the snapshot), and no upstream diff/advisory was consulted. Deployment-dependent factors (whether a filesystem-backed bucket exists, security enabled/disabled) were reasoned from configuration code and shipped examples, not from a live deployment.",
+      "weakness_type": "CWE-22 Path Traversal"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot (2394 visible files, 1258 Java; P1 index covers 2382 files with 12 files missing from the index, 2 parse errors, and no control/data-flow analysis). I read and traced the main HTTP request pipeline (HttpServer, HttpRequestHandler, ApiHandler, Route/RouteContext, HttpTranscoder, HandlerContext, StaticFileHandler/AngularHandler, WebPlugin), authentication/authorization (HttpHandler, AuthHandler, TokenStore, JwtHelper, SecurityStore, User, Directory auth modules), the storage/bucket stack (BucketsApi, FileTransferApi, FileSystemBucket, FileSystemBucketDatabase, RdbBucket, YarchDatabaseInstance, YarchDatabase), plus representative API handlers (Commands, Queues, Alarms, Events, Processing, Mdb, MdbOverride, RocksDb, Indexes, Table, ParameterArchive, Server, Iam, Clearance, Sessions, Links) and configuration/utility classes (YConfiguration, ProcessRunner, YObjectLoader, XtceDbFactory). Several areas were surveyed only by targeted pattern searches (deserialization, XXE/XML factories, SQL construction, scripting engines) rather than file-by-file, and the Angular webapp and simulator modules were not exhaustively reviewed.",
+  "limitations": [
+    "Only read-only, static review was performed; no code was executed, no scanning/exploit payloads were used, and no runtime confirmation exists for any candidate.",
+    "Generated protobuf API classes and HTTP route descriptors (e.g. AbstractBucketsApi, yamcs-web.protobin) are not part of the snapshot, so exact route templates/parameter bindings were inferred from HttpTranscoder/RouteContext and the API implementations.",
+    "The P1 relation index is syntactic only (name/type/arity-based call and containment candidates; no data flow, control flow, semantic resolution or reachability), and 12 source files were not indexed; absence of an index fact is not evidence that an area is safe.",
+    "No test sources are present in the snapshot (the tests module is empty in the visible file set), and no upstream repository history, advisory data or patch information was consulted, so I could not confirm whether any specific issue was later fixed upstream.",
+    "Exploitability of the static-file and bucket vectors depends on deployment details (filesystem-backed buckets, security enabled/disabled, direct exposure vs. load-balancer slash normalization) that cannot be verified from source alone.",
+    "Coverage was selective: I did not read every one of the 1258 Java files line-by-line, and large areas (e.g. full CFDP state machine, RocksDB tablespace internals, webapp TypeScript) were reviewed only partially."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unauthenticated absolute-path file read in the static-file handler: StaticFileHandler.getFilePath returns uri.substring(route.length()+1) (line 92-97) and locateFile (lines 99-107) does staticRoot.resolve(path) with no containment check; a request whose path starts with '//' (e.g. 'GET //etc/passwd' after the context path, or '/static//etc/passwd') yields a path with a leading slash, Path.resolve() then discards the static root and sanitizePath (lines 275-283) only rejects dot components, so StaticFileHandler/AngularHandler (requireAuth false) can serve an arbitrary absolute file unauthenticated. This is a second, distinct root cause; it was not selected because only one candidate is permitted and the bucket traversal has clearer in-code intent evidence. Not runtime-confirmed; some reverse proxies normalize '//' and would mask it.",
+      "reason": "Distinct root cause, plausible and severe, but not selected under the one-candidate cap; left unconfirmed because it could not be executed and depends on how the front-end/network preserves double slashes."
+    },
+    {
+      "lead": "Reflected XSS on the login page: AuthHandler.handleAuthorize (lines 124-128) and showLoginForm (lines 174-179) pass raw query/form parameters (redirect_uri, state, plus errorMessage) into /auth/templates/authorize.html, and the custom template engine appends variable values without HTML encoding (VarStatement.render, lines 14-20; authorize.html lines 48-53 place them in attribute context), enabling script injection in the Yamcs origin via an unauthenticated GET such as /auth/authorize?scope=..&response_type=code&client_id=..&redirect_uri=%22%3E%3Cscript%3E.. - impact is credential/token theft from the login page. Not selected (server-side file disclosure was ranked higher); requires victim interaction and runtime confirmation was not possible.",
+      "reason": "Plausible but lower impact than server-side file access and requires user interaction; not selected."
+    },
+    {
+      "lead": "Open redirect and authorization-code leakage: AuthHandler.redirectWithCode (lines 191-205) redirects to the client-supplied redirect_uri without any registration/allowlist validation (LoginRequest/OpenIDAuthenticationRequest accept arbitrary URIs), so a crafted login link can send the one-time code (CODE_CACHE, 60 s) to an attacker-controlled origin and the code can then be exchanged at /auth/token for the victim's access token. Same code area as the XSS lead; not selected under the one-candidate cap.",
+      "reason": "Real-looking design weakness but selected area overlapped with the XSS lead and impact is account-specific rather than server-wide; left unconfirmed."
+    },
+    {
+      "lead": "ProcessRunner/ProcessBuilder execution in yamcs-core (ProcessRunner line 82-84, YamcsVersion line 60) and YObjectLoader class instantiation (YObjectLoader line 27-29) reached via configuration (service/link/algorithm class names, processor types, instance templates).",
+      "reason": "Command/class strings come from trusted configuration or from privileged API calls (CreateInstances/ControlProcessor/admin MDB changes), not from unauthenticated remote input; no source evidence of a trust-boundary violation."
+    },
+    {
+      "lead": "BackupUtils.verifyBackupDirectory (lines 12-45) allows creating/writing arbitrary directories specified in BackupDatabaseRequest, and RocksDbApi.backupDatabase exposes it.",
+      "reason": "Admin-only path (SystemPrivilege.ControlArchiving) and intended administrative functionality; no privilege bypass found."
+    }
+  ],
+  "summary": "Repository: Yamcs 5.8.6 mission-control framework (2394 visible files, 1258 Java, 953 under yamcs-core, plus yamcs-web/yamcs-xtce/yamcs-tse). I focused on the HTTP/auth surface (HttpRequestHandler, ApiHandler, HttpHandler, StaticFileHandler, AuthHandler, SecurityStore), the storage/bucket API (BucketsApi, FileSystemBucket, FileSystemBucketDatabase, RdbBucket, YarchDatabaseInstance), file transfer/CFDP, SQL/stream builders, and scripting/class-loading paths. The strongest source-supported issue I found is the missing containment check when bucket object names are resolved to filesystem paths: FileSystemBucket.getObject/deleteObject/findObject call root.resolve(objectName) with no canonical-path or normalization check (while putObject has one), and BucketsApi only validates object names for upload (with a regexp that itself permits \"..\" and \"/\"). Because route parameters are URL-decoded after matching, encoded separators reach these methods, so an attacker who can use an existing file-system-backed bucket (or any client when security is disabled, which is the default when security.yaml is absent, where the guest user is active and superuser) can read or delete arbitrary files outside the bucket root. I selected this candidate; a second, distinct unauthenticated file-read lead in the static-file handler and an auth-page XSS/open-redirect lead are recorded as unconfirmed leads, not candidates. No runtime testing was performed; conclusions are source-based."
+}

@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "No attacker-controlled input to the application is required. The attacker is any other unprivileged local user on the same host: the shared temp directory (e.g. /tmp, mode 1777) can be listed, so the newly created junit*.tmp directory is discoverable despite its random name; its default mode (0755 with a typical umask) lets that user traverse it and read any file inside whose own mode allows group/other reads (the default for createNewFile and for files written by test code).",
+      "confidence": "high",
+      "counterevidence_checked": "Searched the whole tree for hardening that could mitigate the issue: setReadable, setWritable, setExecutable, PosixFilePermissions, java.nio.file, createTempDirectory - all zero matches; inspected the full TemporaryFolder class (create/delete/recursiveDelete); confirmed the no-arg newFile() uses File.createTempFile (modern JDKs create those files with restricted permissions), so not every artifact is exposed, but the root directory itself and newFile(String)/newFolder artifacts are. Confirmed the builder allows a private parentFolder, but the default constructor uses the shared system temp dir. Directory mode is environment-dependent (umask), and per-user temp dirs/Windows limit exposure; the random name is not a mitigation because the parent directory is listable. No execution or runtime testing was performed; behavior is reasoned from standard JDK/POSIX semantics.",
+      "id": "junit4-temporaryfolder-insecure-permissions",
+      "impact": "Local information disclosure: sensitive data written by tests into the TemporaryFolder (credentials, tokens, fixtures, dumps, generated secrets) is readable by any other user of the same machine for the lifetime of the folder, because the root directory and the files created by the rule commonly carry world-readable default permissions. Secondary: tampering/DoS by pre-creating the observed path during the delete->mkdir race. No remote exploitation and no privilege escalation are claimed.",
+      "locations": [
+        {
+          "end_line": 251,
+          "path": "src/main/java/org/junit/rules/TemporaryFolder.java",
+          "start_line": 232
+        },
+        {
+          "end_line": 148,
+          "path": "src/main/java/org/junit/rules/TemporaryFolder.java",
+          "start_line": 146
+        },
+        {
+          "end_line": 160,
+          "path": "src/main/java/org/junit/rules/TemporaryFolder.java",
+          "start_line": 153
+        }
+      ],
+      "prerequisites": "Unix-like multi-user host where java.io.tmpdir is shared (default /tmp) and the process umask does not strip group/other bits (typical 022); the test writes sensitive data into the TemporaryFolder (directly, or via newFile(String)/newFolder). Exposure is limited or absent when umask is 077, when java.io.tmpdir is a per-user directory (some platforms/sandboxes), or on Windows where directory ACLs differ. The attacker needs only a local account.",
+      "root_cause": "TemporaryFolder#createTemporaryFolderIn() (src/main/java/org/junit/rules/TemporaryFolder.java:232-251) gets an unpredictable name via File.createTempFile(junit, .tmp, parentFolder) in the system temp directory, deletes the placeholder file, then creates the directory with createdFolder.mkdir() (line 242) and returns it. No permissions are restricted before or after (there is no setReadable/setWritable/setExecutable, PosixFilePermissions or Files.createTempDirectory call anywhere in the tree; searches for these APIs return zero matches). File.mkdir() creates the directory with the process-default mode (0777 & ~umask; typically 0755 with umask 022), so group/other users get read+execute on it. Files created through newFile(String) use File.createNewFile() (lines 153-160) and directories through newFolder(...)/mkdirs() (lines 184-223), also inheriting default permissions, so the contents are readable as well.",
+      "title": "TemporaryFolder creates test directories with default (world-readable) permissions in the shared temp directory",
+      "trace": "A test declares @Rule TemporaryFolder (default constructor, lines 54-56, parentFolder = null). The framework applies the rule: ExternalResource before/after wrapper (ExternalResource.java:46-67) invokes TemporaryFolder.before() (lines 131-134) -> create() (lines 146-148) -> createTemporaryFolderIn(null) (lines 232-251). File.createTempFile places the name candidate in the system temp directory, the placeholder is deleted (lines 243/246), and createdFolder.mkdir() (line 242) creates the directory with default permissions; the directory becomes the rule root (getRoot(), lines 256-262). Nothing in the code path relaxes or verifies the resulting mode. Test artifacts written under getRoot() are then readable by other local users until after()/delete() runs. A collocated user can also observe the short delete->mkdir window and create the path first, causing test failures (secondary, DoS).",
+      "unverified": "Not runtime-confirmed and no exploit attempted. The actual directory mode was not observed on any platform; it depends on the process umask and filesystem. No test sources are present in the snapshot, so the rule's own test suite (which would document intended behavior) could not be reviewed. The precise upstream fix/commit was not inspected.",
+      "weakness_type": "Insecure temporary directory creation / local information disclosure (temp folder readable by other local users)"
+    }
+  ],
+  "coverage_summary": "Reviewed the 279 model-visible repository files reported by get_source_scope (no files excluded for size/sensitivity/symlinks; binary-like files are refused by read_file and skipped by search_code, which affects only site assets such as minified CSS/JS). The snapshot contains main library sources plus build files, docs and site assets; there is no src/test tree. Read or searched the security-relevant surfaces: org.junit.rules (TemporaryFolder, ExternalResource, ExpectedException, RuleChain, Timeout/Stopwatch), runner infrastructure (ParentRunner, BlockJUnit4ClassRunner, Request, JUnitCore, JUnitCommandLineParseResult, FilterFactories, Description), internal file/IO and reflection code (MaxHistory/MaxCore, Throwables, MethodSorter, FrameworkMethod/FrameworkField, TestClass), theories/parameterized/categories, and junit.framework/junit.runner legacy code. Dangerous-API sweeps: Runtime.exec, ProcessBuilder, ObjectInputStream, XStream, System.getenv, setAccessible, Class.forName, createTempFile, deleteOnExit, mkdir/mkdirs, setReadable/setWritable/setExecutable/PosixFilePermissions, java.nio.file.",
+  "limitations": [
+    "No test sources exist in the snapshot, so rule/runner behavior tests could not be inspected.",
+    "No code was executed, compiled, or scanned; all conclusions are static-source based.",
+    "Not every line of every Java file was read in full; coverage prioritized file/temp handling, serialization, class loading/reflection, filtering, and runner/rule infrastructure, while docs and site assets were only spot-checked.",
+    "Platform-specific permission outcomes (umask, ACLs, per-user tmpdir) were reasoned from standard JDK/POSIX behavior and were not observed at runtime.",
+    "Third-party dependencies (hamcrest, maven plugins) are outside the snapshot and were not reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "MaxHistory.readHistory deserializes a Java object graph from a caller-supplied file with an unrestricted ObjectInputStream (src/main/java/org/junit/experimental/max/MaxHistory.java:45-62).",
+      "reason": "Requires the attacker to write/modify the history file at a path chosen by the developer (MaxCore.storedLocally) and a suitable gadget on the classpath; the experimental MaxCore API is not part of the normal test-run input path, so the trust boundary is not clearly crossed by library code. Kept as a rejected lead, not the selected candidate."
+    },
+    {
+      "lead": "FilterFactories/createFilterFactory loads and instantiates arbitrary FilterFactory classes from a filter spec string (src/main/java/org/junit/runner/FilterFactories.java:62-81, reached from JUnitCommandLineParseResult, lines 124-135).",
+      "reason": "The filter spec comes from command-line arguments/system configuration; an actor who can set those already controls the test JVM, so this is not an additional library vulnerability."
+    },
+    {
+      "lead": "MaxCore.getMalformedTestClass calls Class.forName on text derived from a Description (src/main/java/org/junit/experimental/max/MaxCore.java:145-151), and BaseTestRunner reads ~/junit.properties (BaseTestRunner.java:226-247).",
+      "reason": "Description strings originate from the test suite being run, not from external attacker input, and junit.properties is local user configuration; no external trust boundary or meaningful impact identified."
+    },
+    {
+      "lead": "TemporaryFolder.newFile(String)/newFolder(String...) accept names containing '..' and therefore can resolve outside the temp root; only absolute paths are rejected (src/main/java/org/junit/rules/TemporaryFolder.java:184-223).",
+      "reason": "The path is chosen by the test author (the developer), not by an external attacker, and this behavior matches the long-standing API contract; no privilege or trust boundary is crossed."
+    }
+  ],
+  "summary": "The snapshot is JUnit 4.14-SNAPSHOT (main sources only, 279 files: org.junit.*, junit.framework.*, build files and docs/site assets; no test sources). Broad reading of the rule/runner infrastructure, file handling, serialization, reflection/class-loading, filtering and runner code produced one strong candidate: TemporaryFolder creates its root directory with process-default (typically world-readable) permissions on shared POSIX temp directories, exposing test data to other local users. Other leads (MaxHistory Java deserialization, filter-factory class loading, MaxCore/BaseTestRunner reflection) were rejected or judged not to cross a trust boundary in the library itself."
+}

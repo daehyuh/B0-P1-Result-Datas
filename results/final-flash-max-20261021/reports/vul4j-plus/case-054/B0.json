@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the HTTP request to the Jenkins web UI: a POST to `/queue/cancelItem` with the `id` query parameter (a small, usable-sequential queue-item number). Only `@RequirePOST` plus the CSRF crumb are enforced; the attacker does not need any job-level permission (they may be anonymous or a read-only user, since anonymous sessions can obtain a crumb from the crumb issuer).",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) `@RequirePOST` is present, but it only enforces the HTTP method/CSRF crumb, not authorization. (2) A permission predicate does exist (`Queue.Item.hasCancelPermission`), but it is only exposed for views; the server-side endpoint never calls it. (3) `Queue.cancel(Task)` (internal, e.g. from `AbstractProject.makeDisabled`) also lacks checks, but those are trusted in-process callers, not the untrusted web path. (4) The analogous view-driven endpoint `ParameterizedJobMixIn.doCancelQueue` *does* check `Item.CANCEL`, showing the intended permission for the same operation and the inconsistency. (5) Jelly view files (e.g. queue.jelly) are absent from this snapshot, so I could not verify whether the cancel button is gated by `hasCancelPermission()`; if the button is universally shown, the behavior could conceivably be intentional upstream rather than a reverted fix — this is the main uncertainty. (6) No test files are present to see an authorization regression test.",
+      "id": "queue-cancelitem-missing-authz",
+      "impact": "Unauthorized denial of service: any user who can send an authenticated-by-crumb POST (including anonymous/read-only users) can cancel queued builds belonging to other users — including parameterized/release jobs — bypassing the `Item.CANCEL` permission model. Repeated use can keep the queue empty and prevent scheduled work from ever running. It also contradicts the documented meaning of `Item.CANCEL` (\"cancel a scheduled, or abort a running, build\").",
+      "locations": [
+        {
+          "end_line": 762,
+          "path": "core/src/main/java/hudson/model/Queue.java",
+          "start_line": 752
+        },
+        {
+          "end_line": 750,
+          "path": "core/src/main/java/hudson/model/Queue.java",
+          "start_line": 742
+        },
+        {
+          "end_line": 2211,
+          "path": "core/src/main/java/hudson/model/Queue.java",
+          "start_line": 2196
+        },
+        {
+          "end_line": 2131,
+          "path": "core/src/main/java/hudson/model/Queue.java",
+          "start_line": 2125
+        },
+        {
+          "end_line": 240,
+          "path": "core/src/main/java/hudson/model/Item.java",
+          "start_line": 236
+        },
+        {
+          "end_line": 233,
+          "path": "core/src/main/java/jenkins/model/ParameterizedJobMixIn.java",
+          "start_line": 228
+        }
+      ],
+      "prerequisites": "Network access to Jenkins; POST with a valid CSRF crumb (or crumbs disabled); the target queue item id; Jenkins must have at least one queued build (or the attacker can poll `/queue/api/json` for ids if the queue is readable). No `Item.CANCEL`, `Item.BUILD`, or admin permission is required.",
+      "root_cause": "`Queue.doCancelItem` accepts a queue item id and calls `cancel(item)` without verifying that the current user holds the documented `Item.CANCEL` permission. `Queue.cancel(Item)` and `Queue.Item.cancel(Queue)`/`leave()` perform only the removal/notification work, and the existing `Queue.Item.hasCancelPermission()` helper (documented as the predicate for whether a scheduled item may be canceled) is never consulted on this path. The sibling endpoint `ParameterizedJobMixIn.doCancelQueue` performs `asJob().checkPermission(Item.CANCEL)` for the same logical operation, and `Item.CANCEL`'s description explicitly covers cancelling scheduled builds, so the omission is an authorization gap rather than a UI-level concern.",
+      "title": "Queue item cancellation endpoint (/queue/cancelItem) has no Item.CANCEL authorization check",
+      "trace": "HTTP POST /queue/cancelItem?id=N -> `Jenkins.getQueue()` (jenkins/model/Jenkins.java:1667) -> `Queue.doCancelItem` (core/src/main/java/hudson/model/Queue.java:755-762) -> `Queue.cancel(Item)` (Queue.java:742-750) -> `Queue.Item.cancel(Queue)` -> `leave(Queue)` (Queue.java:2203-2211, 2354/2435/2530) which removes the item from waitingList/blockedProjects/buildables and marks its future cancelled. No `checkPermission(Item.CANCEL)`, `hasCancelPermission()`, or `checkAbortPermission()` is executed anywhere on this path.",
+      "unverified": "I could not confirm the upstream project's intended behavior for this endpoint or that a security fix later added a check (no VCS history, no Jelly/UI files, no tests, and no runtime execution). The finding is based on source-level absence of an authorization check plus the asymmetry with the sibling endpoint and the existence of `Item.CANCEL`/`hasCancelPermission`.",
+      "weakness_type": "Missing Authorization (CWE-862 / CWE-863) leading to denial of service"
+    }
+  ],
+  "coverage_summary": "Scope: 8,789 model-visible files under the repository root (no symlinks/sensitive names excluded; binaries refused). I reviewed the Jenkins core Java sources most relevant to remote attack surface: `hudson/model/Queue.java`, `Item.java`, `Computer.java`, `AbstractItem.java`, `Job.java`, `View.java`, `ListView.java`, `User.java`, `Run.java`, `AbstractProject.java`, `ItemGroupMixIn.java`, `Items.java`, `DirectoryBrowserSupport.java`, `Api.java`, `hudson/security/*`, `jenkins/security/*` (ApiTokenProperty, BasicHeader*, s2m whitelisting, confidential store), `jenkins/model/Jenkins.java`, `jenkins/model/ParameterizedJobMixIn.java`, `hudson/util/*` (Secret, SecretRewriter, XStream2, Util), `hudson/cli/*` command classes, `hudson/console/*`, `cli/src/main/java/hudson/cli/*`, plus build files (`pom.xml`, `core/pom.xml`). I verified that Jelly view files (e.g. `core/src/main/resources/hudson/model/Queue/index.jelly`) and all test sources are NOT part of the snapshot, so UI-layer enforcement and regression tests could not be inspected.",
+  "limitations": [
+    "No git history/commit metadata is present, so I could not diff against upstream or confirm which security fix was reverted; the snapshot mixes version eras (POM/changelog appear to be 1.625.x while a subset of Java files contain 2016-2017-era upstream fix code), which limits provenance-based analysis.",
+    "Jelly/HTML view templates and all test files are absent from the assigned source snapshot, so UI-side permission gating (e.g. whether the cancel control is gated by `hasCancelPermission()`) and regression tests could not be checked — this is the key uncertainty for the submitted candidate.",
+    "Third-party dependencies (remoting, Stapler, XStream) are not present as sources; their class-filter blacklists and ACL/interceptor behavior could only be assessed through call sites in this tree.",
+    "No code execution, build, test, or dynamic analysis was performed (read-only source review per instructions), so exploitability is described only at the source-evidence level and is not runtime-confirmed.",
+    "Large areas (e.g. all Jelly-backed endpoints, plugin manager internals, scheduler, compute/provisioning) received targeted rather than exhaustive line-by-line review; other latent issues may remain."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "`hudson/Util.java` `isSafeToRedirectTo` (lines 1475-1480) may be an open-redirect gap: the deprecation comment on `isAbsoluteUri` says to use `isAbsoluteOrSchemeRelativeUri` \"if your goal is to prevent open redirects\", but that method does not exist in the snapshot and `isSafeToRedirectTo` only rejects absolute URIs and `//`-prefixed URIs (no backslash normalization), while its three callers pass attacker-controlled values (`from`, `redirectTo`, `pattern`).",
+      "reason": "The referenced method may simply be a stale/renamed-comment artifact of a past fix, and in its likely semantics (`isAbsoluteUri(uri) || uri.startsWith(\"//\")`) it is behaviorally equivalent to the current code; I could not establish a concrete behavioral gap, so impact/evidence are weaker than the submitted candidate."
+    },
+    {
+      "lead": "`hudson/console/AnnotatedLargeText.createAnnotator` (lines 115-135) deserializes the attacker-supplied `X-ConsoleAnnotator` header with the plugin uber-classloader and no `ClassFilter` (unlike `ConsoleNote.readFrom`).",
+      "reason": "The payload is AES-encrypted with a server-side `CryptoConfidentialKey` (`PASSING_ANNOTATOR`) and is not forgeable by a client; only replay (bounded by a 1-hour timestamp) or CBC malleability is plausible, which I could not turn into a concrete exploitation path. Likely upstream behavior as well."
+    },
+    {
+      "lead": "Later-era fix code overlaid on the 1.625.x tree: `User.ALLOW_USER_CREATION_VIA_URL`/`Jenkins.getUser` (SECURITY-406), `HistoricalSecrets`/`CryptoConfidentialKey` secret-IV code, `ClassFilter`-based deserialization hardening, etc.",
+      "reason": "These represent already-applied fixes (including months/years newer than the declared 1.625.4-SNAPSHOT version), not missing checks; they are useful context but are not themselves vulnerable in the visible source."
+    },
+    {
+      "lead": "`hudson/cli/UpdateJobCommand`/`UpdateNodeCommand`/`UpdateViewCommand` lack explicit permission checks in `run()`.",
+      "reason": "Their delegate methods (`AbstractItem.updateByXml`, `Computer.updateByXml`, `View.updateByXml`) each call `checkPermission(CONFIGURE)`, so no authorization gap is reachable."
+    }
+  ],
+  "summary": "Reviewed the assigned Jenkins core snapshot (declared project version 1.625.4-SNAPSHOT; ~8.8k visible files). I traced web-reachable state-changing endpoints and their permission checks across core Java sources. The strongest source-evidenced issue is in the queue-cancellation web endpoint: `hudson/model/Queue.doCancelItem` (bound to POST /queue/cancelItem) removes an arbitrary queued item via `cancel(Item)` -> `Item.cancel(Queue)` -> `leave()` without ever checking the documented `Item.CANCEL` permission (`Item.hasCancelPermission()` is never consulted on this path), while the sibling \"cancel\" entry point `ParameterizedJobMixIn.doCancelQueue` does check `Item.CANCEL`. Because `Queue` is not an AccessControlled object and the only gate is `@RequirePOST`/CSRF crumb, any session able to obtain a crumb (anonymous or read-only users) can cancel other users' queued builds if the sequential id is known — a denial-of-service / missing-authorization defect. I also noted several other leads that I could not substantiate to the same level. The snapshot mixes eras (e.g., `User.java`/`Jenkins.java` contain 2016–2017-era fix code such as `ALLOW_USER_CREATION_VIA_URL` while the POM/changelog are 1.625.x), and Jelly view files are not part of the snapshot, so UI-side enforcement could not be inspected."
+}

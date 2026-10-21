@@ -1,0 +1,60 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The bytes parsed by the Digester are the contents of workspace/target files selected by an Ant file-set pattern. Anyone who can influence the build workspace content (e.g. commit to a repository built by the job, contribute a pull-request build, control a preceding build step writing files, or control the Maven module's target directory) controls the XML document, including its DOCTYPE and entity declarations. In freestyle jobs the built-in default pattern is `**/*.cs` (CcmPublisher.java line 60), so any committed `.cs` file whose content is crafted XML is parsed even with no explicit configuration; when a pattern is configured it is not validated against report-only files (help text warns \"Be sure not to include any non-report files\"). The XML parser itself imposes no restriction on the content it is handed.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked all 51 model-visible files: repository-wide searches for `setFeature`, `entity`, `XMLInputFactory`, and all `parse(` call sites show this is the only XML parsing entry point and there is no hardening, custom EntityResolver, or secure factory anywhere. `setValidating(false)` does not disable external entity processing. The CcmParser is reachable from both the freestyle publisher and the Maven reporter, so this is not dead code. The impact is bounded by: the publisher must be configured on the job; the malicious file must exist in the parsed workspace/target directory at publish time; execution occurs wherever that workspace is mounted (controller for master builds, generally an agent for distributed builds), and file reads are limited to the process's filesystem/network privileges. No evidence was found that analysis-core's FilesParser or Jenkins core globally disables XXE for this plugin.",
+      "id": "ccm-xxe-digester",
+      "impact": "Server-side request forgery and/or disclosure of local files readable by the Jenkins process (for example credentials or configuration on the controller/agent), including out-of-band exfiltration through a remote DTD; entity expansion also enables denial of service (e.g. exponential entity expansion) and can break/abort builds. Because entity values are bound into the warning model and displayed, the disclosure can be non-blind for a user able to read the job's results.",
+      "locations": [
+        {
+          "end_line": 107,
+          "path": "src/main/java/hudson/plugins/ccm/parser/CcmParser.java",
+          "start_line": 86
+        },
+        {
+          "end_line": 98,
+          "path": "src/main/java/hudson/plugins/ccm/CcmPublisher.java",
+          "start_line": 94
+        },
+        {
+          "end_line": 135,
+          "path": "src/main/java/hudson/plugins/ccm/CcmReporter.java",
+          "start_line": 131
+        }
+      ],
+      "prerequisites": "The CCM publisher/reporter must be active for the job (standard configuration for this plugin), and at least one file matching the configured pattern (default `**/*.cs`, or target/ccm.xml for native Maven jobs) must exist in the parsed workspace at publish time. The build must run while that file content is attacker-chosen. Exploitation occurs on the machine executing the publisher (Jenkins controller for master builds, agent otherwise). No plugin-side authentication is involved.",
+      "root_cause": "CcmParser.parseCCMXmlFile() creates `new Digester()` (line 87), only calls setValidating(false) (line 88) and setClassLoader(), then calls digester.parse(ccmXmlFile) (line 106). No JAXP/SAX hardening is applied: DOCTYPE declarations and external general/parameter entities are not disallowed (e.g. no `http://apache.org/xml/features/disallow-doctype-decl`, no `external-general-entities`/`external-parameter-entities` = false, no `XMLConstants.ACCESS_EXTERNAL_DTD` restriction, no EntityResolver2). `setValidating(false)` disables DTD *validation* only; it does not stop entity resolution. The parser therefore resolves attacker-defined external entities while consuming report content.",
+      "title": "XML External Entity (XXE) processing in CcmParser via unhardened Commons Digester",
+      "trace": "1) CcmPublisher.perform (CcmPublisher.java:94-98) builds a FilesParser with `new CcmParser(getDefaultEncoding())` and the job pattern (default `**/*.cs` at line 60) and runs it via `workspace.act(...)`. 2) FilesParser walks the workspace and invokes the annotation parser on each matching file. 3) CcmParser.parse (CcmParser.java:68-84) calls parseCCMXmlFile(InputStream) (lines 86-107). 4) parseCCMXmlFile constructs a raw `new Digester()` (line 87), sets only validating(false)/classloader, and calls `digester.parse(ccmXmlFile)` (line 106). 5) The underlying SAX parser reaches the crafted DOCTYPE, resolves the external entity, and the resolved value is delivered to the Digester rules (`addBeanPropertySetter(\"ccm/metric/unit\" ... )` lines 98-104) or to the DTD fetch itself. 6) Entity-derived text ends up in Metric.unit/classification/file and then in Bug messages/categories (CcmParser.convert lines 114-138), which are serialized into ccm-warnings.xml and rendered on the build/report pages, making file content disclosure visible to users who can view the job; DTD/entity fetches additionally give SSRF. 7) The same path is used for native Maven jobs via CcmReporter.perform (CcmReporter.java:131-135) with the fixed name ccm.xml.",
+      "unverified": "The exact transitive version and default SAX feature state of commons-digester (pulled in via analysis-core 1.94, whose jar is not in the snapshot) were not executed or inspected; the conclusion rests on the well-documented default behavior of `new Digester()`/SAXParserFactory (doctype allowed, external entities resolved) and on JDK behavior, which can vary with JVM/system-property overrides. The precise rendering/escaping of entity-derived annotation text by analysis-core views (not present in this snapshot) was not verified, so direct in-page disclosure versus out-of-band/SSRF-only impact is not runtime-confirmed. FilesParser matching and exception-handling semantics were inferred from its call sites, not from its source. No exploit was executed.",
+      "weakness_type": "CWE-611: Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Reviewed the full model-visible snapshot (51 files, 0 excluded by policy filters): all 26 Java sources in src/main/java (including every parser, action, descriptor, token, dashboard portlet, and aggregator class), pom.xml dependency/version information, and all resources under src/main/resources and src/main/webapp. No test sources, Jelly views, or bundled third-party library jars are present in the snapshot, so analysis-core 1.94, commons-digester, and Jenkins core behavior were reasoned about from call sites only.",
+  "limitations": [
+    "Third-party dependencies (analysis-core 1.94, commons-digester, Jenkins core) are not part of the snapshot; their runtime behavior and exact versions could not be inspected.",
+    "No Jelly/view files exist in the snapshot, so escaping/rendering of annotation text and potential XSS could not be assessed.",
+    "No tests or build execution were available/permitted; findings are source-level and not runtime-confirmed.",
+    "The node on which the publisher runs (controller vs agent) depends on job configuration and was not determinable from source."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Stored/reflected XSS through attacker-controlled annotation text (metric file, unit, classification) rendered in build/report pages",
+      "reason": "The parser does place unescaped report text into Bug messages/categories, but all view templates (Jelly) and the analysis-core rendering/escaping code are absent from this snapshot, so whether output is escaped cannot be established from the available source. Not submitted as a candidate."
+    },
+    {
+      "lead": "Default pattern `**/*.cs` in CcmPublisher contradicts the documented/default `**/ccm.xml` in config.properties and its help text",
+      "reason": "This is a configuration/copy-paste defect (comment says 'Default PMD pattern'). It is not a vulnerability by itself; it is only noted as an aggravating factor that widens the set of files fed to the vulnerable XML parser."
+    },
+    {
+      "lead": "WarningsPriorityGraphPortlet.getPluginName() returns \"pmd\" instead of \"ccm\" (line 50)",
+      "reason": "Functional copy-paste bug affecting graph lookup, with no security impact demonstrated."
+    },
+    {
+      "lead": "Obsolete transient `pattern` field in CcmReporter (line 161) and unused/aggregation behavior in CcmAnnotationsAggregator",
+      "reason": "No attacker-controlled data flow, authorization bypass, or other security impact found."
+    }
+  ],
+  "summary": "The snapshot is the Jenkins CCM plugin (26 Java files + resources, no views/Jelly in scope). The strongest source-evidenced issue is an XML External Entity (XXE) weakness in CcmParser: the parser builds a default Apache Commons Digester and calls parse() on report streams without disabling DOCTYPE/external entities, so attacker-influenced workspace files are parsed with a non-hardened SAX parser. Freestyle jobs feed every file matching the configured Ant pattern (default \"**/*.cs\") to this parser, and Maven jobs feed target/ccm.xml. I found no countervailing hardening anywhere in the repository (no setFeature, no entity resolver, no secure parser factory). Other leads (XSS through annotation/file text rendered by analysis-core views, the default-pattern/documentation mismatch, minor copy-paste defects) are either unverifiable within this snapshot or not vulnerabilities on their own, so only the XXE candidate is submitted."
+}

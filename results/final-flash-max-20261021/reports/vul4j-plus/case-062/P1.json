@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any remote party that can open a TCP connection to the cluster coordination port (default 0.0.0.0:5001-5099) controls the raw bytes of the Java serialization stream. No credentials, cluster membership, TLS client certificate, or prior handshake is required; the objects are instantiated by ObjectDecoder as soon as a complete frame (up to the 1 MB maxObjectSize) is received.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked for authentication/encryption in the cluster module: no SslHandler, no cipher/credential handshake, and no cluster-credentials check anywhere in enterprise/cluster (grep for auth/secur/encryption/SslHandler returned no security handlers). Checked whether validation precedes decoding: MessageReceiver runs as a separate, later pipeline handler than ObjectDecoder, and Netty fires decoded messages only after deserialization, so no application check can preempt readObject. Checked the default bind: ClusterSettings.cluster_server default is '0.0.0.0:5001-5099' and NetworkReceiver.listen() binds InetSocketAddress(port) for the INADDR_ANY case. Checked that ObjectDecoder (Netty 3.x, org.jboss.netty.handler.codec.serialization.ObjectDecoder) provides no class allow/deny filter. Also confirmed the HA/cluster path is wired only for HA-style enterprise deployments (single-instance enterprise servers do not start this module), and that causal-clustering catchup/raft use separate hand-written marshallers rather than this receiver.",
+      "id": "cand-062-cluster-deserialization",
+      "impact": "Remote, unauthenticated code execution in the Neo4j cluster process (Java deserialization gadget chain; ObjectDecoder uses the application classloader with no class filter, and the module has no authentication layer), or at minimum a reliable remote denial of service that forces huge heap allocations/OOM and can destabilize or crash cluster members. Cluster protocol integrity is also attacker-controllable once a Message is accepted (injected broadcasts/snapshots).",
+      "locations": [
+        {
+          "end_line": 314,
+          "path": "enterprise/cluster/src/main/java/org/neo4j/cluster/com/NetworkReceiver.java",
+          "start_line": 301
+        },
+        {
+          "end_line": 155,
+          "path": "enterprise/cluster/src/main/java/org/neo4j/cluster/com/NetworkReceiver.java",
+          "start_line": 133
+        },
+        {
+          "end_line": 203,
+          "path": "enterprise/cluster/src/main/java/org/neo4j/cluster/com/NetworkReceiver.java",
+          "start_line": 178
+        },
+        {
+          "end_line": 94,
+          "path": "enterprise/cluster/src/main/java/org/neo4j/cluster/ClusterSettings.java",
+          "start_line": 92
+        },
+        {
+          "end_line": 416,
+          "path": "enterprise/cluster/src/main/java/org/neo4j/cluster/com/NetworkSender.java",
+          "start_line": 407
+        },
+        {
+          "end_line": 120,
+          "path": "enterprise/cluster/src/main/java/org/neo4j/cluster/protocol/snapshot/SnapshotMessage.java",
+          "start_line": 107
+        },
+        {
+          "end_line": 72,
+          "path": "enterprise/cluster/src/main/java/org/neo4j/cluster/protocol/atomicbroadcast/AtomicBroadcastSerializer.java",
+          "start_line": 64
+        }
+      ],
+      "prerequisites": "Neo4j Enterprise running in HA cluster mode (HighlyAvailableEditionModule wires ClusterClientModule -> NetworkedServerFactory -> NetworkReceiver), or an Enterprise arbiter (ArbiterBootstrapper uses the same ClusterClientModule). Network reachability to ha.host.coordination, which defaults to 0.0.0.0:5001-5099. RCE additionally requires a usable gadget chain on the server classpath/JDK (Neo4j 3.4 targets Java 8, where JNDI-based JDK gadgets such as javax.sql.rowset.JdbcRowSetImpl historically work); the DoS variant requires no gadget at all.",
+      "root_cause": "The cluster coordination transport serializes whole Java objects and installs org.jboss.netty.handler.codec.serialization.ObjectDecoder unconditionally on every accepted inbound connection. Decoding happens in the Netty pipeline before the application-level handler runs, so attacker-supplied bytes are read with readObject() before any cluster-membership, address, authentication, or protocol validation can occur. The coordination listener has no TLS/authentication handler and, by default, binds to a wildcard address.",
+      "title": "Unauthenticated Java deserialization on the Neo4j Enterprise HA cluster coordination port (Netty ObjectDecoder on 0.0.0.0:5001-5099)",
+      "trace": "1) HighlyAvailableEditionModule / ArbiterBootstrapper construct ClusterClientModule (enterprise/ha/src/main/java/org/neo4j/kernel/ha/factory/HighlyAvailableEditionModule.java:283-288; enterprise/server-enterprise/src/main/java/org/neo4j/server/enterprise/ArbiterBootstrapper.java:69-73). 2) NetworkedServerFactory.newProtocolServer passes NetworkReceiver into the protocol server and starts it (enterprise/cluster/src/main/java/org/neo4j/cluster/NetworkedServerFactory.java:125-128). 3) NetworkReceiver.start() binds a Netty ServerBootstrap to config.clusterServer() host/ports and sets NetworkNodePipelineFactory (NetworkReceiver.java:142-152); listen() resolves the wildcard default to InetSocketAddress(port) i.e. all interfaces (NetworkReceiver.java:186-198). 4) getPipeline() adds ObjectDecoder (maxObjectSize = 1024*1000) followed only by the MessageReceiver handler (NetworkReceiver.java:307-311) - there is no SSL/auth handler in the pipeline. 5) On inbound bytes, ObjectDecoder performs ObjectInputStream.readObject() to reconstruct the object graph; only afterwards does MessageReceiver cast the result to Message (NetworkReceiver.java:337). Consequently attacker-controlled readObject code executes before any validation. 6) In-repo concrete DoS sink for the same primitive: SnapshotMessage.SnapshotState.readObject() executes buf = new byte[in.readInt()] with an attacker-chosen 32-bit length (SnapshotMessage.java:107-120), so a tiny crafted object graph can force a multi-GB allocation/OutOfMemoryError in the cluster thread without needing any gadget chain. 7) If the attacker sends a valid Message object, the cluster state machine processes attacker-chosen payloads; broadcast payloads are then deserialized again via AtomicBroadcastSerializer.receive() -> ObjectInputStream.readObject() (AtomicBroadcastSerializer.java:64-72), a second untrusted-deserialization sink.",
+      "unverified": "Exploitability was not runtime-confirmed (no code executed, no target contacted). RCE depends on availability of a working gadget chain for the JDK/library versions actually deployed (not verified here); the guaranteed worst case from source alone is attacker-triggered unbounded allocation/out-of-memory in the cluster process via objects such as SnapshotMessage.SnapshotState, plus acceptance of forged cluster Messages. I could not confirm whether deployed Neo4j HA documentation/network policy universally isolates port 5001-5099, and I could not verify whether upstream later added a serialization class filter to this decoder.",
+      "weakness_type": "Deserialization of Untrusted Data (CWE-502) leading to RCE/DoS; exposed unauthenticated network service"
+    }
+  ],
+  "coverage_summary": "Snapshot: 6,009 model-visible files, 0 excluded by binary/size/symlink/sensitive-name filters; the P1 relation index reports complete indexing of all 6,009 files (59,436 symbols, 95,255 calls, 121,227 edges, 680 name-based 'security_call' navigation hints) with no file-hash mismatches. I called get_source_scope and get_relation_scope before searching and treated all index output as navigation-only, verifying cited lines in source text. I read and traced: the enterprise cluster/HA transport (NetworkReceiver, NetworkSender, ClusterSettings, AtomicBroadcastSerializer, SnapshotMessage, LearnerState), enterprise/com chunked channel, community server REST layer (AuthorizationEnabledFilter/DisabledFilter, AuthorizedRequestWrapper, UserService, CypherService, CypherExecutor, TransactionalService, JmxService, ConsoleService/ShellSession, CorsFilter, XForwardFilter/Util, HtmlHelper/HtmlFormat, RESTApiModule), community security (BasicAuthManager, BasicLoginContext, Credential, RateLimitedAuthenticationStrategy, AuthProcedures, UserService), enterprise security (MultiRealmAuthManager, InternalFlatFileRealm, LdapRealm, PersonalUserManager, UserManagementProcedures, StandardEnterpriseLoginContext, ShiroAuthenticationInfo), SSL policy loading (SslPolicyLoader, PkiUtils, InsecureRandom), FileURLAccessRule/URLAccessRules, Bolt PackStream/ByteBufInput, dbms archive Dumper/Loader, and module wiring. I did not exhaustively review every module (e.g. most of cypher compiler/runtime, csv parser, lucene/spatial index internals, import-tool, causal-clustering raft/catchup internals, backup protocol internals).",
+  "limitations": [
+    "No tests are present in the snapshot (list_files/search_code for **/src/test/** and *Test.java return nothing), so I could not use tests to confirm intended behavior for the ambiguous leads.",
+    "The P1 relation index is syntactic/navigation-only and does not prove data flow, reachability, or exploitability; every finding above was re-verified against source text, but no runtime, build, or PoC execution was performed (prohibited).",
+    "All selected-candidate locations are in the Neo4j Enterprise HA cluster module; the vulnerability requires an HA/arbiter deployment and network access to the cluster coordination port, and I could not verify actual deployed firewall/network policy.",
+    "Java-deserialization RCE depends on a gadget chain being available for the deployed JDK/classpath; I verified the unfiltered ObjectDecoder sink and an in-repo unbounded-allocation readObject, but did not enumerate or test gadget chains.",
+    "Coverage of the ~6,000-file tree was targeted rather than exhaustive; large modules (cypher compiler/runtime, csv, index providers, causal-clustering internals) were only spot-checked, so an additional independent vulnerability there cannot be ruled out."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Legacy REST Cypher endpoint executes with LoginContext.AUTH_DISABLED (community/server/src/main/java/org/neo4j/server/database/CypherExecutor.java:90-107, reached from community/server/src/main/java/org/neo4j/server/rest/web/CypherService.java:121, mounted by RESTApiModule.java:96), unlike TransactionalService which uses the caller's LoginContext. In enterprise this would let any authenticated user (e.g. reader role) run writes/schema/DBMS procedures and take over the database.",
+      "reason": "In Community edition BasicLoginContext grants AccessMode.Static.FULL to every authenticated user, so no privilege boundary is crossed there; in Enterprise the legacy REST API may intentionally be excluded from fine-grained RBAC (documented legacy limitation), which makes it ambiguous as a vulnerability. Kept as an unconfirmed lead, not the selected candidate."
+    },
+    {
+      "lead": "Path traversal / 'zip-slip' in database archive loading: community/dbms/src/main/java/org/neo4j/dbms/archive/Loader.java:99-113 resolves the raw archive entry name against the destination (destination.resolve(entry.getName())) even though determineEntryDestination() only sanitizes the file name for choosing the target directory; a crafted .tar.gz passed to 'neo4j-admin load' could write files outside the database directory (e.g. auth file or plugins).",
+      "reason": "Requires an operator to run the admin CLI on an attacker-supplied archive (local/user-assisted precondition), so attacker control is weaker; also no evidence in this snapshot that this path is remotely reachable. Unconfirmed lead."
+    },
+    {
+      "lead": "HTML representation of the REST API concatenates attacker-influenced data without encoding: community/server/src/main/java/org/neo4j/server/rest/domain/HtmlHelper.java:146-175 builds an <a href> from an unescaped property value and appends map keys unescaped, and community/server/src/main/java/org/neo4j/server/rest/repr/formats/HtmlFormat.java:125-152 interpolates exception messages/stack traces into HTML unescaped (possible reflected/stored XSS for clients requesting text/html).",
+      "reason": "Legacy text/html representation, requires victim interaction and a written property/error path to reflect attacker text; impact medium and fix intent uncertain. Unconfirmed lead."
+    },
+    {
+      "lead": "LOAD CSV URL handling: GraphDatabaseDependencies.java:57-61 registers http/https/ftp as always permitted (SSRF to internal services from a read query) and FileURLAccessRule.java:56-60 returns the file URL unrestricted when dbms.directories.import is unset (arbitrary local file read in embedded configurations); dbms.security.allow_csv_import_from_file_urls defaults to true (GraphDatabaseSettings.java:310).",
+      "reason": "Documented product behavior for http(s) imports (SSRF lead) and in server distributions the import root is configured by neo4j.conf; exploitation is configuration-dependent. Unconfirmed lead."
+    },
+    {
+      "lead": "Bolt PackStream unpackRawBytes allocates new byte[size] from a wire-provided 32-bit length before reading (community/bolt/src/main/java/org/neo4j/bolt/v1/packstream/PackStream.java:741-752), a possible memory-exhaustion DoS.",
+      "reason": "Allocation is bounded by Integer.MAX_VALUE and the subsequent read fails quickly; practical impact and upstream intent (Netty frame limits/read limits) unclear. Unconfirmed hardening-style lead."
+    }
+  ],
+  "summary": "Reviewed the Neo4j 3.4.9-SNAPSHOT source tree (6,009 model-visible files; no test sources are present in the snapshot). After tracing network-facing input paths, authentication/authorization checks, archive/file handling, and REST output handling, I selected one candidate for submission: the HA/cluster coordination listener in enterprise/cluster deserializes any Java object received on its socket using Netty's ObjectDecoder, before any membership, authentication, or protocol validation. The listener binds by default to 0.0.0.0:5001-5099 (all interfaces), the module contains no TLS or authentication handler, and deserialization itself is the sink (readObject runs during frame decode). This is a remote, unauthenticated untrusted-deserialization primitive (RCE with a suitable gadget chain on the classpath; at minimum a reliable memory-exhaustion DoS via in-repo readObject code). Other plausible leads were kept as rejected/unconfirmed because they are more ambiguous (legacy API by design) or require local/user-assisted preconditions."
+}

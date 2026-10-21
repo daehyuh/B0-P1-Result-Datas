@@ -1,0 +1,63 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The HTTP request path after the plugin label is attacker-controlled. The plugin is registered under the Web Console label 'httpservice' (Activator.java lines 45-51). A crafted URL such as /system/console/httpservice/x%27%3E%3Cscript%3E...%3C/script%3E%3E supplies the payload; percent-encoded characters (e.g. %27, %3C, %3E) are decoded by the servlet container before HttpServletRequest.getPathInfo() returns them, so doGet() concatenates them into 'path' (lines 106-109) and passes them to printForm (line 110).",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the value is encoded later: the Web Console response wrapper (ResourceFilteringWriter) only expands ${...} placeholders and does not escape HTML; no CSP/X-XSS-Protection headers exist in the repo. Checked whether the plugin is reachable: Activator registers it with felix.webconsole.label=httpservice, so it is a normal Web Console page. Checked alternatives in the same file: every other external value goes through the encoding printRow()/Encode (lines 354-379, 408-470, 618-698, 770-856), making line 147 the single unescaped sink. Verified the sibling parameter at line 151 uses Encode.forHtmlAttribute, i.e. the omission is not a deliberate 'path is trusted' design consistent with the rest of the file. Not verified at runtime.",
+      "id": "case-204-c1",
+      "impact": "Reflected script execution in the origin of the OSGi Web Console when an authenticated administrator follows the crafted link. Because the Web Console performs privileged operations via authenticated POSTs (bundle install/update/start/stop, configuration changes in ConfigManager/ConfigAdminSupport) and the codebase contains no CSRF tokens (searches for CSRF returned nothing), injected script can drive those operations with the administrator's credentials/session, i.e. full console compromise from a link click.",
+      "locations": [
+        {
+          "end_line": 153,
+          "path": "http/webconsoleplugin/src/main/java/org/apache/felix/http/webconsoleplugin/impl/HttpServicePlugin.java",
+          "start_line": 100
+        }
+      ],
+      "prerequisites": "The org.apache.felix.http.webconsoleplugin bundle must be installed and an HttpServiceRuntime service present (Activator tracks it and registers the servlet). The victim must already be authenticated to the Web Console and must open the attacker-supplied link; the payload is reflected, not stored. Repo-wide searches found no Content-Security-Policy or X-XSS-Protection headers, so there is no output-side mitigation.",
+      "root_cause": "HttpServicePlugin.printForm() writes the request-derived 'path' (contextPath + servletPath + pathInfo) directly into a single-quoted HTML attribute: pw.print(\"<form method='POST' action='\"); pw.print(path); pw.print(\"'>\"). No HTML attribute encoding is applied, even though the request parameter rendered two lines later is explicitly encoded with Encode.forHtmlAttribute(value). A quote or angle bracket in the decoded request path therefore terminates the attribute and injects markup/script.",
+      "title": "Reflected XSS in Felix HTTP Web Console plugin via unencoded request path in form action attribute",
+      "trace": "HttpServicePlugin.doGet (line 101) -> path = req.getContextPath() + req.getServletPath() + req.getPathInfo() (lines 106-109) -> printForm(pw, test, path) (line 110) -> printForm builds \"<form method='POST' action='\" (line 146) -> pw.print(path) (line 147, unencoded) -> \"'>\" (line 148). The same method encodes the user-controlled 'test' parameter at line 151 (Encode.forHtmlAttribute(value)), demonstrating the intended output-encoding policy that line 147 violates. The response is emitted through the Web Console response wrapper, which only substitutes ${...} variables (ResourceFilteringWriter) and does not escape HTML.",
+      "unverified": "No upstream diff is available, so I cannot prove this line was modified versus pre-existing upstream code; the claim is based on source evidence and the inconsistency with the adjacent encoding call. I could not run the server to confirm that Jetty/Felix HTTP deliver the quote character in getPathInfo() for every deployment (percent-encoded single quotes are normally accepted and decoded, but deployments may differ), nor that the victim's browser executes the injected markup in all configurations.",
+      "weakness_type": "CWE-79 Improper Neutralization of Input During Web Page Generation ('Reflected XSS')"
+    }
+  ],
+  "coverage_summary": "Source scope: 3,154 model-visible files under the assigned root; safety filters excluded 5 MiB+ files (0), sensitive-named paths (0) and symlinks (0). The P1 index is partial: 3,140 of 3,154 files indexed (14 files absent from the index; 18 omitted files; 1 parse error), 2,556 Java files parsed with syntax-only relations (no control-flow, no data-flow, no semantic resolution; Spring/annotation hints unverified). I used the index for navigation (symbol/relation facts on security-relevant calls in the bundlerepository, configadmin, fileinstall, healthcheck, http, inventory, webconsole and webconsole-plugins areas) and verified every retained point against source text. I inspected and traced code in bundlerepository, cm.json, configadmin and its interpolation plugin, configurator, connect, coordinator, eventadmin, examples, fileinstall, framework (+framework.security), gogo, healthcheck, http (base, jetty, jetty12, proxy, sslfilter, webconsoleplugin, wrappers), inventory, ipojo (partially), log, metatype, resolver, scr (partially), tools, utils, webconsole and webconsole-plugins. Omitted/unindexed files and the unfiltered portions of very large modules (framework core, ipojo manipulator, tools) were not exhaustively reviewed.",
+  "limitations": [
+    "No upstream reference/diff or git metadata is present in the snapshot, so I cannot prove which code differs from the original felix-dev source; candidates are source-evidence leads, not confirmed introduced changes.",
+    "No code was executed; deployment details (exact Jetty URI decoding/compliance settings, which bundles are installed, whether an administrator follows the link) determine the runtime exploitability of the XSS candidate.",
+    "The relation index provides only syntactic navigation candidates (no data-flow, control-flow, or semantic resolution) and covers 3,140/3,154 files; areas it does not cover were not treated as reviewed.",
+    "Large modules (framework core, ipojo manipulator/metadata, maven-bundle-plugin) were only partially inspected due to size; a distinct issue could exist there.",
+    "Timezone/time-boxed review: finding selection prioritized web-exposed, source-evident sinks; dependency-version vulnerabilities were not systematically audited beyond spot checks."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Zip Slip / arbitrary path write in bundlerepository FileUtil.unjar (FileUtil.java lines 98-141), ObrGogoCommand.unjar (ObrGogoCommand.java lines 751-794) and gogo/command Util.unjar (Util.java lines 152-195): only entries starting with '/' are rejected; '..' segments are not checked before writing (new File(targetDir, destName) at FileUtil.java:170, ObrGogoCommand.java:823, gogo Util.java:224).",
+      "reason": "Real weakness, but requires a local operator to run the 'obr source -x'/'extract' shell command against attacker-influenced repository metadata, and the pattern is old duplicated upstream code rather than a single distinct injected flaw; weaker and less remote than the submitted candidate."
+    },
+    {
+      "lead": "Health check JSONP callback concatenated unvalidated into the response (healthcheck ResultJsonSerializer.java lines 67-68; HealthCheckExecutorServlet.java lines 350-352).",
+      "reason": "The callback is written into an application/javascript response; direct navigation to a JavaScript response is not rendered as HTML, so practical XSS impact is limited (data-exfiltration style JSONP injection). The servlet also documents no access control by design, so this is likely accepted upstream behavior."
+    },
+    {
+      "lead": "FileInstall writes/deletes files named by the configuration property felix.fileinstall.filename (ConfigInstaller.java lines 240-309, fromConfigKey -> new File(URI.create(key))).",
+      "reason": "A writer to ConfigAdmin could set that property to a file: URI ending in .cfg/.config and have FileInstall overwrite/delete it, but ConfigAdmin write access is already a privileged position, filenames are normally set by FileInstall itself, and this appears to be intended upstream save-back behavior."
+    },
+    {
+      "lead": "Open redirect via sendRedirect helpers that accept '//host' as a rooted URL (webconsole internal/Util.java lines 252-270 and WebConsoleUtil.java lines 121-140), reachable from ConfigManager.doPost line 201 with the configuration PID.",
+      "reason": "Requires an authenticated Web Console administrator to trigger a config apply/create; the redirect target is the created configuration PID, and the impact (redirect) is far lower than the XSS candidate."
+    },
+    {
+      "lead": "Unsafe Java deserialization of state.ser in configurator (State.java lines 80-89, readObject lines 68-78).",
+      "reason": "The file lives in the bundle's private data area obtained via bundleContext.getDataFile(State.FILE_NAME); no network or untrusted-source path to that file was identified."
+    },
+    {
+      "lead": "XML parsers without DTD/external-entity hardening (scr BundleComponentActivator.java lines 410-414; ipojo StreamMetadataProvider.java lines 74-78; bundlerepository StaxParser.java lines 44-55; bundlerepository RepositoryAdminImpl referral handling lines 91-130).",
+      "reason": "Inputs are bundle/config controlled; the SAX-based parsers rely on Xerces defaults (external general entities off) and no concrete attacker-controlled path with data disclosure was traced, so this stays a hardening/uncertain lead."
+    },
+    {
+      "lead": "Web Console default credentials admin/admin (OsgiManager.java lines 143-145) and BasicWebConsoleSecurityProvider NPE paths for unset username/password.",
+      "reason": "The default is documented upstream (webconsole/README.md) and users are told to change it; not an introduced flaw."
+    }
+  ],
+  "summary": "Reviewed the Apache Felix monorepo snapshot (3,154 visible files, ~2,556 Java files) with the P1 source-relation index as navigation only. I searched for dangerous sinks (process execution, deserialization, zip extraction, XML parsing, TLS trust, path handling, redirects) and for escaping asymmetries in web-facing code. The strongest source-supported issue is a reflected XSS in the Felix HTTP Web Console plugin: the request path is written into a single-quoted HTML form action attribute without encoding, while the sibling request parameter in the same form is encoded with OWASP Encode. I submit that single candidate; other real but weaker/unconfirmed leads are listed as rejected."
+}

@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker supplies the imported document: a .xiidm/.iidm/.jiidm file read through `Network.read(...)`/`Importer.importData(...)`/`NetworkSerDe.read(InputStream)` (attacker controls the whole XML including DOCTYPE and entity declarations), a CGMES .zip (CgmesImport/CgmesOnDataSource read EQ/SSH/SV files and their zip entries, including during format detection and multi-grid-model partitioning), or a CIM .zip passed to CimAnonymizer. No sanitization of DOCTYPE/entities exists on these paths.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that (1) hardening exists next door for the same parser class (`cgmes-model` FullModel.java 30-35; `commons` XmlModuleConfigRepository.java 41-44) and for XSD validation (`NetworkSerDe` lines 127-130), so the vulnerable factories are inconsistent omissions; (2) no code path rejects DOCTYPE before `createXMLStreamReader`, and `AbstractTreeDataImporter`/`NetworkSerDe` schema validation is opt-in and separate from the streaming parse; (3) no XMLInputFactory system property / service override is set in the repository; (4) the `SafeZipInputStream` guards added for CGMES only bound zip expansion and do not affect entity processing.",
+      "id": "case-148-xxe-stax",
+      "impact": "While parsing the malicious document the JVM resolves external entities: local files can be read/exfiltrated (classic external-DTD/parameter-entity XXE), arbitrary URLs are fetched from the parsing host (SSRF/internal port probing), and entity expansion permits denial of service. In XIIDM the resolved text is also materialized into the parsed network (e.g. names/IDs), so file content or fetched content can surface in application output.",
+      "locations": [
+        {
+          "end_line": 37,
+          "path": "commons/src/main/java/com/powsybl/commons/xml/XmlReader.java",
+          "start_line": 30
+        },
+        {
+          "end_line": 69,
+          "path": "iidm/iidm-serde/src/main/java/com/powsybl/iidm/serde/XMLImporter.java",
+          "start_line": 39
+        },
+        {
+          "end_line": 89,
+          "path": "cgmes/cgmes-model/src/main/java/com/powsybl/cgmes/model/NamespaceReader.java",
+          "start_line": 49
+        },
+        {
+          "end_line": 343,
+          "path": "cgmes/cgmes-conversion/src/main/java/com/powsybl/cgmes/conversion/CgmesImport.java",
+          "start_line": 251
+        },
+        {
+          "end_line": 70,
+          "path": "cim-anonymiser/src/main/java/com/powsybl/cim/CimAnonymizer.java",
+          "start_line": 66
+        }
+      ],
+      "prerequisites": "An application or service imports an attacker-influenced XML file through powsybl-core (typical case: a web/service endpoint that accepts a user-provided IIDM/CGMES file, or an inter-utility CGMES exchange). The JVM must use a StAX implementation with default entity resolution and no global overrides (no `javax.xml.stream.supportDTD`/`isSupportingExternalEntities` or `ACCESS_EXTERNAL_DTD` settings exist anywhere in this snapshot).",
+      "root_cause": "Multiple production XML parsers instantiate `XMLInputFactory.newInstance()`/`newFactory()` with JDK defaults and never disable DTD processing or external entity resolution. `javax.xml.stream.supportDTD` and `javax.xml.stream.isSupportingExternalEntities` default to true in the JDK StAX implementation, so a DOCTYPE with internal/external entities in an imported file is processed and resolved. Some sibling code hardens the same kind of factory (`FullModel.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, \"\")`, `XmlModuleConfigRepository`, `NetworkSerDe.validate` SchemaFactory), demonstrating the omission rather than a design decision.",
+      "title": "Unhardened StAX XMLInputFactory in network/CIM importers enables XXE on untrusted files",
+      "trace": "XIIDM path: file/stream -> `NetworkSerDe.read(InputStream,...)` (NetworkSerDe.java 548-556) -> `createXmlReader` (574-576) -> `com.powsybl.commons.xml.XmlReader` ctor (XmlReader.java 30-44) -> `XML_INPUT_FACTORY_SUPPLIER.get().createXMLStreamReader(is)` -> `reader.next()`/`getElementText()` resolves declared entities. Format detection also parses before import: `XMLImporter.exists` (XMLImporter.java 64-91) calls the same factory. CGMES path: `CgmesImport`/`CgmesOnDataSource` enumerate zip entries and call `NamespaceReader.namespaces/base` (NamespaceReader.java 47-87, factory line 89) and `MultipleGridModelChecker.readModelingAuthority` (CgmesImport.java 302-343, factory line 251) on attacker-controlled files. `CimAnonymizer` similarly calls `createXMLEventReader` (line 209) with the default factory (line 67).",
+      "unverified": "No code was executed. The actual behavior depends on the JDK StAX implementation in the deployment (JDK 17 is the target): JDK defaults keep DTD support and external entity resolution on, but a container/JVM may globally set `javax.xml.stream.*`/`jdk.xml.*` properties, which would reduce impact. Whether out-of-band exfiltration (external parameter entities) or only local file read/SSRF is possible depends on the StAX/Xerces version; and whether a given consumer parses untrusted files (vs. trusted local files) is a deployment property, not verifiable from source alone.",
+      "weakness_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)"
+    }
+  ],
+  "coverage_summary": "Static review of the 2923 model-visible files in the snapshot (no test sources are present; binary-like files are skipped by policy). I used repository-wide literal searches for the dangerous sinks relevant to this codebase (XML/DOM/SAX/StAX factories, archive extraction/creation, ObjectInputStream, ProcessBuilder/exec, class loading, path joins/resolves, file writes, Jackson polymorphic typing, YAML/Groovy loading) and read the corresponding files in full inside the highest-risk modules: `commons` (xml, datasource, compress, config, binary, json), `iidm-serde` import/export paths, `cgmes-model`/`cgmes-conversion`/`cgmes-completion`, `cim-anonymiser`, `computation-local`/`computation`, `security-analysis` API/distributed, `triple-store`, and DSL/script modules. The XXE candidate is traced from file import entry points to the concrete parser calls; the other leads above are documented with their blocking conditions.",
+  "limitations": [
+    "No code was executed and no tests exist in the snapshot, so all conclusions are source-level only; StAX entity-resolution behavior and any JVM-wide XML hardening system properties in the real deployment are unverified.",
+    "No git history/patch information is available, so I could not confirm whether the unhardened factories were later fixed (i.e., whether this snapshot is the vulnerable pre-fix state) or whether any of the rejected leads is the intended ground-truth issue.",
+    "Several large or peripheral modules (e.g. psse, powerfactory, matpower, ucte, time-series internals, loadflow-validation, math) were reviewed only via targeted searches and spot reads, not line-by-line.",
+    "Whether any specific consumer imports untrusted files through powsybl (as opposed to trusted local files) is an application/deployment property; the finding assumes a realistic import-of-untrusted-data scenario for a library whose formats are exchanged between organizations.",
+    "The RDF4J-based CGMES triplestore parsing path was not fully assessed for external-entity defaults (RDF4J's own parser configuration behavior was not verifiable in this offline review)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Zip Slip / path traversal in `computation-local` `LocalComputationManager.preProcess` ARCHIVE_UNZIP: `Files.copy(..., workingDir.resolve(ze.getName()), REPLACE_EXISTING)` (LocalComputationManager.java 231-240) uses raw zip entry names, so absolute or `../` entry names can write outside the working directory.",
+      "reason": "Real unhardened extraction sink, but no in-repo code instantiates `InputFile(..., FilePreProcessor.ARCHIVE_UNZIP)` (search shows no `new InputFile` producers), so within this snapshot the path is reachable only through external computation providers that already control the command and archive. Exploitation therefore requires an unusual, provider-dependent trust relationship; kept as a secondary lead, not the single candidate."
+    },
+    {
+      "lead": "Possible shell metacharacter injection in `UnixLocalCommandExecutor`/`WindowsLocalCommandExecutor` (args appended inside quotes without escaping at lines 52-54/55-57; env values appended unquoted at lines 41-50/43-53, executed via `bash -c`/`cmd /c`).",
+      "reason": "The quoting is clearly unsafe, but arguments and execution variables are constructed by load-flow/security-analysis providers (e.g. fixed file names and option lists), and I found no trace in this snapshot of parsed untrusted file content reaching a program argument or environment value. Insufficient attacker-controlled source evidence to prefer over the XXE lead."
+    },
+    {
+      "lead": "Path traversal in `cgmes-completion` `CreateMissingContainersPreProcessor`: `fixesFolder.resolve(basename + \".zip\")` followed by `Files.deleteIfExists`/`createFile` (lines 109-119), where `basename` can fall back to attacker-influenced `cgmes.modelId()` (lines 101-107).",
+      "reason": "Requires the opt-in `createMissingContainers` pre-processor and a configured fixes folder, and the write/delete is limited to `.zip`-suffixed paths; impact and reachability are weaker than the XXE lead."
+    },
+    {
+      "lead": "Insecure deserialization: `com.powsybl.math.matrix.SparseMatrix.read(InputStream)` uses `new ObjectInputStream(...).readObject()` (SparseMatrix.java 487-492).",
+      "reason": "No production caller of `SparseMatrix.read(InputStream)` exists in the snapshot (dead code for untrusted input), and the classpath gadget chain would be environment-dependent."
+    },
+    {
+      "lead": "Groovy script evaluation (`dsl` DslLoader, contingency/action/time-series DSLs, `GroovyScriptPostProcessor`, `RunScriptTool`).",
+      "reason": "Executing user-provided scripts is the documented purpose of these modules and the script path/source is explicitly configured by the operator/CLI, so it is an intended feature rather than an injection boundary."
+    },
+    {
+      "lead": "Unbounded decompression / zip-bomb style DoS in `ZipArchiveDataSource`, `NetworkSerDe.gunzip`, `LocalComputationManager` FILE_GUNZIP.",
+      "reason": "These paths read the whole uncompressed stream, but the CGMES first-entry reads were already capped with `SafeZipInputStream`; as a pure availability issue with weaker source evidence it is secondary to the parser issue."
+    }
+  ],
+  "summary": "The strongest plausible issue is a systemic XXE (CWE-611): StAX XML parsers used for several untrusted grid-model formats are created with raw JDK defaults, so DTDs and external entities are processed. `com.powsybl.commons.xml.XmlReader` (used by the native IIDM XIIDM/JIIDM imports through `NetworkSerDe.read`/`createXmlReader`) uses `Suppliers.memoize(XMLInputFactory::newInstance)` with no `SUPPORT_DTD=false` / `IS_SUPPORTING_EXTERNAL_ENTITIES=false` / `ACCESS_EXTERNAL_DTD=\"\"`. The same unhardened pattern appears in `iidm-serde` `XMLImporter.exists()`, `cgmes-model` `NamespaceReader` (namespace/base sniffing of every CGMES file, including zip entries), `cgmes-conversion` `CgmesImport.MultipleGridModelChecker.readModelingAuthority` (EQ files read during multi-grid-model detection), and `cim-anonymiser` `CimAnonymizer.XmlStaxContext` (CIM zip anonymization). Sibling code in the same modules (`FullModel`, `XmlModuleConfigRepository`, `NetworkSerDe` schema validation) explicitly sets `ACCESS_EXTERNAL_DTD`/`ACCESS_EXTERNAL_SCHEMA` to \"\", which shows the omission in these factories is not an intentional trust decision. I submitted no other candidate; the other suspicious areas are recorded as rejected leads."
+}

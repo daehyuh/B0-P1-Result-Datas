@@ -1,0 +1,101 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated client with TCP access to the NameServer port (default 9876) crafts a remoting request with code UPDATE_NAMESRV_CONFIG (318) whose body is a properties document (e.g., 'configStorePath=/root/.ssh/authorized_keys\\n<injected lines>'). The NameServer default processor handles the code directly (DefaultRequestProcessor.processRequest switch), there is no ACL/RPC hook on the NameServer in 4.6.0, and the body is parsed and applied verbatim.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the namesrv has no ACL/RPCHook path (AccessValidator is only referenced in BrokerController/AdminBrokerProcessor/tools/acl); verified UPDATE_NAMESRV_CONFIG is reachable through the registered default processor; checked that Configuration.update's mergeIfExist guard does not block the attack because properties2Object is fed the raw request Properties and configStorePath already exists in the registered config set; confirmed there is a valid setter/getter for configStorePath and that getStorePath() reads it dynamically (setStorePathFromConfig); confirmed string2File really writes/replaces the target path. Considered that unauthenticated namesrv commands are partly by design in 4.x (registerBroker, kv config, etc.), but the ability to repoint the persistence path and write attacker-influenced content is not part of the documented admin CLI contract (mqadmin updateNamesrvConfig expects a privileged operator). Content injection depends on Properties escape semantics, which the code confirms (load unescapes, properties2String does not re-escape); the written file always begins with a few 'key=value' config lines before injected content, which does not prevent use of files that tolerate extra lines.",
+      "id": "rocketmq-namesrv-updateconfig-arbitrary-file-write",
+      "impact": "Unauthenticated remote arbitrary file write/overwrite on the NameServer host (files such as /etc/cron.d/*, ~/.ssh/authorized_keys, shell initialization files, service configs, or the namesrv's own config/data files), leading to potential code execution as the namesrv user, configuration/routing corruption, and denial of service. Even if code execution is not achieved, arbitrary overwrite of the target file plus creation of <target>.tmp/.bak is an integrity/availability compromise.",
+      "locations": [
+        {
+          "end_line": 122,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/processor/DefaultRequestProcessor.java",
+          "start_line": 121
+        },
+        {
+          "end_line": 541,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/processor/DefaultRequestProcessor.java",
+          "start_line": 503
+        },
+        {
+          "end_line": 74,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/NamesrvController.java",
+          "start_line": 63
+        },
+        {
+          "end_line": 153,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/NamesrvController.java",
+          "start_line": 144
+        },
+        {
+          "end_line": 34,
+          "path": "common/src/main/java/org/apache/rocketmq/common/namesrv/NamesrvConfig.java",
+          "start_line": 32
+        },
+        {
+          "end_line": 85,
+          "path": "common/src/main/java/org/apache/rocketmq/common/namesrv/NamesrvConfig.java",
+          "start_line": 79
+        },
+        {
+          "end_line": 216,
+          "path": "common/src/main/java/org/apache/rocketmq/common/Configuration.java",
+          "start_line": 174
+        },
+        {
+          "end_line": 168,
+          "path": "common/src/main/java/org/apache/rocketmq/common/Configuration.java",
+          "start_line": 121
+        },
+        {
+          "end_line": 187,
+          "path": "common/src/main/java/org/apache/rocketmq/common/MixAll.java",
+          "start_line": 151
+        },
+        {
+          "end_line": 299,
+          "path": "common/src/main/java/org/apache/rocketmq/common/MixAll.java",
+          "start_line": 278
+        },
+        {
+          "end_line": 365,
+          "path": "common/src/main/java/org/apache/rocketmq/common/MixAll.java",
+          "start_line": 327
+        }
+      ],
+      "prerequisites": "Network reachability to the namesrv listener; no credentials (ACL is only wired into BrokerController in this version - initialAcl/registerServerRPCHook; the namesrv has no AccessValidator/RPCHook); target path must be writable by the namesrv process (official distributions often run it as root). For full content control rather than just path/overwrite, values must use Properties '\\n' escapes so that MixAll.properties2String re-emits raw newlines; even without that, the write itself overwrites/creates an arbitrary path with configuration text.",
+      "root_cause": "DefaultRequestProcessor.updateConfig() applies an arbitrary Properties body to the NameServer's Configuration without authentication or allow-listing. Configuration.update() calls MixAll.properties2Object(), which invokes any matching setter (including NamesrvConfig.setConfigStorePath), then persist() writes the full config text via MixAll.string2File() to Configuration.getStorePath(), which for the namesrv is read back from the just-modified configStorePath field (setStorePathFromConfig in NamesrvController). There is no validation that the persist path stays inside the intended config directory, and MixAll.properties2String() writes property values verbatim so newline escapes decoded by Properties.load (MixAll.string2Properties) are re-emitted as raw newlines, allowing attacker-directed lines in the written file.",
+      "title": "Unauthenticated NameServer config update allows attacker-controlled persist path -> arbitrary file write",
+      "trace": "1) namesrv DefaultRequestProcessor.java:121-122 dispatches RequestCode.UPDATE_NAMESRV_CONFIG to updateConfig(). 2) updateConfig() (503-541) reads request.getBody(), parses with MixAll.string2Properties (288-299; Properties.load decodes \\n escapes into real newline characters in values) and calls namesrvController.getConfiguration().update(properties) at line 535. 3) Configuration.update() (174-198) runs mergeIfExist, then MixAll.properties2Object(properties, configObject) (line 184), which maps the property key 'configStorePath' to setter setConfigStorePath (MixAll.java 327-365), and finally persist() (line 197). 4) Configuration.persist() (200-216) builds the full config string and calls MixAll.string2File(allConfigs, getStorePath()) (line 207). 5) getStorePath() (145-168) returns the value of the storePathField, which NamesrvController.java:73 bound to NamesrvConfig.configStorePath - i.e., the attacker-supplied path. 6) MixAll.string2File/string2FileNotSafe (151-187) creates parent dirs, writes the string to <path>.tmp, then replaces the target file. 7) MixAll.properties2String (278-286) emits each value raw, so a value containing decoded newlines lands as arbitrary lines inside the written file. 8) NamesrvController.registerProcessor (144-153) registers DefaultRequestProcessor with no authorization wrapper and the namesrv never loads the ACL AccessValidator (only BrokerController.initialAcl does), so no authentication is required.",
+      "unverified": "Not runtime-confirmed (no execution performed). Not verified which concrete filesystem paths are writable on a real deployment; not verified whether OpenSSH/cron on a target host would accept a payload with the leading config lines; whether the same code path is the benchmark's intended ground-truth issue is unknown; the broker-side sibling (AdminBrokerProcessor.updateBrokerConfig -> Configuration.update) was only partially evaluated because the broker uses a fixed brokerConfigPath in this snapshot.",
+      "weakness_type": "CWE-73 External Control of File Name or Path (with CWE-862 Missing Authorization / CWE-74 content injection)"
+    }
+  ],
+  "coverage_summary": "Coverage: 798 repository-relative source files visible (tests/examples absent). I reviewed the remoting protocol/framing layer (RemotingCommand, RocketMQSerializable, NettyDecoder/NettyRemotingAbstract/NettyRemotingServer, TLS config), the NameServer (DefaultRequestProcessor, NamesrvController, KVConfigManager, NamesrvStartup), the broker entry points (BrokerController, BrokerStartup, AdminBrokerProcessor, Send/Pull/Query/Reply/EndTransaction/ClientManage/Forward processors and AbstractSendMessageProcessor), the ACL module (PlainAccessValidator, PlainPermissionManager, Permission, AclUtils/Signer/ClientRPCHook, RemoteAddressStrategyFactory), shared config machinery (Configuration, ConfigManager, MixAll, BrokerConfig/NamesrvConfig/MessageStoreConfig), and portions of the store layer (DefaultMessageStore, ConsumeQueue/ConsumeQueueExt, MappedFileQueue). Search passes covered Runtime.exec/ProcessBuilder, ObjectInputStream/deserialization, file I/O APIs, Class.forName, and JSON parsing. Files were filtered only by the controller's binary/size/symlink policy (0 excluded by sensitive-name, size, or symlink rules).",
+  "limitations": [
+    "No code execution, build, tests, scanner, or runtime verification was performed; findings are source-evidence leads only.",
+    "No git history/patch/ground-truth data is available, so I could not confirm which issue a benchmark considers the target or compare against the upstream fix commit.",
+    "Client, tools, logging, and large parts of store/srvutil modules were inspected only selectively (keyword-driven), not read line-by-line.",
+    "Exploitability of candidate 1 was reasoned from source (Properties.load unescaping, unsynchronized reflection-based config application, MixAll.string2File replacement semantics) but not demonstrated; concrete writable paths and service behavior on a live host are unverified.",
+    "The one-candidate limit means the ACL authorization gap, topic-name path traversal, and RocketMQSerializable allocation issues are reported only as rejected/unconfirmed leads, not as additional candidates."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Broker ACL authorization gap: Permission.ADMIN_CODE (acl/.../Permission.java:33-46) contains only UPDATE_AND_CREATE_TOPIC, UPDATE_BROKER_CONFIG, DELETE_TOPIC_IN_BROKER, UPDATE_AND_CREATE_SUBSCRIPTIONGROUP, DELETE_SUBSCRIPTIONGROUP, while ACL-management codes 50-54 (UPDATE_AND_CREATE_ACL_CONFIG, DELETE_ACL_CONFIG, GET_BROKER_CLUSTER_ACL_INFO, UPDATE_GLOBAL_WHITE_ADDRS_CONFIG, GET_BROKER_CLUSTER_ACL_CONFIG) are absent; PlainPermissionManager.checkPerm (acl/.../PlainPermissionManager.java:314-349) therefore lets any authenticated account invoke them, so a low-privilege user could create an admin account or read all accounts' secret keys (AdminBrokerProcessor.java:302-340 and 440-450).",
+      "reason": "Genuine and high impact, but conditional: it requires aclEnable=true plus at least one valid low-privilege AccessKey/SecretKey; it is an authorization-policy gap rather than a directly unauthenticated primitive. Kept as the strongest secondary lead, not selected under the one-candidate cap."
+    },
+    {
+      "lead": "Missing broker-side topic/group name validation leading to store path traversal: ConsumeQueue builds its directory as storePath + File.separator + topic + File.separator + queueId (store/.../ConsumeQueue.java:60-64); AbstractSendMessageProcessor.msgContentCheck only enforces a 127-char topic length (broker/.../AbstractSendMessageProcessor.java:142-163) and TopicConfigManager auto-creates arbitrary topic names (broker/.../TopicConfigManager.java:163-235). With auto-create enabled, a message with a topic containing '..' causes mapped files such as <store>/consumequeue/../../../../<dir>/<queueId>/00000000000000000000 to be created.",
+      "reason": "Real weakness (arbitrary directory/file creation outside the store root), but the writable file names are constrained to numeric offset names and the content is limited to 20-byte consume-queue records, so concrete security impact is much lower than candidate 1; impact partially depends on broker configuration (autoCreateTopicEnable) and filesystem layout."
+    },
+    {
+      "lead": "Unbounded attacker-controlled allocations while decoding ROCKETMQ-serialized remoting headers: RocketMQSerializable.rocketMQProtocolDecode allocates new byte[remarkLength]/new byte[extFieldsLength] and mapDeserialize allocates new byte[keySize]/new byte[valSize] from header fields without comparing them to the remaining frame size (remoting/.../RocketMQSerializable.java:150-163, 178-188). A small crafted frame can request gigabyte-scale allocations, and NettyDecoder only catches Exception, not Error (remoting/.../NettyDecoder.java:40-61).",
+      "reason": "Plausible remote denial-of-service/hardening issue, but impact is availability-only and depends on heap size and repetition; not selected as the strongest candidate."
+    },
+    {
+      "lead": "Broker UPDATE_BROKER_CONFIG applies arbitrary existing properties to BrokerConfig/NettyServerConfig/NettyClientConfig/MessageStoreConfig without authentication (broker/.../AdminBrokerProcessor.java:486-520, common/.../Configuration.java:174-198), e.g., storePathRootDir can be changed so later TopicConfigManager.persist()/ConsumerOffsetManager.persist() write JSON files under an attacker-chosen directory (BrokerPathConfigHelper.java:34-48).",
+      "reason": "Same configuration-update root cause family as candidate 1 but weaker on the broker side in this snapshot: the broker's own Configuration store path is fixed at construction (BrokerController.java:211-215), so only fixed-suffix JSON files can be redirected; kept as related context rather than a separate candidate."
+    }
+  ],
+  "summary": "RocketMQ 4.6.0 source snapshot (798 visible source files; tests/examples absent). The strongest source-evidenced issue is in the NameServer: any network client that can reach the namesrv port can send UPDATE_NAMESRV_CONFIG (RequestCode 318, no authentication exists on the NameServer in this version) and supply a properties body that is applied wholesale to NamesrvConfig/NettyServerConfig via Configuration.update(). Because the namesrv registers its persistence path from the mutable NamesrvConfig.configStorePath field (NamesrvController constructor calls setStorePathFromConfig(namesrvConfig, \"configStorePath\")), the same request can set configStorePath to an attacker-chosen file and immediately trigger Configuration.persist() -> MixAll.string2File(), producing an arbitrary-path file write with content derived from the config properties (newline escapes decoded by Properties.load are re-emitted raw by MixAll.properties2String, giving content injection). This is an unauthenticated write primitive against any path writable by the namesrv process, with potential code execution (e.g., cron/authorized_keys/shell-init files) and at minimum data destruction/DoS. I selected this over three other plausible-but-weaker/unconfirmed leads listed below."
+}

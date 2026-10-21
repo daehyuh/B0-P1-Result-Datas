@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Consumer side: any remote HTTP client controls the request body and the `Content-Type` header; sending `application/x-java-serialized-object` and a crafted serialized stream reaches `DefaultHttpBinding.readBody` -> `HttpHelper.deserializeJavaObjectFromStream` when the endpoint has `transferException=true` (lines 190-199). Producer side: the remote HTTP server (or a network MITM) controls the response body and `Content-Type`; when the route's endpoint has `transferException=true`, HttpProducer (camel-http line 339-343 / camel-http4 line 383-387), DefaultJettyHttpBinding (line 193-199) and NettyHttpHelper (netty line 140-158, netty4 line 142-160) deserialize the response object into the Camel message/exception. For netty-http/netty4-http no separate allow option exists, so `transferException` is the only gate. The AMQP analogue (camel-rabbitmq) is reachable by anyone allowed to publish to the consumed queue, via the `CamelSerialize` header.",
+      "confidence": "medium",
+      "counterevidence_checked": "`transferException` defaults to false and the option's Javadoc in HttpCommonEndpoint (lines 73-79) explicitly warns that enabling it deserializes incoming Java data; `allowJavaSerializedObject` is a dedicated default-false gate and many code paths require it. Jetty's consumer servlet rejects serialized requests unless allowJavaSerializedObject is true. So this is not exploitable in a default configuration and is partly documented as a trade-off; the security defect is that a non-security exception-propagation flag silently bypasses the explicit allow gate, and that netty-http/netty4-http have no allow gate at all. No runtime exploitation was performed (static review only).",
+      "id": "CAND-1",
+      "impact": "Remote code execution in the Camel application JVM via Java deserialization gadget chains; also arbitrary object injection into exchanges/exception propagation, and denial of service. Producer-side exploitation allows a malicious or compromised HTTP server (or MITM) to execute code on the Camel client; consumer-side allows any network client to do so when the flag is enabled.",
+      "locations": [
+        {
+          "end_line": 207,
+          "path": "components/camel-http-common/src/main/java/org/apache/camel/http/common/DefaultHttpBinding.java",
+          "start_line": 180
+        },
+        {
+          "end_line": 347,
+          "path": "components/camel-http/src/main/java/org/apache/camel/component/http/HttpProducer.java",
+          "start_line": 338
+        },
+        {
+          "end_line": 391,
+          "path": "components/camel-http4/src/main/java/org/apache/camel/component/http4/HttpProducer.java",
+          "start_line": 382
+        },
+        {
+          "end_line": 205,
+          "path": "components/camel-jetty-common/src/main/java/org/apache/camel/component/jetty/DefaultJettyHttpBinding.java",
+          "start_line": 189
+        },
+        {
+          "end_line": 178,
+          "path": "components/camel-netty-http/src/main/java/org/apache/camel/component/netty/http/NettyHttpHelper.java",
+          "start_line": 126
+        },
+        {
+          "end_line": 180,
+          "path": "components/camel-netty4-http/src/main/java/org/apache/camel/component/netty4/http/NettyHttpHelper.java",
+          "start_line": 128
+        }
+      ],
+      "prerequisites": "Deployment sets `transferException=true` on an HTTP/Jetty/netty consumer or producer endpoint (non-default; commonly used for Camel-to-Camel exception propagation), or has `allowJavaSerializedObject=true` (intentional). A deserialization gadget chain must be present on the Camel JVM classpath. Consumer case needs network access to the HTTP endpoint; producer case needs the route to call an attacker-influenced server, with the malicious server or a MITM able to answer when the option is enabled.",
+      "root_cause": "The HTTP-family bindings gate deserialization of `application/x-java-serialized-object` payloads with `component.isAllowJavaSerializedObject() || endpoint.isTransferException()`. `transferException` is a default-off convenience flag whose documented purpose is propagating exceptions as serialized objects; enabling it therefore also permits `ObjectInputStream.readObject()` on bytes controlled by the remote peer. `allowJavaSerializedObject` (the intended, explicit, default-off security gate) is bypassed. In camel-netty-http and camel-netty4-http the deserialization is gated by `transferException` alone: NettyHttpHelper.deserializeJavaObjectFromStream uses a plain `new ObjectInputStream(is).readObject()` with no allow-list and no allow option, and in the producer path the object is deserialized *before* the `instanceof Exception` check, so any gadget class is instantiated.",
+      "title": "transferException authorizes untrusted JDK deserialization in Camel HTTP/Jetty/netty HTTP bindings (allow-list bypass -> RCE)",
+      "trace": "HTTP consumer: HttpCommonEndpoint sets binding.transferException from endpoint.isTransferException() (HttpCommonEndpoint.java lines 221-228) and DefaultHttpBinding.readBody tests `request.getContentType() == application/x-java-serialized-object` then `allowJavaSerializedObject || isTransferException()` (lines 190-199) and calls readObject() inside HttpHelper.deserializeJavaObjectFromStream (HttpHelper.java lines 168-182). HTTP producer: response `Content-Type` checked and `isAllowJavaSerializedObject() || isTransferException()` gates `HttpHelper.deserializeJavaObjectFromStream` (camel-http lines 339-343, camel-http4 lines 383-387). Jetty producer response: same pattern in DefaultJettyHttpBinding lines 193-199. Netty: NettyHttpHelper.populateNettyHttpOperationFailedException checks only `transferException` (netty line 140, netty4 line 142), then calls deserializeJavaObjectFromStream (netty lines 164-178, netty4 lines 166-180), which performs plain `ObjectInputStream.readObject()`; the returned object is only afterwards tested with `instanceof Exception`, so arbitrary gadget graphs are executed during readObject. Contrast: CamelContinuationServlet (camel-jetty-common line 141-146) rejects serialized requests unless isAllowJavaSerializedObject() is set, showing the intended gate.",
+      "unverified": "Which upstream security advisory/CVE exactly corresponds to this snapshot cannot be verified offline (several Camel advisories fixed after 2.21.4 concern this same class: HTTP `transferException` deserialization and the later netty-http/camel-netty transfers). I did not confirm runtime reachability, whether the shipped `transferException` use-cases in a given app enable the path, or the availability of a gadget chain; no build, test, or exploit was executed. The camel-rabbitmq `CamelSerialize` deserialization path (RabbitMQMessageConverter lines 274-310, publisher lines 88-94) is real unsafe `readObject()` with the only gate being an attacker-controlled AMQP header, but I could not tie it to a documented advisory and did not submit it.",
+      "weakness_type": "Deserialization of Untrusted Data (CWE-502) — missing/incorrect authorization gate for Java deserialization"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot as read-only source: 10,572 visible files (Apache Camel 2.21.4, main sources; src/test content appears stripped). P1 relation index is partial: 10,538/10,577 files indexed, 39 source files missing from the index, 31 parse errors, 7,446 Java files parsed, no control-flow/data-flow/semantic resolution (explicitly not SAST). I read camel-core HTTP/header-filter/file/URI utilities and traced the strongest candidate through camel-http-common, camel-http, camel-http4, camel-jetty-common, camel-netty-http and camel-netty4-http; also spot-checked camel-netty, camel-ahc, camel-jms, camel-mail, camel-rabbitmq, camel-cassandraql, camel-mongodb-gridfs, camel-stax, camel-jaxb, camel-jackson, camel-snakeyaml, camel-hessian, camel-castor, camel-xstream, camel-undertow, camel-restlet, camel-sql, camel-shiro and camel-xmlsecurity. Many components (cloud connectors, Spring/CDI integrations, OSGi/Karaf tooling, examples, archetypes, maven plugins) were not reviewed in depth.",
+  "limitations": [
+    "No build, test, scanner or exploit execution; findings are static source analysis only and are not runtime-confirmed.",
+    "P1 index is partial (10,538/10,577 files; 39 missing; 31 parse errors) and provides no control-flow, data-flow, semantic resolution or reachability — absence of a relation is not evidence of safety.",
+    "Tests were stripped from the snapshot, so no test-based confirmation of intended behavior or exploit scenarios was possible.",
+    "The exact upstream advisory/CVE match for this 2.21.4 snapshot could not be verified offline; candidate confidence is medium because the deserialization path requires the non-default transferException option.",
+    "The one-candidate cap means other plausible leads (notably camel-rabbitmq attacker-header-driven readObject) were not fully investigated or submitted."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "camel-rabbitmq: RabbitMQMessageConverter.deserializeBody (lines 274-310) performs plain ObjectInputStream.readObject() on any message whose AMQP header `CamelSerialize` is true; RabbitMQMessagePublisher sets that header when a Serializable body cannot be converted (lines 88-94). Any publisher able to write to the consumed queue can trigger it, with no option gate.",
+      "reason": "Strong unsafe-deserialization pattern, but it appears to be the component's symmetric Camel-to-Camel feature (producer sets the header, consumer reads it), and I found no documented advisory/CVE tying it to the post-2.21.4 security fixes. Kept as a secondary lead under the one-candidate cap."
+    },
+    {
+      "lead": "camel-stax: StAXJAXBIteratorExpression creates XMLInputFactory.newInstance() without disabling DTD/supporting-external-entities (lines 118-125), unlike camel-core's hardened StaxConverter (XMLInputFactory.SUPPORT_DTD=false).",
+      "reason": "Possible XXE, but JDK StAX defaults for external entity resolution vary and I did not establish that the iterator parses a DTD/external entity before the body is consumed; weak/unverified evidence, no clear security fix association."
+    },
+    {
+      "lead": "camel-mail attachment filename handling; camel-ftp/sftp compactPath; FileUtil path helpers.",
+      "reason": "Mail attachments are already sanitized with FileUtil.stripPath (MailBinding line 318), and the FTP/FileUtil compactPath implementations match the shipped long-standing behavior (leading `..` intentionally preserved for relative paths); no demonstrable escape from the endpoint directory without attacker-controlled configuration."
+    },
+    {
+      "lead": "Hessian/Castor/XStream/SnakeYAML de-serialization data formats.",
+      "reason": "The 2017 whitelist fixes are present: HessianDataFormat has whitelistEnabled=true with allow/deny filters, Castor has WhitelistObjectFactory, XStream uses setupDefaultSecurity, SnakeYAML defaults to SafeConstructor/type filters. No bypass found in source."
+    },
+    {
+      "lead": "UnsafeUriCharactersEncoder does not escape CR/LF (components/camel-core .../UnsafeUriCharactersEncoder.java); HTTP_URI/HTTP_PATH/HTTP_QUERY headers are concatenated into the request URI.",
+      "reason": "Attacker control of those Camel headers from an untrusted consumer is blocked by the HTTP header filter strategy (Camel* headers filtered), and whether CR/LF would be emitted on the wire depends on the HTTP client library; not demonstrated as a request-splitting issue, so not submitted."
+    }
+  ],
+  "summary": "Apache Camel 2.21.4 main-source snapshot (tests stripped; 10,572 files, 7,446 Java files indexed, index partial — 39 files missing from the P1 index, and the index has no control/data-flow/SAST capability). I traced attacker-controllable input into security-sensitive sinks across camel-core and sampled HTTP/JMS/mail/data-format components. The strongest distinct issue found is that in the HTTP-component family the unsafe JDK deserialization of `application/x-java-serialized-object` payloads is authorized not only by the dedicated, default-off `allowJavaSerializedObject` option but also by the unrelated `transferException` exception-propagation flag (and in camel-netty-http / camel-netty4-http by `transferException` alone, with no allow-list/allow option at all). A remote peer (HTTP request body on the consumer path, or HTTP response body from a remote/MITM server on the producer path) can therefore force `ObjectInputStream.readObject()` of attacker-supplied bytes in a deployment that merely enabled `transferException` for exception propagation, leading to gadget-chain remote code execution. This matches the class of Camel advisories fixed after 2.21.4 (the deserialization condition was later reduced to the dedicated allow option). One candidate is submitted; the next strongest lead (unconditional JDK deserialization in camel-rabbitmq triggered by the attacker-supplied `CamelSerialize` AMQP header) is noted as a rejected/unconfirmed lead rather than a second candidate."
+}

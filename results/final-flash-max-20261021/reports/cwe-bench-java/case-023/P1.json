@@ -1,0 +1,84 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The raw HTTP request-target path is fully attacker-controlled (method GET/HEAD/POST, no authentication required). The parser accepts literal '.' and '..' segments and rejects only CR/LF/space/tab in the path, so a client can send, for example, GET /./WEB-INF/web.xml or GET /existing/../secret-constraint-file directly. Percent-encoded slashes (%2F/%5C) are re-encoded when ALLOW_ENCODED_SLASH is false and are therefore not needed.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked and rejected obvious mitigations: (a) CanonicalPathHandler exists and would canonicalize, but DeploymentManagerImpl's default chain (lines 207-214) does not install it and no other canonicalization call exists in the request pipeline (only ServletContextImpl.getRealPath, HttpServletResponseImpl.sendRedirect, AsyncContextImpl dispatch and HttpServletRequestImpl.getRequestDispatcher canonicalize); (b) URLUtils.decode re-encodes decoded '/' and '\\\\' when ALLOW_ENCODED_SLASH is false, so %2F/%5C variants are not usable, but literal '.'/'..' segments are unaffected; (c) DefaultServlet.isAllowed blocks paths that start with '/META-INF' or '/WEB-INF' and ServletInitialHandler.isForbiddenPath blocks '/web-inf/...' prefixes, but both are prefix-only checks defeated by a preceding './' or 'x/../' segment; (d) FileResourceManager does perform a canonical-file check, but it only compares the last name component (case-insensitive-filesystem guard) and never verifies containment under base; (e) ServletSecurityConstraintHandler does call the constraint matcher, but with the same un-normalized relativePath, so both the mapping and the constraint check are bypassed consistently.",
+      "id": "case-023-trav-1",
+      "impact": "Unauthenticated information disclosure and authorization bypass: reading deployment descriptor and class/config files under WEB-INF and META-INF (e.g. web.xml), and reading/serving static files mapped to security-constraint-protected URL patterns without authenticating or satisfying the required roles; the same root cause in core ResourceHandler/FileResourceManager permits escaping the configured file-serving base directory. Scope is any servlet deployment (or standalone resource handler) that does not manually insert the optional CanonicalPathHandler.",
+      "locations": [
+        {
+          "end_line": 108,
+          "path": "servlet/src/main/java/io/undertow/servlet/handlers/ServletInitialHandler.java",
+          "start_line": 102
+        },
+        {
+          "end_line": 167,
+          "path": "servlet/src/main/java/io/undertow/servlet/handlers/ServletInitialHandler.java",
+          "start_line": 164
+        },
+        {
+          "end_line": 162,
+          "path": "servlet/src/main/java/io/undertow/servlet/handlers/DefaultServlet.java",
+          "start_line": 128
+        },
+        {
+          "end_line": 103,
+          "path": "core/src/main/java/io/undertow/server/handlers/resource/FileResourceManager.java",
+          "start_line": 80
+        },
+        {
+          "end_line": 56,
+          "path": "servlet/src/main/java/io/undertow/servlet/handlers/security/ServletSecurityConstraintHandler.java",
+          "start_line": 42
+        },
+        {
+          "end_line": 137,
+          "path": "core/src/main/java/io/undertow/server/handlers/resource/ResourceHandler.java",
+          "start_line": 126
+        }
+      ],
+      "prerequisites": "A servlet deployment whose DeploymentInfo uses a FileResourceManager (the normal production configuration for exploded web archives; DefaultServlet reads deployment.getDeploymentInfo().getResourceManager()). A target that exists under the web root (WEB-INF/META-INF content, or a static resource covered by a security-constraint such as /secure/*). No CanonicalPathHandler in front of the deployment chain (DeploymentManagerImpl.deploy() lines 207-214 only install HttpContinueReadHandler and, if configured, URLDecodingHandler). The core ResourceHandler/FileResourceManager variant additionally requires the resource handler to be used for file serving (e.g. examples/filesserving/FileServer uses it without canonicalization).",
+      "root_cause": "Untrusted request paths are treated as already-canonical after URL decoding. HttpRequestParser.handlePath (core/.../protocol/http/HttpRequestParser.java:337-399, plus beginQueryParameters/beginPathParameters/handleFullUrl) copies the decoded path verbatim into HttpServerExchange.requestPath/relativePath; no dot-segment normalization occurs anywhere in the request pipeline (only CanonicalPathHandler, an optional handler not installed by DeploymentManagerImpl.deploy(), performs CanonicalPathUtils.canonicalize). All downstream consumers therefore operate on a non-canonical string: (1) ServletInitialHandler.handleRequest uses exchange.getRelativePath() for isForbiddenPath and for servlet mapping; isForbiddenPath only blocks the exact path '/meta-inf/' or a leading '/web-inf/', so '/./WEB-INF/...' or '/x/../WEB-INF/...' passes; (2) DefaultServlet.doGet derives its path from getServletPath()/getPathInfo() and isAllowed() only tests leading '/META-INF'/'/WEB-INF' prefixes and file extensions, so the same path is allowed and handed to the ResourceManager; (3) FileResourceManager.getResource builds new File(base, path) with '..'/'.' still present and only compares file.getCanonicalFile().getName() with file.getName() (a case check on the last component), which does not confine the resolved file to base; (4) ResourceHandler.serveResource uses exchange.getRelativePath() directly for the same lookup; (5) ServletSecurityConstraintHandler evaluates SecurityPathMatches.getSecurityInfo(exchange.getRelativePath(), method), so a constraint registered for e.g. '/secure/*' (prefix key '/secure') does not match '/x/../secure/y', while the default servlet can still resolve and serve base/secure/y.",
+      "title": "Request path is never canonicalized before servlet routing, security-constraint checks and filesystem resource resolution (path traversal / reserved-path and constraint bypass)",
+      "trace": "GET /./WEB-INF/web.xml -> HttpRequestParser.handlePath stores decoded path '/./WEB-INF/web.xml' into exchange.relativePath (HttpRequestParser.java:349-356) -> ServletInitialHandler.handleRequest: isForbiddenPath('/./WEB-INF/web.xml') is false because the string does not start with '/web-inf/' (ServletInitialHandler.java:103-107,164-167) -> ServletPathMatchesData.getServletHandlerByPath walks back to the always-present default prefix '' and returns ServletPathMatch(defaultServlet, fullPath) so getServletPath() == '/./WEB-INF/web.xml' -> DefaultServlet.doGet -> getPath(req) returns that string and isAllowed() accepts it (no leading /WEB-INF, .xml is allowed) -> FileResourceManager.getResource strips the leading slash, builds new File(base, './WEB-INF/web.xml'), file.exists() is true and file.getCanonicalFile().getName() ('web.xml') equals file.getName(), so the FileResource is returned and served. Analogously '/x/../secure/y' is evaluated by ServletSecurityConstraintHandler via SecurityPathMatches.getSecurityInfo on the un-normalized string, so a '/secure/*' constraint does not apply, while the default servlet still resolves base/secure/y. ResourceHandler does the same lookup with exchange.getRelativePath(), so '/../file' resolves against the parent of the configured base.",
+      "unverified": "Not runtime-confirmed: OS-level path resolution, deployment resource-manager configuration and the exact behavior of File.exists() for the crafted paths were reasoned from source (no code was executed). I could not diff this snapshot against the upstream fix commit or the CVE/fix for this case, so I cannot prove this exact behavior was the introduced/regressed change rather than a long-standing upstream weakness; if the deployment inserts a CanonicalPathHandler or normalizes paths upstream (proxy/container), the attack path is blocked. The P1 relation index proves only syntactic call edges (e.g. ServletSecurityConstraintHandler -> SecurityPathMatches.getSecurityInfo), not data flow or reachability.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal'); secondary CWE-863 Incorrect Authorization"
+    }
+  ],
+  "coverage_summary": "Source scope: 595 files (582 Java, plus POMs, one HTML example, resources); 0 files excluded by the safety filters (no binaries, symlinks, or oversized files); snapshot contains no src/test sources, so no tests were available to confirm intended behavior. P1 index: complete for all 595 files, 0 parse errors, 9,851 symbols and 17,324 syntactic edges, but control/data flow and semantic resolution are not implemented and 12,767 calls are unresolved; index facts are navigation hints only (security_call / config_file). I read and reasoned over: the HTTP request pipeline (HttpRequestParser, HttpReadListener, HttpTransferEncoding, HttpServerConnection, HttpContinue), servlet mapping and security wiring (ServletInitialHandler, ServletPathMatches(Data), SecurityPathMatches, ServletSecurityConstraintHandler/RoleHandler, DeploymentManagerImpl, DefaultServlet), resource handling (ResourceHandler, FileResourceManager, FileResource, ClassPathResourceManager, DirectoryUtils), core auth/security mechanisms (Basic/Digest/Form/ClientCert/External/SSO/CachedAuthenticatedSession, SecurityContextImpl, SimpleNonceManager, confidentiality handlers, IPAddressAccessControlHandler, SSLHeaderHandler, JDBC/access-log handlers), session handling (InMemorySessionManager, SecureRandomSessionIdGenerator, session cookie configs), and representative WebSocket handshake/channel code. Uninspected in depth: most of websockets-jsr (AnnotatedEndpoint/FrameHandler/ServerWebSocketContainer), client AJP/HTTP parsers, cache/encoding handlers, ProxyHandler/LoadBalancingProxyClient internals, and several large servlet spec classes (AsyncContextImpl, ServletOutputStreamImpl) beyond targeted spot checks; conclusions about those areas would require further reading.",
+  "limitations": [
+    "No code was executed, compiled, or tested; OS path resolution and deployment wiring behavior were reasoned from source only.",
+    "No diff against the upstream repository/fix commit was possible, so it cannot be proven that the missing canonicalization is the regression associated with this case rather than a pre-existing upstream weakness (the framework documents CanonicalPathHandler as opt-in and ResourceManager.getResource as requiring a canonicalized path).",
+    "The P1 relation index has no control-flow, data-flow or semantic resolution; all call edges cited are syntactic candidates verified against source text, not runtime facts.",
+    "The repository contains no tests, so intended security behavior (e.g. whether deployments are expected to insert CanonicalPathHandler) could not be confirmed from test expectations.",
+    "Coverage of websockets-jsr, the HTTP/AJP client parsers, proxy handlers and parts of the servlet spec API is limited to targeted spot checks."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HttpServerExchange.getHostAndPort() applies the HTTP default-port check to HTTPS with port 8080 instead of 443 (core/src/main/java/io/undertow/server/HttpServerExchange.java:584-595), inconsistent with getHostPort() which correctly returns 443.",
+      "reason": "Only affects URL formatting in the fallback used when the Host header is absent (non-standard for HTTP/1.1); redirects may omit an explicit port but no attacker-controlled data is involved and no concrete security impact could be established. Possibly an upstream typo rather than a security defect."
+    },
+    {
+      "lead": "Directory listing HTML is built without HTML-escaping the request path or file names (core/.../resource/DirectoryUtils.renderDirectoryListing lines 52-104, used by ResourceHandler and DefaultServlet).",
+      "reason": "Requires directory listing to be explicitly enabled and attacker-controlled file/directory names on the server filesystem; the rendered request path would additionally have to resolve to an existing directory, so a concrete reflected-XSS vector could not be demonstrated from source."
+    },
+    {
+      "lead": "RedirectBuilder.realEncode appears to drop the character immediately before a '/' when re-encoding a path segment (core/src/main/java/io/undertow/util/RedirectBuilder.java:116-139, substring(pos, i - 1)).",
+      "reason": "Functional corruption of generated Location URLs; no attacker-controlled trust boundary or privilege impact identified, and it may be a long-standing upstream quirk."
+    },
+    {
+      "lead": "Header values are not validated for CR/LF in HeaderMap/HeaderValues or in the response writer, so applications that place user input into headers could suffer response splitting (CWE-113).",
+      "reason": "No default handler or built-in flow reflects request-controlled data into a response header was found; exploitation requires application code, so the source evidence for a repository-level vulnerability is insufficient compared with the path-traversal candidate."
+    },
+    {
+      "lead": "No automatic session-ID rotation on authentication (FormAuthenticationMechanism/SecurityContextImpl.login do not call changeSessionId), a possible session-fixation weakness.",
+      "reason": "Servlet 3.1 requires applications to call HttpServletRequest.changeSessionId(); no concrete exploit path and no repository-level enforcement failure could be proven from source."
+    },
+    {
+      "lead": "Digest authentication has unimplemented QOP/auth-int handling and TODO comments about replay/validation ordering (core/.../security/impl/DigestAuthenticationMechanism.java).",
+      "reason": "The behaviors are clearly marked incomplete/TODO and are not enabled by default configurations inspected; no concrete auth-bypass flow could be traced."
+    }
+  ],
+  "summary": "Repository: Undertow 1.0.16.Final (JBoss/Red Hat Java web server; modules core, servlet, websockets-jsr, examples, parser-generator). I inspected the HTTP request pipeline, servlet mapping/security handlers, resource serving, security mechanisms, session handling and representative WebSocket code, and used the P1 index to confirm key call edges (e.g., ServletSecurityConstraintHandler.handleRequest -> SecurityPathMatches.getSecurityInfo with exchange.getRelativePath()). The strongest source-evidenced issue is a missing path-canonicalization step for untrusted request paths before servlet routing, authorization-constraint evaluation and file-resource resolution. Because the HTTP parser only URL-decodes and never normalizes \".\" / \"..\" segments, and because the servlet container and resource managers consume that raw string, an unauthenticated client can reach resources that the reserved-directory checks (ServletInitialHandler.isForbiddenPath, DefaultServlet.isAllowed) and path-based security constraints are meant to protect (CWE-22, with a CWE-863 bypass flavor). I found no confirmed evidence for a stronger distinct issue (e.g., SQLi/command injection/deserialization/CRLF reflection by default are absent or require app-level flows), so only this one candidate is submitted."
+}

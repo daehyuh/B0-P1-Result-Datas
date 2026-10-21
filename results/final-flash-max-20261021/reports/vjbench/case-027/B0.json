@@ -1,0 +1,89 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated API client controls the JSON request body. The `data.attributes` map is deserialized verbatim from the request (elide-core/src/main/java/com/yahoo/elide/jsonapi/models/Resource.java lines 51-63) and its keys/values are passed unchanged to `updateAttribute` on POST (`CollectionTerminalState.createObject`) and PATCH (`RecordTerminalState.patch`). The value may be an arbitrary JSON object/array that `EntityDictionary.coerce` -> `CoerceUtil.coerce` -> `BidirectionalConvertUtilBean.lookup` -> `FromMapConverter` converts into an entity instance with Jackson (`ObjectMapper.convertValue`), so the client can fabricate a target entity object rather than loading it through the datastore.",
+      "confidence": "low",
+      "counterevidence_checked": "The comment in `updateAttribute` (\"Hooks for customize logic for setAttribute/Relation\") shows upstream knew relations could flow through this method, so this may be intended legacy behavior rather than an injected defect. The regular relationship route is fully checked, and I found no direct test or documentation in the snapshot asserting that relationship names must be rejected in `attributes`. The practical impact depends on the application's permission declarations: with restrictive UpdatePermission on the relationship field the attacker cannot reach `setValue`, and without cascade settings the fabricated target entity's own field values are generally not persisted (only the association is changed). I also verified there is no `isAttribute` guard anywhere else on this path and no SharePermission call in `updateAttribute`.",
+      "id": "case-027-cand-1",
+      "impact": "An authenticated user can associate a target object they cannot read/share with an object they can write, i.e., bypass of the SharePermission/read-based control that is otherwise applied on the `relationships` route, and can do so without the target ever being loaded and permission-checked. Depending on model cascade configuration and the deserialized field values, this can also persist attacker-chosen values on the referenced entity (mass-assignment style effect) or corrupt its association state. Scope is limited to fields whose create/update permission the attacker already passes.",
+      "locations": [
+        {
+          "end_line": 348,
+          "path": "elide-core/src/main/java/com/yahoo/elide/core/PersistentResource.java",
+          "start_line": 333
+        },
+        {
+          "end_line": 115,
+          "path": "elide-core/src/main/java/com/yahoo/elide/parsers/state/RecordTerminalState.java",
+          "start_line": 94
+        },
+        {
+          "end_line": 212,
+          "path": "elide-core/src/main/java/com/yahoo/elide/parsers/state/CollectionTerminalState.java",
+          "start_line": 193
+        },
+        {
+          "end_line": 395,
+          "path": "elide-core/src/main/java/com/yahoo/elide/core/PersistentResource.java",
+          "start_line": 370
+        },
+        {
+          "end_line": 707,
+          "path": "elide-core/src/main/java/com/yahoo/elide/core/PersistentResource.java",
+          "start_line": 694
+        },
+        {
+          "end_line": 1423,
+          "path": "elide-core/src/main/java/com/yahoo/elide/core/EntityDictionary.java",
+          "start_line": 1413
+        },
+        {
+          "end_line": 112,
+          "path": "elide-core/src/main/java/com/yahoo/elide/utils/coerce/CoerceUtil.java",
+          "start_line": 88
+        },
+        {
+          "end_line": 464,
+          "path": "elide-graphql/src/main/java/com/yahoo/elide/graphql/PersistentResourceFetcher.java",
+          "start_line": 457
+        }
+      ],
+      "prerequisites": "The attacker must satisfy the permission checks that remain on the route: CreatePermission on the containing entity for POST (for newly created resources the field-level UpdatePermission check in `checkSpecificFieldPermissionsDeferred` is mapped to CreatePermission) or UpdatePermission on the relationship field for PATCH. If the model declares no permissions the defaults allow the operation. The relationship field name must be known to the entity dictionary (`getType` resolves relation types too, so `updateAttribute` accepts them). `@SharePermission` (i.e., the ReadPermission fallback enforced in `checkSharePermission`) is the control being skipped.",
+      "root_cause": "`PersistentResource.updateAttribute()` accepts any dictionary-known field name, coerces the client value to that field's type, checks only the field's UpdatePermission and then sets the value; it does not require `dictionary.isAttribute(...)` and does not call the relationship path's `checkSharePermission(...)`. The JSON-API state handlers iterate the raw client `attributes` map and call `updateAttribute` for every key, so a relationship name placed in `attributes` (instead of `relationships`) reaches `setValue`/`setValueChecked` and mutates the relationship while skipping the sharing/load checks that `updateRelation` performs.",
+      "title": "Relationship written through JSON-API `attributes` map bypasses SharePermission and target read validation",
+      "trace": "1) Body `{\"data\":{\"type\":\"book\",\"id\":\"1\",\"attributes\":{\"author\":{\"id\":\"42\", ...}}}}` -> `JsonApiMapper.readJsonApiDocument` -> `Resource.attributes` holds the relation name. 2) `RecordTerminalState.patch` (or `CollectionTerminalState.createObject`) iterates `resource.getAttributes()` and calls `record.updateAttribute(\"author\", <map>)` with no `isAttribute` check. 3) `PersistentResource.updateAttribute` (lines 333-348): `dictionary.getType` returns the relation class; `dictionary.coerce` uses the Map->Jackson converter (`CoerceUtil` lines 102-110) to build a client-supplied entity instance; only `checkFieldAwareDeferPermissions(UpdatePermission.class, fieldName, ...)` is evaluated; then `setValueChecked` -> `dictionary.setValue` invokes the setter and the resource is marked dirty. 4) At commit, `RequestScope.saveOrCreateObjects`/JPA or Hibernate flush persists the changed association. 5) Contrast: `updateRelation` (PersistentResource lines 370-395) resolves targets through `Relationship.toPersistentResources` (read-permission-checked loads) and calls `checkSharePermission` (lines 435, 497, 501, 694-707), and the GraphQL equivalent explicitly rejects non-attributes (`PersistentResourceFetcher.updateAttributes` lines 457-464).",
+      "unverified": "Not runtime-confirmed. I did not verify Hibernate behavior for assigning a detached, client-constructed entity to a managed association (whether flush merely rewrites the FK or also applies cascade merges), nor which real models in this repo declare the combinations of permissions/cascades required for the strongest impact.",
+      "weakness_type": "CWE-863 Incorrect Authorization / CWE-915 (attribute-route type confusion)"
+    }
+  ],
+  "coverage_summary": "Coverage: all 420 visible files were enumerated (350 Java + build/config/docs); the snapshot contains only main sources (no src/test), and binary-like files were skipped by policy. I read or searched the security-critical core (Elide entry points, RequestScope, PersistentResource, EntityBinding/EntityDictionary/EntityPermissions, permission executors/expressions, filter dialects and predicates, HQL/JPQL/Lucene builders, JSON-API parsers/models, JsonApiPatch, GraphQL fetcher/query runner/model builder, Spring and standalone controllers/settings) plus representative datastore implementations (JPA, Hibernate3/5, multiplex, in-memory, search, noop). Smaller annotation/exception/utility classes and the swagger/test-helper modules were reviewed by targeted search rather than line-by-line reading.",
+  "limitations": [
+    "No tests, harnesses, or runtime execution were available; findings are static source-level leads only and were not confirmed at runtime.",
+    "I could not diff against upstream Elide 4.5.13/4.5.14, so I cannot prove which logic (if any) was intentionally modified; the candidate is an inferential finding based on inconsistent authorization between two input routes.",
+    "Hibernate/JPA flush and cascade semantics for client-fabricated detached entities were not verified, so the strongest mass-assignment variant of the candidate is unproven.",
+    "The package-private/inner classes and third-party library behavior (Jackson coercion, commons-beanutils, Hibernate) were assessed only from call sites, not from library sources."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "PersistentResource.getPermissionFilterExpression (lines 236-243) swallows ForbiddenAccessException and returns an empty read-permission filter",
+      "reason": "Security relevant but no demonstrable bypass: when the permission filter is dropped, loadRecords/loadRecord/getRelationUnchecked still pass the loaded objects through checkFieldAwarePermissions/filter(ReadPermission.class), and FilterExpressionCheck.ok re-applies the same filter in memory, so non-matching records are still rejected. Treating it as a hardening/robustness deviation, not a supported finding."
+    },
+    {
+      "lead": "elide-standalone enables the unauthenticated Codahale AdminServlet at /stats/* by default (enableServiceMonitoring default true) and Util.getEntityManagerFactory ships default MySQL credentials/hbm2ddl=create when options are empty",
+      "reason": "Framework defaults from upstream Elide, operate on developer-supplied configuration rather than request input, and no source evidence ties them to an attacker-controlled path in this snapshot."
+    },
+    {
+      "lead": "Possible HQL/JPQL string construction in RootCollectionFetchQueryBuilder / FilterTranslator",
+      "reason": "Traced all concatenated components: entity alias/name come from bound entity classes, filter values are bound as named parameters, and sorting/filter paths are validated through Path/EntityDictionary; no user-controlled string reaches query text."
+    },
+    {
+      "lead": "SearchDataTransaction returns FULL support for Lucene INFIX filters and trusts Lucene results without in-memory re-checking",
+      "reason": "Contrib-module design trade-off; I could not establish from source alone that its ngram/keyword translation is strictly weaker than the exact Elide predicate, so no evidence-backed bypass."
+    },
+    {
+      "lead": "ObjectEntityCache key collision via type + \"_\" + id concatenation",
+      "reason": "Only objects already loaded/created in the same request are cached, and loadRecord still runs the field-aware read check on cache hits; no source-evidenced privilege escalation."
+    }
+  ],
+  "summary": "Reviewed the Elide 4.5.14-SNAPSHOT tree (420 visible files; no test sources are included in the snapshot). I traced the JSON-API and GraphQL request paths, the permission expression/filter machinery, datastore query builders (HQL/JPQL/Lucene), and the Spring/standalone endpoints. The strongest source-evidenced issue is an authorization asymmetry in the JSON-API write path: the client-controlled `attributes` map is fed to `PersistentResource.updateAttribute` without any check that the key is an attribute, so a relationship name can be smuggled through the attribute route, which never invokes `checkSharePermission` and never loads/validates the referenced object the way `updateRelation` does. Other reviewed areas (permission filters, filter dialects, HQL/JPQL construction, patch extension, error encoding, standalone settings) matched expected behavior and are listed as rejected leads. I did not run code; all statements are source-level leads, not runtime confirmations."
+}

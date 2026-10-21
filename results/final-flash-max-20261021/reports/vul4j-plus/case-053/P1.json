@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `from` HTTP request parameter on the `/loginEntry` endpoint is fully attacker-controlled; an attacker can craft a link such as `https://jenkins/loginEntry?from=//attacker.example/phish` and deliver it to an authenticated Jenkins user.",
+      "confidence": "medium",
+      "counterevidence_checked": "Absolute URLs (`http://evil`, `javascript:`) are rejected by `startsWith(\"/\")`, so exploitation is limited to scheme-relative and slash/backslash-normalization variants. I could not run the server, so I could not observe the emitted Location header or any servlet/Stapler normalization; however, the snapshot itself treats `sendRedirect2(<user value>)` as dangerous unless `Util.isSafeToRedirectTo` passes (DirectoryBrowserSupport.java:164 and ParametersDefinitionProperty.java:177 both carry explicit `avoid open redirect` comments), which is strong in-repo evidence that scheme-relative values reach the browser as external redirects. `AuthenticationProcessingFilter2` (the default login form path) already performs the safe check, so the login form itself is not the vector; the vector is the `/loginEntry` route. The endpoint requires an authenticated principal, lowering exploitability to a phishing/redirect abuse rather than an unauthenticated attack. I did not find any contradicting guard around this specific call site.",
+      "id": "cand-1",
+      "impact": "Client-side open redirect after login. Enables phishing (redirect to a look-alike Jenkins login page), credential/token harvesting, and abusing trust in the Jenkins origin (e.g., link/referrer based flows). It does not by itself bypass authentication or authorization and does not execute code; severity is limited but the flaw is a concrete same-origin/domain-check failure at an authentication-adjacent endpoint.",
+      "locations": [
+        {
+          "end_line": 3958,
+          "path": "core/src/main/java/jenkins/model/Jenkins.java",
+          "start_line": 3954
+        },
+        {
+          "end_line": 1627,
+          "path": "core/src/main/java/hudson/Util.java",
+          "start_line": 1621
+        },
+        {
+          "end_line": 57,
+          "path": "core/src/main/java/hudson/security/AuthenticationProcessingFilter2.java",
+          "start_line": 49
+        },
+        {
+          "end_line": 167,
+          "path": "core/src/main/java/hudson/model/DirectoryBrowserSupport.java",
+          "start_line": 161
+        }
+      ],
+      "prerequisites": "Jenkins with security enabled (any authorization strategy) and a victim who is already authenticated (the method returns early when `req.getUserPrincipal()==null`). No special permissions beyond being logged in are needed. The javadoc says the method is used by LegacySecurityRealm, but the URL route and principal check are realm-independent; `/loginEntry` is mapped in war/src/main/webapp/WEB-INF/web.xml (security-constraint for authenticated principals).",
+      "root_cause": "core/src/main/java/jenkins/model/Jenkins.java:3954-3958 obtains the request parameter `from` and only checks `from.startsWith(\"/\")` before `rsp.sendRedirect2(from)`. A value such as `//attacker.example/...` (protocol/scheme-relative URL) or `http:`-free backslash variants passes that check, is forwarded verbatim to Stapler's `sendRedirect2`, and is resolved by the browser as an external origin, despite the inline comment stating the URL must stay in this domain. The repository already contains the intended validator `hudson.Util.isSafeToRedirectTo` (core/src/main/java/hudson/Util.java:1621-1627, rejects absolute and scheme-relative URIs, used with `// avoid open redirect` comments in hudson/model/DirectoryBrowserSupport.java:164, hudson/model/ParametersDefinitionProperty.java:177, hudson/security/AuthenticationProcessingFilter2.java:56), so the safe helper is available to Jenkins.java (import hudson.*) but is not applied at this sink.",
+      "title": "Open redirect via `from` parameter in Jenkins.doLoginEntry (insufficient scheme-relative URL validation before sendRedirect2)",
+      "trace": "GET /loginEntry?from=//attacker.example -> Jenkins.doLoginEntry -> `req.getUserPrincipal()` non-null -> `from.startsWith(\"/\")` is true for `//attacker.example` (also true for `/\\attacker.example`) -> `rsp.sendRedirect2(from)` -> HTTP 302 with Location `//attacker.example` -> browser treats it as scheme-relative and navigates to the attacker origin.",
+      "unverified": "Runtime confirmation was not possible (no build/tests available in the snapshot; test trees and Jelly views are absent). I could not verify that a regression test for this endpoint exists or fails, could not confirm Stapler 1.250.1's exact sendRedirect2 normalization, and cannot confirm that this is the benchmark's ground-truth item — it is submitted as the strongest source-evidenced candidate, not a confirmed exploit.",
+      "weakness_type": "CWE-601 URL Redirection to Untrusted Site ('Open Redirect')"
+    }
+  ],
+  "coverage_summary": "Reviewed the source-visible Jenkins core snapshot (8936 files) with read-only tools; the P1 relation index covers the same 8936 files (0 missing, 0 hash mismatches) but is syntactic only (no data flow, reachability, or SAST results), and all index-derived leads were re-verified against source text. The snapshot contains no test sources (core/src/test, test module absent) and no Jelly views or binary assets, so UI-layer sinks and test-confirmed behavior could not be assessed. Areas actually read include: Jenkins/Job/Run/AbstractItem/View/ListView/Computer/SlaveComputer/Queue/User/ItemGroupMixIn/LogRecorder/ParametersAction/BuildAuthorizationToken/LoadStatistics handlers; security realm, filters, CSRF, API tokens, remember-me, and authorization strategies; file/path handling (DirectoryBrowserSupport, FilePath, FilePathFilter, IdStrategy, User migration); XStream2/ConsoleNote/CLI deserialization; Secret/ConfidentialStore/AdminWhitelistRule; URL/redirect sinks (grep for sendRedirect2, new URL, isSafeToRedirectTo, startsWith(\\\"/\\\")); CLI modules. Other core areas (install/UpdateCenter/PluginManager internals, remoting-dependent classes, tools/installers, most of jenkins/util, war JS/CSS) were only searched or skimmed, not exhaustively read.",
+  "limitations": [
+    "No code execution, build, tests, or scanners were run; findings are source-evidence-only and not runtime-confirmed.",
+    "P1 relation index is navigational/syntactic only (no complete control/data-flow, no semantic resolution, no exploitability proof) and was used only to navigate, then each relevant edge was checked in source.",
+    "Test trees and Jelly/binary resources are absent from the visible snapshot, so behavior that depends on views/Jelly (including any permission checks performed there) and any regression tests could not be inspected.",
+    "Whether the open-redirect candidate corresponds to the benchmark's ground-truth vulnerability is unknown; ground truth, patches, CVE metadata and sibling runs were not consulted (and were not available).",
+    "Stapler 1.250.1 and remoting libraries are external dependencies not present in the snapshot, so sendRedirect2 resolution semantics and JNLP secret routing were inferred from in-repo usage patterns rather than library source."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "hudson/security/csrf/CrumbFilter.java:66-70 — result of the legacy `extractCrumbFromRequest(httpRequest, \".crumb\")` compatibility fallback is discarded (`crumb` stays null), so clients using the legacy crumb field name fail CSRF validation.",
+      "reason": "This is a functionality regression that fails closed (request is rejected with 403), not a security exposure; no bypass or privilege gain follows from it, and it may be pre-existing upstream behavior."
+    },
+    {
+      "lead": "jenkins/model/IdStrategy.java:274 (CaseInsensitive.idFromFilename) — `else if ('A' <= c && c <= 'a')` instead of `c <= 'Z'`; characters '['..'`' (including backslash) are retained instead of dropped when converting directory names back to user IDs.",
+      "reason": "Reachable only for files already present in $JENKINS_HOME/users (a trusted, admin/filesystem-controlled location); filenameOf() re-sanitizes IDs before any path is built, so I could not construct a remote/attacker-reachable traversal or impersonation path. Weak impact; kept out of the candidate list."
+    },
+    {
+      "lead": "hudson/model/DirectoryBrowserSupport.java:169-174 — the traversal guard (`path.replace('\\\\','/').indexOf(\"/../\")!=-1`) does not reject a path ending in `/..` (e.g. `/..`) or `/foo/..`, allowing `root.child(\"../index.html\")` to be served.",
+      "reason": "Escape depth is one level and limited to the fixed index file name (default `index.html`) or directory listing, so impact is marginal and it appears to be long-standing upstream behavior rather than the injected/reverted security fix."
+    },
+    {
+      "lead": "hudson/slaves/SlaveComputer.java:174-176 — public getter `getJnlpMac()` returns the agent secret HMAC with no permission check or annotation; if Stapler exposes it as /computer/<name>/jnlpMac, any user able to reach the computer object could obtain the agent secret and connect a rogue agent.",
+      "reason": "Potentially critical if HTTP-reachable, but I could not verify from the available files that the getter is routed or which permission governs the route (the SlaveComputer/Computer Jelly views and test trees are not part of the snapshot; soJnlpMac-style checks may exist in excluded views or the remoting library). Flagged as an unconfirmed lead, not the submitted candidate."
+    },
+    {
+      "lead": "hudson/cli/CliCrumbExclusion.java:44-50 — all requests whose pathInfo is `/cli` are excluded from CSRF validation; also BasicAuthenticationFilter accepts API tokens as Basic-auth passwords.",
+      "reason": "Both are deliberate, documented upstream designs (JENKINS-18114; API-token auth requires the per-user token over a per-request credential), and I found no missing validation that turns them into an exploitable CSRF/auth bypass in this snapshot."
+    }
+  ],
+  "summary": "Snapshot is Jenkins core at version 2.73.4-SNAPSHOT (stable-2.73, post-2.73.3, ~Oct 2017), 8936 text-source files (tests, Jelly views and binary assets are not present in the snapshot). I reviewed the security-critical core paths: web request handlers and permission checks (Jenkins, Job, Run, AbstractItem, View/ListView, Computer/SlaveComputer, ItemGroupMixIn, Queue, User, LogRecorder, ParameterizedJobMixIn, BuildAuthorizationToken), authentication/authorization (HudsonFilter, SecurityRealm, AuthenticationProcessingFilter2, BasicAuthenticationFilter, ApiTokenProperty, remember-me, CsrfFilter/CrumbIssuer), path/file handling (DirectoryBrowserSupport, FilePath/FilePathFilter, IdStrategy/User), serialization (XStream2, ConsoleNote, Connection), and crypto/secret handling (Secret, DefaultConfidentialStore, AdminWhitelistRule, TokenBasedRememberMeServices2). One issue meets the evidence threshold: the `from` parameter used by `Jenkins.doLoginEntry` is validated only with `startsWith(\"/\")`, which accepts scheme-relative URLs such as `//evil.com` and is then passed to `sendRedirect2` as-is — an open redirect (CWE-601) that contradicts both the method's own comment (\"make sure the URL falls into this domain\") and the repo's own `Util.isSafeToRedirectTo` helper used for exactly this purpose at three other redirect sinks. Other anomalies I found are fail-closed or too weak/unverifiable to submit."
+}

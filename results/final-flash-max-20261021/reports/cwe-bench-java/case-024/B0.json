@@ -1,0 +1,64 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The archive itself is the untrusted input. For tar, te.getLinkName() (TarUnArchiver.java line 118) and te.getName() are fully attacker-controlled; for zip, the Unix symlink payload read by zipFile.getUnixSymlink(ze) and ze.getName() are attacker-controlled. Entry order, names, link targets, and contents are all chosen by the archive author.",
+      "confidence": "medium",
+      "counterevidence_checked": "The snapshot does contain a canonical-path containment check for entry names (lines 344-353), and getCanonicalFile() does resolve symlinks to existing targets, which blocks the naive 'symlink to an existing outside file/dir, then write through it' variant. The check is also applied before symlink creation, and writes go through Files.newOutputStream. However, neither the symlink destination nor the leaf write is checked with NOFOLLOW_LINKS, and a dangling-target symlink is not resolved by canonicalization, leaving the escape path open; no other guard (e.g. absolute-target rejection or post-creation re-check) exists in the source.",
+      "id": "plexus-archiver-symlink-destination-traversal",
+      "impact": "Arbitrary file write outside the configured extraction directory, subject to the process's filesystem permissions and to the target's parent directory existing and the target not existing at check time (e.g. creating files such as ~/.ssh/authorized_keys when absent, cron/ld.so-style drop paths, or overwriting files that are created later). In build/CI environments that unpack untrusted archives this is a path-traversal file-write primitive. Exact runtime exploitability depends on JVM/OS symlink canonicalization and on plexus-io's SymlinkUtils, which is an external dependency not present in this snapshot; not runtime-confirmed.",
+      "locations": [
+        {
+          "end_line": 396,
+          "path": "src/main/java/org/codehaus/plexus/archiver/AbstractUnArchiver.java",
+          "start_line": 328
+        },
+        {
+          "end_line": 123,
+          "path": "src/main/java/org/codehaus/plexus/archiver/tar/TarUnArchiver.java",
+          "start_line": 113
+        },
+        {
+          "end_line": 217,
+          "path": "src/main/java/org/codehaus/plexus/archiver/zip/AbstractZipUnArchiver.java",
+          "start_line": 168
+        }
+      ],
+      "prerequisites": "The application uses TarUnArchiver/ZipUnArchiver (or subclasses) to extract an attacker-supplied archive; extraction runs with the process's filesystem permissions. The attacker needs a link target whose parent directory already exists and the target file itself to not already exist, so that canonicalization leaves the dangling symlink unresolved and allows the link to be created and subsequently written through.",
+      "root_cause": "AbstractUnArchiver.extractFile resolves entryName with FileUtils.resolveFile and enforces a canonical-path containment check (lines 342-353), but the symlinkDestination supplied by the archive (TarArchiveEntry.getLinkName() for tar, ZipFile.getUnixSymlink() for zip) is passed unchecked to SymlinkUtils.createSymbolicLink at line 371. No containment check exists on the link target, and the later write path uses Files.newOutputStream(targetFileName.toPath()) (line 379), which follows symlinks. Because Java canonicalization does not resolve a symlink whose target does not yet exist, the line 350 containment check can pass for such a link, and the subsequent open(O_CREAT) follows the dangling link and writes outside the destination directory whenever the target's parent directory exists.",
+      "title": "Unvalidated archive symlink target allows extraction to create files outside the destination directory",
+      "trace": "1) TarUnArchiver.execute()/AbstractZipUnArchiver.execute() iterate entries and call extractFile with the archive-provided link name (TarUnArchiver.java 118-120; AbstractZipUnArchiver.java 202-209). 2) In extractFile, the symlink entry creates a real symlink at targetFileName pointing to the attacker-chosen symlinkDestination (AbstractUnArchiver.java 369-372) without validating that destination. 3) A later entry with the same name reaches the containment check (lines 347-353); when the symlink target does not yet exist, getCanonicalFile() leaves the symlink component unresolved (parent canonicalized + last component appended), so the path still starts with canonicalDirPath and the check passes. 4) Files.newOutputStream(targetFileName.toPath()) (line 379) follows the symlink and creates/truncates the file at the external target, outside dir.",
+      "unverified": "Runtime confirmation was not performed (no code execution allowed). The precise behavior of File.getCanonicalFile() on a dangling symlink and of plexus-io 3.4.1 SymlinkUtils.createSymbolicLink could not be read in this snapshot (external dependency), so the dangling-symlink variant is inferred, not proven. Whether existing files can be overwritten (vs. only new files created) also depends on canonicalization order/races.",
+      "weakness_type": "CWE-59 Improper Link Resolution Before File Access / CWE-22 Path Traversal"
+    }
+  ],
+  "coverage_summary": "Reviewed the whole extraction surface: AbstractUnArchiver (including extractFile, validate, shouldExtractEntry), TarUnArchiver, AbstractZipUnArchiver, ZipUnArchiver/JarUnArchiver and their resource collections, plus scanning of AbstractArchiver, DirectoryArchiver, ArchiveEntry, ArchiveEntryUtils, FilePermissionUtils, and the compression wrappers for path/file-handling and permission logic. No src/test sources are present in the snapshot, so tests could not corroborate intended behavior. jira/*.json files were not used as ground truth. Files outside the extraction path were inspected selectively rather than exhaustively.",
+  "limitations": [
+    "No execution or dynamic verification was performed; the dangling-symlink bypass of the canonical check is inferred from JVM canonicalization semantics and OS symlink-following behavior.",
+    "External dependencies (plexus-io SymlinkUtils, plexus-utils FileUtils.resolveFile, commons-compress) are not part of the snapshot, so their exact implementations could not be read.",
+    "No test sources are included, so no repository tests confirm the expected symlink-handling behavior.",
+    "Large files such as AbstractArchiver.java and Manifest.java were only partially read; a deeper audit could reveal additional issues, but none was needed for the single selected candidate."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Zip-bomb / unbounded extraction",
+      "reason": "AbstractZipUnArchiver already implements maxOutputSize with BoundedInputStream/CountingInputStream (lines 45, 79-84, 188-215); no unbounded-output defect found in the inspected extraction path."
+    },
+    {
+      "lead": "Case-insensitive overwrite logic in AbstractUnArchiver.shouldExtractEntry (lines 404-445)",
+      "reason": "The relative-path computation uses an unanchored String.replace, but the result only drives a warning message and an overwrite decision; no path escape or sensitive operation was traced from it."
+    },
+    {
+      "lead": "TarUnArchiver.execute(String path, File outputDirectory) ignores outputDirectory and uses getSourceFile()/getDestDirectory() (lines 96-100)",
+      "reason": "Looks like a functional bug (wrong argument handling), not attacker-controlled traversal; no security impact could be established from source alone."
+    },
+    {
+      "lead": "Hard links in tar archives",
+      "reason": "TarUnArchiver only treats symbolic links specially (line 118); hard links fall through to regular-file extraction, so no link-based escape was identified."
+    },
+    {
+      "lead": "DirectoryArchiver symlink creation from resources (lines 93-102)",
+      "reason": "This is the archiving/writing direction where the resource set is generally operator-controlled; not shown to ingest untrusted archives, so it is a weaker lead than the extraction path."
+    }
+  ],
+  "summary": "Review of the plexus-archiver snapshot (pom.xml declares 4.7.1; 432 visible files: 145 under src/main/java + site, the rest mostly jira/*.json issue dumps and metadata). The extraction core (AbstractUnArchiver, TarUnArchiver, AbstractZipUnArchiver) validates the *entry name* against the destination directory with a canonical-path startsWith check, but never validates the *symlink destination* taken from the archive. A crafted tar/zip containing a symlink entry followed by an entry that resolves through it can therefore cause writes outside the requested destination directory (CWE-59 / CWE-22). This is the strongest source-supported candidate; other suspicious areas were checked and rejected or left unconfirmed."
+}

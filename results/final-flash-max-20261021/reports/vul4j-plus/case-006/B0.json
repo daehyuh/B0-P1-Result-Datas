@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the bytes of a TAR archive consumed by the application, including a PAX extended header entry (typeflag 'x' for a local PAX header or 'g' for a global PAX header, linkflags LF_PAX_EXTENDED_HEADER_LC/UC). The record format is 'LENGTH keyword=value\\n'; LENGTH is parsed as an unbounded decimal integer from the archive (parsePaxHeaders, lines 455-497). Setting LENGTH to e.g. ~2000000000 while providing only a few bytes of actual entry data makes the parser allocate ~2 GB before the subsequent read fails.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that PAX length parsing is reachable by default and is not gated by optional settings (linkflag checks in TarArchiveEntry.isPaxHeader(), automatic invocation at lines 313-321). Checked that the only constraint applied before allocation is the int arithmetic itself (no comparison against the PAX entry's size, entrySize, recordSize, or any MAX constant found in this class). Checked that IOUtils.readFully() validates how many bytes were actually read only after new byte[restLen] has already been allocated. Checked the tar checksum/header validation path: it does not constrain PAX record lengths. Checked that the loop that accumulates len has a break on '\\n', ' ' or EOF, so the parsed value is fully attacker-chosen.",
+      "id": "tar-pax-unbounded-allocation",
+      "impact": "Heap exhaustion / OutOfMemoryError (or NegativeArraySizeException on int overflow) triggered by a very small crafted TAR, i.e. a denial-of-service against services that parse untrusted tar archives with the default PAX handling. An Error escaping the parser can also leave the stream/worker unusable.",
+      "locations": [
+        {
+          "end_line": 503,
+          "path": "src/main/java/org/apache/commons/compress/archivers/tar/TarArchiveInputStream.java",
+          "start_line": 451
+        },
+        {
+          "end_line": 476,
+          "path": "src/main/java/org/apache/commons/compress/archivers/tar/TarArchiveInputStream.java",
+          "start_line": 471
+        },
+        {
+          "end_line": 321,
+          "path": "src/main/java/org/apache/commons/compress/archivers/tar/TarArchiveInputStream.java",
+          "start_line": 313
+        }
+      ],
+      "prerequisites": "Application reads an untrusted TAR through TarArchiveInputStream (directly or via ArchiveStreamFactory). No password, no seekable channel, no special flags are needed: getNextTarEntry() automatically calls paxHeaders()/readGlobalPaxHeaders() for PAX entries before returning them. Impact depends on JVM heap size and on the attacker choosing a large enough (but still int-range) LENGTH; the archive itself can be only a few hundred bytes.",
+      "root_cause": "TarArchiveInputStream.parsePaxHeaders() parses the numeric 'length' field of a PAX extended header record from the archive data and then computes restLen = len - read, allocating new byte[restLen] without validating len against the PAX entry size, remaining record data, or any maximum. len is accumulated as an int with unchecked decimal multiplication/addition (len *= 10; len += ch - '0'), so a short PAX header can request a heap allocation of up to ~Integer.MAX_VALUE bytes (and int overflow can make restLen negative, producing a NegativeArraySizeException). The allocation occurs before IOUtils.readFully() can discover that the declared bytes are absent.",
+      "title": "Unbounded heap allocation driven by attacker-declared PAX header record length in TarArchiveInputStream",
+      "trace": "TarArchiveInputStream.getNextTarEntry() (lines 261-334) -> currEntry.isPaxHeader() (line 317) or isGlobalPaxHeader() (line 313) -> paxHeaders()/readGlobalPaxHeaders() -> parsePaxHeaders(this) (lines 451-503). Inside the parser the digit loop at lines 495-496 accumulates the declared length without bounds; at line 471 restLen = len - read; at line 475 new byte[restLen] allocates the attacker-sized buffer; only afterwards (lines 476-488) does IOUtils.readFully() attempt to populate it and throw IOException on truncation, so truncation detection does not prevent the allocation.",
+      "unverified": "Not runtime-confirmed (no code execution in this review). Actual OutOfMemoryError depends on the target heap size and the chosen LENGTH value; smaller values simply allocate large arrays without OOM. I could not consult upstream history/patches (offline review), so I cannot assert this is the exact historical fix location for any specific CVE; the finding is based solely on the snapshot's source.",
+      "weakness_type": "Uncontrolled resource consumption / unvalidated allocation size (CWE-400, CWE-789) leading to OutOfMemoryError denial of service"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 253 model-visible files (no NUL-skipped or size-excluded files) covering main sources plus site/config files; no test sources are present. I read or searched the archive readers (zip: ZipArchiveInputStream, ZipFile, ZipUtil, ExtraFieldUtils, X0017/PKWareExtraHeader; tar: TarArchiveInputStream/TarArchiveEntry; sevenz: SevenZFile, decoders, AES256SHA256Decoder; cpio; dump/TapeInputStream), key decompressors (BZip2 input, GZip, LZW/Unshrinking, Exploding), and utils (IOUtils, BitInputStream). Coverage was not exhaustive: ZipArchiveOutputStream, TarArchiveOutputStream, ZipFile entry-offset resolution beyond central-directory parsing, DumpArchiveEntry, ArjArchiveInputStream, Snappy/LZ4/LZMA/Z/Brotli/Zstd wrappers and SevenZOutputFile were only partially inspected or skimmed, and no tests or runtime execution were available to confirm behavior.",
+  "limitations": [
+    "All findings are source-level leads; no code was executed and no runtime confirmation was possible.",
+    "Ground-truth/patched versions, upstream commit history, CVE mappings and external references were not available in this run, so I cannot state which historical fix this snapshot precedes.",
+    "Impact of the reported allocation depends on JVM heap configuration and the attacker-chosen size; only a large LENGTH value causes OutOfMemoryError, smaller values allocate large arrays without failing.",
+    "Several compressors and all output/writer classes were not fully audited; additional issues may exist there.",
+    "The repository's own comments/docs/changes.xml were treated as untrusted context, not as evidence of exploitability."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SevenZFile allocates arrays/buffers directly from attacker-controlled 7z header fields: ByteBuffer.allocate(nextHeaderSizeInt) (SevenZFile.java 263-269), new long[(int) numPackStreams] (406), new Folder[(int) numFolders] (436), new Coder[(int) numCoders] (564), new SevenZArchiveEntry[(int) numFiles] (670), new byte[(int) folder.getUnpackSize()] (368).",
+      "reason": "Same DoS class (small input -> huge allocation) and real, but 7z requires a SeekableByteChannel/File entry point rather than the streaming factory path, and several casts can throw NegativeArraySizeException before useful allocation. Kept as an unconfirmed second lead rather than the single candidate."
+    },
+    {
+      "lead": "AES256SHA256Decoder derives the key with for (long j = 0; j < (1L << numCyclesPower); j++) where numCyclesPower is a 6-bit field from coder properties (AES256SHA256Decoder.java 61-86).",
+      "reason": "Attacker-controlled iteration count can force up to 2^63 SHA-256 rounds (CPU DoS), but it requires the caller to supply a password for an encrypted archive, so preconditions are stronger than the chosen candidate."
+    },
+    {
+      "lead": "CpioArchiveInputStream.readCString builds new byte[length - 1] from the header's namesize; namesize 0 yields NegativeArraySizeException (CpioArchiveInputStream.java 457-462, called at 389/417/445).",
+      "reason": "Crash rather than resource exhaustion and impact is limited; not selected."
+    },
+    {
+      "lead": "X0017_StrongEncryptionHeader.parseFileFormat/parseCentralDirectoryFormat read offsets/sizes from extra-field data without bounds checks (e.g. ivSize/erdSize/resize-derived array sizes; X0017_StrongEncryptionHeader.java 302-369), and a debug System.out.println is present.",
+      "reason": "Malformed extra fields can cause ArrayIndexOutOfBounds/NegativeArraySizeException, but the demonstrated security impact is low compared to the selected candidate."
+    },
+    {
+      "lead": "CpioArchiveInputStream CRC is computed over b[pos] instead of b[off + pos] (CpioArchiveInputStream.java 329-334), so CRC verification is wrong when callers read at a non-zero offset.",
+      "reason": "Data-integrity/correctness issue, not a clear attacker-controlled security impact."
+    },
+    {
+      "lead": "ZipArchiveInputStream possible zero-length/EOF-indication edge cases in read paths and the stored-entry-with-data-descriptor signature scan (ZipArchiveInputStream.java 400-523, 799-898).",
+      "reason": "I could not construct a concrete infinite-loop or incorrect-EOF trigger from the source; no source evidence of a definite flaw, so rejected as speculation."
+    }
+  ],
+  "summary": "Reviewed the assigned Apache Commons Compress 1.16-SNAPSHOT source tree (253 model-visible files; no test sources present). I traced untrusted-input paths in the archive readers (zip, tar, 7z, cpio, dump/tape), several decompressors (bzip2, gzip, LZW/unshrinking, explode), and shared utils. The strongest evidence-supported finding is an uncontrolled memory allocation in TarArchiveInputStream's PAX extended-header parser: the record length is parsed from attacker-controlled ASCII digits and used directly to size a byte[] before any check that the data exists. This is a small-input -> huge-allocation denial-of-service primitive on the common streaming entry point. I also found several other plausible resource-exhaustion issues (7z header/count allocations, 7z AES iteration count, cpio name-size handling, X0017 extra-field parsing) but kept only the single strongest candidate and listed the rest as rejected/unconfirmed leads. No runtime confirmation was possible; all findings are source-level leads."
+}

@@ -1,0 +1,90 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote network peer that can reach the name server's listening port (default 9876) fully controls the RemotingCommand: request code 318 (UPDATE_NAMESRV_CONFIG), body bytes, and therefore all property names/values. No credential, signature, or ACL hook is involved on the name server (ACL/RPC hooks are registered only by BrokerController.java:500-540; namesrv registers none, and DefaultRequestProcessor.rejectRequest() always returns false).",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the guard text and that `configStorePathName` appears exactly once in the entire repository (only at the guard itself), so it can never match a setter; verified NamesrvConfig's full field/setter list and that `configStorePath` is the real property and the registered store-path field; verified Configuration.update applies all request properties via properties2Object (not just pre-existing keys) and persists unconditionally; verified MixAll.string2File writes to the resolved store path and not a sandboxed directory; verified the namesrv registers no RPCHook/AccessValidator (only BrokerController registers ACL hooks) and that the name-server port is used by ordinary clients, making code 318 pre-auth reachable; verified ClusterTestRequestProcessor inherits the same updateConfig; verified the broker does not share the primitive (BrokerConfig has no configStorePath field and BrokerController.java:218-222 uses a fixed BrokerPathConfigHelper.getBrokerConfigPath()), and that no Runtime.exec/ProcessBuilder/FilterServerManager exists in this snapshot, so no direct shell-execution claim is made.",
+      "id": "namesrv-updateconfig-arbitrary-file-write",
+      "impact": "Unauthenticated arbitrary-path file write/overwrite on the host running the NameServer, executed with the name-server process's privileges and with partially attacker-controlled content. Practical effects: overwrite or corrupt any file writable by that user (including the configuration file used at startup), persist attacker-chosen name-server settings such as `rocketmqHome` (not guarded either) which selects the logback configuration file loaded at next startup (NamesrvStartup.java:119) and `configStorePath` itself (NamesrvStartup.java:94 sets it from the -c file), and cause persistent denial of service. Because Properties escapes can inject additional lines, the primitive may support broader content control on some deployment layouts, creating a plausible secondary path to code execution where the service writes to files that are later executed or parsed by other system components; that escalation is a hypothesis, not established here.",
+      "locations": [
+        {
+          "end_line": 596,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/processor/DefaultRequestProcessor.java",
+          "start_line": 557
+        },
+        {
+          "end_line": 131,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/processor/DefaultRequestProcessor.java",
+          "start_line": 130
+        },
+        {
+          "end_line": 85,
+          "path": "common/src/main/java/org/apache/rocketmq/common/namesrv/NamesrvConfig.java",
+          "start_line": 32
+        },
+        {
+          "end_line": 73,
+          "path": "namesrv/src/main/java/org/apache/rocketmq/namesrv/NamesrvController.java",
+          "start_line": 69
+        },
+        {
+          "end_line": 217,
+          "path": "common/src/main/java/org/apache/rocketmq/common/Configuration.java",
+          "start_line": 146
+        },
+        {
+          "end_line": 162,
+          "path": "common/src/main/java/org/apache/rocketmq/common/MixAll.java",
+          "start_line": 146
+        },
+        {
+          "end_line": 360,
+          "path": "common/src/main/java/org/apache/rocketmq/common/MixAll.java",
+          "start_line": 273
+        },
+        {
+          "end_line": 168,
+          "path": "common/src/main/java/org/apache/rocketmq/common/protocol/RequestCode.java",
+          "start_line": 165
+        }
+      ],
+      "prerequisites": "TCP reachability to the NameServer port (the port is client-facing: producers/consumers resolve routes through it, so any cluster client or adjacent network host can reach it); default name-server code path without authentication; for the file-write impact, a target path that is writable by the name-server process user (impact is highest when the service runs as root, as commonly deployed in containers).",
+      "root_cause": "DefaultRequestProcessor.updateConfig rejects only properties named `kvConfigPath` and `configStorePathName` (DefaultRequestProcessor.java:584). No config object defines a `configStorePathName` property: NamesrvConfig defines `configStorePath` (NamesrvConfig.java:34, getter/setter 79-85), so that half of the guard is dead code. NamesrvController.java:73 had already registered `namesrvConfig.configStorePath` as the Configuration store path (`setStorePathFromConfig(this.namesrvConfig, \"configStorePath\")`), therefore a request that sets `configStorePath` changes the target of Configuration.persist().",
+      "title": "Unauthenticated NameServer config update allows arbitrary-path file write because the config-path guard checks a non-existent property name",
+      "trace": "1) NamesrvController.registerProcessor installs DefaultRequestProcessor as the default processor (NamesrvController.java:132-140), and any unrecognized code falls through to it (NettyRemotingAbstract.java:192-197); code 318 is explicitly dispatched at DefaultRequestProcessor.java:130-131. 2) updateConfig parses the attacker body with MixAll.string2Properties (283-294, java.util.Properties.load) and applies the guard at line 584; because `configStorePathName` matches no field/setter, `configStorePath=<attacker path>` passes. 3) Configuration.update (Configuration.java:175-199) calls MixAll.properties2Object for each registered config object (MixAll.java:322-360), which reflectively invokes NamesrvConfig.setConfigStorePath (NamesrvConfig.java:83) and stores the attacker string. 4) update() then calls persist() (Configuration.java:198, 201-217); getStorePath() (146-169) returns the bound field value (the attacker's path, since NamesrvController.java:73 set storePathFromConfig for exactly that field), and MixAll.string2File (146-162) writes the config dump, creating parent directories and .tmp/.bak siblings. 5) The written content is produced by getAllConfigsInternal/properties2String (Configuration.java:259-277; MixAll.java:273-281), which emits values verbatim; values entered with Java properties escapes (e.g. a two-character backslash-n) are unescaped into real newlines by Properties.load and re-emitted unescaped, so attacker-set values can introduce additional lines into the file.",
+      "unverified": "No code was executed, so the write was not observed at runtime; the existence of writable, high-impact target paths depends on deployment (user privileges, container/root usage) and was not confirmed. The newline-injection content-control detail is inferred from java.util.Properties.load/properties2String semantics, not runtime-tested. The secondary code-execution escalation (e.g. influencing logback/Joran configuration at next startup, or overwriting files later executed) is deployment-dependent and not proven. Impact description deliberately avoids payloads.",
+      "weakness_type": "CWE-73 External Control of File Name or Path combined with CWE-306 Missing Authentication for Critical Function (broken denylist on a network-reachable config update)"
+    }
+  ],
+  "coverage_summary": "Source scope: 870 model-visible files, no exclusions (binary-like/oversize/symlink/sensitive-name filters removed none). P1 index: 840 files indexed, 30 source files missing from the index, 335 files parsed, 11,894 symbols and 28,185 syntax-level edges, with no control-flow, no data-flow, and no semantic resolution; omitted/unparsed areas were not assumed reviewed. Files inspected directly: root pom.xml (version 4.9.6, fastjson/netty properties), namesrv processor/controller/startup (DefaultRequestProcessor incl. full updateConfig and dispatch, ClusterTestRequestProcessor, NamesrvController, NamesrvStartup), common Configuration, MixAll (string/properties/object conversions and file helpers), NamesrvConfig, RequestCode, remoting NettyRemotingAbstract dispatch and RemotingCommand decode, broker BrokerController Configuration/ACL-hook setup, AdminBrokerProcessor updateBrokerConfig/getBrokerConfig, BrokerPathConfigHelper, BrokerConfig field searches. Repo-wide text sweeps: configStorePath/configStorePathName, Runtime.exec/ProcessBuilder, FilterServer, AccessValidator/registerServerRPCHook, CVE, updateConfig tests. Not reviewed in depth: client module internals, store engine internals, tools/srvutil, DLedger, TLS/FileWatchService, ACL plain-permission internals, tests, and non-Java docs/scripts.",
+  "limitations": [
+    "No code, tests, or scanners were executed; reachability and file-write behavior are based on source reasoning plus syntactic index navigation, not runtime confirmation.",
+    "The P1 index is partial: only 335 of 731 Java files parsed, 30 source files absent from the index, and no data-flow/control-flow/Spring enforcement analysis, so other vulnerable paths could exist outside what was inspected.",
+    "The candidate's impact depends on deployment specifics that cannot be verified from source alone: name-server port exposure, process user/privileges, and whether any writable target path has security-relevant consumers.",
+    "Newline/escape-based content control in the written file is inferred from java.util.Properties and MixAll semantics and was not demonstrated at runtime.",
+    "Dependency versions (netty, logback, fastjson) were not matched against vulnerability data, as external lookups are out of scope for this run."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Broker AdminBrokerProcessor.updateBrokerConfig (broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java:514-548) accepts arbitrary properties without any denylist when ACL is disabled (default), so a remote client can alter broker config (e.g. brokerPermission).",
+      "reason": "Real weakness but no arbitrary-path primitive: BrokerConfig has no configStorePath field (repo-wide search), and BrokerController.java:218-222 builds its Configuration with the fixed BrokerPathConfigHelper.getBrokerConfigPath(), so persist() cannot be redirected. The historical filter-server shell chain is absent (no FilterServerManager/mqfiltersrv code, no Runtime.exec/ProcessBuilder anywhere). Selected lead is strictly stronger."
+    },
+    {
+      "lead": "Unauthenticated name server KV config operations (PUT_KV_CONFIG/GET_KV_CONFIG/DELETE_KV_CONFIG, DefaultRequestProcessor.java:145-200) let any client read/write/delete KV entries.",
+      "reason": "These operate on the configured kvConfigPath, and that property name is correctly blocked by the guard (line 584), so no arbitrary-path write was found; behavior is largely by design for the name server in this version. Not retained as the primary candidate."
+    },
+    {
+      "lead": "RemotingCommand JSON header decoding with fastjson (RemotingCommand.java:184-201, pom.xml:107 uses fastjson 1.2.69_noneautotype).",
+      "reason": "The dependency is the project's no-autotype build and no autoType/gadget configuration was found in source; no evidence of an exploitable deserialization path was established. Not claimed."
+    },
+    {
+      "lead": "Plain ACL permission manager files/writes (acl/src/main/java/org/apache/rocketmq/acl/plain/PlainPermissionManager.java) and file-based ACL import paths.",
+      "reason": "ACL is opt-in and broker-only (BrokerConfig.isAclEnable default false; BrokerController.java:500-515), and this code was not deeply reviewed; no concrete, source-verifiable vulnerability with comparable impact was identified."
+    },
+    {
+      "lead": "Dependency-level exposure (netty 4.1.65.Final at pom.xml:105, logback/logging module, fastjson).",
+      "reason": "No CVE/version databases are available in this run and no source-level exploitation path was established; treated as an unverified hardening observation, not a finding."
+    }
+  ],
+  "summary": "Reviewed the Apache RocketMQ 4.9.6 snapshot (pom.xml:32), focusing on remotely reachable config-update/admin handlers and the shared Configuration/MixAll config-persistence primitives. One candidate submitted: the name server's unauthenticated UPDATE_NAMESRV_CONFIG handler (code 318) attempts to forbid changing config-file paths but checks a property name that does not exist anywhere in the tree (`configStorePathName`), so a remote client can set `configStorePath`; because NamesrvController bound that same field as the Configuration store path, the subsequent persist() writes the name-server config dump to an attacker-chosen filesystem path with attacker-influenced values. Other leads (broker updateBrokerConfig without denylist, unauthenticated KV writes, fastjson/netty versions, ACL internals) were checked and rejected as weaker or unevidenced; they are listed as rejected leads."
+}

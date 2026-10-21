@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An application that uses the ESAPI validator as intended passes attacker-controlled data (form/query parameter, multipart metadata, header) as the `input`/`directorypath` argument of getValidDirectoryPath()/isValidDirectoryPath()/assertValidFileUpload()/isValidFileUpload(), together with a fixed parent directory it wants to confine the data to.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the code text: the flaw is exactly the prefix comparison at line 460, not a symlink issue (getCanonicalPath resolves symlinks, so symlinked escapes are rejected). Checked the companions: getValidFileName() (532-572) additionally validates raw and canonicalized input against the FileName whitelist regex `^[a-zA-Z0-9!@#$%^&{}\\[\\]()_+\\-=,.~'` ]{1,255}$`, which rejects '/', '\\\\', ':' and '..' separators, and requires input==canonical name, so I found no separator-based traversal there; DefaultHTTPUtilities.getFileUploads (520-616) reduces multipart names to the last path segment and calls isValidFileName with the configured extension list, which also blocks simple traversal; its odd `split(\"\\\\/.\")` collision branch (589) only misfeatures the duplicate-name path. The sibling-prefix bypass is not mitigated by any other check in the method. Library-internal callers do not feed request data into this API, so exploitability is contingent on application integration (the API is public and documented for exactly that purpose, and ESAPIFilter/DefaultAccessController/WAF do not compensate).",
+      "id": "esapi-defaultvalidator-directory-prefix-bypass",
+      "impact": "Escape from the intended parent directory in a validation helper whose contract is confinement: files can be created/read/removed in a sibling directory that shares the parent's path prefix. Where the application relies on this API for upload/download confinement, this is a path-traversal/sandbox-escape primitive; combined with ESAPI's default upload extension list (which permits .jsp/.jsf/.exe/.jar etc. in configuration/esapi/ESAPI.properties line 325) placement of an executable file in an attacker-chosen sibling directory could enable code execution if that directory is web-served.",
+      "locations": [
+        {
+          "end_line": 474,
+          "path": "src/main/java/org/owasp/esapi/reference/DefaultValidator.java",
+          "start_line": 438
+        },
+        {
+          "end_line": 815,
+          "path": "src/main/java/org/owasp/esapi/reference/DefaultValidator.java",
+          "start_line": 789
+        },
+        {
+          "end_line": 269,
+          "path": "src/main/java/org/owasp/esapi/Validator.java",
+          "start_line": 257
+        }
+      ],
+      "prerequisites": "1) Application uses one of these validator APIs to confine an attacker-influenced directory path inside a chosen parent and then performs file operations with the accepted path (the documented use case). 2) A sibling directory whose canonical path begins with the parent's canonical path string must exist (e.g. an attacker-writable or pre-existing sibling such as /srv/uploads_evil when the parent is /srv/uploads); the method requires the target to exist and be a directory. 3) The target path must satisfy the DirectoryName regex in ESAPI.properties, which it does (letters, '/', '_', ':' etc. are allowed).",
+      "root_cause": "DefaultValidator.getValidDirectoryPath() enforces the \"directory is inside parent\" contract with `if (!dir.getCanonicalPath().startsWith(parent.getCanonicalPath()))` (line 460). A string-prefix test is not a path-component containment test, so any sibling directory whose absolute path starts with the parent's absolute path string is accepted. The later check that the DirectoryName-validated canonical path equals the caller-supplied input (lines 465-469) does not repair this, because the sibling's canonical path does equal the input. The method then returns that out-of-parent path, and the public wrappers isValidDirectoryPath()/isValidFileUpload()/assertValidFileUpload() propagate the acceptance (isValidFileUpload is even documented to require the directory to be inside parent).",
+      "title": "Path containment bypass in DefaultValidator.getValidDirectoryPath() via String.startsWith prefix comparison",
+      "trace": "Attacker-supplied path -> app calls ESAPI.validator().getValidDirectoryPath(ctx, input, parent, false) or assertValidFileUpload(ctx, input, filename, parent, ...) (DefaultValidator.java:438 / 811) -> dir.exists()/isDirectory()/parent.exists()/isDirectory() pass for the sibling -> line 460 compare: \"/srv/uploads_evil\".startsWith(\"/srv/uploads\") == true, so the containment exception is skipped -> fileValidator.getValidInput(ctx, canonicalPath, \"DirectoryName\", 255, false) returns the same sibling path -> line 467 canonical.equals(input) is true -> method returns the out-of-parent canonical path (or assertValidFileUpload returns normally) -> application writes/reads in the sibling directory, outside the intended root.",
+      "unverified": "Not runtime-verified (no code execution/tests allowed). The concrete sibling directory, the application call site, and whether the application uses the returned path for file operations are assumed from the API contract; no in-repo caller demonstrates end-to-end exploitation. Exact mapping of this issue to a specific published advisory/CVE label was not checked (prohibited) and the snapshot predates several later ESAPI releases, so the documented fix history may differ from this snapshot's state.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-23 Relative Path Traversal (improper containment check)"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned 245-file tree (get_source_scope: 245 model-visible files, 0 excluded by size/sensitivity/symlink filters; binary-like files skipped by policy). The P1 relation index covers all 245 files (index_status complete, 0 source files missing from index; syntactic/navigation candidates only, no data-flow or exploitability proof; no tests or builds run). I read in full or in security-relevant part: DefaultValidator (validation core), StringValidationRule, DefaultHTTPUtilities, SecurityWrapperRequest/Response, SecurityWrapper, ESAPIFilter, ClickjackFilter, RequestRateThrottleFilter, DefaultAccessController, ExperimentalAccessController, FileBasedACRs, ACRPolicyFileLoader/parameter loader, AbstractAuthenticator, FileBasedAuthenticator, DefaultUser, DefaultSecurityConfiguration (key sections), DefaultExecutor, DefaultEncoder, Base64, PercentCodec/HTMLEntityCodec/XMLEntityCodec/CSSCodec/JavaScriptCodec/VBScriptCodec/MySQLCodec, CipherTextSerializer/CipherText (parser + MAC paths)/CryptoHelper/JavaEncryptor seal-unseal-MAC, ObjFactory, RandomAccessReferenceMap/AbstractAccessReferenceMap/IntegerAccessReferenceMap, DefaultIntrusionDetector, tags, ESAPI.properties/validation.properties/antisamy policy, and the WAF filter/rules (EnforceHTTPSRule, MustMatchRule, SimpleVirtualPatchRule, InterceptingHTTPServletRequest partially). Files only skimmed or not line-by-line: large interface classes (Authenticator, User, SecurityConfiguration, HTTPUtilities, Encoder, Validator), CryptoToken, KeyDerivationFunction, CipherSpec, PlainText, DefaultEncryptedProperties/EncryptedPropertiesUtils, Log4JLogger/JavaLogFactory, DefaultMessageUtil, MustMatchRule remaining branches, and parts of the WAF response interception classes; those were checked only for obvious sink/trust-boundary patterns.",
+  "limitations": [
+    "No code was executed, no tests (the snapshot contains no src/test tree) and no scanners were run; all conclusions are static source reading, so runtime reachability and exploitability are unproven.",
+    "The repository-provided relation index is syntactic/navigation-only; it was used to locate symbols/callers and does not prove data flow, and absence of an indexed edge was not treated as absence of a path.",
+    "Exploitation of the selected candidate depends on an application using the public validator APIs with attacker-influenced directory paths and then using the accepted path; no in-repo call site demonstrates this end-to-end.",
+    "Exact ground-truth CVE/advisory mapping was intentionally not inspected, and this 2.1.0.1-SNAPSHOT snapshot predates later ESAPI releases, so it may differ from the code that was ultimately fixed.",
+    "Some large files (CryptoToken, KeyDerivationFunction, full SecurityConfiguration/DefaultSecurityConfiguration, remaining WAF rule internals) were not exhaustively read, so additional issues may exist there."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DefaultHTTPUtilities.getFileUploads() multipart filename handling (fparts split + isValidFileName + extension check, including the unusual `filename.split(\"\\\\/.\")` in the duplicate-name branch at line 589)",
+      "reason": "Examined line by line: the split keeps only the last path component and getValidFileName applies the FileName whitelist regex (no '/', '\\\\', ':') plus canonical-name equality, so I could not construct a separator/`..` bypass. The `split(\"\\\\/.\")` oddity only corrupts the extension of the collision temp file and adds a small-length IllegalArgumentException edge case, not a traversal."
+    },
+    {
+      "lead": "CipherTextSerializer.convertToCipherText() allocates arrays from attacker-supplied length fields (`ivLen` short at line 326-331, `ciphertextLen` int at line 333-337) with no bounds check",
+      "reason": "Plausible DoS (OOM) reachable from attacker-controlled ciphertext blobs (e.g. remember-me cookie through JavaEncryptor.unseal -> AbstractAuthenticator.getUserFromRememberToken, or HTTPUtilities cookie/hidden-field decryption). Judged lower priority than the validation bypass for this library's CVE-class profile and left unconfirmed; a single submission is allowed."
+    },
+    {
+      "lead": "XmlEsapiPropertyLoader.loadPropertiesFromFile() parses XML with a default DocumentBuilderFactory (no DTD/external-entity hardening) and ACRPolicyFileLoader uses commons-configuration XMLConfiguration",
+      "reason": "The XML file path comes from trusted configuration (system properties org.owasp.esapi.opsteam/devteam or the resource directory), not from request data, so no attacker-controlled input reaches the parser in the reviewed code."
+    },
+    {
+      "lead": "EnforceHTTPSRule redirects to `request.getRequestURL()` with http->https replacement (waf/rules/EnforceHTTPSRule.java:83), and SecurityWrapperRequest/DefaultHTTPUtilities sendForward/getRequestDispatcher only check `startsWith(\"WEB-INF\")`",
+      "reason": "Host-header-influenced redirect and forward-path checks are legacy WAF/wrapper behavior of limited, deployment-specific impact; the WAF is not enabled by default and the RequestDispatcher path stays context-relative, so neither was selected."
+    },
+    {
+      "lead": "Base64.decodeToObject() Java deserialization (codecs/Base64.java:1126-1169)",
+      "reason": "The method is deprecated and gated behind the `org.owasp.esapi.enableUnsafeSerialization` system property (throws UnsupportedOperationException otherwise), i.e. the unsafe behavior is opt-in and guarded in this snapshot; no other caller in the tree invokes it."
+    }
+  ],
+  "summary": "OWASP ESAPI Java (legacy) snapshot, POM 2.1.0.1-SNAPSHOT, 245 readable source/config files, no test tree. I audited the web-facing sinks (filters/wrappers, HTTPUtilities, Validator/validation rules, codecs, WAF, authenticator/user, crypto, executor) and the strongest source-evidenced issue is a path-containment bypass in the validation core: `DefaultValidator.getValidDirectoryPath()` decides that a validated directory is \"inside\" a parent using a raw `String.startsWith(parentCanonicalPath)` check. A sibling directory whose canonical path merely shares the parent's string prefix (e.g. `/srv/uploads_evil` vs parent `/srv/uploads`) passes the check, and the subsequent canonical-equals-input check also passes, so the method returns (and callers accept) a path outside the intended parent. This is CWE-22/CWE-23 in a public validation API whose documented contract says the directory must be inside the specified parent; the companion file-name APIs are defended by a whitelist regex that forbids path separators, so they do not show the same bypass."
+}

@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Archive entry names are fully attacker-controlled when the application expands an untrusted ZIP/TAR/7z (or other ArchiveInputStream-supported) archive: Expander does not sanitize nextEntry.getName(), and the public entry points expand(File,File), expand(String,InputStream,File), expand(ZipFile,File), expand(SevenZFile,File) and expand(ArchiveInputStream,File) all funnel into the same private expand() with the flawed check (lines 157-233, 239-248). The attacker needs a archive entry name such as '../data-backup/payload' (possibly with directory entries) and knowledge/guess of the target directory name.",
+      "confidence": "high",
+      "counterevidence_checked": "The check was not simply absent: Expander intentionally enforces containment, and Java's getCanonicalPath() does resolve '..' and symlinks, so most '..' escapes (e.g. '../../etc/x') are rejected. The bypass requires the resolved path to begin with the target's canonical path string, which is exactly the 'target directory has a sibling directory and the name of the target directory is a prefix of the sibling directory's name' case documented as a fixed vulnerability in this snapshot's changes.xml (1.18 entry, dated 2018-06-15). The code lacks any subsequent boundary fix (no File.separator/Path.startsWith/relativize), so the documented fix is not present. Expander is production code in src/main/java (public API since 1.17), not test code, and pom/site config do not exclude the archivers.examples package from the artifact. The public overloads for ZipFile/SevenZFile/ArchiveInputStream all reach the same private expand(), so the weakness is not confined to a single input format.",
+      "id": "expander-target-prefix-path-traversal",
+      "impact": "Arbitrary file creation/overwrite (and directory creation) outside the intended extraction directory, limited to paths whose canonical string starts with the target directory's canonical path string (e.g. sibling 'data-backup' for target 'data'). In applications that unpack untrusted archives with Expander, this can overwrite user or application files (configuration, scripts, classpath/JAR content, etc.) in such sibling locations, i.e. an integrity/availability compromise with a path to code execution depending on what the application later loads from those locations. The library's own changelog characterizes the same edge case as a path-traversal vulnerability.",
+      "locations": [
+        {
+          "end_line": 248,
+          "path": "src/main/java/org/apache/commons/compress/archivers/examples/Expander.java",
+          "start_line": 239
+        },
+        {
+          "end_line": 245,
+          "path": "src/main/java/org/apache/commons/compress/archivers/examples/Expander.java",
+          "start_line": 244
+        },
+        {
+          "end_line": 52,
+          "path": "src/changes/changes.xml",
+          "start_line": 47
+        }
+      ],
+      "prerequisites": "An application uses the shipped public Expander API to extract archives from an untrusted source; the chosen target directory has a sibling directory whose name starts with the target directory name (or a path component elsewhere whose canonical string begins with the target's canonical path string); the process has write permission there. No authentication bypass or special configuration is needed on the library side.",
+      "root_cause": "Expander.expand() resolves the entry target with new File(targetDirectory, entry.getName()) and validates containment with f.getCanonicalPath().startsWith(targetDirectory.getCanonicalPath()). The canonical path of an entry whose name contains '../' is normalized (e.g. /srv/data/../data-backup/x -> /srv/data-backup/x), and a plain string prefix test accepts any path whose first characters match the target directory name, not just paths actually inside it. There is no File.separator/Path-component boundary in the comparison and no normalized Path.startsWith() check, so a sibling directory whose name begins with the target directory's name (target '/srv/data' vs sibling '/srv/data-backup') is treated as inside the target.",
+      "title": "Expander containment check bypassable via sibling directory sharing the target path prefix (path traversal / arbitrary file write outside target directory)",
+      "trace": "1) Attacker builds an archive with an entry name '../data-backup/payload' (tar/zip/7z all preserve such names). 2) Victim calls Expander.expand(archive, new File('/srv/data')). 3) In the private expand() (lines 239-264), f = new File('/srv/data', '../data-backup/payload'); f.getCanonicalPath() normalizes '..' to '/srv/data-backup/payload'. 4) The guard at line 245 evaluates '/srv/data-backup/payload'.startsWith('/srv/data') == true, so no exception is raised. 5) For a non-directory entry, parent.mkdirs() then Files.newOutputStream(f.toPath()) create/write the file at /srv/data-backup/payload, outside the requested target directory (directory entries can likewise create directories outside via f.mkdirs()).",
+      "unverified": "No code was executed and no archive was crafted; the finding is a source-level trace. Only sibling paths sharing the target's canonical prefix are reachable (not arbitrary absolute paths), and exploitability depends on a caller using the public Expander API on untrusted archives. No test sources are present in the snapshot to confirm intended behavior or the exact upstream fix shape.",
+      "weakness_type": "Path traversal (CWE-22) leading to arbitrary file creation/overwrite"
+    }
+  ],
+  "coverage_summary": "Reviewed the 264 visible files (java sources under src/main plus site/config files; no src/test directory in scope). Deep reads: archivers/examples/Expander and Archiver, ZipArchiveInputStream, ZipFile.getInputStream, TarArchiveInputStream/TarUtils, SevenZFile header/stream parsing, ArjArchiveInputStream, CpioArchiveInputStream, DumpArchiveInputStream, ArchiveInputStream/ArchiveOutputStream, IOUtils/ByteUtils, LZWInputStream, ExplodingInputStream, UnshrinkingInputStream, InflaterInputStreamWithStatistics, ExtraFieldUtils, X0017_StrongEncryptionHeader, TempFileCachingStreamBridge, FileBasedScatterGatherBackingStore, plus searches for path/File handling, startsWith, exec/Runtime/Class.forName/deserialization APIs, System.out and unchecked-array patterns. The single strongest evidence-backed candidate is the Expander prefix-boundary path traversal, corroborated by the snapshot's own 1.18 changelog entry describing exactly that vulnerability as fixed while the pre-fix code remains. Other parsing/decoder code was spot-checked but not exhaustively line-by-line audited.",
+  "limitations": [
+    "No code execution, archive crafting, tests, or scanners were used; all conclusions are source-level (static) traces, not runtime-confirmed.",
+    "The snapshot contains no src/test files and no VCS metadata, so the exact upstream fix diff and the fixed-vs-vulnerable relationship could not be verified directly; the changes.xml entry is the main in-repo corroboration.",
+    "Not every decoder/parser was audited exhaustively (e.g. BZip2CompressorInputStream body, HuffmanDecoder/Deflate64, Snappy/LZ4 framed streams, Pack200, write-side output streams), so additional lower-severity issues may exist there.",
+    "Exploitability of the Expander finding depends on how callers use the public API and on filesystem layout (a sibling path sharing the target's canonical prefix); no end-to-end reproduction was attempted.",
+    "No external/disclosure data (CVE IDs, upstream commits, sibling conditions) was consulted, per the review constraints."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "ZipArchiveInputStream.bufferContainsSignature line 928 tests (buf.array()[i] == CFH[2] && buf.array()[i+3] == CFH[3]) instead of comparing i+2; the CFH detection branch appears unreachable.",
+      "reason": "Looks like a longstanding upstream quirk/heuristic rather than an injected defect; the loop still terminates via LFH/DD/EOF handling, and no demonstrated confidentiality/integrity impact beyond possible IOException on unusual but valid archives. Not confirmed against upstream history (no VCS data in snapshot)."
+    },
+    {
+      "lead": "X0017_StrongEncryptionHeader.parseFileFormat/parseCentralDirectoryFormat perform unbounded array copies and unchecked size arithmetic, and line 345 contains a System.out.println(\"rcount: \" + rcount) debug statement.",
+      "reason": "The unchecked parsing appears to be pre-existing upstream code (class marked as a stub since 1.11), reachable only when parsing 0x0017 extra fields; I could not construct a concrete security impact stronger than a corrupt-archive exception/DoS, and the debug print is an information-disclosure nuisance rather than a vulnerability."
+    },
+    {
+      "lead": "CpioArchiveInputStream.read computes the FORMAT_NEW_CRC checksum over b[pos] instead of b[off + pos] (lines 329-333), so CRC validation is wrong when off != 0.",
+      "reason": "Likely an upstream latent bug; impact is a spurious CRC error / failed data read rather than memory corruption, and no attacker-controlled corruption path was traced. Weak relative to the Expander finding."
+    },
+    {
+      "lead": "SevenZFile.readFilesInfo uses an unbounded while(true) property loop and several unchecked casts; ArjArchiveInputStream allocates firstHeaderSize-1 bytes; various decoders (BZip2, HuffmanDecoder, LZ4/Snappy, Deflate64) were not exhaustively audited for malformed-input handling.",
+      "reason": "Corrupt-input cases surface as runtime exceptions rather than an exploitable condition in the traced paths, and no concrete attacker-controlled memory-safety/impact was established. Recorded as uninspected/unconfirmed areas rather than candidates."
+    }
+  ],
+  "summary": "Apache Commons Compress snapshot (1.18-dev, post-1.17 release; 264 visible files, all under src/main and src/site, no tests). The strongest evidenced issue is a path-traversal/arbitrary-write weakness in the public Expander helper: its containment check compares canonical path strings with startsWith() and no directory-separator boundary, so an archive entry such as \"../<sibling>/x\", where the sibling directory name has the target directory name as a prefix (e.g. target /srv/data, sibling /srv/data-backup), passes the check and is written outside the target directory. The in-tree changelog (src/changes/changes.xml, lines 47-52, 1.18 entry dated 2018-06-15) explicitly describes this exact edge case as a path-traversal vulnerability that was fixed; the corresponding code fix (boundary-aware comparison, e.g. targetDirPath + File.separator) is absent from Expander.expand, so the snapshot contains the pre-fix (vulnerable) code. No other equally strong candidate was found."
+}

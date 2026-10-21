@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Archive entry names are fully attacker-controlled for any format (zip/tar/7z/cpio/etc.). Applications using the public high-level extractor `Expander.expand(...)` (public API since 1.17, ships in the main jar) on untrusted archives supply attacker-chosen names to `new File(targetDirectory, nextEntry.getName())`.",
+      "confidence": "medium",
+      "counterevidence_checked": "Canonicalization resolves symlinks and `..` for existing path components, so escapes to arbitrary unrelated paths are rejected by the same check (plain `../../outside` fails) - the bypass requires the prefix-sibling condition. Absolute entry names are not an independent bypass because `new File(parent, child)` relativizes an absolute child in this JDK behavior and canonicalization then stays under the target. Directory entries are subject to the same flawed check. I also confirmed the class contains no other sanitization layer (no File.separator, no Path.startsWith, no `..` filtering) and that the only pending 1.18 changelog entry is precisely this path-traversal edge case, which the snapshot code does not yet handle.",
+      "id": "case-005-expander-path-traversal",
+      "impact": "Arbitrary file write outside the intended extraction directory (limited to paths whose canonical string is prefixed by the target path, i.e. the target itself or its string-prefix siblings), including creation of directories via mkdirs and overwriting existing files if permissions allow. In deployments where the target directory is a string prefix of a security-relevant sibling (e.g. `/srv/app/data` vs `/srv/app/data-config`, or a user's `.ss` vs `.ssh`-style layout), this can overwrite configuration or data files. The project itself classified the corresponding fix as a path-traversal fix.",
+      "locations": [
+        {
+          "end_line": 264,
+          "path": "src/main/java/org/apache/commons/compress/archivers/examples/Expander.java",
+          "start_line": 239
+        },
+        {
+          "end_line": 53,
+          "path": "src/changes/changes.xml",
+          "start_line": 45
+        }
+      ],
+      "prerequisites": "(1) Application extracts an attacker-supplied archive with Expander; (2) the extraction target has (or an attacker can arrange) a sibling directory whose canonical path is prefixed by the target's canonical path (the exact edge case described in the repo's own changes.xml 1.18 entry, e.g. `/x/out` vs `/x/out-anything`); (3) attacker can guess or enumerate the target path (often fixed/known). Multiple `..` segments and directory entries can be combined.",
+      "root_cause": "Expander.expand(ArchiveEntrySupplier, EntryWriter, File) computes `String targetDirPath = targetDirectory.getCanonicalPath()` (Expander.java:241) and validates each entry with `if (!f.getCanonicalPath().startsWith(targetDirPath))` (Expander.java:244-248). A plain String.startsWith on a canonical path does not enforce directory containment: if a sibling directory exists whose canonical path extends the target's canonical path (e.g. target `/data/out`, sibling `/data/out-old`), an entry name such as `../out-old/file` canonicalizes to `/data/out-old/file`, which still startsWith `/data/out`. The check passes and the file is created via `Files.newOutputStream(f.toPath())` (Expander.java:258-259), after `parent.mkdirs()` (Expander.java:254-257). There is no trailing File.separator, no java.nio.file.Path component-wise comparison, and no `..`/name sanitization anywhere in the class.",
+      "title": "Path traversal in Expander.expand writes outside target directory via sibling-directory prefix bypass",
+      "trace": "nextEntry.getName() (untrusted, e.g. `../out-old/evil.conf`) -> `new File(targetDirectory, nextEntry.getName())` (244) -> `f.getCanonicalPath()` resolves `..` to `/<parent>/out-old/evil.conf` -> `.startsWith(\"/<parent>/out\")` is true -> containment check passes -> `parent.mkdirs()` (255) -> `Files.newOutputStream(f.toPath())` (258) creates/overwrites the file outside the intended directory. A vanilla `../../etc/passwd`-style name is rejected because its canonical string does not share the target prefix; the bypass specifically uses a prefix-sibling path, which matches the pending changelog entry (src/changes/changes.xml:47-52).",
+      "unverified": "No runtime reproduction or test execution (not permitted). Exploitability depends on the deployment: Expander is an examples/high-level helper, not the core streams; the sibling-directory condition must be satisfiable, and write success depends on filesystem permissions. I could not consult upstream history/patches to confirm exactly how the fix was implemented, so the claim that this snapshot is the reverted-fix state (rather than merely pre-fix) is an inference from the presence of the 2018-06-15 changes.xml entry combined with the still-vulnerable check.",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal'); root-cause CWE-697 incorrect comparison / CWE-20"
+    }
+  ],
+  "coverage_summary": "All 264 model-visible files were in scope (source_root_files=264; P1 index indexed 264/264, 0 missing, complete; no binary/sensitive/symlink exclusions). There are no test files in the snapshot and tests were not run. I read in depth: Expander (candidate), ZipArchiveInputStream (all 1214 lines), ZipFile central-directory/local-header paths, ExtraFieldUtils, AsiExtraField, X0017, SevenZFile (headers/FilesInfo/NID parsing, AES decoder), TarUtils and TarArchiveInputStream parsing, CpioArchiveInputStream, ArjArchiveInputStream, DumpArchiveInputStream/TapeInputStream, LZWInputStream/UnshrinkingInputStream, ExplodingInputStream, Deflate64 HuffmanDecoder/Deflate64CompressorInputStream, BZip2CompressorInputStream, BitInputStream, IOUtils, BoundedInputStream (both variants). I skimmed rather than line-audited: ZipArchiveOutputStream, TarArchiveOutputStream, Cpio/Ar/Arj output streams, BZip2CompressorOutputStream/BlockSort, LZ4/Snappy/Brotli/Zstd/XZ/Pack200 wrapper code, ArchiveStreamFactory/CompressorStreamFactory, ChangeSetPerformer/ChangeSet, ParallelScatterZipCreator/ScatterZipOutputStream, and site XML.",
+  "limitations": [
+    "No code execution, tests, fuzzing, or runtime confirmation; findings are source-level leads only.",
+    "No upstream diff, patch, CVE/CWE label, or external advisory was consulted (prohibited), so the mapping between this snapshot and a specific historical fix/CVE is inferred, not verified.",
+    "The P1 relation index supplies only syntactic/navigation candidates and does not prove reachability, data flow, or exploitability; every cited edge was re-checked against source text.",
+    "The snapshot has no test directory, so test resources that might exercise the vulnerable paths were unavailable.",
+    "The Expander candidate's real-world impact depends on deployment-specific directory layouts (sibling-prefix condition) and whether applications use the examples-package API for untrusted archives.",
+    "Sections listed as skimmed in the coverage summary may contain additional defects not surfaced by this review."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Infinite loop in ZipArchiveInputStream.read / readStored / readStoredEntry (CVE-2018-11771 candidate, version window 1.18-SNAPSHOT fits)",
+      "reason": "Extensive source audit of read(), readStored(), readStoredEntry(), bufferContainsSignature(), cacheBytesRead(), closeEntry(), skip(), readDeflated/readFromInflater found explicit anti-loop/EOF guards (r <= 0 -> IOException('Truncated ZIP file'), lastStoredEntry ByteArrayInputStream returning -1 at exhaustion, inf.finished() -> -1, in.read()==-1 -> -1). I could not identify a concrete crafted-input path that makes read() return 0 persistently, so source evidence is insufficient for a candidate."
+    },
+    {
+      "lead": "AsiExtraField.parseFromLocalFileData `new byte[length - WORD]` and X0017_StrongEncryptionHeader.parseFileFormat/parseCentralDirectoryFormat unchecked sizes",
+      "reason": "Crafted short extra fields can cause NegativeArraySizeException/AIOOBE (DoS via uncaught RuntimeException), but these code shapes exist in upstream versions of the file and the impact is exception-based, not memory corruption; no loop or write primitive established."
+    },
+    {
+      "lead": "SevenZFile AES256SHA256Decoder KDF loop `for (long j = 0; j < (1L << numCyclesPower); j++)` with attacker-controlled numCyclesPower up to 62",
+      "reason": "Plausible CPU-exhaustion DoS (effectively unbounded SHA-256 iterations), but I could not verify absence of an upstream bound in this snapshot's call path, and it is a different root cause than the primary candidate; left unconfirmed."
+    },
+    {
+      "lead": "SevenZFile.readFilesInfo `while (true)` property loop and ArjArchiveInputStream.readHeader magic rescan loop as infinite loops",
+      "reason": "Both consume input every iteration and terminate via EOFException/BufferUnderflowException at end of input; no zero-progress path found in source."
+    },
+    {
+      "lead": "CpioArchiveInputStream.readCString `new byte[length - 1]` for namesize 0",
+      "reason": "Negative array size -> uncaught exception (DoS-by-exception) only; low impact and no craftable infinite loop."
+    }
+  ],
+  "summary": "Reviewed the full 264-file Apache Commons Compress 1.18-SNAPSHOT tree (pom.xml version 27, changes.xml 1.18 section open, only 2018-06-15 entry). Audit focused on attacker-controlled parsing paths: zip (ZipArchiveInputStream, ZipFile, ExtraFieldUtils/AsiExtraField/X0017), tar, cpio, arj, dump/TapeInputStream, 7z (SevenZFile, AES256SHA256Decoder), codecs (LZW/Unshrinking/Exploding, Deflate64/HuffmanDecoder, BZip2, LZ4, snappy), and utils (IOUtils, BoundedInputStream, BitInputStream). The strongest, source-evidenced issue is a path traversal in the public high-level extractor `org.apache.commons.compress.archivers.examples.Expander`: its containment check uses `String.startsWith` on the canonical target path without a separator/component-wise comparison, so an entry named like `../<target-dir-name>-sibling/file` writes outside the target directory whenever a sibling directory shares the target's canonical path as a string prefix. The repository's own pending 1.18 changelog describes exactly this \"sibling directory / name is a prefix\" edge case as having been fixed on 2018-06-15, yet the code in this snapshot still contains the unhardened prefix check, which is strong corroboration. I could not pinpoint a concrete defect for the other plausible lead (CVE-2018-11771-style infinite loop in ZipArchiveInputStream); that code contains multiple anti-loop guards, so it is recorded as a rejected lead rather than a candidate."
+}

@@ -1,0 +1,83 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the entire JWT string presented to the application (typically an HTTP Authorization/whatever header), including the base64url header JSON (alg/typ/kid), the base64url payload JSON (sub, exp, roles/custom claims), and the presence/absence of the trailing dot. No key material or valid signature is required.",
+      "confidence": "high",
+      "counterevidence_checked": "Searched all occurrences of `parts.length`, `verify(`, and `Algorithm.none` in the snapshot: verification and the MissingVerifierException are strictly limited to `parts.length == 3` (JWTDecoder.java:149,153), and no other code path requires a signature for two-segment input. The guard comments (lines 68, 118) state the intent to not decode unsecured JWTs when verifiers are provided, confirming the missing rejection is a defect rather than intentional behavior; the guard itself only enables the unsigned path when no verifiers exist. `canVerify` returning false only nulls the verifier (JWTDecoder.java:127-128), it does not reject the token, so even a kid that matches a configured verifier does not save the caller. String.split(\"\\\\.\") on \"A.B.\" yields [\"A\",\"B\"], which combined with the endsWith(\".\") check confirms two-segment acceptance (JWTDecoder.java:175-178). Downstream Mapper uses a plain Jackson ObjectMapper without polymorphic/default typing (Mapper.java:32-56), so the impact is claim forgery rather than gadget deserialization. Not runtime-confirmed: no code was executed and the snapshot contains no tests demonstrating or denying the behavior.",
+      "id": "prime-jwt-decoder-unsecured-jwt-bypass",
+      "impact": "Complete verification bypass: any party can mint unsigned JWTs with arbitrary claims (identity, roles, expiration) that applications using JWTDecoder.decode(token, verifier...) or decode(token, verifierMap) will accept as authentic. Where JWT claims drive authentication or authorization, this is account/privilege takeover without knowledge of the HMAC secret or RSA private key; it also defeats the library's own MissingVerifierException protection, which only fires for three-segment tokens.",
+      "locations": [
+        {
+          "end_line": 82,
+          "path": "src/main/java/org/primeframework/jwt/JWTDecoder.java",
+          "start_line": 60
+        },
+        {
+          "end_line": 133,
+          "path": "src/main/java/org/primeframework/jwt/JWTDecoder.java",
+          "start_line": 112
+        },
+        {
+          "end_line": 157,
+          "path": "src/main/java/org/primeframework/jwt/JWTDecoder.java",
+          "start_line": 143
+        },
+        {
+          "end_line": 182,
+          "path": "src/main/java/org/primeframework/jwt/JWTDecoder.java",
+          "start_line": 174
+        },
+        {
+          "end_line": 65,
+          "path": "src/main/java/org/primeframework/jwt/hmac/HMACVerifier.java",
+          "start_line": 56
+        },
+        {
+          "end_line": 70,
+          "path": "src/main/java/org/primeframework/jwt/rsa/RSAVerifier.java",
+          "start_line": 61
+        }
+      ],
+      "prerequisites": "The application decodes tokens with at least one verifier configured, i.e. `JWT.getDecoder().decode(token, verifier...)` or `decode(token, verifiersMap)` with a non-empty map (the normal production usage shown in README.md lines 24-55). The token must end with '.' so getParts() accepts two segments, and the header must contain a parseable algorithm name (e.g. \"none\" or \"HS256\") so Header deserialization and canVerify() do not fail. No authentication, key, or special configuration is needed.",
+      "root_cause": "In JWTDecoder, the actual signature check and the missing-verifier check are both inside `if (parts.length == 3)` blocks (lines 149-157), so any two-segment token skips verification entirely. The only unsecured-token guard (lines 68-71 and 118-121) merely returns early for the unsigned path when the verifier collection is EMPTY (`verifiers.length == 0` / `verifiers.isEmpty()`); it does not throw when verifiers were provided and the token is unsigned or two-segment. Consequently, when a caller supplies verifiers, a token of the form `base64url(header).base64url(payload).` (trailing dot required by getParts(), lines 174-182) falls through to the private decode(), the `verifier == null` case is only rejected for parts.length == 3, no `verify()` call occurs, and the attacker-controlled payload is deserialized and returned. This also accepts tokens whose header advertises HS256/RS256 but carry no signature segment, and both the varargs API and the kid/verifier-map API are affected.",
+      "title": "JWTDecoder accepts unsigned two-segment (unsecured / stripped-signature) JWTs while verifiers are configured, bypassing signature verification",
+      "trace": "1) Attacker crafts `base64url({\"alg\":\"none\"}) + \".\" + base64url({\"sub\":\"victim-or-admin\",\"exp\":<future>, ...}) + \".\"`. 2) getParts() (JWTDecoder.java:174-182) splits into 2 parts and accepts them because encodedJWT.endsWith(\".\"). 3) The early-return guard at line 69 (and 119 for the map overload) requires `verifiers.length == 0` / `verifiers.isEmpty()`; with real verifiers supplied this is false, so the unsecured branch is NOT taken and no rejection occurs. 4) Verifier resolution: for alg=none, HMACVerifier.canVerify (HMACVerifier.java:56-65) and RSAVerifier.canVerify (RSAVerifier.java:61-70) return false, so the varargs loop leaves verifier == null; in the map overload an attacker-chosen/absent kid yields `verifiers.get(key) == null`, and even a matched verifier is nulled by the `!canVerify` branch (JWTDecoder.java:125-130). 5) Private decode() (JWTDecoder.java:143-157): `parts.length == 3` is false, so the MissingVerifierException at lines 149-151 is not thrown and `verifier.verify(...)` at line 156 is never called. 6) The payload is deserialized at line 159 and returned after only exp/nbf checks (lines 161-169) as a trusted JWT.",
+      "unverified": "Static analysis only; behavior was traced by reading the source, not executed. No caller applications, tests, git history, or build artifacts are present in the snapshot, so the exact fraction of downstream consumers that call decode() with verifiers is inferred from JWTDecoder's API and README usage examples rather than observed. A token with a syntactically valid but unsupported alg value (e.g. \"ES256\") would fail Header deserialization, and a header missing `alg` would throw NPE instead of bypassing (see rejected leads), so the attacker must include a supported alg name such as \"none\" or \"HS256\".",
+      "weakness_type": "Improper Verification of Cryptographic Signature (CWE-347) leading to authentication/authorization bypass (JWT alg=none / unsigned token acceptance)"
+    }
+  ],
+  "coverage_summary": "get_source_scope reports 35 model-visible source files, 0 excluded binaries/symlinks/sensitive paths, with the same filters for B0 and P1. All 35 files were listed and read (JWTDecoder, JWTEncoder, JWTUtils, OpenIDConnect, Signer/Verifier/UnsecuredSigner, HMAC signer/verifier, RSA signer/verifier/utils/PEMUtils, Mapper/JacksonModule/ZonedDateTime serializers, JWT/Header/Algorithm/JSONWebKey and the exception/domain types). JWTDecoder's verification flow was traced line-by-line; remaining files are small helpers/POJOs that hold no crypto verification logic. No test sources, build outputs, or dependency binaries exist in the snapshot, and no code was executed.",
+  "limitations": [
+    "Static, read-only review only: no compilation, tests, or runtime execution, so the bypass is a high-confidence source-level lead, not runtime-confirmed.",
+    "No test suite or consumer applications are included in the snapshot; exploitability depends on downstream callers invoking decode() with verifiers, which README.md documents as the standard usage pattern.",
+    "The snapshot lacks repository history/patch context, so it is unknown whether a later upstream release fixed this path; nothing in the snapshot itself rejects two-segment tokens when verifiers are supplied.",
+    "Third-party dependency CVEs (Jackson 2.8.1 declared in pom.xml) were not assessed, as the review is limited to the assigned source files."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HMACVerifier uses Arrays.equals for MAC comparison (HMACVerifier.java:78), a non-constant-time comparison.",
+      "reason": "Potential timing side channel on HMAC verification; no practical exploit path or timing analysis is possible from this static snapshot, and impact is far weaker than the deterministic unsigned-token bypass."
+    },
+    {
+      "lead": "HMACSigner/HMACVerifier impose no minimum secret length (HMACSigner.java:40-55; HMACVerifier.java:40-53) while RSA enforces >=2048 bits.",
+      "reason": "The secret is caller-configured, not attacker-controlled input, and short-secret misuse is a configuration weakness rather than an input-driven vulnerability."
+    },
+    {
+      "lead": "Header processing NPE/DoS: missing `alg` causes canVerify(null) NPE at JWTDecoder.java:76 or header.algorithm.getName() NPE at line 150.",
+      "reason": "At most a malformed-input availability/exception-handling issue; no confidentiality or integrity impact."
+    },
+    {
+      "lead": "varargs verifier selection uses the LAST matching verifier (JWTDecoder.java:74-79) despite the Javadoc saying the first supporting verifier will be used.",
+      "reason": "Documentation/selection-semantics inconsistency with no demonstrated security consequence; each candidate verifier still applies its own verification and fails closed on mismatch."
+    },
+    {
+      "lead": "JWTDecoder.getInstance()/JWTEncoder.getInstance() lazy singletons are not synchronized (JWTDecoder.java:39-47; JWTEncoder.java:36-44).",
+      "reason": "Benign race that can create duplicate stateless instances; no security impact."
+    },
+    {
+      "lead": "RSAUtils imports internal sun.security.* classes (RSAUtils.java:19-21) and PEM parsing uses indexOf without validating ordering (RSAUtils.java:192-198).",
+      "reason": "Portability/maintainability concerns rather than an attacker-reachable vulnerability; callers supply well-formed keys."
+    }
+  ],
+  "summary": "The repository is the prime-jwt JWT library (com.inversoft:prime-jwt 1.3.0, all main sources; no tests in the snapshot). The strongest issue is in JWTDecoder: signature verification is gated on the token having exactly three segments, and the \"unsecured JWT\" guard only permits the unsigned path when no verifiers are supplied rather than rejecting unsigned/2-segment tokens when verifiers ARE supplied. As a result, a two-segment token ending in a dot (e.g. header {\"alg\":\"none\"} plus an attacker-chosen payload, no signature segment) is fully deserialized and returned as a valid JWT by both public decode() overloads whenever at least one verifier is configured — a full signature-verification bypass. All other observations were weak or speculative and are listed as rejected leads."
+}

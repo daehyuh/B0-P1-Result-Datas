@@ -1,0 +1,73 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The values of `sasl.oauthbearer.token.endpoint.url` and `sasl.oauthbearer.jwks.endpoint.url` in the SASL/OAUTHBEARER configuration map for a client, Connect worker, or broker. These can be supplied by whoever controls the effective client/broker configuration (e.g., connector client-override properties when the Connect override policy allows them, per-connector SASL settings, application config loaded from a semi-trusted source, or operator-managed config where a lower-privileged user can set values).",
+      "confidence": "medium",
+      "counterevidence_checked": "The file:// and http(s) handling is documented as an intended feature (SaslConfigs.SASL_OAUTHBEARER_TOKEN_ENDPOINT_URL_DOC), so the issue only materializes when the config value is attacker-influenced; validateFile enforces existence, readability and non-directory; the client-side LoginAccessTokenValidator intentionally does not verify signatures (the broker verifies), so file content is not directly returned by an API; no runtime exploit was executed and the exact Connect override policy in a given deployment was not verified.",
+      "id": "oauth-endpoint-url-scheme-ssrf-file-read",
+      "impact": "Arbitrary local file read within the privileges of the Kafka client/Connect/broker JVM (content becomes the OAuth token or JWKS and can leave the process through the SASL exchange or logs/errors), and server-side request forgery from that process to internal-only HTTP(S) services (including cloud metadata endpoints and internal administration interfaces), potentially exposing credentials or enabling further compromise. The token path also permits basic-auth client credentials to be sent to an attacker-chosen endpoint.",
+      "locations": [
+        {
+          "end_line": 88,
+          "path": "clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtils.java",
+          "start_line": 68
+        },
+        {
+          "end_line": 184,
+          "path": "clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtils.java",
+          "start_line": 163
+        },
+        {
+          "end_line": 89,
+          "path": "clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/AccessTokenRetrieverFactory.java",
+          "start_line": 57
+        },
+        {
+          "end_line": 55,
+          "path": "clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/FileTokenRetriever.java",
+          "start_line": 42
+        },
+        {
+          "end_line": 193,
+          "path": "clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/HttpAccessTokenRetriever.java",
+          "start_line": 158
+        },
+        {
+          "end_line": 89,
+          "path": "clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/VerificationKeyResolverFactory.java",
+          "start_line": 57
+        },
+        {
+          "end_line": 147,
+          "path": "clients/src/main/java/org/apache/kafka/common/config/SaslConfigs.java",
+          "start_line": 144
+        }
+      ],
+      "prerequisites": "Attacker influence over OAuth-related SASL configuration of a Kafka client, Connect worker, or broker. For the file-read path, the target file must exist and be readable by the Kafka process and must not be a directory (`validateFile` checks only these properties). The resulting content is consumed as an access token or JWKS; for http(s) the JVM must be able to reach the internal target.",
+      "root_cause": "`ConfigurationUtils.validateUrl` accepts any URL whose protocol is `http`, `https`, or `file` and performs no host/port/scheme allow-listing, and `validateFile` only checks existence/readability/not-a-directory. `AccessTokenRetrieverFactory.create` then dispatches `file:` URLs to `FileTokenRetriever` (reads the referenced file's contents) and all other URLs to `HttpAccessTokenRetriever` (opens the raw attacker-supplied URL), and `VerificationKeyResolverFactory.create` does the same for JWKS URLs (`JwksFileVerificationKeyResolver` for `file:`, `HttpsJwks` for the raw URL). The only bound on the path/host is the attacker-controlled config value itself.",
+      "title": "Unvalidated OAuth/OAUTHBEARER token and JWKS endpoint URLs permit arbitrary local file reads and SSRF",
+      "trace": "config map -> ConfigurationUtils.validateUrl (lines 163-184: only protocol ∈ {http, https, file} is enforced; no host/allowlist check) -> AccessTokenRetrieverFactory.create (line 61 validateUrl; line 63-64 file branch -> FileTokenRetriever; line 78-87 otherwise -> HttpAccessTokenRetriever) -> FileTokenRetriever.init line 44 `Utils.readFileAsString(accessTokenFile.toFile().getPath())` reads any readable path, and HttpAccessTokenRetriever.retrieve line 172 `(HttpURLConnection) new URL(tokenEndpointUrl).openConnection()` issues a POST to the arbitrary URL (default redirect following, no host restriction). Reached from OAuthBearerLoginCallbackHandler.configure line 191. On the broker/JWKS side, OAuthBearerValidatorCallbackHandler.configure line 135 -> VerificationKeyResolverFactory.create lines 57-89: line 63-65 file branch -> JwksFileVerificationKeyResolver, line 74 -> HttpsJwks(raw URL) -> RefreshingHttpsJwks.refresh performs the network fetch. The same config values are documented as accepting file-based and HTTP(S) URLs (SaslConfigs lines 144-147) with no security constraint.",
+      "unverified": "Whether a concrete deployment path lets an unprivileged actor set these SASL properties (e.g., Connect's connector.client.config.override.policy setting), and the exact exfiltration/impact chain at runtime; no code was executed and no network/file access was attempted.",
+      "weakness_type": "SSRF and arbitrary file read via unvalidated configuration URL (CWE-918/CWE-22 class)"
+    }
+  ],
+  "coverage_summary": "Coverage: the snapshot contains 3,853 visible files (Kafka 3.9.0), including main Java sources for clients/connect/metadata/raft/storage/streams/tools, Scala broker sources, docs, and build files; no test sources are present. I inspected the OAuth/OAUTHBEARER secured package, JAAS/JaasContext handling, config providers (AllowedPaths, FileConfigProvider, DirectoryConfigProvider, ConfigTransformer), Connect SafeObjectInputStream, StandardAuthorizer/StandardAuthorizerData, SaslServerAuthenticator authentication flow, SCRAM/PLAIN constant-time comparisons, the broker SASL max-receive limit, and the password encoder. The P1 relation index parsed 3,131 Java files and omitted 91 files (no control-flow, data-flow, semantic resolution, or reachability analysis), so coverage is partial: Scala broker/controller code and much of streams/connect were only sampled, and the index does not prove reachability or exploitability.",
+  "limitations": [
+    "No code was executed; no build, test, scanner, or exploit run was performed, so all findings are static and not runtime-confirmed.",
+    "Test sources are absent from the snapshot, so upstream regression tests for the affected behavior could not be used as evidence.",
+    "The P1 index has no data-flow/control-flow or semantic resolution; 91 source files were not indexed, and index facts are name-based navigation hints only.",
+    "The strength of the finding depends on the attacker being able to influence the effective OAuth/SASL configuration (e.g., connector client-override policy in Connect); this precondition was argued from code structure, not verified in a deployment.",
+    "Scala broker/controller code and large parts of connect/streams/tools were not exhaustively audited; additional issues may exist there."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Incomplete login-module denylist in `JaasUtils.DISALLOWED_LOGIN_MODULES_DEFAULT` (only `com.sun.security.auth.module.JndiLoginModule`) checked by `JaasContext.throwIfLoginModuleIsNotAllowed`, so a JAAS config supplied via `sasl.jaas.config` could still load other dangerous JDK login modules (e.g., `LdapLoginModule`) that perform JNDI/LDAP lookups.",
+      "reason": "Plausible second issue in the same snapshot (the denylist is an explicit security control), but it was not selected: the unsafe behavior resides in a JDK-provided LoginModule rather than in this repository, so the RCE claim cannot be substantiated from the snapshot's source alone, and only one candidate may be submitted. Retained as an unconfirmed secondary lead."
+    },
+    {
+      "lead": "Granting `LdapLoginModule`-style modules via untrusted `sasl.jaas.config` in Kafka Connect connector configurations could lead to code execution on the Connect worker.",
+      "reason": "Same root cause as the lead above; not independently evidenced in this source snapshot (Connect-side config propagation not traced), and not selected because it is a variant of one issue rather than a distinct root cause."
+    }
+  ],
+  "summary": "Reviewed the Apache Kafka 3.9.0 source snapshot (3,853 visible files; 3,131 Java files parsed by the P1 index; test sources absent from the snapshot). I traced attacker-influenced configuration into OAuth/OAUTHBEARER token and JWKS retrieval and found one strong, source-evidenced candidate: the client/broker accepts arbitrary file:// and http(s):// endpoint URLs for `sasl.oauthbearer.token.endpoint.url` and `sasl.oauthbearer.jwks.endpoint.url`, then reads any readable local file (FileTokenRetriever/JwksFileVerificationKeyResolver) or opens the raw URL (HttpAccessTokenRetriever/HttpsJwks) in the JVM, giving arbitrary local file reads and SSRF from Kafka client/Connect/broker processes. I also found a second plausible lead (login-module denylist gap for LdapLoginModule) but did not select it because it is a one-entry denylist omission whose exploitability depends on JDK login-module behavior outside this repository; it is noted as an unselected lead under the one-candidate cap."
+}

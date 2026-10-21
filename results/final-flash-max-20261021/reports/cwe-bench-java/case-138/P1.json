@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remotely supplied request path/content (and the static text file content served) drives DefaultServlet; whether the Writer path is taken depends on application wiring (a filter/servlet/valve that called response.getWriter() and has not written buffered output before the static resource is served, e.g. a forward to a static resource after getWriter()). The mismatch is deterministic for non-ASCII text whose file encoding differs from the response encoding.",
+      "confidence": "low",
+      "counterevidence_checked": "1) Include dispatches are mitigated: ApplicationHttpResponse.setContentLengthLong ignores the call when included==true (ApplicationDispatcher.doInclude wraps the response with including=true), so the classic JSP include case does not reach the vulnerable effect. 2) When the application explicitly sets a differing response encoding, conversionRequired becomes true and the content length is not set (comment at 1104-1105). 3) The surrounding change is documented in the snapshot changelog ('Allow the default servlet to set the content length ... a Writer is being used'), so some form of this guard is intentional; I could not compare against the upstream/next-commit text. 4) No runtime confirmation was possible; the flow is derived from source only.",
+      "id": "defaultservlet-writer-content-length",
+      "impact": "Response body shorter/longer than the declared Content-Length. Clients truncate or wait for missing bytes; with HTTP/1.1 keep-alive (or a front-end proxy that reuses backend connections) the left-over bytes can be interpreted as the next response, i.e. response queue poisoning/desynchronization, and can corrupt or inject content into subsequent responses on the same connection. Also causes inconsistent behavior versus the normal OutputStream (raw-byte) path.",
+      "locations": [
+        {
+          "end_line": 1109,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 1099
+        },
+        {
+          "end_line": 1087,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 1077
+        },
+        {
+          "end_line": 1050,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 1035
+        },
+        {
+          "end_line": 1136,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 1118
+        },
+        {
+          "end_line": 2689,
+          "path": "java/org/apache/catalina/servlets/DefaultServlet.java",
+          "start_line": 2670
+        }
+      ],
+      "prerequisites": "DefaultServlet serving a text resource; response.getWriter() already obtained (so response.getOutputStream() throws ISE and the writer branch at line 1042-1045 is used); response not yet committed with contentWritten==0; file encoding (fileEncoding/platform default) with characters whose re-encoded byte length differs from the file size; no explicit response character encoding override (which is what would set conversionRequired).",
+      "root_cause": "In serveResource(), the recently added Writer branch sets a response Content-Length from the file's byte size whenever `writer != null` and `contentWritten == 0` (line 1099-1108). The only encoding guard is `!conversionRequired`, and conversionRequired is raised only when the response encoding was *explicitly* overridden and differs from the file encoding (lines 1077-1084). When the response keeps the container default encoding (e.g. ISO-8859-1) while the file encoding is the platform default/configured fileEncoding (e.g. UTF-8), the guard is false, yet the content is decoded with `inputEncoding` and re-encoded by the Writer in copy(InputStream,PrintWriter,String) (lines 2670-2689, reached from 1136). The number of bytes written then differs from the file size that was used as Content-Length, so the response framing is wrong.",
+      "title": "DefaultServlet can set a Content-Length that does not match the bytes written when serving static text through a Writer",
+      "trace": "Request -> DefaultServlet.serveResource() -> ostream==null, writer=response.getWriter() (1038-1045, ranges forced FULL) -> contentLength = resource.getContentLength() (1024) -> line 1100 condition true via `writer != null` -> conversionRequired false because outputEncodingSpecified is false -> response.setContentLengthLong(fileSize) (1107) -> copy(resource stream, writer, inputEncoding) (1136) decodes with fileEncoding and re-encodes with the response charset (2670-2689), producing a different byte count than the declared length.",
+      "unverified": "Whether upstream Tomcat marks this as a defect and how the next commit adjusts the guard (e.g. comparing respones charset with fileEncodingCharset instead of only explicit overrides) is unverified. The practical attacker reachability depends on application wiring that causes the Writer path.",
+      "weakness_type": "Incorrect Content-Length / HTTP response framing error (possible response desync through connection reuse)"
+    }
+  ],
+  "coverage_summary": "Reviewed request parsing/normalization (CoyoteAdapter, Http11Processor/InputBuffer, HttpParser usage), multipart pipeline (Request.parseParts, FileUploadBase, MultipartStream, FileItemIteratorImpl, DiskFileItem limits), web resources (StandardRoot, AbstractResourceSet, AbstractFileResourceSet, DirResourceSet, CVE-2024-56337/2025-49125 logic), authenticators/realm/base constraints, valves (ParameterLimitValve, RewriteValve, RemoteIpValve), filters (CorsFilter, Csrf, RateLimit*, RemoteIp), HTTP/2 parser/HPACK/flow-control/overhead limits, session handling, and the newest 9.0.107 changes (DefaultServlet, AbstractResourceSet, Request.parseParts, Connector limits). The P1 index is partial (2,975/3,070 files indexed; 923 parsed; 95 source files missing from the index; control/data-flow and semantic resolution are not implemented) and I did not rely on index labels as verdicts. Unit tests are not present in the snapshot, so no test expectations could be cross-checked, and no code was executed.",
+  "limitations": [
+    "No git history/upstream diff available; candidate provenance (injected vs long-standing upstream) could not be verified.",
+    "No runtime, build, or test execution; findings are source-derived only and not runtime-confirmed.",
+    "P1 index omits 95 files and does not model data flow/reachability; files not surfaced by the index were not automatically covered.",
+    "Cannot confirm the exact fix that followed this snapshot; candidate is a lead, not a confirmed vulnerability.",
+    "Many security-sensitive areas (JASPIC/SPNEGO details, WebSocket framing, Jasper compiler/tag plugins, tribes/cluster, jdbc-pool) were only sampled, not exhaustively reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Http11InputBuffer.isChunking()/Http11OutputBuffer.isChunking() iterate `i < lastActiveFilter`, excluding the last active filter, while sibling loops (addActiveFilter, recycle) use `i <= lastActiveFilter`; since the chunked filter is normally the last filter, isChunking() returns false for ordinary chunked requests, making Request.isTrailerFieldsReady() always true for HTTP/1.1 (contradicting the API contract) and Response trailer support inconsistent.",
+      "reason": "Concrete logic inconsistency, but the observable impact is confined to trailer-field readiness/support signaling; no memory, framing or code-execution impact could be traced. Could not verify whether this is long-standing upstream code or a modification, and no runtime confirmation is possible."
+    },
+    {
+      "lead": "Multipart processing: FileUploadBase.parseRequest fully materializes parts before Request.parseParts() applies connector maxPostSize (Request.java 2716-2751); with a servlet using default @MultipartConfig (maxRequestSize/maxFileSize = -1) a large non-file part or many file parts can consume unbounded temp-disk/IO before any size check.",
+      "reason": "Looks like documented, configuration-dependent behavior (spec defaults plus documented maxPartCount/maxPartHeaderSize; FailedRequestFilter can reject failures). Not enough evidence of a code defect distinct from intended design."
+    },
+    {
+      "lead": "CoyoteAdapter.parsePathParameters() mixes relative semicolon offsets with absolute ByteChunk.findBytes() results (CoyoteAdapter.java 918-944, ByteChunk.findBytes 904-915).",
+      "reason": "Resolved as not exploitable: parsedURI is produced by MessageBytes.duplicate()/ByteChunk.allocate() (MessageBytes.java 548-555, ByteChunk.java 161-170), so its start is 0 and the mixed arithmetic is consistent."
+    },
+    {
+      "lead": "ParameterLimitValve applies the first matching pattern from a ConcurrentHashMap (ParameterLimitValve.java 264-275), so with overlapping patterns the applied limit is non-deterministic.",
+      "reason": "Appears to be the intended 'first match wins' design of the new valve; no attacker-controlled bypass could be demonstrated without a specific overlapping configuration."
+    },
+    {
+      "lead": "CorsFilter.checkRequestType uses `if(RequestUtil.isSameOrigin(...))` with a style deviation (CorsFilter.java 551).",
+      "reason": "Formatting-only observation; logic matches intended same-origin handling."
+    }
+  ],
+  "summary": "Tomcat 9.0.107-dev snapshot (post-9.0.106, ~late June 2025). I reviewed the request-parsing/session/mapping chain, multipart handling, web-resources path checks (CVE-2024-56337/CVE-2025-49125 logic), auth stack, filter/valve matching, HTTP/2 framing/limits, rewrite valve, rate limiting, and the newest 9.0.107 changes. Most mechanisms match the expected hardened state, but the newest Catalina change (DefaultServlet content-length when a Writer is used) leaves a narrow case where the declared Content-Length can differ from the bytes actually written. I report that as the single candidate (low confidence)."
+}

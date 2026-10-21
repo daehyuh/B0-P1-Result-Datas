@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The JSON value that Jackson treats as the type id (e.g. the class-name string in a wrapper-array typed value or the `@class`/configured type property) is fully attacker-controlled. `ClassNameIdResolver._typeFromId` passes it to `TypeFactory.findClass`, which calls `Class.forName(className)` / `Class.forName(className, true, loader)`, i.e. the attacker chooses the class to load and bind.",
+      "confidence": "medium",
+      "counterevidence_checked": "The denylist does block the readily available JDK-only gadget chains (TemplatesImpl, JdbcRowSetImpl, FileHandler, UnicastRemoteObject, com.sun.org.apache.bcel ClassLoader) and the Spring `AbstractApplicationContext`/`AbstractPointcutAdvisor` superclass heuristic covers the Spring context classes; default typing is opt-in (`ObjectMapper()` starts with a null default typer, lines 1354-1435), so a plain mapper is not affected. I also checked the alternate paths that skip `_validateSubType`: `createBuilderBasedDeserializer`/Throwable/custom-deserializer/abstract-materialization/std-deserializer branches — none gives a generic attacker-controlled route to an arbitrary gadget type because builder selection depends on code-side annotations, and the known gadget classes are not Throwable/custom/std types. `FromStringDeserializer` (File/URL/InetAddress) performs side effects but is intended JDK-type support, not an arbitrary-class path. Within this repository there is no gadget library on the classpath (c3p0 etc. are absent), so no in-tree end-to-end exploit is demonstrated.",
+      "id": "jackson-incomplete-subtype-denylist",
+      "impact": "Environment-dependent remote code execution via unlisted gadget classes whose constructors/setters perform JNDI lookups, class loading, or nested object construction (the pattern behind the databind RCE advisories for 2017-2018); at minimum SSRF/DNS resolution or denial of service through attacker-chosen class binding. Unlike the blocked JDK-only chains, exploitation needs a matching library on the victim classpath, so severity varies by application.",
+      "locations": [
+        {
+          "end_line": 53,
+          "path": "src/main/java/com/fasterxml/jackson/databind/jsontype/impl/SubTypeValidator.java",
+          "start_line": 26
+        },
+        {
+          "end_line": 99,
+          "path": "src/main/java/com/fasterxml/jackson/databind/jsontype/impl/SubTypeValidator.java",
+          "start_line": 67
+        },
+        {
+          "end_line": 147,
+          "path": "src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java",
+          "start_line": 141
+        },
+        {
+          "end_line": 850,
+          "path": "src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java",
+          "start_line": 845
+        },
+        {
+          "end_line": 84,
+          "path": "src/main/java/com/fasterxml/jackson/databind/jsontype/impl/ClassNameIdResolver.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 283,
+          "path": "src/main/java/com/fasterxml/jackson/databind/type/TypeFactory.java",
+          "start_line": 242
+        }
+      ],
+      "prerequisites": "Application must enable polymorphic deserialization using class names for a reachable value: `ObjectMapper.enableDefaultTyping(...)`/`enableDefaultTypingAsProperty(...)` (lines 1354-1412 set `JsonTypeInfo.Id.CLASS`) or an explicit `@JsonTypeInfo(use = Id.CLASS/MINIMAL_CLASS)` on a property whose value is attacker-controlled. A gadget class reachable from the deployment classpath (third-party library, e.g. C3P0/DBCP2/XBean) with hazardous constructor/setter/JNDI behavior. Deserialization must be performed on untrusted JSON (the documented `readValue` usage).",
+      "root_cause": "`SubTypeValidator` protects polymorphic deserialization solely through a closed enum-like set of exact class names plus a heuristic that only examines classes whose binary name starts with `org.springframework.` and whose superclass chain contains `AbstractPointcutAdvisor`/`AbstractApplicationContext`. Any class outside that set is accepted. Because type ids are attacker-supplied class names resolved with `Class.forName` when default typing / `Id.CLASS` is enabled, the control is only as good as its last enumeration; the file itself shows three successive expansions ([databind#1680], [databind#1737], [databind#1855]) and still omits classes that the project later added for follow-on RCE advisories (e.g. C3P0 `ComboPooledDataSource`, DBCP2 datasource factories, XBean `JndiConverter`). The check is also invoked from a single site (`BeanDeserializerFactory._validateSubType`), so it is a denylist guard rather than a structural restriction on which classes can be bound.",
+      "title": "Incomplete SubTypeValidator class-name denylist allows unlisted gadget classes to be deserialized when polymorphic typing is enabled",
+      "trace": "`ObjectMapper.readValue` -> `DeserializationContext.findRootValueDeserializer`/`findContextualValueDeserializer` -> `TypeDeserializerBase._findDeserializer` -> `ClassNameIdResolver.typeFromId` (line 68 `tf.findClass(id)`) -> `TypeFactory.findClass` (`Class.forName`, lines 242-283) -> `BeanDeserializerFactory.createBeanDeserializer`: after `isPotentialBeanType` it calls `_validateSubType` (line 145) -> `SubTypeValidator.validateSubType` (lines 67-99) checks `_cfgIllegalClassNames.contains(full)` (line 76) and the Spring-only superclass heuristic (lines 83-93); for any class not enumerated it returns normally (line 94) -> `buildBeanDeserializer` instantiates the class and binds attacker JSON to its creators/setters (e.g. `ValueInstantiator.createUsingDefault` / `CreatorProperty` / `MethodProperty.set`). The attacker-chosen class name therefore reaches object construction with only the finite denylist as a barrier.",
+      "unverified": "No runtime confirmation was performed. Exact hazardous class names not present in this snapshot are drawn from the project's later denylist additions (external knowledge), so the finding is a probable gap rather than a proven bypass for a specific gadget; whether any concrete deployed application both enables class-name default typing and has an unlisted gadget library on the classpath is unknown. The relation index is syntax/navigation-only (no data-flow or reachability proof), and no tests or builds were available/executed.",
+      "weakness_type": "CWE-184 (Incomplete List of Disallowed Inputs) leading to CWE-502 (Deserialization of Untrusted Data)"
+    }
+  ],
+  "coverage_summary": "Reviewed the model-visible snapshot (399 files: 393 Java main sources, 4 attic/attic files, pom/README/CI metadata) with the P1 index (398 files indexed, 393 Java parsed, 1 omitted, 2 unparsed non-Java; index is syntax-only with no control/data flow and only 21 name-based facts). Deep read of the polymorphism/typing path (SubTypeValidator, BeanDeserializerFactory, ClassNameIdResolver, TypeDeserializerBase, AsPropertyTypeDeserializer), ObjectMapper typing configuration, TypeFactory.findClass, ClassUtil access/serialization helpers, FromStringDeserializer, LRUMap, JdkDeserializers, DeserializerCache deserializer construction, and the annotated-member readResolve methods; targeted greps for Class.forName/newInstance/setAccessible/readObject/arraycopy/denylist and issue-number markers. No test sources exist in the snapshot and no build, scanner, or runtime execution was performed.",
+  "limitations": [
+    "The P1 relation index is explicitly partial/syntax-only (control flow, data flow, semantic resolution, Spring DI/security enforcement unverified; 7664 unresolved calls); it was used only for navigation, and all cited facts were verified in source text.",
+    "No test sources are present in the snapshot, so fix-verification tests and version-identifying test names could not be inspected; no build, dependency resolution, or runtime verification was possible.",
+    "The exact set of hazardous classes missing from the denylist is known from the project's later security releases (external knowledge), not from this tree; the candidate therefore describes a class-of-issue (incomplete denylist) with environment-dependent exploitability rather than a proven end-to-end exploit.",
+    "Excluded from the model-visible scope: 1 omitted file (binary/NUL-prefixed or otherwise excluded), and non-Java build artifacts; those were not reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "`BeanDeserializerFactory.createBuilderBasedDeserializer` (lines 151-160) and the Throwable branch (lines 113-115) build deserializers without calling `_validateSubType`, a literal validation bypass relative to the bean path.",
+      "reason": "Routing a type through the builder path requires code-side annotations (`@JsonDeserialize(builder=...)`/`@JsonPOJOBuilder`) on the target class; the attacker cannot add them, and known gadget classes are ordinary beans, so this is a latent design weakness rather than a demonstrated attacker-controlled bypass."
+    },
+    {
+      "lead": "`FromStringDeserializer.Std` instantiates `java.net.URL`, `java.io.File`, and resolves `InetAddress`/`InetSocketAddress` from attacker strings (lines 206-276), enabling SSRF/DNS side effects during deserialization.",
+      "reason": "This is documented, intentional JDK-type binding behavior in Jackson; no memory-unsafe or authorization-boundary violation is shown, and impact depends entirely on how the application later uses the constructed object."
+    },
+    {
+      "lead": "`LRUMap.readResolve` allocates a new `ConcurrentHashMap` using `_jdkSerializeMaxEntries` read from a serialized stream (lines 85-97), potentially attacker-influenced and capable of memory-exhaustion.",
+      "reason": "Reachable only through Java (JDK) object serialization of the internal cache, not through JSON/`ObjectMapper` input; outside the untrusted-data boundary reviewed here."
+    },
+    {
+      "lead": "`TypeFactory.findClass`/`JavaType` deserialization (`FromStringDeserializer` STD_CLASS/STD_JAVA_TYPE) allows loading classes named by input strings.",
+      "reason": "Loading without instantiation is the intended feature (used for `Class`-typed properties); no side-effectful instantiation is shown, so it is not itself a vulnerability."
+    },
+    {
+      "lead": "Possible synthetic modification of upstream code (injected vulnerability) elsewhere in the 393 Java files.",
+      "reason": "Spot checks across the deserialization, jsontype, introspection, util and serialization packages matched internally consistent upstream 2.7-branch code and comments; the only anomaly identified is the denylisted-class coverage gap reported as the candidate."
+    }
+  ],
+  "summary": "The snapshot is the Jackson 2.7 branch at pom version 2.7.9.3-SNAPSHOT (393 parsed Java files; no test sources; one non-Java/omitted file). Review concentrated on the polymorphic-deserialization security boundary, which is this library's dominant remotely reachable attack surface. The single strongest candidate is the incompleteness of the `SubTypeValidator` class-name denylist (CWE-184 leading to CWE-502). With default typing / `JsonTypeInfo.Id.CLASS` enabled by the application, the JSON type id is fully attacker-controlled and is resolved to a `Class` via `TypeFactory.findClass`; the only rejection control is a closed set of exact class names plus a narrow Spring-prefix/simple-name heuristic. The tree already shows this control being repeatedly patched (comments for [databind#1680], [databind#1737], [databind#1855]), demonstrating the blocklist is known-incomplete, and it does not yet contain several later-recognized hazardous datasource/JNDI classes (e.g. C3P0 `com.mchange.v2.c3p0.ComboPooledDataSource`, DBCP2 datasource factories, XBean `JndiConverter`). Under the documented usage model (default typing is how users enable polymorphic handling of `Object`/abstract types), any unlisted class on the classpath can be instantiated and have its setters/creators invoked from untrusted JSON, giving environment-dependent RCE/SSRF/DoS. I did not find evidence of a synthetically injected defect elsewhere; all other plausible leads were checked and judged weaker or non-exploitable (details below)."
+}

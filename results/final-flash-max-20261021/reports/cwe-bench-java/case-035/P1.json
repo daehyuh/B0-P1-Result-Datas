@@ -1,0 +1,69 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A network client able to reach the WebAdmin TCP port controls the HTTP method, path, query and body sent to exposed admin routes. Under the standard enabled configuration with JWT authentication left at its default false value, no credential is required. The configured host does not constrain the client's source or the server's listening interface.",
+      "confidence": "high",
+      "counterevidence_checked": "The WebAdmin server is gated by configuration.isEnabled(), so a disabled server is not exposed. If jwt.enabled=true, JwtFilter verifies signature and requires the admin claim, which would prevent the unauthenticated-access impact. A host firewall or reverse proxy could also block the port. The host field is used by SwaggerParser, so it could be mistaken for documentation-only configuration; however, the default host is localhost, TEST_CONFIGURATION sets 127.0.0.1, and the sample/packaged files set host=localhost, indicating an intended local binding/security boundary. The relation index shows no call from WebAdminServer to getHost, consistent with the source review.",
+      "id": "case-035-webadmin-host-ignored",
+      "impact": "Remote unauthenticated administrative access to the mail server control plane. An attacker could enumerate or alter users, domains, aliases, mailboxes, Sieve scripts, repositories, queues, and task state, and could trigger data-export or maintenance operations, depending on the deployed route set. This can compromise mailbox confidentiality and integrity and may allow destructive administrative actions.",
+      "locations": [
+        {
+          "end_line": 115,
+          "path": "server/protocols/webadmin/webadmin-core/src/main/java/org/apache/james/webadmin/WebAdminServer.java",
+          "start_line": 96
+        },
+        {
+          "end_line": 47,
+          "path": "server/protocols/webadmin/webadmin-core/src/main/java/org/apache/james/webadmin/WebAdminConfiguration.java",
+          "start_line": 32
+        },
+        {
+          "end_line": 145,
+          "path": "server/protocols/webadmin/webadmin-core/src/main/java/org/apache/james/webadmin/WebAdminConfiguration.java",
+          "start_line": 119
+        },
+        {
+          "end_line": 157,
+          "path": "server/container/guice/protocols/webadmin/src/main/java/org/apache/james/modules/server/WebAdminServerModule.java",
+          "start_line": 116
+        },
+        {
+          "end_line": 39,
+          "path": "server/container/guice/cassandra-guice/sample-configuration/webadmin.properties",
+          "start_line": 23
+        },
+        {
+          "end_line": 72,
+          "path": "server/protocols/webadmin/webadmin-swagger/src/main/java/org/apache/james/webadmin/swagger/SwaggerParser.java",
+          "start_line": 65
+        }
+      ],
+      "prerequisites": "WebAdmin must be enabled (the packaged/sample config sets enabled=true). JWT authentication must remain disabled (the default) and no external reverse proxy, firewall, or network policy may restrict port 8000. The Spark dependency must use its documented default bind address, 0.0.0.0, because the application never calls service.ipAddress(). Deployments with WebAdmin disabled, JWT enabled, or port access blocked are not exposed this way.",
+      "root_cause": "WebAdminServer.start() configures Spark with service.port(...) but never applies configuration.getHost() via service.ipAddress(...). The host field defaults to \"localhost\" and is populated from webadmin.properties, but its only runtime consumer is Swagger documentation generation. Because JWT authentication defaults to disabled, WebAdminServerModule supplies a NoAuthenticationFilter that performs no checks. With Spark's default bind address, the private admin routes are therefore exposed on all interfaces rather than the configured localhost address.",
+      "title": "WebAdmin configured bind host is ignored, exposing unauthenticated admin routes beyond localhost",
+      "trace": "WebAdminServerModule.provideWebAdminConfiguration reads enabled, port, host, and jwt settings and builds WebAdminConfiguration. providesAuthenticationFilter returns NoAuthenticationFilter when jwt.enabled is false. WebAdminServer.start checks isEnabled(), calls service.port(configuration.getPort().getValue()), installs private routes behind the filter, and starts the service. No call applies configuration.getHost(); searching WebAdmin sources shows getHost() is used only in SwaggerParser. Consequently the host=localhost setting in webadmin.properties does not restrict the listening socket, and Spark's default bind is used. Private routes include account/domain administration, mailbox/repository operations, task execution, and Sieve management.",
+      "unverified": "The exact Spark 2.9.3 default bind address was not read from dependency source or confirmed at runtime in this review. No server was started, no port binding was observed, and no HTTP request was sent. Actual exposure depends on deployment settings and network controls. Some WebAdmin integration tests may not detect the issue because they connect locally even when the bind host is ignored.",
+      "weakness_type": "CWE-668 Exposure of Resource to Wrong Sphere"
+    }
+  ],
+  "coverage_summary": "Source scope reported 4,305 files; P1 indexed 4,248 files with 57 source files missing, 3,096 Java files parsed, no control-flow or data-flow analysis, and unresolved call relations. Review focused on WebAdmin configuration/startup and authentication, JMAP authentication and method dispatch, SMTP authentication/relay hooks, mailbox/message authorization, ManageSieve and Sieve file storage, and selected file-based repositories. The WebAdmin source path was traced end to end through configuration, filter selection, server startup, and the Swagger-only use of the host value. No build, tests, scanners, or runtime checks were executed.",
+  "limitations": [
+    "Not all 4,305 source files were individually reviewed; coverage was broad but targeted.",
+    "Fifty-seven files were absent from the P1 relation index, and the index has no semantic resolution, control-flow, or data-flow proof.",
+    "The Spark 2.9.3 default bind address is dependency behavior not verifiable from the repository snapshot alone; it is the key runtime assumption for the candidate.",
+    "No server was started and no HTTP request was issued, so reachability and unauthenticated access are source-evidence leads, not runtime-confirmed facts.",
+    "The sample configuration explicitly says not to use it as-is, although the packaged Docker template also enables WebAdmin with host=localhost and JWT disabled.",
+    "Deployment firewalls, reverse proxies, WebAdmin enablement, and JWT configuration can change the actual exposure."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SieveFileRepository.putScript/renameScript construct files from script names and enforce only the global sieve root, omitting the per-user boundary; a name such as ../victim/script could target another user's script directory.",
+      "reason": "The write path is source-suspicious and the root check allows sibling user directories, but normal-user reachability with arbitrary script content is uncertain: the network ManageSieve frame decoder is line-oriented and PUTSCRIPT literal content is not visibly aggregated, while other putScript callers are administrative or optional. This was not selected over the WebAdmin exposure without runtime validation."
+    },
+    {
+      "lead": "JMAP request handling and ProcessingContext recursively process attacker-controlled JSON without an obvious depth/size limit.",
+      "reason": "A denial-of-service lead is plausible but no concrete resource-exhaustion path or runtime confirmation was established, and it is weaker than the unauthenticated WebAdmin exposure."
+    }
+  ],
+  "summary": "The strongest source-evidenced candidate is a network-exposure/auth flaw in WebAdmin: the configured bind host is parsed and stored but never applied when the Spark server starts, while WebAdmin authentication defaults to a no-op filter. A standard packaged/sample configuration enables WebAdmin on port 8000 with host=localhost and JWT disabled; if Spark uses its documented default bind address (0.0.0.0), the private admin API is reachable remotely without authentication. This was not runtime-confirmed. Other plausible leads, notably file-backed Sieve script path traversal, were not selected because reachability and attacker content control were less certain."
+}

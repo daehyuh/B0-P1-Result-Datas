@@ -1,0 +1,71 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A remote, unauthenticated attacker controls the HTTP request target (request URI, including path parameters, percent-encoded characters and dot-segments). Shiro derives its authorization-decision path from that attacker-controlled URI (servletPath/pathInfo), so the attacker chooses the value matched against the configured chain patterns and the value the container/framework eventually dispatches on.",
+      "confidence": "medium",
+      "counterevidence_checked": "Current snapshot already contains substantial mitigations, so I checked whether any of them closes the gap: (1) removeSemicolon() strips everything after the first ';' — blocks the classic '/admin/..;/' form; (2) normalize() resolves '/../' and '/./' and collapses '//' — blocks plain decoded traversal; (3) PathMatchingFilterChainResolver strips a single trailing '/' from both the derived request path and the configured pattern (lines 104, 122-124) — that is the 1.8.0/1.11.0 trailing-slash fix; (4) InvalidRequestFilter is registered as a global filter by default in IniFilterChainResolverFactory (line 55), ShiroFilterFactoryBean (line 145) and ShiroWebModule (line 131) and blocks ';', '\\' and non-ASCII; (5) Spring Boot users get ShiroEnvironmentPostProcessor forcing spring.mvc.pathmatch.matching-strategy=ant_path_matcher and ShiroUrlPathHelper routing Spring's lookup path through WebUtils, which neutralizes the PathPatternParser double-resolution variant for that integration; (6) RegExPatternMatcher uses Pattern.DOTALL (CVE-2022-32532 fixed), and remember-me uses a per-instance random AES key (Shiro-550 mitigated). Residual gap that keeps the candidate alive: none of the above canonicalizes a surviving trailing '/..'-style segment, decodes/validates percent-encoded dot-segments, treats alternate separators consistently, or verifies that the Shiro path and the container/framework-resolved path are identical; normalize() explicitly disclaims security checking, and the InvalidRequestFilter deliberately does not inspect '.', '%2e', '%2f' or '%5c'.",
+      "id": "shiro-path-chain-bypass",
+      "impact": "Potential authentication/authorization bypass: an unauthenticated or lower-privileged remote user can reach URL-pattern-protected resources that the configured Shiro chains are intended to guard. Secondary impact of the same mismatch: the wrong filter chain (missing authc/roles/perms filters) executes for a protected resource. This is the same defect class as the Shiro path-traversal bypass advisories against the 1.11.0 line (CVE-2023-34478 fixed in 1.12.0; CVE-2023-46749 fixed in 1.13.0).",
+      "locations": [
+        {
+          "end_line": 115,
+          "path": "web/src/main/java/org/apache/shiro/web/util/WebUtils.java",
+          "start_line": 113
+        },
+        {
+          "end_line": 234,
+          "path": "web/src/main/java/org/apache/shiro/web/util/WebUtils.java",
+          "start_line": 183
+        },
+        {
+          "end_line": 252,
+          "path": "web/src/main/java/org/apache/shiro/web/util/WebUtils.java",
+          "start_line": 244
+        },
+        {
+          "end_line": 135,
+          "path": "web/src/main/java/org/apache/shiro/web/filter/mgt/PathMatchingFilterChainResolver.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 109,
+          "path": "web/src/main/java/org/apache/shiro/web/filter/InvalidRequestFilter.java",
+          "start_line": 57
+        }
+      ],
+      "prerequisites": "A web application using Shiro's filter-chain resolver (PathMatchingFilterChainResolver / PathMatchingFilter, i.e. URL patterns such as '/admin = authc' plus a permissive fallback such as '/** = anon') and a servlet container or framework layer whose request-path canonicalization/dispatch differs from Shiro's normalize()+removeSemicolon() text pass (version-specific behavior, e.g. encoded separators such as %2e/%2f/%5c, dot-segments terminated by ';', backslash handling, or double-decoding in a Spring layer). Where a chain definition maps only an exact protected path (rather than '/protected/**'), the mismatch is easier to reach because the derived path fails the exact pattern and falls through to the permissive chain.",
+      "root_cause": "WebUtils.getPathWithinApplication() builds the path used for all Shiro filter-chain and path-pattern decisions as normalize(removeSemicolon(getServletPath(request) + getPathInfo(request))) (web/src/main/java/org/apache/shiro/web/util/WebUtils.java:113-115). removeSemicolon() only truncates at the first ';' (lines 249-252) and normalize() only rewrites the literal sequences '//', '/./' and '/../' (lines 183-234); its own javadoc states it 'does not try to perform security checks for malicious input'. Paths whose dot-segments survive that textual pass (e.g. a trailing '/..', a dot-segment terminated by a semicolon or by percent-encoded separators, or characters the container decodes after Shiro has already computed its path) are therefore used as-is for the chain decision by PathMatchingFilterChainResolver.getChain() (web/src/main/java/org/apache/shiro/web/filter/mgt/PathMatchingFilterChainResolver.java:103-135) and by PathMatchingFilter.pathsMatch() (web/src/main/java/org/apache/shiro/web/filter/PathMatchingFilter.java:123-127). If the container/Spring resolves the same request to the protected resource, the request is served by a permissive chain (e.g. the fallback '/**' / anon chain) although its chain matching was performed against a different, unnormalized path — an authentication/authorization bypass.",
+      "title": "Authorization filter-chain decision uses a non-canonical path derived from servletPath/pathInfo, allowing crafted request paths to bypass Shiro's chain matching",
+      "trace": "Request URI (attacker-controlled) -> container sets servletPath/pathInfo -> WebUtils.getServletPath()/getPathInfo() (WebUtils.java:139-147) -> WebUtils.removeSemicolon() (249-252) -> WebUtils.normalize() (183-234, unresolved dot-segments/encoded separators survive) -> PathMatchingFilterChainResolver.getChain() compares this derived path against configured chain names using AntPathMatcher (103-135) -> a permissive chain is selected -> PathMatchingFilter (or the chain's filters) run/isPermitted checks against the permissive chain -> the request reaches the container/framework-mapped protected handler, whose own resolution of the same URI resolves differently. The same resolved path also drives AuthorizationFilter/AuthenticationFilter 'isLoginRequest' matching and can route the request through 'anon'/'user' filters instead of 'authc'/'roles'/'perms'.",
+      "unverified": "Runtime reachability was not verified (no code execution, no tests present in the snapshot — src/test is excluded, and the environment forbids running builds/scanners). The concrete mismatch depends on the servlet container and framework version (Tomcat/Jetty/Undertow canonicalization, encoded-slash/backslash policy, Spring MVC matching strategy). I did not confirm that a specific container+filters combination in this snapshot yields a working bypass, and I could not consult the upstream fix commits or advisories, so the exact CVE-to-code mapping (CVE-2023-34478 vs CVE-2023-46749) is inferred, not verified.",
+      "weakness_type": "Authentication/authorization bypass via path canonicalization mismatch (CWE-22 / CWE-863 class)"
+    }
+  ],
+  "coverage_summary": "Snapshot: 756 model-visible files (578 Java, per the relation index), no excluded sensitive files, no binaries. Read/verified by source text: web module filter-chain resolution and path handling (WebUtils, PathMatchingFilterChainResolver, DefaultFilterChainManager, InvalidRequestFilter, PathMatchingFilter, AccessControlFilter, AuthenticationFilter/FormAuthenticationFilter/LogoutFilter, AuthorizationFilter, ShiroHttpServletRequest, SimpleCookie, DefaultWebSessionManager, RedirectView, SavedRequest), Spring integration (ShiroFilterFactoryBean, AbstractShiroWebFilterConfiguration, ShiroUrlPathHelper, ShiroRequestMappingConfig, ShiroEnvironmentPostProcessor, ShiroWebMvcAutoConfiguration), Guice/JAX-RS/CAS integration entry points, core authc/authz (ModularRealmAuthorizer, WildcardPermission, annotation handlers, SimpleCredentialsMatcher, HashedCredentialsMatcher, DefaultPasswordService), session/remember-me internals, and crypto defaults (AesCipherService/JcaCipherService/normalize/randomness). Relation index coverage is partial: 702 of 756 files indexed, 54 source files missing from the index, 578 parsed Java files, 4,645 unresolved calls, and capabilities explicitly report no control-flow, no data-flow, no semantic resolution and only annotation-name Spring hints — so no reachability or enforcement claim rests on index labels. I did not read every one of the 578 Java files line-by-line (e.g. LDAP/JDBC realm internals, JDBC/Properties/Ini realms, tags, hazelcast/ehcache/quartz/aspectj support, tools, and the samples/integration-tests trees were only skimmed).",
+  "limitations": [
+    "No tests exist in the snapshot (src/test is absent), and per instructions no code, build, or scanner was executed, so every behavioral claim is static and unconfirmed; the candidate is a lead, not a confirmed vulnerability.",
+    "The exact upstream fix commit/CVE-to-line mapping could not be consulted (no web access; no git history or patch files in the snapshot), so the finding is reasoned from source evidence plus version context (pom 1.11.0, Dec-2022 dependency set), not from the advisory diff.",
+    "Exploitability is container/framework-version dependent: Tomcat/Jetty/Undertow reject or rewrite some encoded traversal forms (e.g. %2f handling, '//' collapsing), so the mismatch may be neutralized by the deployment; conversely, deployments that do not use ShiroEnvironmentPostProcessor/ShiroUrlPathHelper (plain Spring MVC, legacy containers) widen it. I could not verify either case here.",
+    "The P1 relation index omits 54 files and 4,645 calls are unresolved; areas not surfaced by the index (no data-flow/control-flow) were reviewed only by direct text reading, and files I did not read remain uninspected rather than implicitly clean.",
+    "Findings were capped at one candidate by the review contract; the open-redirect lead (redirectToSavedRequest/RedirectView) is the strongest secondary lead and could become the primary finding under a different ground-truth mapping."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Open redirect via saved request after form login: SavedRequest.getRequestUrl() is request.getRequestURI() plus query string (web/src/main/java/org/apache/shiro/web/util/SavedRequest.java:43-67), passed with contextRelative=false by WebUtils.redirectToSavedRequest() (web/src/main/java/org/apache/shiro/web/util/WebUtils.java:682-703) into RedirectView, whose sendRedirect() emits the target URL unvalidated (web/src/main/java/org/apache/shiro/web/util/RedirectView.java:295-306) — a raw '//evil.com/...' target becomes a protocol-relative Location header.",
+      "reason": "Plausible and source-evident (this matches the CVE-2023-46750 'form authentication open redirect' class), but it requires the container to preserve a '//'-prefixed raw request URI into getRequestURI(), needs the victim to be in the not-authenticated + saved-request flow, and the impact (phishing-style redirect) is lower than the authorization bypass. Kept as an unconfirmed alternative to the single submitted candidate."
+    },
+    {
+      "lead": "Remember-me deserialization of attacker-supplied cookies (AbstractRememberMeManager.decrypt/deserialize, core/src/main/java/org/apache/shiro/mgt/AbstractRememberMeManager.java:462-485; ClassResolvingObjectInputStream, lang/src/main/java/org/apache/shiro/io/ClassResolvingObjectInputStream.java).",
+      "reason": "Not a snapshot-specific vulnerability: the constructor generates a per-instance random AES key (AbstractRememberMeManager.java:95-100), so the historical static-key issue (Shiro-550) is mitigated by default; exploitation requires an operator-supplied known/static cipher key and a gadget chain on the classpath (configuration issue, not a source-level bug in this snapshot)."
+    },
+    {
+      "lead": "Session id accepted from URL path/query parameters (DefaultWebSessionManager.getReferencedSessionId/getUriPathSegmentParamValue, web/src/main/java/org/apache/shiro/web/session/mgt/DefaultWebSessionManager.java:121-210) enabling session-fixation/URL-leak classes.",
+      "reason": "Deliberate backwards-compatibility behavior for URL rewriting in Shiro 1.x (documented SHIRO-351 code); sessionIdUrlRewritingEnabled=false only controls URL generation, and no source evidence of an injected defect. Rejected as a design weakness rather than a distinct finding."
+    },
+    {
+      "lead": "Hard-coded credentials in bundled samples (e.g. samples/spring-hibernate BootstrapDataPopulator admin/admin, samples shiro.ini users).",
+      "reason": "Sample/demo code, not part of the shipped framework runtime; no trust boundary crossing in production code."
+    }
+  ],
+  "summary": "Reviewed the Apache Shiro snapshot (pom version 1.11.0; Spring 5.3.23 / Spring Boot 2.7.7 / hibernate 5.6.14 ⇒ repo state ≈ the 1.11.0 release, Dec 2022). Coverage was broad but source-only: web filter-chain resolution/path handling, the Spring/Guice/Boot integrations, core authc/authz, session management, cookies/remember-me, and crypto defaults were read; the highest-risk surface is still web request-path handling, where the filter-chain decision path and the servlet-container/Spring dispatch path can diverge. The single strongest candidate is that Shiro's authorization-decision path is derived from container-decoded `getServletPath()+getPathInfo()` with only best-effort textual normalization, leaving unresolved dot-segments/encoded separators able to defeat chain matching while the underlying request is still routed to the protected resource (authentication/authorization bypass) — the class of issue fixed in the Shiro 1.12.0/1.13.0 line (CVE-2023-34478 path traversal auth bypass; later CVE-2023-46749). This is a lead, not a confirmed exploit: exploitation depends on container/framework canonicalization behavior, and several mitigations are present in this snapshot."
+}

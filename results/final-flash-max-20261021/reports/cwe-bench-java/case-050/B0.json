@@ -1,0 +1,60 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The entire input is attacker-controlled JSON-like content passed to JsonSanitizer.sanitize(...) / EvalMinifier.minify(...); the attacker chooses characters and JS escapes inside a string literal, e.g. the six-character input `\"]\\]>\"` (quote, ], backslash, ], >, quote).",
+      "confidence": "medium",
+      "counterevidence_checked": "Tested the analogous `</script` path: the only character ever elided in sanitizeString is a backslash (lines 565, 584, 592, 614), and a backslash immediately preceding '/' is a recognized escape retained verbatim (lines 570-573), so a `<` + elided-char + `/sc` construct could not be built; the `/` guard additionally requires the raw predecessor to be '<'. Verified the `]` guard's lookahead (`i+2<end`) is not the limiting factor: a full raw `]]>` would satisfy it, so the failure is specifically the raw-adjacency test. Confirmed the output is still valid JSON/JS (`\"]]>\"`), i.e. this is a loss of the embedding guarantee, not a syntax break. No code was executed; the trace is a static reading of the state machine and buffer bookkeeping.",
+      "id": "json-sanitizer-cdata-embedding-guard-bypass",
+      "impact": "An application that trusts the documented property and places sanitized output into an XML CDATA section (XHTML/SOAP/RSS/SVG wrappers etc.) has the CDATA section terminated early by attacker-influenced content; remaining attacker-controlled string content is then parsed as markup instead of text, enabling markup/script injection (XSS / XML injection) in the embedding document. The same property underpins the HTML `<script>` embedding claim, though no `</script` instance could be constructed (see counterevidence).",
+      "locations": [
+        {
+          "end_line": 561,
+          "path": "src/main/java/com/google/json/JsonSanitizer.java",
+          "start_line": 544
+        },
+        {
+          "end_line": 615,
+          "path": "src/main/java/com/google/json/JsonSanitizer.java",
+          "start_line": 611
+        },
+        {
+          "end_line": 72,
+          "path": "README.md",
+          "start_line": 71
+        }
+      ],
+      "prerequisites": "Application relies on the library's advertised guarantee (class Javadoc lines 60-61; README line 72) that sanitized output contains no `]]>` and is therefore safe to splice into an XML CDATA section without further encoding, and applies the sanitizer to untrusted content (its stated use case).",
+      "root_cause": "The embedding guards in sanitizeString test adjacency in the pre-sanitization buffer (`jsonish`) rather than in the output. The backslash default branch (lines 611-615) elides the backslash of a JS NonEscapeCharacter escape (e.g. `\\]`), so characters that are not adjacent in `jsonish` become adjacent on output. The `]` guard (lines 556-561) only triggers when `jsonish.charAt(i+1)==']' && jsonish.charAt(i+2)=='>'` at the same raw index, so it misses a `]]>` created by eliding an intervening backslash.",
+      "title": "JsonSanitizer can emit `]]>` in its output, defeating the documented XML/HTML embedding guarantee (CDATA breakout)",
+      "trace": "1) Input `\"]\\]>\"` (chars: 0 '\"', 1 ']', 2 '\\\\', 3 ']', 4 '>', 5 '\"'). 2) Main loop case '\"' -> endOfQuotedString returns 6, so sanitizeString(0,6) is called. 3) i=1 ']': guard reads raw charAt(2)='\\\\' != ']' -> no replacement. 4) i=2 '\\\\': inner switch on charAt(3)=']' falls to default (lines 611-615), elide(2,3) drops the backslash from the output. 5) i=3 ']': guard reads raw charAt(4)='>' != ']' -> no replacement. 6) Loop finishes with closed=true; sanitize() then appends jsonish[3..6)=`]>\"` after the buffered prefix, producing output `\"]]>\"`, which contains the raw substring `]]>`. 7) JS evaluation semantics are unchanged (`\\]` is a NonEscapeCharacter equal to `]`), but the documented CDATA-embedding property is violated.",
+      "unverified": "Not runtime-confirmed. The security impact requires a downstream consumer to actually embed the sanitized output in an XML CDATA (or similar) context; the library documents this as a supported output property but the snapshot has no callers or tests. Whether upstream treats `]]>` escaping as contractual or best-effort is not further qualified in the visible docs/source.",
+      "weakness_type": "Improper output neutralization / security-property bypass in a sanitizer (CWE-116/CWE-79 class)"
+    }
+  ],
+  "coverage_summary": "Model-visible scope: 11 text files (0 binaries excluded, 0 files over 5 MiB). Read in full: src/main/java/com/google/json/JsonSanitizer.java (1149 lines), README.md, and EvalMinifier.java lines 1-300. File listings confirm there are no test sources, resources, or additional Java classes. Not deeply inspected: pom.xml, .travis.yml, docs/*, src/site/site.xml, package-info.java, and EvalMinifier.java lines 300-341. No code execution, builds, tests, scanners, or history inspection were performed (nor permitted); all conclusions are static source reading.",
+  "limitations": [
+    "No runtime confirmation: the `]]>` bypass trace is a careful static simulation of the state machine and StringBuilder bookkeeping, not an executed test.",
+    "No test sources or callers exist in the snapshot, so the downstream embedding context that determines real-world impact cannot be observed here.",
+    "Whether the snapshot matches a specific upstream release or known advisory could not be checked (no network, no repository history).",
+    "pom.xml dependency/build configuration, docs, and EvalMinifier NameGenerator (lines 300-341) were not reviewed and could contain additional context."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Octal-escape conversion computes values over the wrong character range (JsonSanitizer.java lines 594-610: value loop starts at `j = i`, i.e. at the backslash instead of the first digit, and the third-digit test uses `ch` (the backslash) instead of the digit). Static trace: `\"\\012\"` becomes `\\u000612` (JS value ACK + \"12\") instead of `\\u000a`.",
+      "reason": "Strong correctness defect versus the README's documented `\\012` conversion, but I found no direct injection or embedding-guard bypass: the branch never removes a backslash and never emits a raw '/' or '>', so it cannot create `</script` or `]]>` adjacency. Kept as an unconfirmed lead rather than the single candidate because its security impact is a downstream semantic change, not a demonstrated injection."
+    },
+    {
+      "lead": "Configured maximum nesting depth is used as an array size but never enforced (JsonSanitizer.java lines 250-258: `isMap[bracketDepth] = map` with no bound check against `maximumNestingDepth`, default 64, cap 4096).",
+      "reason": "Input with 65 nested `[` triggers ArrayIndexOutOfBoundsException inside sanitize() instead of graceful handling (availability/DoS), but this may be an intended hard cap and the impact is an uncaught exception, not memory corruption; weaker security evidence than the embedding-guarantee bypass."
+    },
+    {
+      "lead": "Possible `</script` escaping bypass analogous to the `]]>` bypass using an elided backslash (e.g. `<\\-/script`, `<\\u002fscript`, octal `\\57`, doubled backslashes).",
+      "reason": "Could not substantiate: the only character elided by sanitizeString is a backslash, and a backslash immediately before '/' is a recognized escape retained verbatim (lines 570-573), so raw `<` and `/` adjacency cannot be produced on output."
+    },
+    {
+      "lead": "Hex/unicode escape branches could accept malformed sequences or leave JS-only escapes in the output.",
+      "reason": "The `\\x`/`\\u` branches either rewrite to `\\u00xx` or elide only the backslash and leave the following character intact; I found no path that manufactures a guard-relevant adjacency or leaves an unescaped U+2028/U+2029, so this remains unconfirmed."
+    }
+  ],
+  "summary": "Reviewed the 11-file OWASP json-sanitizer snapshot. The main security surface is src/main/java/com/google/json/JsonSanitizer.java (read in full); EvalMinifier.java consumes its output (lines 1-300 read). One source-evidenced candidate is submitted: the `]]>` output filter in sanitizeString is bypassable because it tests adjacency in the raw input while the output buffer may have a backslash elided, so sanitized output can still contain `]]>` (e.g. input `\\\"]\\\\]>\\\"` -> output `\\\"]]>\\\"`), defeating the library's documented CDATA/HTML embedding guarantee. Other leads examined (octal-escape mis-conversion, unenforced nesting-depth bound, possible `</script` equivalent) are reported as rejected/unconfirmed rather than additional candidates."
+}

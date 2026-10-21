@@ -1,0 +1,92 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remote HTTP GET to the middleware remoting servlet: /remoting/download?s=<session UUID>&p=<path>. The 'p' value is fully attacker-controlled (raw or percent-encoded, including '+'-encoded spaces), and is passed through URLDecoder twice, so '..' / '%2e%2e' and '%2f' traversal encodings are accepted. No method-level permission or role check is applied to the 'p' branch.",
+      "confidence": "high",
+      "counterevidence_checked": "Verified that the session check exists (getSession) — a valid/refreshable session UUID is needed unless the anonymous session (created at startup by AnonymousSessionHolder with the platform-default constant id) is used. Verified the default cuba.download.directories value and that it is non-empty, so the 'p' branch is enabled by default; verified the remoting servlet has no filter/interceptor/authorization and exposes the controller. Verified that the check only applies replace(\"\\\\\",\"/\") — no canonicalization or '..' rejection — and that URLDecoder double-decoding does not neutralize traversal. Checked the sibling LogDownloadController, which does sanitize with FilenameUtils.getName, showing the codebase knows the pattern but FileDownloadController does not apply it.",
+      "id": "case-179-cuba-filedownload-path-traversal",
+      "impact": "Authenticated (with the default anonymous session id, unauthenticated) arbitrary file read as the middleware process user. Files readable by the middleware JVM can be exfiltrated: application configuration in cuba.confDir (DB credentials, trusted-client password, keystore paths), Tomcat configuration/logs, WEB-INF content, /etc/passwd and similar OS files. Reading deployment secrets can enable privilege escalation/lateral movement; the endpoint itself does not require any specific role or permission.",
+      "locations": [
+        {
+          "end_line": 152,
+          "path": "modules/core/src/com/haulmont/cuba/core/controllers/FileDownloadController.java",
+          "start_line": 140
+        },
+        {
+          "end_line": 168,
+          "path": "modules/core/src/com/haulmont/cuba/core/controllers/FileDownloadController.java",
+          "start_line": 154
+        },
+        {
+          "end_line": 108,
+          "path": "modules/core/src/com/haulmont/cuba/core/controllers/FileDownloadController.java",
+          "start_line": 66
+        },
+        {
+          "end_line": 38,
+          "path": "modules/core/src/com/haulmont/cuba/app.properties",
+          "start_line": 37
+        },
+        {
+          "end_line": 24,
+          "path": "modules/core/src/com/haulmont/cuba/remoting-spring.xml",
+          "start_line": 24
+        },
+        {
+          "end_line": 47,
+          "path": "modules/core/web/WEB-INF/web.xml",
+          "start_line": 38
+        }
+      ],
+      "prerequisites": "1) Network reachability of the middleware remoting servlet (/remoting/*, default dispatcherBaseUrl .../remoting). 2) cuba.download.directories set (a platform default: ${cuba.tempDir};${cuba.logDir}). 3) A session resolvable by UserSessionsAPI.getAndRefresh() for the 's' value: any authenticated user's own session UUID works (e.g. taken from a legitimate middleware download URL), and if the platform default cuba.anonymousSessionId=9c91dbdf-3e73-428e-9088-d586da2434c5 is left in place the anonymous session is created at startup and the request is unauthenticated. 4) The caller must know/guess the literal allowed-directory prefix (leaked by normal application-generated download URLs).",
+      "root_cause": "FileDownloadController.getFile() decodes the attacker-supplied 'p' parameter (URLEncodeUtils.decodeUtf8(request.getParameter(\"p\")) — a second decode after the container's own) and authorizes it only with isPermittedDirectory(), which merely checks filePath.startsWith(d) for each configured directory (after appending a trailing '/'). No canonical path resolution is performed and '..' segments are neither rejected nor normalized, so a path such as <allowedDir>/../../../../etc/passwd passes the check and is then turned into a File and streamed to the client in download() (file = getFile(...); FileUtils.openInputStream(file)).",
+      "title": "Path traversal in middleware FileDownloadController allows arbitrary file read",
+      "trace": "(1) HTTP request reaches RemotingServlet (extends DispatcherServlet, mapped /remoting/* in modules/core/web/WEB-INF/web.xml); remoting-spring.xml component-scans com.haulmont.cuba.core.controllers, registering FileDownloadController. (2) download() (line 66) accepts the request after getSession() only checks that userSessions.getAndRefresh(sessionId) != null. (3) Because request.getParameter(\"p\") != null, getFile() is called (line 76-77). (4) getFile() (line 140-152) decodes 'p' and calls isPermittedDirectory(). (5) isPermittedDirectory() (line 154-168) returns true for any string beginning with one of the configured directories, so '<permitted>/../../../etc/passwd' is accepted. (6) getFile() returns new File(filePath); download() opens it with FileUtils.openInputStream(file) (line 91) and copies the bytes into the HTTP response (lines 92-94) — no canonicalization, no '..' check, no permission check on the target file.",
+      "unverified": "Actual exploitability depends on deployment: whether the application overrides cuba.anonymousSessionId (only then is the request truly unauthenticated), whether the middleware port is reachable by the attacker, and whether the attacker can determine the exact allowed-directory prefix. No code execution or runtime test was performed; the file read was established only by static source tracing.",
+      "weakness_type": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Source scope: 4,462 model-visible files (3,724 Java, plus XML/properties/SQL); binary-like files skipped by the NUL-byte filter; no symlinks or sensitive-name exclusions reported. P1 relation index: 4,459 files indexed, 3 source files missing from the index; capabilities limited to syntax containment and name/type/arity call/inheritance candidates — control flow, data flow and semantic resolution are 'not_implemented', and Spring annotation candidates are explicitly unverified (89,835 unresolved calls). I inspected: core/web/portal controllers and servlets; remoting (HttpServiceExporter, RemotingServlet, ServiceExportHelper, serialization); authentication/session handling (AuthenticationServiceBean, providers, AnonymousSessionHolder, UserSessions, TrustedClientService); file storage/upload/download; scripting/Groovy call sites and query macros; XML parsing (Dom4j) helpers; JDBC/query/config loading; and selected GUI/desktop usages. Coverage caveats: the large Vaadin UI/widget code (modules/gui, most of modules/web UI), desktop module internals, db update scripts and most of the 4,459 indexed files were not read line-by-line, so additional issues may exist there; the relation index cannot prove reachability or data flow and was used only for navigation, with every cited edge verified against source text.",
+  "limitations": [
+    "Static review only: no code was executed, no build/tests/scanners were run, and no runtime behaviour was confirmed.",
+    "The path-traversal candidate requires deployment conditions that cannot be verified from source: middleware network exposure, whether cuba.anonymousSessionId is left at the platform default (for the unauthenticated case), and whether the attacker can determine the exact permitted-directory prefix.",
+    "The relation index is syntactic and partial (3 files missing; no data-flow/control-flow/semantic resolution), so call/reachability claims were validated manually and may still miss indirect invocations.",
+    "Dependency-CVE exposure (e.g. Spring HttpInvoker, XStream, JGroups) was noted only where source showed usage; gadget-chain availability on a real classpath was not verified.",
+    "Large UI/GUI/desktop areas were reviewed only at selected security-relevant points, not exhaustively."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Java deserialization of untrusted HTTP data in remoting: HttpServiceExporter.doReadRemoteInvocation → SerializationSupport/StandardSerialization.readObject (no class filtering), with Spring HttpInvokerServiceExporter serving /remoting/cuba_*Service.",
+      "reason": "Real hardening concern (CWE-502) and the endpoint is unauthenticated at read time, but exploitability depends on a working gadget chain on the deployment classpath (commons-collections4/groovy/xstream are present, yet no chain was verified) and this is the framework's documented trusted-client transport; not selected over the fully source-traceable traversal."
+    },
+    {
+      "lead": "FileUploadController (/remoting/upload) accepts f=id,extension,createDate and FileStorage.getFileName concatenates id + '.' + extension, so a '..' extension can escape the storage root at write time.",
+      "reason": "Source-confirmed input path, but FileDescriptor.setExtension truncates to 20 characters, severely limiting traversal depth and target name length; concrete high-impact write target could not be established from source."
+    },
+    {
+      "lead": "ResourceService.getResourceAsString → ConfigurationResourceLoader.getResource supports 'file:'/'http:' URLs and confDir-relative paths (new File(confDir, location)), giving file read/SSRF to any client that can invoke the remote service.",
+      "reason": "URL-based resource loading is documented/intended behaviour and service invocation relies on the platform's trusted-client model; no clear broken validation boundary compared with the traversal candidate."
+    },
+    {
+      "lead": "Hardcoded default cuba.trustedClientPassword=MLdWm1Ik4NmM in modules/core/src/com/haulmont/cuba/app.properties (and app-component.xml/web-app.properties).",
+      "reason": "Remote trusted login is IP-restricted: RemotingServlet sets RemoteClientInfo and AuthenticationServiceBean.preprocessCredentials overwrites clientIpAddress from the real remote address, then TrustedLoginHandler.checkAddress applies the default localhost whitelist; not exploitable from arbitrary hosts."
+    },
+    {
+      "lead": "Reflected XSS in CubaApplicationServlet.redirectWithBlankHtmlPage: request parameter names/values are appended unencoded and injected into the redirect-page template (meta refresh and window.location.href).",
+      "reason": "Gated by cuba.web.useRedirectWithBlankPageForLinkAction, whose default is false (WebConfig @DefaultBoolean(false)); with the default configuration sendRedirect is used instead."
+    },
+    {
+      "lead": "ClusterManager/JGroups deserializes Java objects from any received message and the default stacks (jgroups.xml/jgroups_tcp.xml) have no AUTH/encryption.",
+      "reason": "Requires network access to the cluster multicast/TCP ports and assumes a trusted network; impact and reachability cannot be established from source alone."
+    },
+    {
+      "lead": "RememberMeToken generated with RandomStringUtils.randomAlphanumeric (java.util.Random-based PRNG).",
+      "reason": "Weak PRNG for a security token (CWE-330) but practical token prediction/forgery was not established from source; lower confidence than the traversal."
+    },
+    {
+      "lead": "TestingServiceBean.executeUpdateSql/executeSelectSql run raw SQL; clearScheduledTasks deletes scheduled tasks without the test-mode check.",
+      "reason": "The SQL methods are gated by the cuba.unitTestMode system property; remaining impact is limited availability/data deletion and service-invocation trust assumptions."
+    }
+  ],
+  "summary": "Reviewed the CUBA Platform 7.2 source snapshot (4,462 visible files, 3,724 Java; XML/properties/SQL also present; binaries refused by the NUL-byte filter). I traced HTTP entry points, the middleware remoting layer, authentication/session handling, file storage/upload/download, scripting (Groovy) call sites, XML parsing helpers, JDBC/query code and configuration loading. The single strongest source-evidenced candidate is an arbitrary-file-read path traversal in the middleware FileDownloadController: `request.getParameter(\"p\")` is URL-decoded and validated only with a raw `String.startsWith` against `cuba.download.directories`; `..` segments are accepted and the string is passed to `new File(...)` and `FileUtils.openInputStream(...)`. The endpoint is exported by the RemotingServlet (which component-scans `com.haulmont.cuba.core.controllers`) at `/remoting/download`, and the default allowed directories are `${cuba.tempDir}` and `${cuba.logDir}`, so `<allowedDir>/../../../../…` bypasses the intended containment check. Other security-relevant issues I found (HttpInvoker Java deserialization, FileDescriptor-extension write traversal, ResourceService file:/SSRF reads, default trusted-client password, config-gated reflected XSS in CubaApplicationServlet, JGroups cluster deserialization, weak remember-me token PRNG, test-only SQL service) are weaker/conditional and are listed as rejected leads."
+}

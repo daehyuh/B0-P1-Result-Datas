@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker fully controls the contents and entry names of the `.pear` file (a ZIP/JAR) that the victim installs, merges, or migrates. Entry names such as `../../<name>` or Windows `..\\..\\<name>` are accepted by `java.util.jar.JarFile`/`JarEntry` and are used verbatim as filesystem paths. Delivery can be a local path or a URL (InstallationController extracts a downloaded remote PEAR as well, lines 761-777). The extraction happens before any verification, and the packaged CLI tools (`runPearInstaller*`, `runPearMerger*`, `runV3migrateJCas*`) and the public APIs `PackageInstaller.installPackage` / `InstallationController.extractPEARFile` are callable on an untrusted archive.",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched the extraction stack for canonical-path, `normalize`, `startsWith(targetDir)` or `..` validation (none present in uimaj-core pear tooling); verified `DirFileFilter` only checks extension/dir prefix and accepts traversing names; verified `PackageBrowser`/`InstallationDescriptorHandler` do not sanitize entry names; verified XML parsing in this version is hardened via `XMLUtils` (`disallow-doctype-decl`, `accessExternalDTD/Stylesheet` disabled) so XXE is not the issue here. Considered that installing a PEAR is already a semi-trusted operation (PEARs contain executable components and descriptor actions can rewrite files), which reduces the marginal impact in install-and-run flows, but writing files outside the declared installation root exceeds any intended behavior and can occur before the component is ever run or verified. This is a lead, not a runtime-confirmed vulnerability.",
+      "id": "UIMA-330-ZIPSLIP-1",
+      "impact": "Arbitrary file creation/overwrite outside the intended PEAR installation directory with attacker-chosen content, under the privileges of the user/tool performing the install. A crafted PEAR can overwrite user or deployment files that are later read or executed (configuration, shell profiles, start-up scripts, class/JAR files in directories that are subsequently loaded), or corrupt/overwrite files to cause denial of service. The write occurs during extraction, before installation verification, so even package-inspection/verify flows are affected.",
+      "locations": [
+        {
+          "end_line": 759,
+          "path": "uimaj-core/src/main/java/org/apache/uima/pear/util/FileUtil.java",
+          "start_line": 729
+        },
+        {
+          "end_line": 826,
+          "path": "uimaj-core/src/main/java/org/apache/uima/pear/tools/InstallationController.java",
+          "start_line": 722
+        },
+        {
+          "end_line": 187,
+          "path": "uimaj-core/src/main/java/org/apache/uima/pear/tools/PackageInstaller.java",
+          "start_line": 119
+        },
+        {
+          "end_line": 363,
+          "path": "uimaj-tools/src/main/java/org/apache/uima/tools/pear/merger/PMController.java",
+          "start_line": 357
+        }
+      ],
+      "prerequisites": "Victim runs one of the UIMA PEAR tooling entry points or API calls on an attacker-supplied PEAR: e.g. `PackageInstaller.installPackage()` (used by `InstallPearCli`, `InstallPear` GUI), `InstallationController.extractPEARFile()`, `PMController.mergePears()` (PEAR merger), or `MigrateJCas` which installs PEARs found in a scanned project (uimaj-v3migration-jcas/src/main/java/org/apache/uima/migratev3/jcas/MigrateJCas.java lines 388-392). No authentication or package-signature check exists in these paths. The write executes with the privileges of the installing user/process (often targeting `UIMA_HOME` or shared deployment directories).",
+      "root_cause": "`FileUtil.extractFilesFromJar(JarFile, File targetDir, FileFilter)` enumerates archive entries and builds the output path as `new File(targetDir, jarEntry.getName())` (line 741) and writes the entry bytes to that path (lines 746-755) without normalizing or validating that the resolved path stays inside `targetDir`. Archive entry names are attacker-controlled and may contain `..` segments (or platform separators), so `targetDir/../../...` escapes the intended install/extraction root. The same missing containment check exists in every variant that funnels through this method (`extractFilesFromJar`, `extractFilesWithExtFromJar`, `extractDirectoryFromJar`); `DirFileFilter` only checks filename extension and directory prefix strings and does not reject traversal segments.",
+      "title": "Zip Slip path traversal in PEAR package extraction (FileUtil.extractFilesFromJar) allows writes outside the installation directory",
+      "trace": "PEAR archive -> `InstallationController.extractFilesFromPEARFile` (line 792 `new JarFile(pearFile)`; lines 793-796 dispatch to `FileUtil.extractFilesFromJar`/`extractFilesWithExtFromJar`) -> `FileUtil.extractFilesFromJar` (line 733 iterates `jarFile.entries()`) -> line 741 `File file = new File(targetDir, jarEntry.getName())` -> lines 743-745 create the parent directories of the unvalidated path -> lines 746-755 `new FileOutputStream(file)` and copy attacker-controlled bytes. Callers confirmed: `InstallationController.installComponent` (extract at 1562), `installComponentDescriptors` (extract at 1627), the public `extractPEARFile` (842-845), `PMController.extractInputPears` (361), and transitively `PackageInstaller.installPackage` (controller created at 183, install at 187).",
+      "unverified": "No code execution, test, or exploit was performed. Exploitability depends on the victim installing/merging an attacker-supplied PEAR and on filesystem permissions of the installing user. I could not confirm which of several real issues in this snapshot corresponds to the benchmark's intended finding; the unsafe CAS Java-deserialization path and the unvalidated `componentId`-derived install directory remain plausible alternative leads (see rejected leads).",
+      "weakness_type": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal' / Zip Slip)"
+    }
+  ],
+  "coverage_summary": "Coverage was based on the 1,860 model-visible files reported by get_source_scope (no files excluded by the safety filters; binary-like files are skipped by the tools). I enumerated the tree and searched broadly for XML parser creation, Java object deserialization, archive/zip handling, Runtime.exec/ProcessBuilder, path construction, and reflection across modules. I deep-read: the PEAR tooling stack (InstallationController, PackageInstaller, PackageBrowser, FileUtil, InstallationProcessor, LocalInstallationAgent, InstallationDescriptorHandler), CAS (de)serialization (CasIOUtils, Serialization, BinaryCasSerDes, CommonSerDes, CASSerializer), XML hardening (XMLUtils and all factory call sites), uimaj-adapter-vinci (CASTransportable, VinciSaxParser, Descriptor), uimaj-tools PEAR tools/CVD entry points, jVinci VNS/ServiceRegistry, uimaj/PEAR usages in uimaj-v3migration-jcas, and the jcasgen path derivation. Eclipse plug-in modules, docbooks, and generated/sample code were only spot-checked rather than read line-by-line.",
+  "limitations": [
+    "No code, tests, scanners, or exploit payloads were executed; findings are source-level leads, not runtime-confirmed vulnerabilities.",
+    "No web/CVE/advisory lookups were permitted, so I could not verify which historical advisory or patch corresponds to this snapshot; candidate selection is based only on the source in the tree.",
+    "Line numbers refer to the assigned snapshot and may differ from upstream tags/patches.",
+    "The unsafe CAS Java-deserialization leads were traced to their sinks but their practical severity depends on application usage and available deserialization gadgets, which cannot be assessed statically here.",
+    "Eclipse plug-in (uimaj-ep-*) modules and documentation sources were not exhaustively reviewed; they may contain additional issues not covered by this report.",
+    "I could not confirm whether defense-in-depth in callers (sandboxing, running installers as an unprivileged user, refusing untrusted PEARs) mitigates the submitted issue in a given deployment."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unsafe Java deserialization of CAS streams: `CasIOUtils.load` treats any non-XML/non-binary input as Java serialization and calls `new ObjectInputStream(casInputStream).readObject()` with no ObjectInputFilter (uimaj-core/src/main/java/org/apache/uima/util/CasIOUtils.java lines 459-483); `CasIOUtils.readCasManager` does the same for externally supplied TSI streams (lines 595-605); and `BinaryCasSerDes.maybeReadEmbeddedTSI` deserializes embedded type-system info whenever the attacker-controlled header flags mark TS/TSI as included (uimaj-core/src/main/java/org/apache/uima/cas/impl/BinaryCasSerDes.java lines 617-628, flags parsed in CommonSerDes.readHeader lines 228-258). This is a genuine deserialization-of-untrusted-data sink that can give code execution if a gadget is on the classpath, and it is reachable from public load APIs and in-repo tools. I did not submit it as the top candidate because the `SERIALIZED`/`SERIALIZED_TSI` formats are documented, intentionally Java-serialized formats, and impact depends on caller behavior and available gadget classes; it is a strong unconfirmed alternative.",
+      "reason": "Real but not selected: documented Java-serialization format, environment-dependent RCE via gadget chain, and could not be distinguished from intended behavior without runtime/context; kept as a lead rather than the single submitted candidate."
+    },
+    {
+      "lead": "Unvalidated `componentId` used to derive the install root: `InstallationController` computes `_mainComponentRoot = new File(_installationDir, componentId)` (uimaj-core/src/main/java/org/apache/uima/pear/tools/InstallationController.java line 1273) from the PEAR descriptor's `mainComponentId` (PackageInstaller lines 143, 183), so a `componentId` containing `../` redirects the whole extraction outside the caller's install directory. Distinct code location from the submitted entry-name traversal; not separately submitted due to the one-candidate cap.",
+      "reason": "Related path traversal but a different root cause (descriptor-derived directory name); one-candidate limit, submitted the archive-entry traversal instead."
+    },
+    {
+      "lead": "Descriptor-driven file rewriting via the `find_and_replace_path` install action: `InstallationProcessor.findAndReplacePath` builds `new File(filePath)` from the PEAR install descriptor and rewrites matching strings (uimaj-core/src/main/java/org/apache/uima/pear/tools/InstallationProcessor.java lines 187-204, invoked at 352-353), which can target absolute paths. Impact is content-constrained (requires a matching find string) and is an install-action feature, so it did not meet the threshold compared with the extraction traversal.",
+      "reason": "Feature-like install action with constrained content modification; weaker than the arbitrary-content write in the submitted candidate."
+    },
+    {
+      "lead": "JCasGen writes generated classes to paths derived from type-system names (`outputDirectory + '/' + pkgName.replace('.', '/') + '/' + className + '.java'`, uimaj-tools/src/main/java/org/apache/uima/tools/jcasgen/Jg.java lines 1103-1124). I could not establish that name handling (`getJavaName`, `getPkg`, built-in type mapping) lets `..` survive into the path, so this remains an unverified hardening concern, not a candidate.",
+      "reason": "Insufficient evidence that traversal segments survive the name mapping; not demonstrated from source."
+    },
+    {
+      "lead": "XXE-style issues in descriptor/CAS parsing: all `SAXParserFactory`/`DocumentBuilderFactory`/`TransformerFactory` creation points I found route through `XMLUtils` with `disallow-doctype-decl` and `accessExternalDTD`/`accessExternalStylesheet` disabled (uimaj-core/src/main/java/org/apache/uima/internal/util/XMLUtils.java), jVinci explicitly disables doctypes (jVinci/src/main/java/org/apache/vinci/transport/document/XMLToVinci.java lines 52-61), and Vinci network CAS deserialization feeds SAX events directly without an XML parser. No XXE lead survived inspection.",
+      "reason": "Mitigations present; no unguarded XML parser found."
+    },
+    {
+      "lead": "Configured process execution from CPE descriptors (`VinciCasProcessorDeployer`, `FencedProcessReaper`, `SystemEnvReader`) and local checkpoint deserialization in uimaj-cpe (`Checkpoint.restoreFromCheckpoint`).",
+      "reason": "Process launch is the configured purpose of CPE deployment (trusted pipeline configuration), and checkpoint files are local service state with a much smaller trust boundary; rejected as not the strongest boundary-crossing issue."
+    }
+  ],
+  "summary": "Snapshot is the Apache UIMA Java SDK 3.3.0 release tree (1,860 model-visible files; Java, Maven, Eclipse plug-ins, jVinci transport). I traced the PEAR package tooling, CAS (de)serialization stack, XML parser factories, Vinci network CAS handling, VNS registry, and the v3-migration PEAR path. The single strongest source-evidenced issue is a classic Zip Slip / path traversal in the PEAR archive extraction utility: `FileUtil.extractFilesFromJar` writes every `JarEntry` to `new File(targetDir, jarEntry.getName())` with no canonical-path containment check, and this is reached from the shipped PEAR installer/merger tools and public APIs. I checked the XMI/XCAS/XML paths (hardened via XMLUtils), so XXE-style issues appear mitigated in this version. I also found a real unsafe-Java-deserialization surface in the CAS loading code and an unvalidated `componentId`-derived install directory, but I selected only the extraction-path issue per the one-candidate limit; they are documented as rejected/unsubmitted leads. No runtime confirmation was performed."
+}

@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker controls the `query_id` field of the JSON body of POST /kylin/api/system/diag/query (and to a lesser extent `job_id` of POST /kylin/api/system/diag, plus `project`). No length/charset/UUID/regex validation is applied to these values anywhere between the request object and the shell command; only `start`/`end` pass through validateDataRange(), and that check is skipped when job_id is non-blank. The front-end (kystudio/src/service/system.js, Diagnostic store) simply posts whatever query_id it has.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked the surrounding call chain for validation: no ID/queryId/jobId validation exists (searches for checkQueryId/validateJobId/queryId.matches/jobId.matches returned nothing); start/end are validated by validateDataRange but are emptied when jobId is supplied, and queryId is never validated. Verified that Callers do enforce some ACL (checkProjectQueryPermission / checkDiagPermission), but these are project-scoped, not admin-only, and do not constrain the identifier string. Verified that @PreAuthorize is globally enabled via <scr:global-method-security pre-post-annotations=\"enabled\"/> in kylinSecurity.xml, so the *commented-out* annotation means the method really is unguarded by method security. Verified the sink uses a shell (CliCommandExecutor.runNativeCommand /bin/bash -c), not an argv-array exec that would neutralize metacharacters. Contrast: DefaultSparkBuildJobHandler.checkCommandInjection (engine-spark) shows the project added an anti-injection check for Spark conf values, but no equivalent check exists on the diag path. No test sources are present in the snapshot, so intended behavior of the id fields could not be cross-checked against tests.",
+      "id": "kylin-diag-query-command-injection",
+      "impact": "Remote command execution as the user running the Kylin server process (e.g., kylin), enabling theft of Kylin/DB/HDFS credentials from kylin.properties and keytabs, modification of metadata, lateral movement to cluster services, and full host compromise. Privilege required is only a normal query-capable account, i.e., a low-privilege authenticated user can escalate to OS command execution.",
+      "locations": [
+        {
+          "end_line": 182,
+          "path": "src/common-server/src/main/java/org/apache/kylin/rest/controller/NSystemController.java",
+          "start_line": 166
+        },
+        {
+          "end_line": 182,
+          "path": "src/common-service/src/main/java/org/apache/kylin/rest/service/SystemService.java",
+          "start_line": 128
+        },
+        {
+          "end_line": 29,
+          "path": "src/common-service/src/main/java/org/apache/kylin/rest/request/QueryDiagPackageRequest.java",
+          "start_line": 24
+        },
+        {
+          "end_line": 190,
+          "path": "src/core-common/src/main/java/org/apache/kylin/common/util/CliCommandExecutor.java",
+          "start_line": 139
+        }
+      ],
+      "prerequisites": "An authenticated account with DATA_QUERY permission on at least one project (checkProjectQueryPermission passes for ordinary analysts; kylin.security.allow-non-admin-generate-query-diag-package defaults to TRUE and in any case does not gate generation). The `host` request parameter must be absent/empty so the request is handled locally; both /api/system/diag and /api/system/diag/query are only `isAuthenticated()` in kylinSecurity.xml (not permitAll). For the job variant, the caller needs project-admin or the project field set to a project they administer (checkDiagPermission).",
+      "root_cause": "SystemService.dumpLocalDiagPackage() builds a shell command by string concatenation: arguments such as \"-query\", <queryId>, \"-project\", <project> (or \"-job\", <jobId>) are put in a String[] without any validation/escaping and then joined with spaces into String.format(\"%s/bin/diag.sh %s\", KylinConfig.getKylinHome(), StringUtils.join(arguments, \" \")), which is handed to CliCommandExecutor.execute(). CliCommandExecutor.runNativeCommand() spawns /bin/bash -c <command>, so shell metacharacters in the HTTP-supplied query_id/job_id are interpreted by the shell. The HTTP entry point QueryDiagPackageRequest.queryId is taken verbatim from the JSON body, and the only guard on the query path is a project-scope query-permission check; the admin @PreAuthorize on the method is commented out.",
+      "title": "OS command injection via unvalidated query_id/job_id in /api/system/diag/query (SystemService → /bin/bash -c)",
+      "trace": "1) POST /kylin/api/system/diag/query?host= with body {\"query_id\":\"<payload>\",\"project\":\"<p>\"} → NSystemController.getRemoteDumpQueryDiagPackage (NSystemController.java:166-182); with blank host it calls systemService.dumpLocalQueryDiagPackage(queryId, project) at line 175. 2) SystemService.dumpLocalQueryDiagPackage (SystemService.java:184-187) runs aclEvaluate.checkProjectQueryPermission(project) and forwards the raw queryId into dumpLocalDiagPackage(null,null,null,queryId,project). 3) In dumpLocalDiagPackage (SystemService.java:129-182) the raw value is placed into the arguments array (lines 161-162: \"-project\", project, \"-query\", queryId; job path lines 152-156: \"-job\", jobId), then line 168-169 builds String finalCommand = String.format(\"%s/bin/diag.sh %s\", KylinConfig.getKylinHome(), StringUtils.join(arguments, \" \")) and line 170 calls commandExecutor.execute(finalCommand, patternedLogger, uuid). 4) CliCommandExecutor.execute (CliCommandExecutor.java:139-146) → runNativeCommand (171-190) sets cmd = {\"/bin/bash\",\"-c\",command} and ProcessBuilder.start()s it; shell metacharacters in queryId/jobId therefore execute arbitrary commands. Note the commented-out `//    @PreAuthorize(Constant.ACCESS_HAS_ROLE_ADMIN)` at SystemService.java:128 leaves no admin gate on this method itself.",
+      "unverified": "Did not execute anything; runtime reachability/exploitability was not confirmed. Deployment-specific facts not verified: which module/security config stack (XML kylinSecurity.xml block for testing/ldap/custom vs src/server SecurityConfig) is effective at runtime, and whether any deployment-level filter/WAF sanitizes request bodies. The exact injected payload and shell semantics (e.g., comment/semicolon behavior inside the unquoted command) were reasoned from source, not executed. Whether the job_id path is reachable by project admins in all configurations was not runtime-checked. The diag.sh tool is assumed present under $KYLIN_HOME/bin as the code requires.",
+      "weakness_type": "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+    }
+  ],
+  "coverage_summary": "Reviewed the assigned snapshot (3537 source files; P1 index parsed 2354 Java files, 3530 files indexed, 7 source files not in the index; no test sources exist in the snapshot, and the index has no data-flow/control-flow analysis). I focused on REST controllers, service layer, security configuration (kylinSecurity.xml and src/server SecurityConfig), command-execution sinks, file/HDFS operations, deserialization, and request models, and verified every cited edge against source text. Java controllers/services in common-server, common-service, metadata-server, modeling-service, data-loading-server, query-server, datasource-service, and the server module were sampled; kystudio (JS), most of spark-project (Scala/Java Spark jobs), the tool module, and many of the 2354 Java files were not read line-by-line.",
+  "limitations": [
+    "No execution, build, tests, or scanners were run; all conclusions are source-level and no finding is runtime-confirmed.",
+    "The snapshot contains no test sources, so intended validation behavior of query_id/job_id could not be cross-checked.",
+    "Runtime deployment topology is uncertain: both an XML security config (kylinSecurity.xml, profile testing/ldap/custom) and a Java SecurityConfig exist, and which filter chain is effective for /api/** was not determinable from source alone.",
+    "Whether any reverse proxy/WAF or deployment-specific filter sanitizes the diag request body was not verified.",
+    "Coverage was targeted rather than exhaustive: large areas (kystudio front-end, most Spark/Scala job code, tool module, datasource/JDBC configuration paths) were not audited in depth."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unauthenticated / size-gated arbitrary local-file read and HDFS path traversal in the metadata-backup RPC endpoints: /api/system/metadata_backup_tmp_file (permitAll in kylinSecurity.xml profiles testing/ldap/custom) → FileService.getMetadataBackupFromTmpPath(new File(tmpFilePath)) reads any server file when tmp_file_size equals its length; /api/system/broadcast_metadata_backup builds an HDFS path from the request's backup_dir (StringUtils.appendIfMissing(HadoopUtil.getBackupFolder(...)) + backupDir + METADATA_FILE) and recursively deletes a directory at that path before copying.",
+      "reason": "Real weaknesses, but not selected: exploitability of the read requires knowing the exact file length (the FileNotFoundException message that discloses the length is not obviously returned to clients in this Spring Boot setup, and no error-page/message handling was found), the write path additionally requires the read step to succeed, and both endpoints are RPC-style internal APIs whose effective security depends on which of the two parallel security stacks is active. Kept as a secondary lead rather than the single candidate."
+    },
+    {
+      "lead": "Bypass of the Spark-conf command-injection check: DefaultSparkBuildJobHandler.appendSparkConf wraps conf values in single quotes and checkCommandInjection only rejects backticks and $(...) ; a value containing a single quote plus a shell metacharacter could break out of the quoting.",
+      "reason": "Plausible defense-in-depth gap, but it requires model/project override privileges plus a triggered build job, depends on how SparkAppDescription.sparkConf is populated/validated upstream of this class, and is a hardening/qualification weakness around a previously added mitigation rather than a direct unvalidated-input-to-sink flow. Not submitted."
+    },
+    {
+      "lead": "SSRF-ish proxying: NBasicController.decodeHost returns any http:// host verbatim, and /api/system/diag* forwards requests (with client headers) to host-derived URLs; SparkUIUtil.resendSparkUIRequest also follows arbitrary redirect Location headers to internal services.",
+      "reason": "The diag/status/download proxy paths require admin (downloadFromRemoteHost is @PreAuthorize admin) or are intended cluster-RPC behavior, and the spark-ui proxy target is derived from server-side config, so the attacker-controlled input either crosses an admin boundary that the product treats as trusted or is configuration-scoped. Lower severity and weaker attacker control than the selected candidate."
+    },
+    {
+      "lead": "Java deserialization of cache data: SerializeUtil.deserialize uses a raw ObjectInputStream, and RedisCache.convertByteToObject deserializes bytes read from the Redis cache.",
+      "reason": "Requires write access to the backend Redis/cache to deliver a gadget payload (precondition not established from source); cache contents are normally produced by the same Kylin instances. Rejected as a standalone finding."
+    }
+  ],
+  "summary": "The single strongest source-evidenced issue is an OS command injection in the diagnostic-package APIs: an authenticated low-privilege Kylin user can place an arbitrary string in `query_id` (or `job_id`) and have it concatenated into a shell command line that `CliCommandExecutor` executes via `/bin/bash -c`, yielding command execution as the Kylin server OS user. The trace is short and fully readable in source (controller → service → shell sink), with no format validation of the identifiers and only a project-scoped query-permission gate. Other plausible but weaker leads (unauthenticated-size-gated file read via the metadata-backup RPC endpoints, a single-quote breakout of the Spark-conf injection check, host-parameter SSRF/proxying, Redis cache Java deserialization) are noted as rejected/unconfirmed."
+}

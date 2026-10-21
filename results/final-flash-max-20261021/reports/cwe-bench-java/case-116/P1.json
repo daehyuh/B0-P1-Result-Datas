@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any principal able to publish a message to the JMS queue/topic that a NiFi flow consumes with ConsumeJMS, GetJMSQueue, or GetJMSTopic. The attacker controls the message type (ObjectMessage) and the complete serialized body bytes; where the broker is shared with other systems, or a producer credential/queue is compromised, this is not a trusted component. (PublishJMS sends BytesMessage, so the payload comes from the broker side.)",
+      "confidence": "medium",
+      "counterevidence_checked": "ObjectMessage consumption is documented as intended functionality (ConsumeJMS capability description lists ObjectMessage), so this may be argued as by-design support; some JMS clients restrict trusted packages by default, which could reduce exploitability for certain providers; no NiFi-side property or code check disables or filters the ObjectMessage path, and no test in either module covers ObjectMessage, so nothing in the snapshot mitigates it; JmsFactory.getObject() is only reached for ObjectMessage, not Text/Bytes/Stream/Map messages.",
+      "id": "jms-objectmessage-deserialization",
+      "impact": "Potential arbitrary code execution in the NiFi JVM under the NiFi service account (classic Java deserialization gadget execution), or at minimum attacker-controlled object instantiation/readObject side effects and a deserialization-based denial-of-service surface during the consumer thread. Data in the flow is also attacker-influenced.",
+      "locations": [
+        {
+          "end_line": 102,
+          "path": "nifi-nar-bundles/nifi-jms-bundle/nifi-jms-processors/src/main/java/org/apache/nifi/jms/processors/MessageBodyToBytesConverter.java",
+          "start_line": 96
+        },
+        {
+          "end_line": 187,
+          "path": "nifi-nar-bundles/nifi-jms-bundle/nifi-jms-processors/src/main/java/org/apache/nifi/jms/processors/JMSConsumer.java",
+          "start_line": 185
+        },
+        {
+          "end_line": 218,
+          "path": "nifi-nar-bundles/nifi-standard-bundle/nifi-standard-processors/src/main/java/org/apache/nifi/processors/standard/util/JmsFactory.java",
+          "start_line": 205
+        },
+        {
+          "end_line": 202,
+          "path": "nifi-nar-bundles/nifi-standard-bundle/nifi-standard-processors/src/main/java/org/apache/nifi/processors/standard/JmsConsumer.java",
+          "start_line": 191
+        }
+      ],
+      "prerequisites": "A running flow using ConsumeJMS / GetJMSQueue / GetJMSTopic against a JMS broker; attacker has publish rights to the consumed destination; the JMS client deserializes the ObjectMessage payload with the NiFi JVM classpath (typical for JMS ObjectMessage). NiFi bundles a large dependency set, so gadget classes for known chains are plausibly available on the instance/NAR classpath.",
+      "root_cause": "NiFi's JMS consumer code converts received ObjectMessage bodies by calling javax.jms.ObjectMessage#getObject(), which performs Java native deserialization of the message body supplied by whoever published the message. Neither conversion path applies an ObjectInputFilter, class allowlist, trusted-package check, or a property to opt out; the deserialized object is then re-serialized and exposed to the flow. MessageBodyToBytesConverter.toBytes(ObjectMessage) calls SerializationUtils.serialize(message.getObject()) (line 98) and JmsFactory.getMessageBytes(ObjectMessage) calls oos.writeObject(message.getObject()) (line 211). ObjectMessage is explicitly accepted as a supported message type (ConsumeJMS class description, JMSConsumer receiveMessage), so no configuration gates this behavior.",
+      "title": "Java deserialization of untrusted JMS ObjectMessage payloads in JMS consumer processors",
+      "trace": "Broker -> MessageConsumer.receive() -> JMSConsumer.receiveMessage(): message instanceof ObjectMessage -> MessageBodyToBytesConverter.toBytes((ObjectMessage) message) -> message.getObject() (native deserialization) -> SerializationUtils.serialize(...) -> FlowFile content. Parallel path: JmsConsumer.map2FlowFile() -> JmsFactory.createByteArray(Message) -> getMessageBytes(ObjectMessage) -> ObjectOutputStream.writeObject(message.getObject()) (deserialization). Both paths execute the deserialization before any validation; the conversion exception handler in JMSConsumer only logs/acks after the attempt.",
+      "unverified": "No build, test, or runtime execution was performed; I could not confirm against patch history/CVE labels (not available in the snapshot and explicitly out of scope) whether this is the specific fixed issue for this version, nor whether every supported JMS provider deserializes arbitrary gadget classes by default. Line numbers are from the static snapshot only.",
+      "weakness_type": "CWE-502 Deserialization of Untrusted Data (potential RCE)"
+    }
+  ],
+  "coverage_summary": "Per get_source_scope: 8,182 source-root files, 8,151 model-visible, 31 excluded for sensitive name/path, binary-like files refused/skipped; the same filters apply to B0 and P1. Per get_relation_scope: index is partial (7,910 indexed files of 8,182; 6,436 Java files parsed, 3 parse errors, 272 source files missing from index), supports only syntax containment and name/type/arity-based call and inheritance candidates with no control-flow, data-flow, semantic resolution, or runtime reachability. I inspected source in: nifi-jms-bundle (JMSConsumer/MessageBodyToBytesConverter/ConsumeJMS/PublishJMS), nifi-standard-processors JMS path (JmsConsumer/JmsFactory/GetJMSQueue/GetJMSTopic), MiNiFi C2 service and C2 client, nifi-web-security (JWT, ProxiedEntitiesUtils, content viewer/JSP), framework authorization providers, DBCP service, XML parsing utilities, provenance repository, and asana/RocksDB deserialization sites. The remaining processor bundles and most of the framework were not exhaustively reviewed.",
+  "limitations": [
+    "No build, tests, scanners, or exploit payloads were executed; all conclusions are static source-text evidence only and are not runtime-confirmed.",
+    "The P1 index is navigational and incomplete (no data-flow/control-flow, unresolved calls, 272 files not indexed, 3 parse errors); I verified every cited line against source text rather than trusting index labels.",
+    "CVE/CWE ground-truth labels and patch history were deliberately not consulted, so I cannot assert which specific advisory this snapshot corresponds to; the candidate is a lead, not a confirmed vulnerability.",
+    "Coverage is broad but not exhaustive across ~8k files; other genuine issues may exist in unreviewed modules (e.g., individual processor bundles).",
+    "Exploitability of the JMS deserialization depends on the JMS provider's deserialization defaults and on gadget classes available on the NiFi classpath; neither was verified at runtime."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "MiNiFi C2 server POST /c2/config/acknowledge lacks the authorizer.authorize(...) call that its sibling endpoints (heartbeat, getConfig, getContentTypes) perform, while authorizations.yaml declares a policy for /c2/config/acknowledge (CWE-862 missing authorization).",
+      "reason": "Real asymmetry with source evidence (ConfigService.java lines 283-295 vs. 191/302/327, C2AuthenticationToken#setAuthenticated(true) means anonymous tokens satisfy fullyAuthenticated(), and CSRF is likely absent because WebSecurityConfigurerAdapter(true) disables defaults), but impact is conditional: the shipped authorizations.yaml also allows ROLE_ANONYMOUS for that path by default, so only non-default configurations lose enforcement. Weaker impact than the deserialization candidate; kept as rejected lead."
+    },
+    {
+      "lead": "DBCPConnectionPool accepts an arbitrary JDBC URL/driver with no H2-specific validation (nifi-dbcp-service DBCPConnectionPool.getDataSourceConfiguration, DATABASE_URL), enabling H2-URL code-execution techniques (CVE-2023-34468-like).",
+      "reason": "The in-repo evidence is only the absence of validation in a component whose whole purpose is arbitrary JDBC configuration (the H2 driver itself is third-party and test-scoped in the module POM; the vulnerable semantics are not verifiable from this snapshot). Requires an authenticated user with controller-service write rights; not the strongest source-evidenced candidate."
+    },
+    {
+      "lead": "GenericObjectSerDe.deserialize() uses ObjectInputStream.readObject() on byte arrays (nifi-asana-processors) and RocksDBFlowFileRepository reads Java-serialized swap-location data.",
+      "reason": "Asana path deserializes distributed-cache entries (server/cache-trust dependent); RocksDB path reads local repository state. Both are weaker trust-boundary cases than broker-supplied JMS messages."
+    },
+    {
+      "lead": "ProxiedEntitiesUtils / OIDC / SAML / Knox authentication code in nifi-web-security.",
+      "reason": "Reviewed entry points show format validation, DN escaping, issuer/audience/expiry claims, and escaping in the content-viewer JSP; no concrete flaw established."
+    }
+  ],
+  "summary": "Reviewed the Apache NiFi 1.21.0-RC2 snapshot (8,182 source-root files; 8,151 model-visible, 31 excluded by sensitive name/path filters, per get_source_scope). The P1 relation index covers 7,910 files / 6,436 Java files with syntax containment and name-based call/inheritance candidates only (no data flow, control flow, or semantic resolution; 272 files absent, 3 parse errors). I browsed security-relevant framework code (web security/JWT, authorizers, content viewer, XML parsing, DBCP, MiNiFi C2, provenance, JMS) and traced candidate sinks in source text. The strongest single issue found: JMS consumer processors deserialize attacker-controlled ObjectMessage bodies via ObjectMessage#getObject() with no class allowlisting or opt-out, in two parallel code paths (nifi-jms-processors/ConsumeJMS and nifi-standard-processors/GetJMSQueue|GetJMSTopic). This matches the behavior class of a known NiFi deserialization advisory fixed after 1.21.0 (I could not confirm CVE/patch labels from the snapshot, which is out of scope)."
+}

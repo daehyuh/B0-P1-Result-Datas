@@ -1,0 +1,56 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Unauthenticated HTTP request headers: \"host\" (used verbatim, or combined with an attacker-supplied \"scheme\" header when it does not contain \"://\"). A value such as \"169.254.169.254/latest/meta-data/x#\" or \"file:///etc/passwd#\" is concatenated with the configured stats path, and `new URL(...)`/`openConnection()` then contacts/reads the attacker-chosen target. The external stats path itself is deployment configuration, but only the path part is fixed; scheme/host/port/path-/query-prefix come from the headers.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the code validates/allow-lists the request host or scheme before fetching (none found; getHostString is the only place these headers are read, FrontendUtils lines 589-601). Checked whether a configurable absolute URL avoids the issue (it does when the configured URL is absolute; the flaw only affects root-relative configured URLs, which is the default). Checked whether the callers pass a server-controlled host (they do not; VaadinRequest.getCurrent() is the live attacker request and VaadinServletRequest.getHeader delegates unfiltered to the wrapped request). Checked that the JDK URL parser preserves the attacker-controlled host/scheme and honors fragment truncation (standard java.net.URL behavior; not executed here).",
+      "id": "CAND-1",
+      "impact": "Server-side request forgery from the application server (internal network probing, requests to internal/cloud metadata services, bypass of network ACLs), potential local-file access through the file: scheme when the constructed URL can be truncated with '#', and cache poisoning of the application-wide stats content that controls module script URLs inserted into all users' bootstrap pages (integrity impact on served pages). No credentials or user interaction are needed beyond sending a request.",
+      "locations": [
+        {
+          "end_line": 601,
+          "path": "flow-server/src/main/java/com/vaadin/flow/server/frontend/FrontendUtils.java",
+          "start_line": 545
+        },
+        {
+          "end_line": 351,
+          "path": "flow-server/src/main/java/com/vaadin/flow/function/DeploymentConfiguration.java",
+          "start_line": 339
+        }
+      ],
+      "prerequisites": "The application must have the non-default external stats feature enabled (DeploymentConfiguration.isStatsExternal(), Constants.EXTERNAL_STATS_FILE / \"external.stats.file\", typically injected through build-info by the Maven plugin when externalStatsFile/externalStatsUrl is configured) and the configured external stats URL must be root-relative (default DEFAULT_EXTERNAL_STATS_URL = \"/vaadin-static/VAADIN/config/stats.json\", which starts with '/'). Both bootstrap-page rendering (BootstrapHandler.appendNpmBundle -> FrontendUtils.getStatsAssetsByChunkName, lines 646-659) and template parsers (NpmTemplateParser/LitTemplateParserImpl -> FrontendUtils.getStatsContent, lines 423-435) call this code on ordinary browser requests, so any request that triggers these paths is enough.",
+      "root_cause": "FrontendUtils.getStatsFromExternalUrl(externalStatsUrl, context) builds the URL it will open with the JDK URL/HttpURLConnection stack from request headers when the configured stats URL is root-relative: url = getHostString(request) + externalStatsUrl (lines 550-555). getHostString(request) (lines 589-601) takes the raw request header \"host\" and, if it does not already contain \"://\", prepends the value of the nonstandard request header \"scheme\" (default \"http\"). Neither header is validated against the application's configured host/protocol or restricted to an allow-list, so a caller can choose the scheme, host, port, and (via '/'/'?'/'#' characters in the header value) the request path that the server fetches. VaadinServletRequest is a plain HttpServletRequestWrapper (VaadinServletRequest.java lines 32-33), so no filtering occurs before these reads. The fetched response is then cached in the VaadinContext and reused to compute the bootstrap page's chunk <script> src values.",
+      "title": "Untrusted Host/scheme headers used to build server-side stats.json URL (SSRF, possible file:// read) in FrontendUtils.getStatsFromExternalUrl",
+      "trace": "HTTP request (with crafted Host/scheme) -> VaadinService.handleRequest -> BootstrapHandler page render / template parser -> FrontendUtils.getStatsAssetsByChunkName or getStatsContent -> getStatsFromExternalUrl -> getHostString(request) concatenates attacker headers -> new URL(url).openConnection() (lines 556-563) performs the outbound request from the server -> getHeaderField(\"last-modified\") / getInputStream() (lines 564, 581) reads the response. With scheme \"file\" and a '#' in the host value the fixed stats path becomes a URL fragment (e.g. file:///etc/passwd#/vaadin-static/VAADIN/config/stats.json), so the server opens the local file; the content is then parsed/filtered as stats, and (when the target server returns JSON) the parsed chunk names are cached application-wide and emitted into other users' bootstrap pages as ./VAADIN/<chunkName> module scripts (BootstrapHandler.appendNpmBundle lines 746-790).",
+      "unverified": "Runtime confirmation not performed (no code execution allowed). Whether a reverse proxy in a given deployment rewrites/normalizes the Host header, how much of the fetched response can be observed by the attacker directly, and whether the file: path produces an exact attacker-chosen filename in a given deployment were not verified. I could not verify against the upstream fix commit, so this is a source-evidence lead, not a confirmed vulnerability.",
+      "weakness_type": "CWE-918 Server-Side Request Forgery; secondary CWE-22/CWE-73 via file: scheme"
+    }
+  ],
+  "coverage_summary": "Scope reported by get_source_scope: 1702 model-visible files (no binaries excluded, no files excluded by name/path/size; same filters for B0/P1). The snapshot contains only main sources for the modules (no src/test trees). I reviewed flow-server request handling (VaadinServlet/VaadinService, BootstrapHandler, Index/JavaScript/WebComponent bootstrap handlers, Uidl/ServerRpc/MapSync/PublishedEventHandler RPC, StreamRequest/StreamReceiver/StreamResource handlers, StaticFileServer/PwaHandler/FaviconHandler, connect controller + access checker, deployment configuration and frontend utilities), flow-client Java/JS/TS sources (SystemErrorHandler, RouterLinkHandler, SimpleElementBindingStrategy, Connect.ts, VaadinDevmodeGizmo.ts, bootstrap/connection code), and flow-polymer-template/flow-lit-template parsers at a survey level. Build tooling, flow-data, flow-dnd, flow-html-components and the flow-tests views were only spot-checked.",
+  "limitations": [
+    "No test sources are present in the snapshot, so intended security behavior could not be cross-checked against tests; no git history was available to identify the fix commit.",
+    "No code execution, dependency resolution, or dynamic verification was possible; the SSRF/file-scheme behavior is reasoned from JDK URL semantics, not runtime-confirmed.",
+    "The SSRF candidate requires the non-default external-stats feature to be enabled; on stock deployments with isStatsExternal()==false the code path is not reached.",
+    "Client-side TypeScript/JS resources and generated/build-time code were reviewed only partially, so an unrelated issue in those areas cannot be excluded.",
+    "Only one candidate is allowed by the task; the zip-slip and dev-mode proxy leads remain unconfirmed rather than disproven."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Zip-slip: DefaultArchiveExtractor.extractZipArchive (flow-server/.../frontend/installer/DefaultArchiveExtractor.java lines 79-96) extracts ZIP entry names without the canonical-path containment check that the tar path applies (lines 141-146), so a malicious node archive could write outside the install directory.",
+      "reason": "Clear missing check, but the archive comes from nodejs.org over HTTPS (or an operator-configured node download root), so remote attacker control requires compromising the download source; also effectively Windows-only. Looks more like a hardening/supply-chain issue than a remotely reachable vulnerability, so it is not submitted as the single candidate."
+    },
+    {
+      "lead": "Dev-mode webpack proxy: DevModeHandler.serveDevModeRequest/prepareConnection (flow-server/.../DevModeHandler.java lines 273-389) forwards request.getPathInfo() to the webpack-dev-server through `new URL(WEBPACK_HOST + \":\" + port + path)` with no path normalization/'..' validation.",
+      "reason": "Development mode only, and servlet containers normally decode and normalize/reject encoded traversal before getPathInfo is exposed, so no demonstrable path traversal or SSRF was established from source alone."
+    },
+    {
+      "lead": "WebComponentBootstrapHandler.getServiceUrl (flow-server/.../WebComponentBootstrapHandler.java lines 419-434) builds the service URL from the client-supplied `url` request parameter (truncated at /web-component/web-component) and reflects it into the bootstrap configuration/JS.",
+      "reason": "The value is truncated at a fixed marker and only influences URLs inserted when the web-component bootstrap script is loaded; no confirmed way for an attacker to make a victim load the crafted script URL or to break out of the URL context."
+    },
+    {
+      "lead": "DOM innerHTML sinks with server-derived strings (flow-client SystemErrorHandler.java lines 180-200; VaadinDevmodeGizmo.ts getDedicatedWebSocketUrl lines 695-715).",
+      "reason": "The values are system messages/push URL strings produced by the server configuration rather than directly attacker-controlled request input, and the service-URL builder only emits '.'/'..' path segments; no confirmed injection chain."
+    }
+  ],
+  "summary": "Reviewed the vaadin/flow 6.0-SNAPSHOT server-side request handling, bootstrap/communication handlers, static/stream resources, connect endpoints/access checker, frontend/build utilities, and client-side Flow sources reachable from untrusted input. The strongest source-evidenced issue is an unauthenticated server-side request forgery (with possible local-file read) in FrontendUtils.getStatsFromExternalUrl/getHostString: when the opt-in external stats feature is enabled, the absolute URL fetched by the server is assembled from the request's Host header and a nonstandard \"scheme\" header, with no validation that the host/scheme is the application's own. I submit that as the single lead; other plausible-looking issues (zip-slip in archive extraction, dev-mode webpack proxy path handling, WebComponentBootstrapHandler url parameter, DOM innerHTML sinks) are documented as rejected/unconfirmed leads."
+}

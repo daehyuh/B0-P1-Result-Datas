@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated management client controls the `name` attribute of the `take-snapshot` operation (e.g. via the HTTP POST /management JSON/DMR endpoint or the native protocol; `ModelDescriptionConstants.NAME`, documented as \"The name of the snapshot being taken\"). The value is a plain STRING with no validator, so arbitrary characters including `/`, `\\` and `..` can be sent. The optional `comment` is also attacker-controlled but is sanitized.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether the `name` value is sanitized or validated elsewhere: `SnapshotTakeHandler` defines SNAPSHOT_NAME with only `setNullSignificant(true)` (no ParameterValidator); `FilePersistenceUtils.sanitizeFileName` is called only for the `comment` inside ConfigurationFile.snapshot (repo-wide search shows no other callers), so the prefix path is unprotected. Checked the deletion path (`delete-snapshot`) - it matches the supplied prefix only against actual directory entries (`findSnapshotWithPrefix`), so it is not traversable. Checked `GitConfigurationPersister.snapshot`, which uses the name as a JGit tag name (JGit ref-name validation, not a filesystem path concatenation) - not the same issue. Checked that `Files.copy` requires an existing parent and preserves REPLACE_EXISTING (bounds the write to pre-existing directories but does not prevent escape). The finding was not runtime-confirmed (no code execution permitted).",
+      "id": "case-207-take-snapshot-name-path-traversal",
+      "impact": "Arbitrary-path file creation/overwrite (content limited to the server's current configuration XML) as the server process user, outside the intended snapshot directory. Because the name suffix is fixed, direct arbitrary-content write or code execution is not shown, but an authenticated management user can clobber files (e.g. other WildFly installations' `standalone.xml`/`host.xml` reachable on the same host, files in `$JBOSS_HOME/bin`, `/tmp`, etc.), causing denial of service / configuration integrity loss, and can plant copies of the configuration (which may include infrastructure details) in unintended locations. The flawed helper is used by the standalone, host-controller and domain-master persisters, so the exposure applies to all three.",
+      "locations": [
+        {
+          "end_line": 647,
+          "path": "controller/src/main/java/org/jboss/as/controller/persistence/ConfigurationFile.java",
+          "start_line": 635
+        },
+        {
+          "end_line": 639,
+          "path": "controller/src/main/java/org/jboss/as/controller/persistence/ConfigurationFile.java",
+          "start_line": 638
+        },
+        {
+          "end_line": 46,
+          "path": "controller/src/main/java/org/jboss/as/controller/operations/common/SnapshotTakeHandler.java",
+          "start_line": 37
+        },
+        {
+          "end_line": 66,
+          "path": "controller/src/main/java/org/jboss/as/controller/operations/common/SnapshotTakeHandler.java",
+          "start_line": 54
+        },
+        {
+          "end_line": 113,
+          "path": "controller/src/main/java/org/jboss/as/controller/persistence/BackupXmlConfigurationPersister.java",
+          "start_line": 110
+        },
+        {
+          "end_line": 59,
+          "path": "controller/src/main/java/org/jboss/as/controller/persistence/FilePersistenceUtils.java",
+          "start_line": 42
+        },
+        {
+          "end_line": 654,
+          "path": "controller/src/main/resources/org/jboss/as/controller/descriptions/common/LocalDescriptions.properties",
+          "start_line": 651
+        }
+      ],
+      "prerequisites": "(1) Authenticated access to the management interface; (2) authorization to execute `take-snapshot` (registered MASTER_HOST_CONTROLLER_ONLY with the SNAPSHOTS sensitive-target access constraint, so Administrator/SuperUser when RBAC is enabled, or any authenticated management user under default/non-RBAC configuration); (3) the target parent directory must already exist and be writable by the server process (Files.copy does not create parents); (4) the written file name is fixed to the current configuration file name (`standalone.xml`, `host.xml`, `domain.xml`, ...) optionally prefixed by the sanitized comment.",
+      "root_cause": "`ConfigurationFile.snapshot(String prefix, String comment)` sanitizes only the `comment` via `FilePersistenceUtils.sanitizeFileName(comment)`, which strips path separators and other illegal characters. The `prefix` argument (the management operation's `name` parameter) is concatenated directly into the snapshot file name and passed to `new File(snapshotsDirectory, name)`. Because the operation definition for `take-snapshot` declares `name`/`SNAPSHOT_NAME` with no validator and no other caller-side sanitization exists (the only caller of `sanitizeFileName` is the comment path), a `name` containing `../` sequences escapes the snapshot directory and `FilePersistenceUtils.copyFile` writes the current configuration file to an arbitrary existing directory writable by the server process.",
+      "title": "Path traversal / arbitrary-path file write via the take-snapshot 'name' parameter (unsanitized snapshot-file prefix)",
+      "trace": "1. Client executes `take-snapshot` with e.g. name=\"../../../../tmp/pwn\" (optionally comment=...). 2. `SnapshotTakeHandler.execute` (lines 60-66) resolves `SNAPSHOT_NAME` with no validation and calls `persister.snapshot(snapshot, comment)`. 3. `BackupXmlConfigurationPersister.snapshot(name, comment)` (lines 110-113) delegates to `ConfigurationFile.snapshot(name, comment)`. 4. `ConfigurationFile.snapshot` (lines 635-639) sanitizes only the comment, then builds `fileName = [sanitizedComment + \"-\"] + mainFile.getName()` and `name = prefix + fileName`, and constructs `new File(snapshotsDirectory, name)`. 5. `FilePersistenceUtils.copyFile(source, snapshot)` (ConfigurationFile line 642 -> FilePersistenceUtils lines 86-88) performs `Files.copy(source, backup, REPLACE_EXISTING)`, resolving `..` at the OS level and creating/overwriting the file outside `standalone_xml_history/snapshot` (the method even returns the resulting location in the operation reply).",
+      "unverified": "Not runtime-confirmed and the exact real-world CVE/ground-truth match is not proven. Unverified points: whether the shipped CLI restricts '/' in the `name` argument (raw DMR/HTTP clients are not restricted by the server code shown); exact behaviour on Windows separators; whether a later upstream fix sanitizes this parameter (no fixed version available in the snapshot); and the precise file names a deployment/config owner could target. The management privilege requirement (sensitive snapshots constraint; MASTER_HOST_CONTROLLER_ONLY) limits severity to highly privileged/authenticated users.",
+      "weakness_type": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+    }
+  ],
+  "coverage_summary": "Source scope: 3,383 files (Java-dominated wildfly-core 27.0.0.Beta7 snapshot); no sensitive/binary/symlink exclusions were reported by the source scope (binary-like files are refused/skipped by the tools). I reviewed modules most exposed to management-plane/file-operation risk (controller persistence + operations/common, server deployment/content handlers, deployment-repository, domain-http, logging, elytron subsystem definitions, installation-manager, patching/deployment-scanner/io/CLI paths) using targeted searches for path handling, XML parsing, deserialization, trust managers, command execution, SQL, and crypto primitives, then traced the strongest candidate end-to-end across files. P1 relation index: 3,351/3,383 files indexed (32 source files missing), Java-only syntax index (2,889 Java files), 47,512 symbols, syntax containment and name/arity-based call/inheritance candidates only; no control-flow, data-flow or semantic resolution, so reachability/exploitability cannot be established from the index and index facts were treated only as navigation hints. No builds, tests, scanners or payloads were executed.",
+  "limitations": [
+    "No fixed/patched version of the project is available in the run, so I could not diff the snapshot against the upstream fix; the candidate is based on source reading, not on a known patch.",
+    "No runtime execution, tests or dynamic confirmation were performed; the write primitive and its prerequisites (existing writable target directory, authorization to run take-snapshot) are inferred from the source only.",
+    "The repository is very large (3,383 files); covereage is targeted rather than exhaustive, and uninspected areas remain (notably large parts of testsuite, bootable-jar, host-controller HA/discovery, protocol/remoting SASL plumbing, core-feature-pack resources, and the bulk of the elytron subsystem).",
+    "P1 index omits 32 source files and does not implement control/data flow or semantic resolution, so absence of an index edge is not evidence of absence of a call or of safety.",
+    "Whether this specific issue matches the benchmark's ground-truth vulnerability/CWE is unverified; several other plausible leads were rejected and are recorded above."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "domain-http: LogoutHandler reads the Referer header from exchange.getResponseHeaders() instead of getRequestHeaders() (LogoutHandler.java:72), making the referrer branch dead code and deriving redirect targets from the request Host header.",
+      "reason": "Real code defect (dead check) but no demonstrable attacker-controlled security impact: the Host-header fallback is the designed behaviour, the Referer branch would itself be attacker-influenceable, and Undertow validates header values (no CRLF injection). Impact is at most a theoretical open redirect/reflected content issue; rejected as unproven."
+    },
+    {
+      "lead": "Server deployment management name (address element) used to build the managed-exploded content path (DeploymentHandlerUtil.getExplodedDeploymentRoot -> serverDataDir/managed-exploded/<name>), with no visible name validation in DeploymentAddHandler/DeploymentResourceDefinition.",
+      "reason": "Plausible path traversal if a DMR address value with '/' is accepted, but I found no source evidence that such values reach this path unvalidated (address handling/CLI parsing may prevent it), and no concrete sink/impact was traced; weaker and less verifiable than the take-snapshot case."
+    },
+    {
+      "lead": "Installation-manager custom-patch GAV used to build a directory (InstMgrService.getCustomPatchDir -> customPatchPath.resolve(manifestGav)) and then unzip into it.",
+      "reason": "Mitigated in this snapshot: ManifestValidator and ChannelValidator reject '/' and '\\' in the manifest GAV before use (InstMgrCustomPatchHandler.java:32-53, InstMgrResourceDefinition.java:303-365). No bypass identified (separators blocked, ':' split validated)."
+    },
+    {
+      "lead": "Deployment overlay content child names and DeploymentOverlayDeploymentUnitProcessor using deploymentRoot.getRoot().getChild(path) without explicit '..' validation.",
+      "reason": "Reachable only by users with deployment/overlay management privileges, content comes from the server-side content repository, and no concrete VirtualFile escape/write primitive was verified in source; rejected as speculative."
+    },
+    {
+      "lead": "server/mgmt/domain/HostControllerConnectionService.getAcceptingSSLContext() installs a trust-all X509TrustManager used for the server-to-host-controller connection (CWE-295 candidate).",
+      "reason": "The code is explicitly documented as an intentional trust decision for the local host-controller connection that already supplied the connection information; no attacker-controlled MITM path was demonstrated. Rejected as design assumption rather than a source-verifiable vulnerability."
+    }
+  ],
+  "summary": "The WildFly Core snapshot (27.0.0.Beta7) contains a source-verified path-traversal / arbitrary-file-write flaw in the management `take-snapshot` operation. The user-supplied `name` attribute is passed unsanitized as a path prefix into `ConfigurationFile.snapshot(prefix, comment)`, which concatenates it with the snapshot file name and resolves it with `new File(snapshotsDirectory, name)` before copying the current configuration file there. The sibling `comment` value is cleaned with `FilePersistenceUtils.sanitizeFileName` (which strips '/', '\\\\', ':' and other illegal characters), but the same sanitization is never applied to the `name`/prefix — an asymmetric/incomplete sanitization that permits `../` traversal out of `*_xml_history/snapshot`. The write is reachable from the management HTTP/native APIs because `SnapshotTakeHandler` defines `name` without any validator and delegates directly to the persister. This is the strongest distinct issue found; several other leads were examined and rejected (see below). No runtime confirmation was performed."
+}

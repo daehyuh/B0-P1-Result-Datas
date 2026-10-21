@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Any JSON-like input string passed to JsonSanitizer.sanitize(String[,int]) or EvalMinifier.minify(String[,int]) that contains a backslash followed by a digit 0-7 inside a string literal (e.g. an API payload such as {\"a\":\"\\1\"} or \"\\012\"). The input is fully attacker-controlled whenever the sanitizer is applied to untrusted JSON-like data, which is its documented use case.",
+      "confidence": "medium",
+      "counterevidence_checked": "The affected labels are only reached for backslash followed by 0-7 inside strings, so ordinary JSON inputs do not hit this path; a coder could argue JSON output remains 'valid' for multi-digit cases because the produced text (\\u0006 + digits) still parses - but that is exactly the silent-corruption case. For the lone-digit case the output really is not valid JSON, and README lines 50 and 67-74 plus class javadoc lines 52-70 explicitly promise octal conversion and RFC 4627 output, so the code contradicts its own documented contract. Bounds: isOctAt calls are guarded by `< end` checks, so the defect is not an out-of-bounds read. No test sources exist in this snapshot to confirm intended behavior and I could not compare against upstream or execute code.",
+      "id": "json-sanitizer-octal-escape-normalization",
+      "impact": "Attacker-influenced input can make the sanitizer emit output that is not valid JSON (breaking downstream strict parsers that the sanitizer is supposed to protect, i.e. a denial-of-service/robustness failure), and can silently alter string values in otherwise valid output (data-integrity corruption of security-relevant fields such as tokens, identifiers, or authorization data). The documented eval-equivalence and embedding-safety properties are not guaranteed for this input class. The path does not by itself demonstrate script/code injection because JSON has no octal escapes and the parser's JSON validation of the rest of the document is unaffected.",
+      "locations": [
+        {
+          "end_line": 610,
+          "path": "src/main/java/com/google/json/JsonSanitizer.java",
+          "start_line": 594
+        },
+        {
+          "end_line": 1136,
+          "path": "src/main/java/com/google/json/JsonSanitizer.java",
+          "start_line": 1131
+        },
+        {
+          "end_line": 514,
+          "path": "src/main/java/com/google/json/JsonSanitizer.java",
+          "start_line": 514
+        }
+      ],
+      "prerequisites": "Application routes untrusted JSON-like text through this sanitizer (or EvalMinifier) and relies on the documented guarantee that the output is well-formed RFC 4627 JSON that is eval-equivalent to the input, e.g. by feeding the result to a strict JSON parser. No elevated privileges or special configuration are needed; the default sanitize(String) path is affected.",
+      "root_cause": "In JsonSanitizer.sanitizeString, the case '0'..'7' branch of the backslash handler is internally inconsistent. (1) The whole conversion is gated on `octalEnd + 1 < end && isOctAt(octalEnd + 1)` with `octalEnd = i + 1` (line 597), i.e. it requires a *second* octal digit, so a lone octal escape such as \\1 or \\0 is never rewritten and is copied verbatim into the output even though JSON defines no octal escapes. (2) The third-digit guard tests `ch <= '3'` (line 599) where `ch` is the backslash character itself (`char ch = jsonish.charAt(i)`, line 514), so the condition is always false (0x5C <= 0x33) and the third digit is never consumed. (3) The value accumulator `for (int j = i; j < octalEnd; ++j)` (line 603) starts at the backslash index, so the value includes 0x5C-'0' = 44. (4) `replace(i + 1, octalEnd, \"u00\")` (line 606) only replaces digits before octalEnd, leaving trailing octal digits as literal characters. (5) appendHex (lines 1131-1136) appends hex digits from the least-significant nibble upward, so even a correct value would be emitted byte-reversed (e.g. value 0x0A -> \"a0\"). The net effect is that the documented promise 'octal escapes are converted to JSON unicode escapes' (README line 50) and the well-formed-JSON/embedding-safety output contract (README lines 67-74, class javadoc lines 52-70) are not met for this input class.",
+      "title": "Octal string-escape normalization produces non-JSON or silently corrupted output",
+      "trace": "1) sanitize() dispatches a quoted string to sanitizeString(i, strEnd) (lines 234-239). 2) In sanitizeString, a backslash is handled at line 563; `sch = jsonish.charAt(i + 1)` (line 568) selects case '0'..'7' (lines 594-595); note `ch` (line 514) is the backslash, not the digit. 3) Input `\"\\1\"`: octalEnd = i+1; the gate at line 597 tests jsonish.charAt(i+2), which is the closing quote, so it is false; the block is skipped and `i = octalEnd - 1` (line 609) makes the loop continue after the escaped digit, so the sequence backslash+'1' is emitted unchanged -> output `\"\\1\"`, which JSON.parse rejects (invalid JSON) and which violates the library's output contract. 4) Input `\"\\012\"`: the gate succeeds via the second digit, but line 599 is dead (ch is backslash), so the third digit is not consumed; the value loop starts at the backslash (44) giving value 352; line 606 replaces only the first digit with \"u00\" and appendHex appends the low two nibbles LSB-first (\"06\"), so the emitted escape is \\u0006 followed by the literal digits '1','2' -> the string value changes from U+000A to U+0006 + \"12\" (silent data corruption). 5) For an even value such as octal \\12 -> 0x0A, appendHex's reversed order would emit \"a0\" (U+00A0) rather than \"0a\".",
+      "unverified": "Not runtime-confirmed: behavior was derived by reading the source only. I could not verify against upstream json-sanitizer sources or history (not permitted in this run) and no tests are present in the snapshot, so I cannot exclude that some of this branch reflects pre-existing upstream behavior rather than an intentionally introduced defect; however, the dead `ch <= '3'` guard, the accumulator starting at the backslash index, the two-digit gate, and appendHex's reversed digit order are mutually consistent with a defect and inconsistent with the documented contract.",
+      "weakness_type": "Improper encoding/escaping of special elements (output not valid JSON; data corruption) - CWE-838"
+    }
+  ],
+  "coverage_summary": "Read all 11 files in the snapshot's file listing. Fully read src/main/java/com/google/json/JsonSanitizer.java (1176 lines) and src/main/java/com/google/json/EvalMinifier.java (341 lines), README.md (112 lines), the pom.xml (read to line 260 of 286; remainder is release/GPG profile configuration), and the small docs/package-info/travis/site files were at least listed. Note the snapshot contains no test sources (src/test is absent) and no other Java sources, so dynamic confirmation and cross-checking against tests were impossible.",
+  "limitations": [
+    "No code execution, tests, or scanners were permitted; all conclusions are static source reading and may contain transcription errors in manual tracing.",
+    "No upstream/patched source or CVE/advisory data may be consulted in this run, so I could not establish which lines deviate from upstream json-sanitizer.",
+    "The snapshot lacks src/test, LICENSE, and history, so intended behavior for octal escapes, \\v, and nesting-depth rejection could not be confirmed from tests.",
+    "pom.xml lines 261-286, .travis.yml, .gitattributes, .gitignore, docs/contact.md, docs/getting_started.md, and src/site/site.xml were not read in depth (build/metadata content, low security relevance).",
+    "Only the single strongest candidate is reported; the rejected leads above are unconfirmed and would each require targeted validation."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Nested-bracket depth is not enforced: isMap is allocated with maximumNestingDepth slots (line 253) but isMap[bracketDepth] = map (line 256) is written without a bounds check, so input nested deeper than maximumNestingDepth (default 64) throws ArrayIndexOutOfBoundsException.",
+      "reason": "Plausible DoS via unhandled runtime exception on hostile input, but the API documents maximumNestingDepth as a bound and an exception on exceeding it can be considered intended fail-fast behavior; impact is an exception rather than unsafe output, and no explicit exception contract is stated, so this is weaker than the octal candidate and was not selected."
+    },
+    {
+      "lead": "JS '\\v' (U+000B) is rewritten to '\\u0008' (backspace) at lines 574-577.",
+      "reason": "Appears semantically wrong, but it is part of the same escape-translation root cause area and impact would again be value corruption; not independently strong enough to displace the octal candidate and I could not confirm intended behavior."
+    },
+    {
+      "lead": "normalizeNumber recodes any multi-digit number with a leading zero as octal (lines 813-822); the guard `digVal < 0` can never fire on a digit run and there is no `digVal > 7` check, so e.g. 089 would be emitted as 73.",
+      "reason": "Produces valid JSON but a numerically different value; potentially an upstream quirk for legacy JS decimal-with-leading-zero literals, and less clearly security-relevant than the octal string escape case."
+    },
+    {
+      "lead": "The '</script' filter in sanitizeString (lines 547-555) only checks for '<','s','c' and requires i > start, so it is deliberately conservative; possible misses for exotic encodings were considered.",
+      "reason": "No concrete bypass found: the check escapes every '</sc' sequence in the unescaped input, and backslash-escaped forms such as <\\/script do not terminate an HTML script element."
+    },
+    {
+      "lead": "EvalMinifier token pooling / NameGenerator reserved-keyword logic.",
+      "reason": "Reviewed and found no concrete defect with security impact within the available time (pool keys are compared by content, keys followed by ':' are excluded, and generated names skip reserved words via binary search over length-indexed tables)."
+    }
+  ],
+  "summary": "The snapshot is the OWASP json-sanitizer library (11 files; version 1.2.1-SNAPSHOT). The single strongest source-evidenced candidate is in the string-escape normalizer of JsonSanitizer.sanitizeString: the octal-escape branch (lines 594-610) plus the appendHex helper (lines 1131-1136) cannot produce the valid, value-preserving JSON output that the class and README promise for octal escapes. Lone octal escapes such as \\1 or \\0 are left verbatim in the output (JSON has no octal escapes, so output is not well-formed JSON), and multi-digit octal escapes are mis-decoded because the accumulator starts at the backslash and leftover digits are not consumed, while appendHex emits hex digits least-significant-nibble first. This is a concrete violation of the library's core output contract (well-formed, embedding-safe, eval-equivalent JSON) reachable from the public sanitize()/minify() APIs with attacker-influenced input; it is an integrity/availability issue for consumers, not shown to be script injection. One other plausible but weaker lead (missing nested-bracket depth guard) is recorded as rejected."
+}

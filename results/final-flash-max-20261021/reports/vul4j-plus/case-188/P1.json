@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The remote HTTP/2 peer controls the inbound control frames it sends (PING with attacker-chosen payloads, repeated SETTINGS, invalid stream references that trigger RST_STREAM) and controls whether it reads/consumes the server's responses (it can simply stop reading the TCP socket while continuing to send).",
+      "confidence": "medium",
+      "counterevidence_checked": "(1) Checked that the class is truly unreachable: global searches for `Http2ControlFrameLimitEncoder`, `ControlFrameLimit`, `new Http2ControlFrameLimitEncoder`, and `maxOutstandingControlFrames` return only the class file itself and no wiring. (2) Checked other HTTP/2 DoS countermeasures: `Http2SettingsReceivedConsumer` exists and HPACK enforces `maxHeaderListSize`, but the lazy SETTINGS-ACK path is only used when `autoAckSettingsFrame` is explicitly disabled (default is true), so it does not bound the default path, and neither mechanism bounds PING ACKs/RST_STREAM. (3) Considered generic backpressure: channel writability watermarks do not gate these decoder-initiated control-frame writes, which are issued regardless of `isWritable()`. (4) Considered that the unused class could be a work-in-progress artifact rather than an intentional removal; either way the limiting code is absent from every runtime pipeline in this snapshot. (5) Could not execute code/tests or measure memory growth; impact is argued from source-level control flow only. (6) The exact historical fix commit/CVE identifier was not inspected (out of scope per instructions).",
+      "id": "netty-http2-control-frame-flood-unbounded",
+      "impact": "Remote denial of service: unbounded server-side memory growth (outbound buffers plus per-frame promises/listeners) leading to GC pressure, heap exhaustion/OOM, or connection unavailability; also modest bandwidth amplification since small inbound control frames trigger outbound frames. The unused class's own Javadoc states it exists specifically to 'reduce the risk of DDOS' for this scenario.",
+      "locations": [
+        {
+          "end_line": 113,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2ControlFrameLimitEncoder.java",
+          "start_line": 25
+        },
+        {
+          "end_line": 486,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/AbstractHttp2ConnectionHandlerBuilder.java",
+          "start_line": 468
+        },
+        {
+          "end_line": 186,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2FrameCodecBuilder.java",
+          "start_line": 179
+        },
+        {
+          "end_line": 212,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/Http2MultiplexCodecBuilder.java",
+          "start_line": 205
+        },
+        {
+          "end_line": 489,
+          "path": "codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2ConnectionDecoder.java",
+          "start_line": 466
+        }
+      ],
+      "prerequisites": "A Netty endpoint using the stock HTTP/2 builders (`Http2FrameCodecBuilder`, `Http2MultiplexCodecBuilder`, or `Http2ConnectionHandlerBuilder`) without adding a custom limiting encoder, with default `autoAckPingFrame`/`autoAckSettingsFrame` values (both true in this snapshot), reachable by an untrusted HTTP/2 peer. Attacker needs to sustain a control-frame stream while refusing to read responses.",
+      "root_cause": "codec-http2 ships a defensive wrapper, `Http2ControlFrameLimitEncoder`, that counts outstanding control frames it writes (PING ACK, SETTINGS ACK, RST_STREAM) and closes the connection with ENHANCE_YOUR_CALM once a configured maximum is reached (file lines 25-113, especially `handleOutstandingControlFrames`, lines 88-112). However, the class is dead code: a repository-wide text search finds no `new Http2ControlFrameLimitEncoder(...)` and no other reference to the type, so it is never wrapped around the connection encoder. All encoder construction paths install only `DefaultHttp2ConnectionEncoder` (optionally wrapped by `StreamBufferingEncoder`): `AbstractHttp2ConnectionHandlerBuilder.buildFromConnection` lines 470-486, `Http2FrameCodecBuilder.build` lines 179-186, `Http2MultiplexCodecBuilder.build` lines 205-212. No `maxOutstandingControlFrames` option exists on any builder either. At the same time `DefaultHttp2ConnectionDecoder` unconditionally writes a reply for attacker-triggered control frames: `onSettingsRead` writes a SETTINGS ACK whenever `settingsReceivedConsumer == null` (the default, since `autoAckSettingsFrame = true`, `AbstractHttp2ConnectionHandlerBuilder` line 108), lines 466-480; `onPingRead` writes a PING ACK whenever `autoAckPing` is true (default `autoAckPingFrame = true`, line 109), lines 482-489; RST_STREAM replies are also emitted by lifecycle error handling. Because these writes are never bounded or short-circuited, a peer that never reads the socket causes the control-frame responses and their channel promises/listeners to accumulate in Netty's outbound buffer until memory is exhausted.",
+      "title": "HTTP/2 control-frame responses are unbounded: Http2ControlFrameLimitEncoder is never installed in any pipeline",
+      "trace": "Peer sends PING frame -> DefaultHttp2FrameReader.readPingFrame -> DefaultHttp2ConnectionDecoder.onPingRead (autoAckPing default true, line 483-487) -> encoder.writePing(ack=true, ...) -> DefaultHttp2ConnectionEncoder.writePing -> DefaultHttp2FrameWriter writes an ACK frame whose promise completes only when the bytes are flushed. Peer does not read -> socket send buffer fills -> each additional ACK stays in ChannelOutboundBuffer with its promise/listener. The same unbounded path exists for SETTINGS (onSettingsRead -> writeSettingsAck, lines 466-474) and for RST_STREAM responses. The only intended guard, `Http2ControlFrameLimitEncoder` (which calls ctx.flush() once and then closes the channel at the limit, lines 88-112), is never constructed, so no count/limit/listener ever runs.",
+      "unverified": "No runtime confirmation: I did not build or run Netty, send HTTP/2 frames, or measure buffer growth. The exact default limit intended by the author of `Http2ControlFrameLimitEncoder` and the exact upstream patch that wires it could not be inspected. It is possible some downstream application adds its own limiting encoder or disables auto-ack, which would mitigate the issue for those deployments. The relationship of this gap to a specific historical advisory/commit is inferred from the snapshot version (4.1.39.Final-SNAPSHOT) and the orphaned class, not proven.",
+      "weakness_type": "CWE-400 Uncontrolled Resource Consumption (missing HTTP/2 control-frame flood protection)"
+    }
+  ],
+  "coverage_summary": "Coverage was limited to the 1,988 repository-visible main source files reported by `get_source_scope` (no test sources are present in this snapshot); the P1 index reports all 1,988 files indexed with no hash mismatches or omissions, but index edges are syntactic navigation hints only and were verified against source text where used. I performed repository-wide literal searches (control-frame limit, auto-ack, CVE/TODO/comments, dangerous APIs) and targeted reading of codec-http2 (builders, decoder, frame codec, control-frame limit encoder, HPACK), codec-http (HttpObjectDecoder, HttpUtil paths, multipart classes), codec-haproxy, codec compression classes, buffer/common/transport spot checks, and the example/testsuite-supplemental modules by search only. I did not review every file, did not inspect the 11 native `.c` files in depth, and did not inspect build wiring beyond the POM/version evidence.",
+  "limitations": [
+    "No build, test, or execution was performed; all conclusions are static source reading and may miss runtime behavior, configuration-dependent behavior, or unreachable-code analysis.",
+    "The P1 relation index is syntactic and incomplete for data flow/reachability; the 'unused class' conclusion was verified by repository-wide text search, but dynamic/reflective use cannot be fully excluded.",
+    "Test sources are not part of the snapshot, so no test names or assertions could be used as corroborating evidence.",
+    "Native C sources (transport-native-*) and large handlers (e.g., SslHandler, HTTP/2 flow controllers, multipart decoders) were only partially reviewed.",
+    "The snapshot's development version (4.1.39.Final-SNAPSHOT) was used to reason about which historical fix window this tree belongs to; that dating is inference from POM/dependency versions and referenced issue numbers, not ground truth.",
+    "The specific upstream fix commit/CVE and the intended default limit for `Http2ControlFrameLimitEncoder` were not inspected (per instructions), so the link between this gap and the case's reference vulnerability remains a lead, not a confirmed match."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HTTP request smuggling in `HttpObjectDecoder` / `HttpUtil`: no rejection of duplicate `Content-Length`, no `Transfer-Encoding`+`Content-Length` conflict handling, and `splitHeader` trims whitespace before the colon (codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java lines 568-627 and 720-751; `contentLength()` delegates to `HttpUtil.getContentLength`).",
+      "reason": "This is a genuine weakness class in this old code, but it is a known pre-fix state whose public fixes are associated with later 4.1.x development windows (version string here is 4.1.39.Final-SNAPSHOT), and I found no snapshot-specific artifact (e.g., a partial/inert countermeasure) tying it to this case. Left unconfirmed rather than selected."
+    },
+    {
+      "lead": "`HAProxyMessageDecoder` header-length handling (codec-haproxy/src/main/java/io/netty/handler/codec/haproxy/HAProxyMessageDecoder.java lines 190-430).",
+      "reason": "Reviewed `findEndOfHeader`/`extract`: the declared v2 length is compared against readable bytes and the configured max before slicing, and v1 is bounded by V1_MAX_LENGTH; I did not establish a concrete out-of-bounds or bypass path in this snapshot."
+    },
+    {
+      "lead": "Decompression resource exhaustion in `codec/src/main/java/io/netty/handler/codec/compression/` (Bzip2/JdkZlib/Snappy/Lz4 decoders).",
+      "reason": "Historically vulnerable patterns exist, but no snapshot-specific evidence (no orphaned mitigation, no partial patch artifacts) distinguishes any of them as this case's target; not selected."
+    },
+    {
+      "lead": "`codec-http` multipart decoders (`HttpPostMultipartRequestDecoder`, `HttpPostStandardRequestDecoder`) resource/NPE handling.",
+      "reason": "Large, complex code reviewed only at a high level; no concrete, snapshot-specific exploitable path was established, so it did not meet the evidence threshold for the single candidate."
+    },
+    {
+      "lead": "`SniHandler` / `SslHandler` (handler module) and native transport C code.",
+      "reason": "Only superficially inspected; the `.c` sources were not reviewed in depth and no source-level evidence of a specific defect was gathered."
+    }
+  ],
+  "summary": "Snapshot reviewed: Netty 4.1.39.Final-SNAPSHOT (main sources only, 1,988 files, no test sources). The strongest source-evidenced issue found is in codec-http2: the tree contains `Http2ControlFrameLimitEncoder`, a class whose own Javadoc says it exists to stop a peer that \"will not consume our responses\" from forcing a \"massive amount of control frames\" (DDOS), yet nothing in the repository ever constructs it and no builder exposes a limit. The default HTTP/2 pipelines auto-emit one control frame (PING ACK, SETTINGS ACK, RST_STREAM) per inbound control frame, so a remote peer that floods PING/SETTINGS/RST_STREAM and does not read responses accumulates unbounded outbound frames/promises in the channel outbound buffer (CWE-400 remote DoS). Other plausible historical weaknesses (HTTP/1 request smuggling in `HttpObjectDecoder`, HAProxy decoder bounds, Bzip2/multipart resource handling) were checked and are listed as rejected leads because they are not tied to any snapshot-specific artifact and, for the smuggling issues, the fix windows known for Netty do not match this snapshot's development version. No code was executed and no runtime behavior was confirmed."
+}

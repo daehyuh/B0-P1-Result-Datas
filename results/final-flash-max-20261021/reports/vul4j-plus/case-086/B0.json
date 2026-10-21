@@ -1,0 +1,76 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The value passed as `href` to getDocumentElementByUrl comes from the `<include href=\"...\">` attribute of an AntiSamy policy document (Policy.getParseContext -> getPolicy -> getDocumentElementByUrl, lines 379-384/534-597); the value passed as `systemId` to resolveEntity is a caller-supplied URL string (resolveEntity is public static, and internally getSourceFromUrl passes baseUrl.toExternalForm()). The attacker must therefore be able to influence a policy file's include href or a systemId passed to Policy.resolveEntity/getInstance(URL) - e.g. a configured/templated/parameterized policy, or an application that loads policies from a location an attacker can write. It is not reachable from the sanitized HTML string itself, which is the main reason confidence is limited.",
+      "confidence": "low",
+      "counterevidence_checked": "Some mitigation code does exist and I confirmed its exact scope: verifyLocalUrl (lines 1053-1062) is called at both call sites, and the surrounding javadoc/annotations explicitly claim local-files-only. The gap is that it is invoked on baseUrl before resolution rather than on the resolved/open URL, so the mitigation is trivially bypassable by an absolute href. I also checked that external XML entities are disabled (setFeature EXTERNAL_GENERAL_ENTITIES/EXTERNAL_PARAM_ENTITIES/DISALLOW_DOCTYPE_DECL/LOAD_EXTERNAL_DTD at lines 492-495 and 605-608), so this is not XXE and the fetched content cannot inject entities; and I confirmed that the URL-based factory is documented as the only path that supports <include> while the InputStream path explicitly rejects includes (lines 359-364). Exploitability depends on the policy's include href being attacker-influenceable, which is a weaker trust boundary than sanitized HTML input - this is the main reason I rate confidence low.",
+      "id": "antisamy-policy-include-url-validation-bypass",
+      "impact": "Server-side request forgery from the application server to arbitrary HTTP(S)/FTP hosts reachable from it (including loopback, RFC1918, and cloud metadata endpoints), and opening of arbitrary local file:/jar: URLs (the content is parsed as XML; parse errors surface as PolicyException, so this is primarily DoS/blind access rather than direct disclosure). More seriously, because the fetched document is parsed as an AntiSamy policy and its rules are merged into the ParseContext before the main policy's rules, an attacker who can point an include at a schema-valid policy document of their choosing can extend the effective policy (e.g. add allow rules for tags/attributes/CSS values absent from the local policy), turning the bypass into a sanitizer whitelist bypass and hence XSS for subsequently scanned untrusted HTML.",
+      "locations": [
+        {
+          "end_line": 597,
+          "path": "src/main/java/org/owasp/validator/html/Policy.java",
+          "start_line": 567
+        },
+        {
+          "end_line": 1044,
+          "path": "src/main/java/org/owasp/validator/html/Policy.java",
+          "start_line": 1011
+        },
+        {
+          "end_line": 1062,
+          "path": "src/main/java/org/owasp/validator/html/Policy.java",
+          "start_line": 1053
+        },
+        {
+          "end_line": 325,
+          "path": "src/main/java/org/owasp/validator/html/Policy.java",
+          "start_line": 318
+        }
+      ],
+      "prerequisites": "Application loads a policy through the URL/File-based factory (Policy.getInstance(URL)/getInstance(File) - the only paths that process <include>) or calls the public Policy.resolveEntity(systemId, baseUrl) with an attacker-influenced systemId. The policy (or an included document) must contain an absolute or traversal-capable href. With default schema validation enabled, a remote document must additionally be a schema-valid policy to influence the effective policy; a plain SSRF/local-open happens regardless of schema validity because the stream is opened before parsing.",
+      "root_cause": "Policy.verifyLocalUrl(URL) (Policy.java 1053-1062) enforces that only file:/jar: URLs are used, but the two call sites verify only the *base* URL: getDocumentElementByUrl calls verifyLocalUrl(baseUrl) at line 576 and resolveEntity calls it at line 1019, then each resolves an attacker-influenceable href/systemId against that base with `new URL(baseUrl, href)` and opens the stream directly (url.openStream() at lines 584 and 1025) without ever calling verifyLocalUrl on the resolved URL. An absolute href/systemId therefore overrides the base and can reach any scheme/host (for example http://169.254.169.254/..., http://internal/, or file:///etc/passwd). The fallback paths (lines 586-597 and 1028-1038, via URIUtils.resolveAsString) likewise construct and open a URL with no protocol/host check. This contradicts the class documentation and SpotBugs suppressions, which assert that only local file/jar URLs are allowed (Policy.java 318-325, 400-401, 532-533, 565-566, 1009-1010).",
+      "title": "Local-URL restriction in policy loading is applied to the base URL only, so resolved include/systemId URLs (http/https/file) are opened without verification",
+      "trace": "1) Policy.getParseContext(topLevelElement, baseUrl) iterates `<include>` elements (lines 379-384) and calls getPolicy(href, baseUrl). 2) getPolicy -> getDocumentElementByUrl(href, baseUrl, true) (lines 534-538, 567). 3) getDocumentElementByUrl checks only the origin: verifyLocalUrl(baseUrl) (line 576), which passes for a legitimate file:/jar: policy location. 4) It then resolves the include with `url = new URL(baseUrl, href)` (line 581); for an absolute href the resolved URL is an attacker-chosen http(s)/file URL. 5) `source = new InputSource(url.openStream())` (line 584) performs the request/open with a 0-arg URL stream and no second verifyLocalUrl/host allow-list; the resulting document element is then parsed (lines 622-626) and, if schema-valid, merged as policy rules (getParseContext lines 382-384). 6) The same pattern exists in the public resolveEntity(systemId, baseUrl): verifyLocalUrl(baseUrl) at line 1019, `new URL(baseUrl, systemId)` at line 1024, `url.openStream()` at line 1025.",
+      "unverified": "Not runtime-confirmed: I did not execute the loader or perform any request. I could not verify whether an unauthenticated/remote attacker can control a policy include href in any deployed configuration, nor whether upstream AntiSamy later added verifyLocalUrl on the resolved URL (no diff/history available in this snapshot). The claim that a fetched schema-valid policy merges into the effective policy is based on reading getParseContext/parsePolicy; I did not build a policy XML to confirm rule precedence end to end.",
+      "weakness_type": "Improper URL validation / SSRF (CWE-918), with local file access and possible attacker-controlled policy injection"
+    }
+  ],
+  "coverage_summary": "Reviewed all 54 files listed by get_source_scope: every Java source file under src/main/java (Policy, InternalPolicy, AntiSamy, CleanResults, TagMatcher, PolicyException, ScanException, all scan/* scanners and serializers, all css/* classes, all model/util classes) and the metadata/config files (.github workflows, pom.xml, README.md, SECURITY.md, site.xml). Resource policy/properties files (antisamy*.xml, AntiSamy_*.properties, ~460KB) were sampled by targeted search (regexp/directive/tag/attribute/property definitions, URL and CSS regexes, embedStyleSheets, onUnknownTag, dangerous CSS properties) rather than read line by line. The policy XSD (antisamy.xsd) referenced by Policy.getPolicySchema() is not present in the visible snapshot and could not be inspected; .gitignore, .github/dependabot.yml and the 8 files under .github were read or trivially reviewed.",
+  "limitations": [
+    "Read-only static review: no code was compiled or executed, no requests were made, and no runtime confirmation of any behaviour was obtained.",
+    "The visible snapshot contains no test sources, no git history/patch data, and no antisamy.xsd, so I could not diff against upstream or verify whether a line is injected/regressed versus original AntiSamy code.",
+    "Only files visible through get_source_scope were examined; binary-like, over-size, symlinked or sensitive-named files would have been skipped (the scope reports zero such exclusions for this case).",
+    "Exploitability of the submitted candidate depends on how deployments populate/parameterize policy files; I could not verify attacker reachability of a policy include href in any real deployment.",
+    "The shipped policy XMLs (~460KB total) were searched by keyword rather than reviewed exhaustively, so a policy-level regex relaxation (e.g. in a non-default policy file) could have been missed.",
+    "Dependency-level vulnerabilities (batik-css 1.14, neko-htmlunit 2.60.0, httpclient5 5.1.3, xercesImpl 2.12.2) were out of scope for this source-only review and were not assessed against advisory data (no web access permitted).",
+    "The SAX/DOM strict-attribute-names asymmetry, the CSS @import SSRF path, the matches()-vs-find() defects, and the 'style'.endsWith bug are unconfirmed leads; none was verified to produce an attacker-visible security impact."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "AntiSamySAXScanner.getParser() does not enable the patched NekoHTML security feature 'http://cyberneko.org/html/features/enforce-strict-attribute-names', while AntiSamyDOMScanner.getDomParser() does (with a comment that its absence means the patched nekohtml is missing).",
+      "reason": "Real asymmetry in the same library version (neko-htmlunit 2.60.0 in pom.xml), and the SAX path is the default for AntiSamy.scan(String) with a pre-loaded policy, so an attribute-name parsing weakness could yield XSS. However, I could not establish from source that the strict-attribute-names feature is required for the SAX path, that upstream sets it there, or that the SAX path's notify-char-refs/notify-builtin-refs do not already neutralize the same class of attribute-name/value attacks; asserting an XSS bypass would be speculation, so this is recorded as unconfirmed rather than submitted as a second candidate. Recommended verification: check the neko-htmlunit HTMLScanner feature semantics and whether both parser facades need the feature."
+    },
+    {
+      "lead": "Attacker-controlled CSS @import can trigger outbound HTTP requests (CssScanner.parseImportedStylesheets, lines 261-368) and the response body is parsed and embedded into the sanitized output (CssHandler.importStyle, lines 286-350; CssScanner.getCleanStylesheetWithImports, lines 240-250).",
+      "reason": "This is genuine attacker-controlled SSRF/exfiltration *if* enabled, but the behaviour is gated by the non-default 'embedStyleSheets' directive (false in every shipped policy in src/main/resources, and CssHandler.importStyle returns early with ERROR_CSS_IMPORT_DISABLED when disabled). With default configuration it is unreachable, and timeouts/import-count/size limits are implemented, so I could not rate it above the submitted candidate."
+    },
+    {
+      "lead": "Matcher.matches() used where find() was intended, making sanitization no-ops: XMLUtil.decode (lines 158-182) and AntiSamyDOMScanner.stripNonValidXMLCharacters (lines 734-741) only transform strings that consist entirely of the pattern (single character / single entity), so multi-character values containing invalid XML characters or entities are returned unchanged.",
+      "reason": "Source evidence is clear and the intent/implementation mismatch is real, but the security consequence is unproven: Policy attribute values are already XML-decoded by the DocumentBuilder in the common case, and control characters passed unchanged to NekoHTML did not yield a demonstrable bypass from source inspection alone. Also, the identical idiom appears in both files, so it is more likely a long-standing upstream defect than an injected one."
+    },
+    {
+      "lead": "MagicSAXFilter.startElement computes `boolean isStyle = \"style\".endsWith(element.localpart);` (line 280), so tags whose local name is a suffix of 'style' ('tyle', 'yle', 'le', 'e') are treated as style elements.",
+      "reason": "The condition is semantically wrong, but the effect is fail-closed rather than fail-open: such elements have their children dropped and their text passed through CssScanner before serialization, which does not create an attacker-visible script/HTML path in the inspected code. No exploitable outcome found."
+    },
+    {
+      "lead": "CssHandler.importStyle discards the result of URI normalization (`importedStyleSheet.normalize();`, line 310) while the comment says 'canonicalize the URI'.",
+      "reason": "java.net.URI is immutable, so this is a dead call, but the URL allow-list check is performed on the same raw string that is later fetched, and relative URLs are rejected separately (lines 323-341). I found no way to turn the missing normalization into an allow-list bypass, so no vulnerability is claimed."
+    },
+    {
+      "lead": "Deployment supply-chain / dependency exposure: batik-css 1.14, neko-htmlunit 2.60.0, httpclient5 5.1.3 and xercesImpl 2.12.2 are pinned in pom.xml (lines 66-132).",
+      "reason": "Dependency CVEs cannot be established from repository source alone (no advisory data or lockfile metadata available in this run), and the task is a source-code review; excluded as an unverifiable lead."
+    }
+  ],
+  "summary": "AntiSamy (OWASP HTML/CSS sanitizer, snapshot pom v1.6.6.1) source review. I traced the sanitizer pipeline (AntiSamy -> AntiSamyDOMScanner/AntiSamySAXScanner -> MagicSAXFilter -> CssScanner/CssHandler/CssValidator -> serializers) and the policy loader (Policy/InternalPolicy). The sanitizer core shows the expected 1.6.4+ defenses (external entities disabled in Policy's DocumentBuilderFactory, strict attribute-name feature in the DOM parser, char-ref notification in the SAX parser, &colon; lookahead in the URL regexes, CSS value validation, input-size limits). The single strongest source-evidenced issue is in the policy-file loader: the documented \"local URLs only\" restriction is enforced against the base URL but not against the URL that is actually resolved and opened, so a policy <include href=\"...\"> (or an untrusted systemId) can cause an outbound request or a local file open starting from a validated file:/jar: base. Because policy includes are configuration rather than ordinary attacker input, exploitable-vulnerability confidence is limited; I report it as a lead with explicit prerequisites and record the other candidates as rejected/unconfirmed leads rather than additional findings."
+}

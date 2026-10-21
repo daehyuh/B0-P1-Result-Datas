@@ -1,0 +1,80 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `Transfer-Encoding` header value (and an optional `Content-Length`) is fully attacker-controlled on the message: a remote client of a Netty HTTP server, or an upstream/peer server for a Netty client, can send a list value containing \"chunked\" (for example \"identity, chunked\" or \"gzip, chunked\"). No authentication or special privileges are required.",
+      "confidence": "medium",
+      "counterevidence_checked": "(a) Verified that HttpHeaders.contains is an exact whole-value comparison and does not split commas (HttpHeaders.java:1569-1585); (b) verified the comma-aware alternative HttpHeaders.containsValue exists and its private implementation splits on ',' and trims OWS (HttpHeaders.java:1587-1605, 1607-1650), and that HttpUtil.isKeepAlive already uses it for `Connection` (HttpUtil.java:69-73), demonstrating the intended matching semantics; (c) verified DefaultHttpHeaders value validation permits commas and only rejects CR/LF/NUL/VT/FF (DefaultHttpHeaders.java:444-508), so a multi-coding TE value is accepted; (d) verified HttpObjectDecoder.readHeaders performs no other TE/CL consistency rejection (HttpObjectDecoder.java:607-618); (e) verified single-token \"chunked\" values (any case, after OWS trimming by the header parser) are still recognized, narrowing the flaw to comma-separated lists; (f) noted that exploitation requires an intermediary whose TE interpretation differs, and that the behavior was not runtime-verified in this review.",
+      "id": "netty-te-chunked-list-smuggling",
+      "impact": "HTTP request smuggling / message-framing desynchronization between Netty and RFC-conforming intermediaries. A message that an intermediary treats as a single chunked request can be seen by Netty as a body-less or Content-Length-framed message followed by additional requests (and the inverse on the response/encoder path). This class of defect enables bypass of proxy or WAF access-control rules, cache poisoning, request hijacking/credential capture in the smuggled stream, and can be a stepping stone to more severe attacks.",
+      "locations": [
+        {
+          "end_line": 303,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 302
+        },
+        {
+          "end_line": 337,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpUtil.java",
+          "start_line": 314
+        },
+        {
+          "end_line": 618,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 607
+        },
+        {
+          "end_line": 251,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java",
+          "start_line": 245
+        },
+        {
+          "end_line": 1605,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpHeaders.java",
+          "start_line": 1566
+        },
+        {
+          "end_line": 97,
+          "path": "codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectEncoder.java",
+          "start_line": 95
+        }
+      ],
+      "prerequisites": "HTTP traffic is processed by Netty's HttpObjectDecoder/HttpObjectEncoder (e.g. HttpServerCodec/HttpClientCodec), and the message traverses an intermediary (reverse proxy, gateway, load balancer, WAF) that interprets transfer-codings per RFC 7230, i.e. recognizes \"chunked\" inside a comma-separated list. Netty and the intermediary must disagree on framing for the desync; the exact exploit outcome depends on the intermediary's own TE/CL handling. Single-token values (\"chunked\" in any case, trimmed by the header parser) are recognized correctly, and header-value validation (DefaultHttpHeaders.java:444-508) permits commas, so list values are stored and accepted unchanged.",
+      "root_cause": "HttpUtil.isTransferEncodingChunked() (HttpUtil.java:302-303) calls HttpHeaders.contains(name, value, true), which performs an exact, whole-value equalsIgnoreCase comparison per stored header value (HttpHeaders.java:1569-1585) and never splits on commas. A `Transfer-Encoding` value such as \"identity, chunked\" or \"gzip, chunked\" therefore fails the check, even though RFC 7230 permits a comma-separated transfer-coding list and requires chunked to be honored as the final coding. The comma-aware helper HttpHeaders.containsValue() (HttpHeaders.java:1587-1605, implementation at 1607-1650) already exists in the same class and is used for `Connection` in HttpUtil.isKeepAlive (HttpUtil.java:69-73), but it is not used for Transfer-Encoding. HttpObjectDecoder.readHeaders (HttpObjectDecoder.java:609-618) branches on this result, so such a message is framed as READ_FIXED_LENGTH_CONTENT (if an attacker-supplied Content-Length is present) or READ_VARIABLE_LENGTH_CONTENT instead of READ_CHUNK_SIZE. HttpUtil.setTransferEncodingChunked(m, false) (HttpUtil.java:314-337) contains the same exact-match defect when removing the coding, and HttpObjectEncoder.encode (HttpObjectEncoder.java:95-97) also chooses the wire framing from this check, so outbound messages can be serialized without chunk framing while the Transfer-Encoding header claims chunked.",
+      "title": "Transfer-Encoding 'chunked' not recognized inside comma-separated header values → HTTP framing desync / request smuggling",
+      "trace": "1) Incoming headers are parsed in HttpObjectDecoder.readHeaders and the framing decision is made at line 612: `else if (HttpUtil.isTransferEncodingChunked(message))`. 2) isTransferEncodingChunked (HttpUtil.java:302-303) delegates to HttpHeaders.contains(..., true), which compares each stored value with equalsIgnoreCase against \"chunked\" (HttpHeaders.java:1569-1585) and returns false for a list value such as \"gzip, chunked\". 3) readHeaders therefore selects READ_FIXED_LENGTH_CONTENT when a Content-Length is present (line 614-615) or READ_VARIABLE_LENGTH_CONTENT otherwise (line 617). 4) In decode()'s default branch, a request with no Content-Length (contentLength() == -1) is completed immediately with LastHttpContent.EMPTY_LAST_CONTENT and resetNow() (lines 245-251); with a Content-Length, exactly that many bytes are consumed (lines 279-306). In both cases the remaining bytes of what an intermediary considers the chunked payload are parsed as one or more additional HTTP messages. 5) Symmetrically, HttpObjectEncoder.encode (lines 95-99) classifies a message whose TE list contains chunked as ST_CONTENT_NON_CHUNK and writes its content without chunk framing. Because Netty and the intermediary derive different message boundaries from the same byte stream, a request can be smuggled past the intermediary's routing/authorization/WAF decisions, caches can be poisoned, and another user's request/response stream can be desynchronized.",
+      "unverified": "Whether real deployments forward such multi-valued Transfer-Encoding headers to a Netty back end unchanged, and whether a given front end treats e.g. \"identity, chunked\"/\"gzip, chunked\" as chunked, were not verified at runtime. The exact number and sequence of smuggled messages depends on intermediary behavior. The setTransferEncodingChunked removal defect and the encoder-side effect are reasoned from source but not exercised.",
+      "weakness_type": "HTTP request smuggling (inconsistent message framing / improper input validation)"
+    }
+  ],
+  "coverage_summary": "Scope: 1,961 model-visible files from the assigned Netty 4.1.44.Final-SNAPSHOT tree; source filters excluded no files, and there are no src/test sources in the snapshot (so no test-based confirmation was possible). Inspected in depth: codec-http HTTP parsing (HttpObjectDecoder, HttpHeaders, HttpUtil, DefaultHttpHeaders, HttpObjectEncoder, HttpObjectAggregator, QueryStringDecoder, multipart decoders, WebSocket framing/handshake, CORS, cookies), codec-http2 HPACK/HTTP2 frame handling, codec compression (Zlib/JZlib, Bzip2, Snappy, Lz4, FastLz, Lzf), codec-dns name decoding, codec-haproxy, buffer indexing/bounds checks, and ByteToMessageDecoder. The P1 relation index is partial/syntactic only (1,832 Java files parsed, 2 omitted, no control-flow or data-flow analysis, semantic resolution not implemented, 27,908 unresolved calls), so it was used only for navigation and every candidate was re-verified in source text. Not exhaustively reviewed: SSL/TLS internals (SslHandler/OpenSsl*), native transports, transport internals, resolver-dns resolution logic, and large parts of example/ and microbench/ modules.",
+  "limitations": [
+    "No runtime execution, tests, or scanners were used; all findings are source-evidence leads, not confirmed vulnerabilities.",
+    "Exploitability of the submitted framing-desync candidate depends on intermediary proxy/gateway behavior and pipeline configuration, which were not inspectable in this snapshot.",
+    "The P1 relation index is explicitly partial (control-flow and data-flow not implemented, semantic resolution not implemented, 2 omitted files, 27,908 unresolved calls), so unreported code areas were not assumed reviewed.",
+    "No test sources are present in the snapshot, so no regression or PoC tests could be checked to corroborate behavior.",
+    "Area review was prioritized by attacker-facing parsing/framing code; SSL/native transport, resolver-dns resolution, and parts of example/microbench modules were not exhaustively audited."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unbounded Zlib decompression buffer (CVE-style DoS): JdkZlibDecoder.decode allocates ctx.alloc().heapBuffer(inflater.getRemaining() << 1) and grows with decompressed.ensureWritable(inflater.getRemaining() << 1) (JdkZlibDecoder.java:180, 211); JZlibDecoder.decode allocates heapBuffer(inputLength << 1) and grows with ensureWritable(z.avail_in << 1) (JZlibDecoder.java:108, 112). ZlibDecoder (ZlibDecoder.java:24-31) exposes no max-allocation cap and ZlibCodecFactory (ZlibCodecFactory.java:112-133) cannot supply one; HttpContentDecompressor.java:54-65 and DelegatingDecompressorFrameListener.java:166-177 instantiate these decoders for attacker-chosen Content-Encoding, so decompression bombs can force large heap growth (memory-exhaustion DoS).",
+      "reason": "Real secondary lead, not selected under the one-candidate cap: its security impact is resource exhaustion/DoS rather than an authorization/framing boundary bypass, and the code partially reflects the inherent need to buffer decompressed output (lack of a configurable cap is closer to a resource-limit defect than a discrete framing flaw). Source evidence is solid if a DOE/DoS candidate is preferred over the smuggling finding."
+    },
+    {
+      "lead": "Snappy frame decompression allocation: SnappyFrameDecoder.decode's COMPRESSED_DATA case (SnappyFrameDecoder.java:160-193) has no upper bound on the uncompressed length declared in the compressed stream; Snappy.decode's READ_PREAMBLE path (Snappy.java:277-287) accepts a value up to ~0x0FFFFFFF (268 MB) from a few input bytes and calls out.ensureWritable(uncompressedLength), allowing a tiny frame to trigger a huge allocation per frame (OOM DoS).",
+      "reason": "Plausible additional boundedness gap, but secondarily reachable (requires SnappyFrameDecoder in the pipeline) and not selected because the Transfer-Encoding finding has broader HTTP-facing reachability; behavior not runtime-verified."
+    },
+    {
+      "lead": "Multipart temporary files created with default permissions: AbstractDiskHttpData.java:87-96 calls File.createTempFile(...) without tightening POSIX permissions, so decoded uploads/attributes may be world-readable under a permissive umask (local information disclosure).",
+      "reason": "Weaker impact (local info disclosure) and only a permissions hardening gap; not selected."
+    },
+    {
+      "lead": "Duplicate/odd Content-Length handling: HttpUtil.getContentLength / HttpObjectDecoder use headers().get(CONTENT_LENGTH) and Long.parseLong (HttpUtil.java:146-199), i.e. first value wins and parsing errors cause an invalid message, with no explicit duplicate-Content-Length rejection in readHeaders.",
+      "reason": "Looked for a concrete Netty-side desync (e.g. duplicate Content-Length versus other parsers) but found no source evidence of a boundary discrepancy that Netty itself accepts; treated as unconfirmed, standard-ish behavior rather than a vulnerability."
+    },
+    {
+      "lead": "XmlDecoder uses a default Aalto InputFactoryImpl without explicitly disabling DTD/external entities (XmlDecoder.java:38-41).",
+      "reason": "Unconfirmed configuration/hardening lead; the shipped Netty codec makes no secure-parser guarantee for untrusted XML and I did not verify the library defaults in this snapshot, so it does not meet the evidence threshold."
+    }
+  ],
+  "summary": "Reviewed the assigned Netty 4.1.44.Final-SNAPSHOT source tree (1,961 model-visible files; Java main sources plus module POMs, no test sources). The strongest source-evidenced issue is an HTTP message-framing defect: Netty's chunked-transfer detection does an exact whole-value comparison, so `Transfer-Encoding` values that contain \"chunked\" inside a comma-separated list (e.g. \"identity, chunked\" or \"gzip, chunked\") are treated as not chunked. The HTTP decoder then applies Content-Length/zero-length framing instead of chunked framing, which desynchronizes message boundaries with RFC-conforming intermediaries (request smuggling). A secondary, unselected lead is the absence of any cap on Zlib decompression buffers (remote memory-exhaustion DoS); other leads are listed as rejected/unconfirmed. No code was executed; all conclusions are from source reading and are leads, not runtime-confirmed findings."
+}

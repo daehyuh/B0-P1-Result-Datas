@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker is a non-superuser role that has been granted SELECT or MODIFY on 'ALL KEYSPACES' (DataResource.root()) or on a system keyspace. That role then submits ordinary CQL: e.g. SELECT salted_hash, is_superuser FROM system_auth.roles, or UPDATE/INSERT on system_auth.roles (role, is_superuser, can_login, salted_hash) for its own role or a new role. The role name/keyspace are supplied by the client, and no server-side re-validation distinguishes system_auth from any other table for DML.",
+      "confidence": "medium",
+      "counterevidence_checked": "I verified that (i) READABLE_SYSTEM_RESOURCES deliberately only covers system.local/peers_v2 plus system_schema/system_virtual_schema tables; (ii) the superuser short-circuit in CassandraAuthorizer.authorize means superusers are unaffected by the gap; (iii) DDL on local/replicated system keyspaces is blocked by preventSystemKSSchemaModification, so the gap is specifically DML/SELECT; (iv) default grants do not include root-level permissions, so a misconfiguration/grant of ALL KEYSPACES or system_auth access is required, which limits breadth; (v) CHANGES.txt line 9 ('Tighten up permissions on system keyspaces', CASSANDRA-20090) indicates this exact area was the subject of a recent hardening, but I could not confirm the upstream patch content and the snapshot's ClientState code still matches the shape I recall from earlier 4.0/4.1 code, so I cannot prove the hardening is absent versus simply implemented elsewhere.",
+      "id": "case-205-candidate-1",
+      "impact": "A non-superuser with data-level grants on all keyspaces can (a) read bcrypt password hashes of every role, including the default superuser, for offline cracking, and (b) write to system_auth.roles directly to set is_superuser=true for itself or to insert a role with a known salted_hash, yielding full cluster superuser privileges (schema changes, other roles' data, JMX-equivalent authority). It also lets such a user modify/truncate other system keyspace tables that store cluster state.",
+      "locations": [
+        {
+          "end_line": 394,
+          "path": "src/java/org/apache/cassandra/service/ClientState.java",
+          "start_line": 376
+        },
+        {
+          "end_line": 457,
+          "path": "src/java/org/apache/cassandra/service/ClientState.java",
+          "start_line": 426
+        },
+        {
+          "end_line": 44,
+          "path": "src/java/org/apache/cassandra/auth/Resources.java",
+          "start_line": 33
+        },
+        {
+          "end_line": 113,
+          "path": "src/java/org/apache/cassandra/auth/CassandraRoleManager.java",
+          "start_line": 105
+        },
+        {
+          "end_line": 9,
+          "path": "CHANGES.txt",
+          "start_line": 8
+        }
+      ],
+      "prerequisites": "PasswordAuthenticator + CassandraAuthorizer (or any authorizer where the non-superuser has a root/keyspace grant) so that requireAuthorization() is true; the attacker role must be able to log in (can_login=true and local-DC access); a SELECT or MODIFY grant on the root data resource (or on system_auth) must exist for that role. READABLE_SYSTEM_RESOURCES (ClientState lines 67-75) only pre-authorizes SELECT on system.local/peers_v2 and system_schema/system_virtual_schema tables, so system_auth.roles is not covered by that exemption; the escalation path is only reachable when 'ALL KEYSPACES'-style grants exist.",
+      "root_cause": "ClientState.ensurePermission(String keyspace, Permission, DataResource) only enforces special protections for system keyspaces on DDL: preventSystemKSSchemaModification (lines 438-457) returns immediately for any permission other than CREATE/ALTER/DROP, and the PROTECTED_AUTH_RESOURCES branch (lines 390-392) throws only for CREATE/ALTER/DROP. Consequently SELECT/MODIFY on a system table is satisfied through the generic resource chain in ClientState.ensurePermissionOnResourceChain -> Resources.chain (Resources.java lines 33-44), whose last element is DataResource.root(). A role holding SELECT/MODIFY on the root data resource ('ALL KEYSPACES') therefore obtains SELECT/MODIFY on system_auth.roles (and other system tables) even though it is not a superuser; nothing in ClientState special-cases replicated/local system keyspaces for DML.",
+      "title": "Non-DDL data access to system keyspaces is inheritable from broad (root/ALL KEYSPACES) grants, allowing non-superusers to read password hashes and to escalate to superuser via system_auth.roles",
+      "trace": "1) ModificationStatement.authorize (src/java/org/apache/cassandra/cql3/statements/ModificationStatement.java:240-243) calls state.ensureTablePermission(metadata, Permission.MODIFY). 2) ClientState.ensureTablePermission -> ensurePermission(keyspace, perm, resource) (ClientState.java:376-394). 3) preventSystemKSSchemaModification is called but returns because perm is MODIFY, not CREATE/ALTER/DROP (lines 438-443). 4) READABLE_SYSTEM_RESOURCES exemption does not apply (perm != SELECT... and for SELECT on system_auth.roles the resource is not in the set anyway). 5) PROTECTED_AUTH_RESOURCES contains system_auth.roles, but the throw is limited to CREATE/ALTER/DROP (lines 390-392), so MODIFY/SELECT fall through. 6) ensurePermission(perm, resource) -> ensurePermissionOnResourceChain -> Resources.chain(resource) yields [data/system_auth/roles, data/system_auth, data]; authorize(data) returns MODIFY/SELECT because the role was granted on the root resource, so the operation is allowed. 7) Executing the row update on system_auth.roles changes is_superuser/salted_hash used by CassandraRoleManager.ROW_TO_ROLE (lines 84-103) and PasswordAuthenticator; after cache refresh the role is treated as a superuser (AuthenticatedUser.isSuper -> Roles.hasSuperuserStatus).",
+      "unverified": "Not verified at runtime. I could not inspect the fix commit, tests, CQL/CQL.textile reference docs, or the Python cqlsh sources (absent from the snapshot), so I could not confirm the intended semantics of 'ALL KEYSPACES' versus system keyspaces for this release. It is possible Cassandra intends root-level grants to cover system keyspaces and that this is accepted behavior; it is also possible the real CASSANDRA-20090 change was in a different location (e.g. Resources/CassandraAuthorizer) that I did not see. The claim that writing system_auth.roles actually changes authorization relies on reading CassandraRoleManager/PasswordAuthenticator and the RolesCache refresh interval, not on an execution of the path.",
+      "weakness_type": "Improper authorization / privilege escalation (CWE-269, CWE-863)"
+    }
+  ],
+  "coverage_summary": "Readable scope was 2,172 files. I focused on src/java security-sensitive packages (auth/auth.jmx, service.ClientState and CQL authorization statements, transport native protocol/auth framing, net internode handshake/authentication and TLS, security/, cql3/functions UDF sandbox, audit, config loading) and spot-checked tools/ and conf/ scripts. I searched for classic sink patterns (Runtime/ProcessBuilder exec, ObjectInputStream, URL/SSRF, XML parsing, string equality, Arrays.equals, SecureRandom, unescaped CQL formatting) and read the full text of the small, high-risk classes (ClientState, AlterRoleStatement/CreateRoleStatement/DropRoleStatement/ListRolesStatement/PermissionsManagementStatement, CassandraAuthorizer/CassandraRoleManager/CassandraNetworkAuthorizer, AuthorizationProxy, JMXServerUtils, SSLFactory, UDFBytecodeVerifier/UDFunction/ScriptBasedUDFunction, CBUtil, Envelope/Decoder, FrameDecoder*, AuthResponse/ServerConnection). I did not review the entire 1,900-file Java tree line by line; large storage-engine, compaction, streaming, repair, gossip, and messaging files were only sampled via targeted searches, so a memory-safety/DoS issue in those areas could have been missed.",
+  "limitations": [
+    "The snapshot excludes test sources, the Python cqlsh/cqlshlib sources, extensionless bin scripts (bin/cassandra, bin/cqlsh, bin/nodetool) and the ANTLR grammar/CQL docs; server behavior and the intended permission semantics therefore had to be reconstructed from source alone.",
+    "No precomputed source-relation index or git history is available in this B0 run, so I could not diff the snapshot against upstream 4.0.16 or confirm which code corresponds to a reverted/absent security fix.",
+    "I did not execute code, tests, or scanners; all conclusions are static-source leads. The candidate's key premise (that root/ALL KEYSPACES grants should not confer DML/SELECT on system_auth) could not be verified against release notes, docs, or (unavailable) tests for 4.0.16.",
+    "Large areas (compaction, streaming/repair, commit log, BTree/memtable, hint storage, internode message serialization) were only sampled; a vulnerability injected there would not have been found with the searches used.",
+    "CHANGES.txt line 9 ('Tighten up permissions on system keyspaces', CASSANDRA-20090) was treated as a hint only; I could not confirm whether the corresponding change is present, absent, or located in files outside the paths I inspected."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "CassandraNetworkAuthorizer.setRoleDatacenters/drop interpolate role.getName() (and getSetString interpolates DC names) into internally executed CQL without escape(), unlike CassandraRoleManager.escape (src/java/org/apache/cassandra/auth/CassandraNetworkAuthorizer.java:102-151).",
+      "reason": "Real unescaped-interpolation smell, but exploiting it requires a role whose name contains a crafted single quote, which in turn requires CREATE on roles plus ALTER on the crafted role; the practical escalation delta over the already-granted privileges is small, and I could not confirm whether this asymmetry exists in upstream (it appears to). Kept as a rejected lead rather than the submitted candidate."
+    },
+    {
+      "lead": "AlterRoleStatement.authorize has no superuser/privilege check tying dcPermissions to SUPERUSER-only changes, so a non-superuser can run ALTER ROLE <self> WITH ACCESS TO ALL DATACENTERS and CassandraNetworkAuthorizer.setRoleDatacenters will clear its DC restriction (AlterRoleStatement.java:69-106).",
+      "reason": "Looks like a genuine missing check versus the adjacent SUPERUSER checks, but I could not verify that upstream intended DC-access self-service to be forbidden, and it is a different area from the 'system keyspaces' hardening suggested by CHANGES.txt. If the intended finding for this case concerns system keyspace permissions, this would be a false positive."
+    },
+    {
+      "lead": "Snapshot tag handling: Directories.clearSnapshot/getSnapshotDirectory concatenate a client/JMX-supplied tag into filesystem paths without rejecting '..' (Directories.java:555-565, 1088-1111; StorageService.clearSnapshot).",
+      "reason": "Potential path traversal/deletion, but it is reachable only through JMX operations that already require high privilege (typically superuser EXECUTE on StorageService), and the same unvalidated-tag behavior appears to be long-standing upstream. Insufficient security impact delta."
+    },
+    {
+      "lead": "tools/stress StressServer reads a Java-serialized object from an accepted socket and deserializes it (tools/stress/.../StressServer.java:91-100).",
+      "reason": "Deserialization of untrusted data, but this is a developer load-testing daemon that defaults to binding 127.0.0.1; it is documented tooling, not the server trust boundary, and there is no evidence it is the snapshot's intended issue."
+    },
+    {
+      "lead": "UDF sandbox, JMX beanshooter deny-list, RMI registry wrapper, YAML SafeConstructor, UDF rate-limited auth pool, endpoint verification and CBUtil UTF-8 handling.",
+      "reason": "I inspected these known hardening areas (UDFByteCodeVerifier/UDFunction filters, AuthorizationProxy.checkVulnerableMethods, JMXServerUtils.JmxRegistry, YamlConfigurationLoader SafeConstructor, Dispatcher authExecutor, SocketFactory.newSslHandler plus require_endpoint_verification call sites, CBUtil.writeString/writeLongString) and the expected fixes are present, so they were rejected as already-mitigated."
+    }
+  ],
+  "summary": "I reviewed the Apache Cassandra 4.0.16 snapshot (2,172 readable files, almost all under src/java plus tools/, conf/, doc/). I traced authentication/authorization (auth package, ClientState, CQL permission statements), JMX (AuthorizationProxy/JMXServerUtils), internode handshake/auth/TLS (net package, SSLFactory, EncryptionOptions), the UDF sandbox, CQL protocol decoding (CBUtil/Envelope), and the audit subsystem. I checked the known Cassandra hardening points (UDF class filters, JMX beanshooter deny-list, RMI registry wrapper, SafeConstructor YAML, endpoint verification) and those fixes are present. I found one strength-worthy authorization lead around permissions on system keyspaces and several weaker rejected leads. One candidate is submitted; it is a lead, not a runtime-confirmed vulnerability."
+}

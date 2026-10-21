@@ -1,0 +1,87 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "HTTP request parameter names and values (query string, form body, or multipart form fields) submitted to any endpoint that binds request data to a non-basic (POJO) target, which is the default behavior for Spring MVC @ModelAttribute/POJO arguments and Spring WebFlux form/query binding (WebExchangeDataBinder).",
+      "confidence": "medium",
+      "counterevidence_checked": "CachedIntrospectionResults does explicitly exclude 'classLoader' and 'protectionDomain' for Class.class, so the direct 'class.classLoader' path is blocked - the bypass is via 'module' and requires JDK 9+. Nested binding requires a writable final property, and DataBinder has canonicalization plus a collection auto-grow limit (DEFAULT_AUTO_GROW_COLLECTION_LIMIT=256), but neither restricts nested path traversal. Applications can eliminate the issue by setting allowedFields, which the DataBinder Javadoc explicitly recommends, so exploitability is configuration- and container-dependent. The framework-level defect is nonetheless present in the source as the pre-hardening condition.",
+      "id": "case-073-c1",
+      "impact": "Remote, potentially unauthenticated manipulation of server-side object state outside the intended model object (mass assignment). In the common WAR/Tomcat scenario this permits modifying the container's access-log valve properties and writing a JSP/webshell, i.e. remote code execution; more generally it permits disclosure or tampering of container/ClassLoader-reachable state. The same binding path applies to Spring WebFlux applications via WebExchangeDataBinder.",
+      "locations": [
+        {
+          "end_line": 297,
+          "path": "spring-beans/src/main/java/org/springframework/beans/CachedIntrospectionResults.java",
+          "start_line": 282
+        },
+        {
+          "end_line": 788,
+          "path": "spring-context/src/main/java/org/springframework/validation/DataBinder.java",
+          "start_line": 754
+        },
+        {
+          "end_line": 105,
+          "path": "spring-web/src/main/java/org/springframework/web/bind/WebDataBinder.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 870,
+          "path": "spring-beans/src/main/java/org/springframework/beans/AbstractNestablePropertyAccessor.java",
+          "start_line": 814
+        }
+      ],
+      "prerequisites": "(1) JDK 9+ so that java.lang.Class exposes the 'module' property; (2) an application that binds request parameters to a non-basic type without explicitly calling setAllowedFields/setDisallowedFields; (3) for the full remote-code-execution chain, a servlet container whose ClassLoader graph exposes mutable internals (the widely documented case: WAR deployment on Tomcat, reaching AccessLogValve setters). Lesser impact (tampering/exposure of container internals) requires less.",
+      "root_cause": "CachedIntrospectionResults introspects java.lang.Class and suppresses only the 'classLoader' and 'protectionDomain' properties (spring-beans/.../CachedIntrospectionResults.java:283-288). On JDK 9+ the introspected 'module' property remains visible, and Module.getClassLoader() re-exposes the ClassLoader. Because DataBinder defaults to no allowed/disallowed fields ('Default is none.' in spring-context/.../DataBinder.java:441-463) and WebDataBinder adds no default restrictions, and because AbstractNestablePropertyAccessor recursively wraps every intermediate value in a new accessor (spring-beans/.../AbstractNestablePropertyAccessor.java:814-870), attacker-supplied parameter names such as 'class.module.classLoader.<...>.<property>' are resolved and the final writable property is set on objects reachable through the Class/ClassLoader graph.",
+      "title": "Unrestricted data binding traverses Class.module.classLoader (JavaBean mass assignment reaching ClassLoader/container internals)",
+      "trace": "Request parameter with a nested name reaches DataBinder.bind -> checkAllowedFields(MutablePropertyValues) -> isAllowed(field): allowedFields==null and disallowedFields==null, so both PatternMatchUtils checks pass and the value is kept (DataBinder.java:754-788). WebDataBinder contributes no default disallowed patterns (WebDataBinder.java:55-105; its Javadoc/behavior sets only field marker/default prefixes). applyPropertyValues -> BeanWrapperImpl.setPropertyValue -> AbstractNestablePropertyAccessor.getPropertyAccessorForPropertyPath splits 'class.module.classLoader...' and for each segment calls getNestedPropertyAccessor, which reads the current value and creates a fresh nested accessor for it (lines 814-870) - so the POJO's getClass() result (a Class) is introspected through CachedIntrospectionResults, whose only Class-level filter drops 'classLoader' and 'protectionDomain' but not 'module' (CachedIntrospectionResults.java:283-288). The traversal therefore continues through Module.getClassLoader() to the web application ClassLoader and its container objects, and the last path segment is written via its JavaBeans setter.",
+      "unverified": "No code was executed and no runtime confirmation exists; the exact chain to container objects (e.g., Tomcat AccessLogValve) was not tested and depends on the deployment container and its classloader layout. No upstream diff/patch comparison was performed, so it is possible that the benchmark's intended data-binding finding is a closely related but distinct hardening gap (e.g., case-sensitive disallowed-field matching with no default 'class.*' patterns in WebDataBinder/DataBinder); that possibility is noted in rejected leads.",
+      "weakness_type": "CWE-915 (Improperly Controlled Modification of Dynamically-Determined Object Attributes / mass assignment), leading toward CWE-470 (Externally-Controlled Input to Select Classes or Code) and potential RCE"
+    }
+  ],
+  "coverage_summary": "Reviewed a 4300-file Spring Framework 5.2.19.RELEASE main-source snapshot (4186 Java files, no test sources present). Coverage was broad but not exhaustive: security-sensitive areas of spring-beans (introspection, property accessors, XML loading), spring-context (DataBinder/validation, scanning, resource bundles), spring-core (StringUtils/cleanPath, AntPathMatcher, Resource/URL handling, SerializationUtils), spring-web/spring-webmvc/spring-webflux (resource resolvers, CORS, URI/header/HTML escaping, multipart, XML converters), spring-expression (SpEL resolvers/locators), spring-jdbc, spring-messaging/spring-websocket (STOMP framing, SockJS/WebSocket origin checks), and spring-oxm were inspected, most with targeted searches plus file reads. The relation index is partial and syntax-only: 4289 of 4300 files indexed, 11 files missing from the index, 1054 files parsed for symbols, 54,366 unresolved calls, and no control-flow, data-flow, semantic resolution, Spring runtime/DI enforcement, or exploitability analysis; its 'security_call' facts are keyword-based navigation hints only. No build, tests, or scanners were run; no prior findings or ground-truth data were consulted.",
+  "limitations": [
+    "No diff against upstream was possible, so I could not positively distinguish an injected modification from the unmodified 5.2.19 release; my candidate rests on the source's pre-hardening data-binding condition, which is present either way.",
+    "The snapshot contains no test sources, eliminating regression-test hints that might otherwise corroborate the intended issue.",
+    "Exploitability of the reported binding path is environment-dependent (JDK 9+, binding to a POJO, WAR/Tomcat-style container for RCE) and was not executed or dynamically verified.",
+    "The P1 relation index omits 11 files, parses only a subset for symbols, and provides no data/control flow; unreported areas are not claimed to be reviewed.",
+    "Large portions of the codebase (e.g., full ASM/CGLIB repackaged code, Kotlin sources, integration-tests, most spring-webmvc/spring-webflux handler classes) were sampled rather than read line-by-line.",
+    "Related data-binding hardening gaps (case-sensitive disallowed-field matching, absent default class.* patterns) remain unconfirmed alternatives and were not submitted as additional candidates per the one-candidate limit."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DataBinder disallowed-field matching is case-sensitive and WebDataBinder defines no default 'class.*'/'Class.*' patterns (spring-context DataBinder.isAllowed, spring-web WebDataBinder) - a closely related data-binding hardening gap.",
+      "reason": "Plausible as a distinct binding-bypass/DoS-class issue and possibly the intended target, but it produces weaker and more configuration-dependent impact than the ClassLoader traversal path, and I could not confirm the intended patch scope without external ground truth; kept as a secondary note rather than a second candidate."
+    },
+    {
+      "lead": "Path traversal in static resource handling (ResourceHttpRequestHandler/ResourceWebHandler/PathResourceResolver isInvalidPath and isInvalidEncodedPath, StringUtils.cleanPath).",
+      "reason": "Code matches the hardened upstream logic: WEB-INF/META-INF checks, cleanPath check for '../', URL-decoded second-pass check, and location-containment checks are all present (e.g. spring-webmvc .../resource/ResourceHttpRequestHandler.java:660-690, PathResourceResolver.java:228-258). No weakened condition found."
+    },
+    {
+      "lead": "XXE in XML message converters / marshallers (SourceHttpMessageConverter, Jaxb2RootElementHttpMessageConverter, AbstractMarshaller, Jaxb2Marshaller).",
+      "reason": "Default configuration disables DTDs (`disallow-doctype-decl` = !isSupportDtd()) and installs a NO_OP EntityResolver unless external entities are explicitly enabled; matches hardened upstream behavior."
+    },
+    {
+      "lead": "CORS / WebSocket origin validation bypass (DefaultCorsProcessor, CorsConfiguration.checkOrigin/checkHeaders, WebUtils.isValidOrigin, SockJS checkOrigin).",
+      "reason": "Logic matches upstream: null/empty origin handling, credential-aware '*' handling, per-origin equalsIgnoreCase comparison, and same-origin fast path are intact; no weakened check observed."
+    },
+    {
+      "lead": "HTML escaping incompleteness (HtmlUtils / HtmlCharacterEntityReferences and its .properties table).",
+      "reason": "The five markup-significant mappings (& < > \" ') are present and complete in spring-web/src/main/resources/.../HtmlCharacterEntityReferences.properties:233-237; convertToReference special-cases all five characters for UTF-* encodings."
+    },
+    {
+      "lead": "SpEL sandbox escapes (StandardTypeLocator, ReflectiveMethodResolver/DataBindingMethodResolver, MethodReference).",
+      "reason": "Standard safeguards present: Class/ClassLoader/Object method filtering in the data-binding resolvers, java.lang-only default import registration, and no removed capability checks found in sampled SpEL classes."
+    },
+    {
+      "lead": "SQL injection in spring-jdbc statement construction (AbstractJdbcInsert, CallMetaDataContext, incrementers).",
+      "reason": "String-built SQL uses configuration-supplied catalog/schema/table/sequence names and PreparedStatement parameter binding; no attacker-controlled parameter concatenation into SQL was found in the sampled code."
+    },
+    {
+      "lead": "Unsafe Java deserialization utilities (SerializationUtils.deserialize, CodebaseAwareObjectInputStream, RemoteInvocationSerializingExporter).",
+      "reason": "These are documented, opt-in remoting utilities not reachable from default framework request handling; no new exposed call path or removed guard was identified."
+    },
+    {
+      "lead": "OS command execution sinks.",
+      "reason": "No Runtime.exec/ProcessBuilder usage exists anywhere in the snapshot, so no command-injection candidate is available."
+    }
+  ],
+  "summary": "The snapshot is Spring Framework 5.2.19.RELEASE (main sources only; test tree absent). The strongest source-evidenced issue is an unrestricted JavaBean data-binding (mass assignment) exposure of the Class/ClassLoader graph: `CachedIntrospectionResults` filters only `classLoader`/`protectionDomain` when introspecting `java.lang.Class`, leaving `module` (JDK 9+) and therefore `class.module.classLoader...` reachable, while `DataBinder`/`WebDataBinder` impose no default allowed/disallowed field restrictions and `AbstractNestablePropertyAccessor` recursively resolves arbitrary nested paths. This is the pre-hardening state of the framework's binder and can allow manipulation of container internals (e.g., Tomcat AccessLogValve) and remote code execution in common WAR-on-Tomcat deployments. I reviewed and rejected weaker leads (resource path-traversal defenses, XXE configuration, CORS/WebSocket origin checks, HTML escaping tables, SpEL safeguards, SQL construction), which all matched hardened upstream logic."
+}

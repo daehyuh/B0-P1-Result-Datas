@@ -1,0 +1,64 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker fully controls the PDF byte stream: the last `startxref` value, the contents of two valid xref tables or xref streams, and the /Prev integer in each trailer/xref-stream dictionary. No user interaction or elevated privileges are needed beyond having the victim library open the file.",
+      "confidence": "high",
+      "counterevidence_checked": "Checked for any existing cycle protection: XrefTrailerResolver.setStartxref has a loop-count sanity check (lines 258-262), but it runs only after parseXref has already returned, so it cannot break the cycle. Checked EOF handling: readLine() throws at EOF (BaseParser.java:1107-1111), but the cycling parser never reaches EOF. Checked non-lenient mode: checkXRefOffset() returns startXRefOffset directly when !isLenient (lines 1167-1171), so disabling leniency does not help. Checked repair logic: bfSearchForXRef() only runs when offsets are invalid; two mutually valid xref offsets pass through unchanged. Checked that re-parsing the same offset is harmless to state (map overwrites, no exception), which is why the loop continues. Could not check upstream fix history or run the parser, so it is not runtime-confirmed.",
+      "id": "cand-001",
+      "impact": "Denial of service (availability): a very small crafted PDF hangs any consumer that opens it with PDFBox (PDDocument.load, PDFParser, Tika-style extraction services, PDF debugger/tools, preflight pipelines), tying up a worker thread indefinitely. Repeated requests can exhaust a thread pool. No memory-corruption or code-execution impact; this is a pure infinite-loop resource-exhaustion issue.",
+      "locations": [
+        {
+          "end_line": 300,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdfparser/COSParser.java",
+          "start_line": 209
+        },
+        {
+          "end_line": 298,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdfparser/COSParser.java",
+          "start_line": 272
+        },
+        {
+          "end_line": 262,
+          "path": "pdfbox/src/main/java/org/apache/pdfbox/pdfparser/XrefTrailerResolver.java",
+          "start_line": 242
+        }
+      ],
+      "prerequisites": "A victim application calls PDDocument.load(...) / PDFParser.parse() on an untrusted PDF (the standard PDFBox use case). The file must contain two parseable xref sections whose trailers/stream dictionaries reference each other with /Prev (A->B, B->A; a longer cycle works too). Default configuration is enough: PDFParser is lenient by default, and in non-lenient mode checkXRefOffset() returns the offset unchanged, so the loop still occurs.",
+      "root_cause": "COSParser.parseXref walks the xref chain with `while (prev > 0)` (COSParser.java:211) and takes each next offset from the attacker-controlled trailer /Prev entry (line 272) or from the xref-stream dictionary (line 287) without recording visited offsets, without an iteration bound, and without an EOF/cycle check. checkXRefOffset() (lines 1165-1187) returns a syntactically valid xref offset unchanged in both lenient and non-lenient modes, so a cycle of two valid xref sections is re-parsed forever. The loop guard that exists in XrefTrailerResolver.setStartxref (XrefTrailerResolver.java:258-262) is only reached after parseXref returns, so it does not protect this loop.",
+      "title": "Infinite loop in COSParser.parseXref on a cyclic xref /Prev chain (document-open DoS)",
+      "trace": "1) PDFParser.initialParse() obtains the last startxref offset (getStartxrefOffset, COSParser.java:341-403) and calls parseXref(startXRefOffset) (PDFParser.java:189-192). 2) parseXref seeks to the first xref, then enters `long prev = startXRefOffset; while (prev > 0)` (COSParser.java:209-211). 3) For a table it calls parseXrefTable(), then parseTrailer() (which stores the parsed trailer, line 1833-1834), then reads `prev = trailer.getInt(COSName.PREV)` (line 272); for a stream it sets `prev = parseXrefObjStream(prev, true)` (line 287). 4) The subsequent checkXRefOffset(prev) (lines 276-281 / 291-297) seeks to prev; if a syntactically valid `xref` table or XRef stream is there it returns that same offset, otherwise calculateXRefFixedOffset()/bfSearchForXRef() may 'repair' to another attacker-chosen xref offset - either way no visited-set or counter exists. 5) With trailer A's /Prev = B and trailer B's /Prev = A, the parser alternates A->B->A->B indefinitely, re-adding the same xref entries (XrefTrailerResolver.nextXrefObj overwrites the same map keys and throws nothing). The loop never reaches EOF, so readLine()'s EOF exception is never hit. 6) Result: the calling thread spins at 100% CPU with stable memory until the process/thread is externally killed; there is no parser timeout or cancellation API.",
+      "unverified": "Not executed and not compared against upstream/fixed code (no history, patches, or network access in this run). The precise upstream fix (visited-offset set / iteration limit) and CVE mapping are unverified; whether a downstream wrapper imposes its own parsing timeout was not assessed. A file must contain two valid xref sections for the loop, which is easy for an attacker but was not empirically tested.",
+      "weakness_type": "CWE-835 Loop with Unreachable Exit Condition ('Infinite Loop')"
+    }
+  ],
+  "coverage_summary": "Scope: all 1078 model-visible files in the snapshot (no sensitive-name, symlink, or >5 MiB exclusions reported by get_source_scope; binary-like files are refused/skipped by policy, though this tree is text sources). I read the primary untrusted-input path end to end: COSParser (xref table/stream chain, rebuild/brute-force paths, object-stream parsing), BaseParser, PDFStreamParser, PDFXrefStreamParser, XrefTrailerResolver; plus CFFParser/Type1/Type2 charstring parsing, LZW/Flate/Predictor/CCITT/ASCII/RunLength filters, SampledImageReader/PDImageXObject, PDFStreamEngine content processing, PDFTextStripper, StandardSecurityHandler/RC4Cipher, and all XML parsing entry points across pdfbox, fontbox, xmpbox, preflight and tools. Remaining files (debugger UI, app, examples, many PDModel dictionaries) were searched but not read line-by-line. No relation index or history was available (B0), and no code was executed.",
+  "limitations": [
+    "No git history, tags, fix commits, or patch data are exposed, so the snapshot could not be diffed against a known-bad/known-fixed revision; the finding is source-evidence based and not runtime-confirmed.",
+    "The repository is large (1078 files); I prioritized parsing, font, filter, image, encryption and XML code. Some peripheral modules (debugger, examples, app) were only spot-checked.",
+    "The /Prev cycle was verified by reading the control flow (loop condition, /Prev assignment, checkXRefOffset behavior, absence of a visited set), but I could not execute the parser or build a test PDF in this run.",
+    "The exact upstream fix (if any) and CVE identifier for this root cause are unknown/unverified; other plausible leads remain unconfirmed and were not submitted as candidates per the one-candidate limit."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Unbounded recursion in Type2CharStringParser.parse()/Type1CharStringParser.parse() when a CFF/Type1 font subroutine calls itself (fontbox/src/main/java/org/apache/fontbox/cff/Type2CharStringParser.java:85-173 and Type1CharStringParser.java:75-104): no recursion-depth limit, so a malicious embedded font can raise StackOverflowError during rendering/text extraction.",
+      "reason": "Genuine robustness gap, but it requires a crafted embedded font and a code path that loads its charstrings; the failure is an Error rather than an unbounded loop, and I could not tie it to a specific fixed-source construct with confidence. Kept as an unconfirmed secondary lead only."
+    },
+    {
+      "lead": "Self-referential Type 1 'seac' (Type1CharString.java:466-498) and self-nesting Type 3 glyph content (PDFStreamEngine.showType3Glyph, PDFStreamEngine.java:776-800) can recurse without a depth guard and raise StackOverflowError.",
+      "reason": "Plausible but more contrived than the xref cycle and equally unverifiable against upstream; not selected to keep a single root cause."
+    },
+    {
+      "lead": "Unbounded allocations from attacker numbers: PDFXrefStreamParser.parse() builds a List<Long> entry per /Index (or default /Size) element with no bound (PDFXrefStreamParser.java:86-100, pdfbox/src/main/java/org/apache/pdfbox/pdfparser/PDFXrefStreamParser.java), and SampledImageReader.getRGBImage() allocates a raster from unvalidated /Width x /Height (SampledImageReader.java:120-132); both allow OOM from a tiny file.",
+      "reason": "Real DoS amplification, but these shapes exist in later PDFBox versions too, so they are less likely to correspond to the intended fixed vulnerability; reported as leads, not candidates."
+    },
+    {
+      "lead": "XXE through XML parsing of PDF metadata/XFA.",
+      "reason": "Checked and rejected: XMLUtil.java, PDXFAResource.java and DomXmpParser.java all disable DOCTYPE, external entities, external DTD loading, XInclude and entity expansion; the remaining DocumentBuilderFactory uses only create new (empty) documents."
+    },
+    {
+      "lead": "Encryption/key-derivation weakness in StandardSecurityHandler/RC4Cipher.",
+      "reason": "Reviewed R2-R6 preparation and decryption paths; the padding, hashing, validation and key-derivation logic match the PDF specification, with no source-evident bypass found."
+    }
+  ],
+  "summary": "Reviewed the PDFBox 2.1.0-SNAPSHOT tree (all 1078 model-visible files were within scope; no files were filtered out beyond binary-detection). I concentrated on the untrusted-input parsing path (COSParser/BaseParser/PDFStreamParser/PDFXrefStreamParser), font parsers (CFF/Type1/Type2), stream filters, image conversion, encryption, and XML parsers. The strongest source-evidenced issue is an unguarded xref /Prev chain in COSParser.parseXref: a small crafted PDF whose two xref sections (tables or streams) point at each other via /Prev makes the parser loop forever at document-open time (CWE-835, availability/DoS). Several other plausible-but-weaker leads (font subroutine recursion, Type 3 self-recursion, unbounded allocation sizes) were checked and are listed only as rejected leads."
+}

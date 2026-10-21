@@ -1,0 +1,72 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An unauthenticated network client controls the multipart/form-data request body: the number of parts, each part's declared Content-Length, and the total body size. No request header can raise a limit, but with defaults all limits are off, so the attacker controls how much work and storage parsing consumes.",
+      "confidence": "low",
+      "counterevidence_checked": "The snapshot already contains the mitigation the project cites for this class of issue: settable fileCountMax (AbstractFileUpload lines 510-518) and sizeMax/fileSizeMax, enforced in parseRequest and FileItemInputIteratorImpl/FileItemInputImpl; part headers are capped at 512 bytes by DEFAULT_PART_HEADER_SIZE_MAX (MultipartInput lines 576, 942-948); buffer-size DoS fixes for CVE-2014-0050/CVE-2016-3092 are present (MultipartInput lines 709-714); the project's security-reports.xml states that file-count limits are intentionally 'not enabled by default and must be explicitly configured', so this may be accepted design rather than a defect. I could not identify a code path that bypasses configured limits.",
+      "id": "unbounded-upload-resources-default",
+      "impact": "Remote denial of service: a large number of small parts forces millions of FileItem objects/header maps into the heap, and a very large part forces unbounded copying into memory or the repository directory, leading to OutOfMemoryError, temp-directory exhaustion, or severe CPU/IO consumption and loss of service availability.",
+      "locations": [
+        {
+          "end_line": 135,
+          "path": "commons-fileupload2-core/src/main/java/org/apache/commons/fileupload2/core/AbstractFileUpload.java",
+          "start_line": 125
+        },
+        {
+          "end_line": 491,
+          "path": "commons-fileupload2-core/src/main/java/org/apache/commons/fileupload2/core/AbstractFileUpload.java",
+          "start_line": 461
+        },
+        {
+          "end_line": 291,
+          "path": "commons-fileupload2-core/src/main/java/org/apache/commons/fileupload2/core/FileItemInputIteratorImpl.java",
+          "start_line": 243
+        }
+      ],
+      "prerequisites": "Application uses the shipped defaults (does not call setSizeMax/setFileSizeMax/setFileCountMax), parses requests from untrusted clients (e.g., JakartaServletFileUpload/JavaxServletFileUpload), and the container does not impose its own request-body cap. Each part header is limited to 512 bytes, but part count and part/total size are not.",
+      "root_cause": "AbstractFileUpload initializes sizeMax, fileSizeMax, and fileCountMax to -1 (no limit) and parseRequest only enforces fileCountMax when the application has set it; FileItemInputIteratorImpl only wraps the request stream in a BoundedInputStream and only wraps each part stream in a BoundedInputStream when sizeMax/fileSizeMax are configured. With the shipped defaults, an unauthenticated multipart request is parsed and each part is turned into a FileItem whose content is copied out with no cap, one item per part accumulating in a List.",
+      "title": "Default configuration allows unbounded multipart upload resources (no default request size, file size, or part-count limit)",
+      "trace": "Servlet adapter -> JakartaServletFileUpload.getItemIterator/parseRequest -> AbstractFileUpload.parseRequest (line 461) -> new FileItemInputIteratorImpl with sizeMax=-1/fileSizeMax=-1 -> MultipartInput reads the stream with no BoundedInputStream (FileItemInputIteratorImpl.init lines 258-274) -> for each part the loop (lines 467-482) creates a FileItem (small items buffered in memory, large ones in a temp file) and copies the body via IOUtils.copyLarge (line 485) -> itemList grows without any count cap because the check at lines 468-471 only fires when fileCountMax != -1.",
+      "unverified": "No runtime, container, or test execution was performed; whether the default behaviour is reachable in a given deployment depends on the application and container request-size limits, which were not inspected. The candidate is a design/default lead, not a confirmed vulnerability.",
+      "weakness_type": "Uncontrolled Resource Consumption (CWE-400) — denial of service"
+    }
+  ],
+  "coverage_summary": "Covered all 26 Java sources in commons-fileupload2-core, plus the Jakarta servlet5/servlet6, javax, and portlet adapter classes and package-info files; read the exception classes, factories, MIME/RFC2231/quoted-printable decoders, parameter parser, multipart parser, iterator, and DiskFileItem implementation line by line. Also inspected the root and module POMs, changes/security/release notes, CI workflows, and assembly/checkstyle/spotbugs configuration at a skim level. No files were excluded by the tool filters (99 files visible, none binary, symlinked, or over the size limit), and no runtime execution, builds, or external lookups were performed.",
+  "limitations": [
+    "No code execution, unit tests, fuzzing, or container-based reproduction was possible, so all conclusions are static and the candidate is not runtime-confirmed.",
+    "No upstream patch/CVE repository comparison was available; equivalence to the genuine upstream implementation and the exact historical fix boundary were assessed from source structure and comments only.",
+    "Deployment-specific behavior (servlet container request-size limits, application use of sizeMax/fileSizeMax/fileCountMax, temp-directory permissions) was not observable, so exploitability of the default-limits lead depends on conditions outside the snapshot.",
+    "Site XML, checkstyle/PMD/spotbugs configuration, and POM plugin configuration were only skimmed for obviously hostile changes; a subtle build-time issue there would not have been caught."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Multipart part headers can grow unbounded, causing memory exhaustion",
+      "reason": "Mitigated in this snapshot: MultipartInput.Builder defaults partHeaderSizeMax to DEFAULT_PART_HEADER_SIZE_MAX = 512 and readHeaders() (lines 942-948) throws FileUploadSizeException after 512 bytes per part header block. No bypass path found."
+    },
+    {
+      "lead": "Path traversal / arbitrary file write using attacker-controlled multipart filename",
+      "reason": "The library intentionally returns the client-supplied name; DiskFileItem.checkFileName (lines 146-169) only rejects NUL/invalid paths, and the javadoc/site warn that callers must not use getName() directly as a path. Impacts depend on application code outside this repository, so no library-level flaw could be evidenced."
+    },
+    {
+      "lead": "Predictable temp-file name / TOCTOU in DiskFileItemFactory default repository",
+      "reason": "Temp names use a per-classloader random UUID plus counter (DiskFileItem lines 122-127, 271) and the risk with a shared system temp directory is explicitly documented in DiskFileItemFactory (lines 41-45). No attacker-controlled name/path is used."
+    },
+    {
+      "lead": "NullPointerException on nested multipart/mixed part without a boundary parameter and on requests with no Content-Type",
+      "reason": "FileItemInputIteratorImpl line 173 calls multi.setBoundary(null) when getBoundary returns null, and AbstractRequestContext.isMultipartRelated (line 96) passes a possibly null Content-Type to Matcher; both are reachable robustness bugs causing an uncaught NPE/500, but they abort the attacker's own request and produce no demonstrated resource, integrity, or confidentiality impact, so they do not meet the evidence threshold."
+    },
+    {
+      "lead": "skipPreamble flag in FileItemInputIteratorImpl is never reset to false",
+      "reason": "Traced all reachable states: repeated skipPreamble() consumes the CRLF plus boundary and is equivalent to readBoundary() once positioned at a boundary, and returning from a nested multipart also requires the discard-to-boundary behaviour. Only a minor efficiency/error-mapping difference was identified, not a security defect."
+    },
+    {
+      "lead": "Vulnerable third-party dependency (commons-lang3 3.17.0 / commons-io 2.19.0)",
+      "reason": "commons-lang3 is test-scope only in all modules; no runtime dependency version issue is derivable from source evidence alone, and dependency CVE matching was out of scope."
+    },
+    {
+      "lead": "CI workflow injection in .github/workflows",
+      "reason": "Workflows use pull_request (not pull_request_target), minimal permissions, and SHA-pinned actions; no untrusted event data is interpolated into run steps."
+    }
+  ],
+  "summary": "Reviewed the 99-file Apache Commons FileUpload 2.0.0-M5-SNAPSHOT tree (core plus Jakarta Servlet 5/6, javax, and portlet adapters). All Java sources in commons-fileupload2-core and the adapter modules were read and traced; build/site/docs files were skimmed. The snapshot contains the known hardening of this component (part header limit default 512 bytes, opt-in size/file-size/file-count limits, buffer-size checks for CVE-2014-0050/CVE-2016-3092, NUL filename check, non-serializable classes), and I found no clearly injected or otherwise concrete memory-safety, injection, or traversal flaw. The single lead that is directly source-supported is that the library ships with every upload resource limit disabled by default (-1), so a remote multipart request can drive unbounded memory/disk consumption unless the application explicitly configures limits; I am submitting it as a low-confidence candidate because the vendor treats these limits as deliberately opt-in."
+}

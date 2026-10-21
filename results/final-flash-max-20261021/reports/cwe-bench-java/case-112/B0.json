@@ -1,0 +1,77 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "`fullName` query parameter of `GET /dolphinscheduler/resources/download` (and equivalently the read/view API `fullName`), e.g. an absolute host path or a `../` traversal path such as `/etc/passwd` or `/dolphinscheduler/tenants/<other-tenant>/resources/<file>`; no validation/normalisation is applied to this value in the service. The caller also controls `resTenantCode` on the read API (only compared to the caller's own tenant), and needs a valid session cookie or `token` header for the login interceptor.",
+      "confidence": "medium",
+      "counterevidence_checked": "Verified the login interceptor does require an authenticated, enabled user (LoginHandlerInterceptor.preHandle) and that self-registered users are disabled (UsersServiceImpl.registerUser → createUser with Flag.NO), so this is not pre-auth. Verified the storage sink is real and unguarded: HdfsStorageOperator.copyHdfsToLocal uses FileUtil.copy on the raw path, and object-store download() ignores tenantCode and uses the raw key. Verified this is a deviation from the codebase's own control pattern: queryResourceListPaging (ResourcesServiceImpl.java:541-549) rejects fullName values not starting with the caller's base directory and checks isUserTenantValid; readResource does at least check tenant validity and suffix, downloadResource checks neither. Confirmed no `@PreAuthorize`/Spring Security layer exists that could block the endpoint (only the interceptor). Considered that on object-store deployments the impact degrades to cross-tenant object reads rather than host-file reads, and that no runtime execution was performed, so exploitability is a static-code inference. Alternative candidates were checked and not selected (see rejected leads).",
+      "id": "resource-download-fullname-arbitrary-read",
+      "impact": "Any authenticated low-privileged user can read files readable by the API server process (LOCAL default storage), including API-node config/secrets such as api-server/conf/application.yaml, common.properties (DB/cloud credentials), keytabs, and OS files (e.g. /etc/passwd); with HDFS storage, arbitrary HDFS paths; with object storage, arbitrary objects in the configured bucket. The same missing confinement on readResource/vimFile leaks file contents subject to the online-view suffix whitelist. This is a confidentiality breach that can be chained to credential theft/lateral movement, and a cross-tenant authorization bypass because resTenantCode/resource ownership are never validated for downloads.",
+      "locations": [
+        {
+          "end_line": 464,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/controller/ResourcesController.java",
+          "start_line": 446
+        },
+        {
+          "end_line": 1401,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 1370
+        },
+        {
+          "end_line": 299,
+          "path": "dolphinscheduler-storage-plugin/dolphinscheduler-storage-hdfs/src/main/java/org/apache/dolphinscheduler/plugin/storage/hdfs/HdfsStorageOperator.java",
+          "start_line": 295
+        },
+        {
+          "end_line": 379,
+          "path": "dolphinscheduler-storage-plugin/dolphinscheduler-storage-hdfs/src/main/java/org/apache/dolphinscheduler/plugin/storage/hdfs/HdfsStorageOperator.java",
+          "start_line": 358
+        },
+        {
+          "end_line": 227,
+          "path": "dolphinscheduler-storage-plugin/dolphinscheduler-storage-s3/src/main/java/org/apache/dolphinscheduler/plugin/storage/s3/S3StorageOperator.java",
+          "start_line": 203
+        },
+        {
+          "end_line": 1124,
+          "path": "dolphinscheduler-api/src/main/java/org/apache/dolphinscheduler/api/service/impl/ResourcesServiceImpl.java",
+          "start_line": 1066
+        },
+        {
+          "end_line": 27,
+          "path": "dolphinscheduler-common/src/main/resources/common.properties",
+          "start_line": 24
+        }
+      ],
+      "prerequisites": "A valid, enabled account (the public `/users/register` endpoint creates users in disabled state, UsersServiceImpl.java:1339, so self-registration alone is insufficient unless an admin activates the account). `storageOperate` must be non-null i.e. `resource.storage.type` configured; the shipped default is LOCAL (common.properties:27), which gives host-filesystem reads, HDFS gives HDFS-namespace reads; S3/OSS/GCS/ABS/OBS give key-based object reads (still cross-tenant for resources the API server's credentials can reach). The API server process must be able to read the target path and its `data.basedir.path` (default /tmp/dolphinscheduler) must be writable for the download staging file.",
+      "root_cause": "ResourcesServiceImpl.downloadResource() (dolphinscheduler-api/.../service/impl/ResourcesServiceImpl.java:1370-1401) accepts an attacker-controlled `fullName` and passes it straight to StorageOperate.download(tenantCode, fullName, localFileName, true). The method performs no resource-table lookup/permission check, no isUserTenantValid() check and no prefix confinement (`startsWith(baseDir)`) even though sibling methods in the same class do (e.g. queryResourceListPaging at lines 541-549 enforces isUserTenantValid + startsWith(fullName, baseDir); other methods check resource ownership before acting). StorageOperate implementations treat the argument as the final source path: HdfsStorageOperator.download() (dolphinscheduler-storage-plugin/.../hdfs/HdfsStorageOperator.java:295-299) calls copyHdfsToLocal(), which does `new Path(srcHdfsFilePath)` and `FileUtil.copy(fs, srcPath, dstPath, false, conf)` (lines 358-379) with no base-dir check; for the default LOCAL storage (LocalStorageOperatorFactory maps `file:/` to HdfsStorageOperator; resource.storage.type=LOCAL in common.properties:27) this resolves host filesystem paths. Object-store implementations (e.g. S3StorageOperator.download, lines 203-227) likewise use the key verbatim and ignore tenantCode. The related readResource()/vimFile() path (ResourcesServiceImpl.java:1066-1124; HdfsStorageOperator.catFile/vimFile, lines 229-247) has the same missing confinement, mitigated only by the online-view suffix whitelist and tenant check.",
+      "title": "Authenticated arbitrary file read via resource-center download `fullName` (no tenant/base-dir confinement, no resource permission check)",
+      "trace": "GET /resources/download?fullName=<path> → LoginHandlerInterceptor authenticates → ResourcesController.downloadResource (ResourcesController.java:454-456) → resourceService.downloadResource(loginUser, fullName) (ResourcesServiceImpl.java:1371) → user/tenant lookup (1378-1385), only check is `fullName.endsWith(\"/\")` (1373-1376) → storageOperate.download(tenantCode, fullName, localFileName, true) (1393) → HdfsStorageOperator.download (295-298) → copyHdfsToLocal(fullName, dstFile, false, true) (358-378) → `FileUtil.copy(fs, new Path(fullName), dstPath, false, fs.getConf())` reads the attacker-chosen file into the staging path → FileUtils.file2Resource(localFileName) (1395) → controller streams the file bytes in the HTTP response (460-463).",
+      "unverified": "Not runtime-confirmed (no code/build/test execution permitted). Exact exploitability depends on deployment storage type (LOCAL/HDFS vs object stores) and on the API server process's filesystem permissions; the CVE/fix association for this snapshot was not verified against any external source. Whether upstream considers the readResource suffix list an adequate mitigation for that endpoint is also unverified.",
+      "weakness_type": "CWE-22 Path Traversal / CWE-862 Missing Authorization (arbitrary file read; cross-tenant resource read)"
+    }
+  ],
+  "coverage_summary": "Snapshot: DolphinScheduler 3.2.0-SNAPSHOT, 3332 visible files (no src/test sources present in this snapshot; binary-like files skipped by the tools). I reviewed the API security stack (LoginHandlerInterceptor, AppConfiguration path/exclusions, Authenticator implementations, ResourcePermissionCheckServiceImpl/BaseServiceImpl, UsersServiceImpl registration and update paths, AccessTokenServiceImpl), the main API controllers/services (Resources, Logger, Executor, ProcessDefinition/Instance, TaskDefinition, Project, Users, AccessToken, Scheduler, DataSource, Environment, Cluster, K8s, and the v2 controllers), DAO mapper XML for `${}` interpolations (only internal `${alias}`/`baseSql` usage found; filters parameterized), remote RPC codec/JsonSerializer (no default typing or Java deserialization), storage plugins (HDFS/LOCAL, S3, OSS, GCS, ABS, OBS download/upload/vim paths), datasource plugins' JDBC handling, master/worker task execution paths incl. Switch logic task, alert-script plugin, and security-relevant configuration defaults (common.properties storage type, api/standalone application.yaml python-gateway token, application registration path). UI and docs were skimmed for intent/usage; not every file was read line-by-line.",
+  "limitations": [
+    "No test sources are included in the snapshot, so upstream tests cannot be used to confirm intended behavior or fix state.",
+    "No code execution, build, or dynamic testing was performed; all conclusions are static source analysis and the finding is not runtime-confirmed.",
+    "Exploitability of the download finding depends on deployment storage type and process filesystem permissions; the LOCAL default is taken from common.properties, but production deployments may use HDFS or object stores where the impact is cross-tenant object reads instead of host file reads.",
+    "Whether this or the rejected leads correspond to the upstream security fix/CVE for this snapshot could not be verified (no external references, patches, or ground-truth data may be consulted under this review's rules).",
+    "Large modules (Kubernetes deployment templates, registry/scheduler plugins, many task plugins, frontend code) were reviewed only by targeted search for dangerous sinks rather than exhaustively."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "v2 paginated query APIs perform authorization only if `projectName` is supplied, so omitting it returns objects across all projects: TaskDefinitionServiceImpl.filterTaskDefinition (dolphinscheduler-api/.../service/impl/TaskDefinitionServiceImpl.java:678-692 with TaskDefinitionMapper.xml:153-172 omitting the project filter when projectCode==0), ProcessInstanceServiceImpl.queryProcessInstanceList (ProcessInstanceServiceImpl.java:401-429 with ProcessInstanceMapper.xml:295-322), ProcessDefinitionServiceImpl.filterProcessDefinition (ProcessDefinitionServiceImpl.java:609-623) and SchedulerServiceImpl.filterSchedules (SchedulerServiceImpl.java:622-632).",
+      "reason": "Real missing-authorization pattern (any authenticated user can read cross-project workflow/task/schedule metadata; task params can be sensitive), but not selected as the single candidate: the same root cause is spread across several endpoints/files and the impact is disclosure rather than file read, making it a weaker/less-localized finding than the download flaw. Left as an unconfirmed secondary lead rather than an additional candidate."
+    },
+    {
+      "lead": "Master-side evaluation of user-defined Switch-task conditions with the Nashorn JavaScript engine: SwitchTaskUtils.evaluate (dolphinscheduler-master/.../utils/SwitchTaskUtils.java:24-37) and SwitchLogicTask.calculateConditionResult (SwitchLogicTask.java:103-107).",
+      "reason": "Plausible code-injection (workflow author could use Java interop to run code in the master JVM, which holds DB credentials), but the behavior is explicitly documented as `javax.script.ScriptEngine.eval` (docs/docs/en/guide/task/switch.md) and requires workflow create/execute privileges; whether it is treated as intended functionality or as a patched vulnerability is unverified, so it was not selected."
+    },
+    {
+      "lead": "Python gateway starts by default on 0.0.0.0:25333 with a hard-coded default authentication token (ApiConfig.java:78-88, application.yaml:132-140, standalone application.yaml:226-234), exposing PythonGateway project/workflow/user management methods to anyone who can reach the port and knows the public default token.",
+      "reason": "High impact if the default token is unchanged, but it is a documented default ('Should be changed the default value when you deploy in public network') and depends on network exposure and operator configuration; treated as a hardening/configuration weakness rather than the strongest source-level defect. Unconfirmed."
+    }
+  ],
+  "summary": "Reviewed the DolphinScheduler 3.2.0-SNAPSHOT snapshot (3332 visible files; test sources are absent from this snapshot). I traced untrusted-input flows through API controllers → services → DAO mappers/storage/RPC sinks, checked the login interceptor and permission framework, MyBatis XML interpolation, JSON/network deserialization, storage plugins, task/master logic, and security-relevant defaults (python gateway, storage type, self-registration). The strongest single candidate is an authenticated arbitrary-file-read / path-confinement failure in the resource-center download API: the user-supplied `fullName` parameter is passed unvalidated to the storage backend, which reads the given path verbatim (LOCAL/HDFS) or the given object key (S3/OSS/GCS/ABS/OBS), with no resource-table lookup, no tenant validation, and no base-directory prefix check — unlike sibling resource-center methods that do enforce those controls. Other plausible but weaker/uncertain leads (v2 paginated APIs missing project authorization when `projectName` is omitted; master-side Nashorn evaluation of Switch-task conditions; hard-coded default python-gateway token on 0.0.0.0) are recorded as rejected/unconfirmed leads, not as additional candidates."
+}

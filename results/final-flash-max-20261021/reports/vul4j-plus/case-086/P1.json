@@ -1,0 +1,75 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The full HTML string passed to AntiSamy.scan(...) is attacker-controlled. The attacker controls whether a CDATA section is present and its entire body, including `>` and markup-like text that is never parsed into element/attribute events and therefore never validated.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked whether any other layer neutralizes the content: (a) the serializer's CDATA handling does the opposite of neutralizing - ASHTMLSerializer.endElementIO explicitly emits `]]>` for an open CDATA section, and neither ASHTMLSerializer nor ASXHTMLSerializer overrides characters() to escape CDATA text; (b) the XSLT transformer stage is an identity transformation and does not apply the policy; (c) the errored-out branches in MagicSAXFilter (ScanException path, endElement) do not rewrite character data; (d) HTMLEntityEncoder.htmlEntityEncode is applied only to the error-message argument, not to the forwarded XMLString; (e) the DOM scanner does neutralize CDATA (stripCData), so the behavior is a genuine path asymmetry rather than a repository-wide invariant; (f) the CSS/attribute paths and policy regexes (e.g. `anything` is confined to specific attributes such as classid/data-*/value/flashvars, not to the CDATA path) do not cover this input channel because CDATA bodies never reach attribute or tag validation at all. Runtime confirmation was not possible in this run (no code execution/build), so exploitability after HTML re-parsing is argued from source plus standard HTML parsing behavior, not observed.",
+      "id": "cdata-passthrough-sax-filter",
+      "impact": "Sanitizer bypass leading to script execution (XSS) in the consuming application when the cleaned HTML is parsed as HTML: markup and event-handler attributes embedded in a CDATA section are emitted verbatim although they were never evaluated against the AntiSamy policy. Only an informational error message ('A CDATA section was found, which is not allowed...' - the localized bundles say its removal 'should not have any side effects') is produced, and the README explicitly warns that an empty/limited error list does not mean the input was safe, so applications that consume getCleanHTML() are affected. The same primitive can also be used to inject markup that bypasses tag/attribute whitelisting (policy violation) even where script execution is not possible.",
+      "locations": [
+        {
+          "end_line": 115,
+          "path": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+          "start_line": 97
+        },
+        {
+          "end_line": 218,
+          "path": "src/main/java/org/owasp/validator/html/scan/AntiSamySAXScanner.java",
+          "start_line": 204
+        },
+        {
+          "end_line": 57,
+          "path": "src/main/java/org/owasp/validator/html/scan/ASHTMLSerializer.java",
+          "start_line": 49
+        },
+        {
+          "end_line": 654,
+          "path": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+          "start_line": 649
+        }
+      ],
+      "prerequisites": "Application uses the SAX scan path, which is the default: AntiSamy.scan(String) delegates to scan(taintedHTML, this.policy, SAX) (AntiSamy.java lines 69-71), and scan(String, Policy) with scanType SAX is also reachable via scan(taintedHTML, filename)/scan(taintedHTML, File) — note that scan(String,Policy) itself uses DOM. The cdata-sections feature must be enabled on the SAX parser, which it unconditionally is in AntiSamySAXScanner.getParser(); no policy directive disables or re-enables it. Impact requires the application to take the sanitized string (CleanResults.getCleanHTML()) and render/parse it as HTML (the documented usage of the library; the bundled policies also default to useXHTML=true, which does not prevent HTML re-parsing by a browser).",
+      "root_cause": "In the SAX path the NekoHTML parser is configured with the cdata-sections feature enabled (AntiSamySAXScanner.getParser(), line 209), so `<![CDATA[ ... ]]>` in the attacker input is reported as a CDATA section. MagicSAXFilter.characters() (lines 97-115) handles that case by computing an HTML-entity-encoded copy of the text *only for the error message* and then unconditionally forwarding the raw, unmodified `text` to super.characters(), i.e. into the XSLT/serializer pipeline. Because the parser reports the CDATA body as character data, its contents are never dispatched as startElement/endElement/attribute events and therefore are never checked against the AntiSamy policy. The serializer keeps CDATA sections in its output (BaseMarkupSerializer.startCDATA/endCDATA behavior is relied upon by ASHTMLSerializer.endElementIO, lines 51-53, which prints `]]>` when `state.inCData`; the comment there even notes CDATA is 'Illegal in HTML, but still' emitted). The DOM scanner implements the opposite, safe behavior for the same construct: recursiveValidateTag() detects `Text` nodes of type CDATA_SECTION_NODE and calls stripCData() (lines 254-257, 649-654), which replaces the CDATA node with an ordinary text node whose content is escaped on serialization.",
+      "title": "Unvalidated CDATA-section content is passed through the SAX scanner and emitted as a CDATA section (mXSS/policy bypass)",
+      "trace": "Attacker input -> AntiSamy.scan(String) -> AntiSamySAXScanner.scan() -> SAXParser (cdata-sections=true, AntiSamySAXScanner line 209) -> MagicSAXFilter.startCDATA (line 222, sets inCdata=true) -> MagicSAXFilter.characters (lines 103-113: only an encoded copy is used for the ERROR_CDATA_FOUND message; the raw XMLString is forwarded to super.characters) -> no policy lookup/validation for the CDATA body -> XSLT identity transform -> ASHTMLSerializer/ASXHTMLSerializer prints the CDATA section delimiters and unescaped content (endElementIO prints `]]>` for an open CDATA section, lines 51-53) -> CleanResults.getCleanHTML() -> consumer embeds the output in an HTML document, where `<![CDATA[` is parsed as a bogus comment that ends at the first attacker-controlled `>`, so text after it is re-parsed as live markup (elements/event-handler attributes) that AntiSamy never saw. DOM-mode comparison: the same input goes through recursiveValidateTag -> stripCData, producing escaped text and no CDATA delimiters, i.e. the SAX path is missing the DOM path's neutralization.",
+      "unverified": "Not verified by executing the library or a browser. The exact serialized output (whether the identity XSLT stage preserves SAX LexicalHandler startCDATA/endCDATA events as a CDATA section, and how the specific serializer implementation formats it) was inferred from the code that administers `_state.inCData` in ASHTMLSerializer/ASXHTMLSerializer, since the Xerces serializer and NekoHTML sources are external dependencies not present in this snapshot. The final XSS depends on the consumer parsing getCleanHTML() output as HTML (typical, documented usage) rather than as XML; with a true XML/XHTML parse the CDATA body stays inert text.",
+      "weakness_type": "CWE-79 / improper neutralization of script-related HTML tags (sanitizer bypass, mutation XSS)"
+    }
+  ],
+  "coverage_summary": "All 54 model-visible files reported by get_source_scope were in scope (54/54 indexed by the relation index, 0 missing, 0 binary-refused, no symlinks or size-based exclusions; identical filters for B0/P1). I read the complete text of every file under src/main/java (AntiSamy, AntiSamyDOMScanner, AntiSamySAXScanner, MagicSAXFilter, AbstractAntiSamyScanner, ASHTMLSerializer, ASXHTMLSerializer, Constants, CleanResults, Policy, InternalPolicy, PolicyException, ScanException, TagMatcher, model/*, util/*, css/*), plus README.md, SECURITY.md, pom.xml and .github workflow files, and spot-read the bundled policy XML files (directives, common-regexps, common-attributes, tag-rules for anchors/style/img/font, css-rules for URI-bearing properties, dynamic-attribute section) and the localized error-message bundles. The relation index was used only for navigation (symbol/containment/call edges and the four navigation 'facts'); its qualification that edges are syntactic candidates and prove neither reachability nor exploitability was respected. No build, tests, scanners, or code execution were performed, and dependency sources (Xerces serializer, NekoHTML, Batik CSS, HttpClient) are not part of the snapshot, so behavior attributable to those libraries was reasoned about from the repository code that configures them.",
+  "limitations": [
+    "No runtime validation: no compilation, tests, or browser parsing were executed, so the serialized shape of the CDATA output and the resulting HTML re-parse behavior are inferred from source (ASHTMLSerializer/ASXHTMLSerializer inCData handling) and standard HTML tokenization rules, not observed.",
+    "Dependency code is not in the snapshot: org.apache.xml.serialize (Xerces) BaseMarkupSerializer/HTMLSerializer CDATA and attribute-escaping behavior, NekoHTML's cdata-sections and attribute-name handling, and Batik's CSS AST toString() output could not be read directly and are treated as inferred.",
+    "The bundled test suite is not present (only src/main and resources), so the maintainers' intended behavior and regression expectations for CDATA, comments, and the SAX/DOM asymmetries could not be cross-checked.",
+    "The repository snapshot corresponds to pom version 1.6.6.1 with outputTimestamp 2022-04-07; I could not consult release history or advisories, so mapping this code state to a specific published CVE/fix commit is not possible from the supplied material.",
+    "Coverage of the very large policy XML files was targeted (regexps, directives, tag/attribute rules, CSS property rules) rather than line-by-line exhaustive; per-property CSS whitelist analysis was limited to URI-bearing and string-bearing properties.",
+    "The relation index reports no omissions for this tree, but its calls/containment edges are syntactic and were not treated as proof of data flow or reachability; areas with no indexed record were not claimed as reviewed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "SSRF / unbounded response read in CssScanner.parseImportedStylesheets (httpClient.execute(new HttpGet(stylesheetUri), ...), lines 261-366; EntityUtils.toString reads the whole entity before the sizeLimit check).",
+      "reason": "Attacker-influenced absolute URLs can be fetched, but only when the policy directive embedStyleSheets is enabled - all bundled policies set embedStyleSheets=false (e.g. antisamy.xml line 27). It is therefore configuration-dependent and opt-in, and the URL must satisfy the policy's onsiteURL/offsiteURL regexps, so it is weaker evidence than the default-path CDATA issue. Left as an unconfirmed lead, not a second candidate."
+    },
+    {
+      "lead": "MagicSAXFilter keeps a `style` attribute for every validated tag without checking that the policy permits it on that tag (lines 300-311), unlike AntiSamyDOMScanner.processAttributes which requires attr != null (line 520).",
+      "reason": "With the bundled policies `style` is declared as a global attribute (antisamy.xml line 507), so the asymmetry has no effect in the default configuration; the CSS value is still sanitized by CssScanner. Policy-configuration-dependent, low demonstrable impact."
+    },
+    {
+      "lead": "`boolean isStyle = \"style\".endsWith(element.localpart);` (MagicSAXFilter line 280) is a reversed/inverted comparison that is true for local names 'tyle', 'yle', 'le', 'e'.",
+      "reason": "No bundled policy defines a validated tag whose name is a suffix of 'style', so the mistaken branch is not reachable with the shipped policies; impact is limited to unusual custom policies."
+    },
+    {
+      "lead": "`cleaned = \"<![CDATA[[\" + cleaned + \"]]>\";` (CssScanner.scanStyleSheet line 188) looks like an extra bracket (an unbalanced opening delimiter) versus the CDATA regex it re-wraps.",
+      "reason": "The branch is only reached when the stylesheet matches the CDATA pattern and useXHTML is false, while all bundled policies set useXHTML=true; no clear security impact traceable to the extra character (it yields malformed CSS text, not an escape from a CSS/style context)."
+    },
+    {
+      "lead": "Policy loading/`<include>`/`resolveEntity`/`URIUtils.resolveAsString` URL handling (Policy lines 390-630, 1009-1062) as SSRF/path-traversal.",
+      "reason": "verifyLocalUrl restricts the base URL to file:/jar: and the policy document is trusted configuration, not attacker input in the documented usage; no attacker-controlled path to these calls was established."
+    },
+    {
+      "lead": "Unbounded recursion / no depth limit on the SAX path versus maxDepth=250 on the DOM path (AntiSamyDOMScanner lines 74, 237-239).",
+      "reason": "Plausible DoS hardening gap, but no source evidence that the SAX pipeline recurses per nesting level in attacker-controllable depth, and no concrete security impact established from source alone."
+    }
+  ],
+  "summary": "AntiSamy (OWASP HTML/CSS sanitizer, pom version 1.6.6.1) reviewed as a defensive source assessment across all 54 model-visible files (Java scanner/CSS/policy code plus bundled policy XML and locale bundles; no binaries, no tests, no build). The strongest single source-supported issue is in the default (SAX) scan path: MagicSAXFilter forwards CDATA-section content to the serializer without any policy validation or escaping, only logging an error, so attacker markup that the sanitizer never validated is emitted inside a CDATA section and becomes live markup when the result is parsed as HTML (mutation XSS / sanitizer bypass). The DOM scan path contains the neutralizing counterpart (CDATA section converted to a plain text node), which confirms the intended invariant and the SAX-side gap."
+}

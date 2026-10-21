@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "A malicious or compromised HTTP/2 server (or any MITM of an h2c connection) fully controls PUSH_PROMISE frames: the promised stream ID, the associated stream ID, the pushed request's `:authority`/`:path`, and all subsequent HEADERS/DATA/RST_STREAM on the created stream. Client stream IDs are sequential and predictable, so the attacker can target the client's next IDs.",
+      "confidence": "low",
+      "counterevidence_checked": "putIfAbsent rejects a promised ID that is currently in use by an active local stream, so a direct hijack of an in-flight request fails with a connection error; RESPONSE frames on an unknown even stream are rejected or ignored by HTTP2ClientSession.onHeaders; HTTP/2 server push is only delivered to applications that register Request.onPush (otherwise the stream is RST_STREAMed with REFUSED_STREAM); no Jetty component automatically re-sends a pushed request (HttpReceiverOverHTTP2 marks the push exchange complete without sending it), so the 'different authority' consequence requires application code to act on the supplied Request; the origin server already controls its own responses, which limits the severity of the stream-confusion part; HTTP2ServerSession.onHeaders, by contrast, does enforce client-stream parity, showing the client-side path lacks the equivalent check.",
+      "id": "jetty-http2-client-push-promise-stream-validation",
+      "impact": "A malicious HTTP/2 server can (a) make the client associate server-originated frames with stream IDs belonging to the client's own request space, producing request failures/stream mis-association ('reading from the wrong streams'); (b) hand the application a synthetic request whose authority is not the connected server, and if that request is forwarded/executed, cause requests (and any credentials/cookies resolved for that URI) to be sent to an attacker-chosen server (unintended intermediary / request redirection); (c) degrade/DoS the client's ability to issue requests on the connection by occupying its future stream IDs.",
+      "locations": [
+        {
+          "end_line": 127,
+          "path": "jetty-core/jetty-http2/jetty-http2-client/src/main/java/org/eclipse/jetty/http2/client/internal/HTTP2ClientSession.java",
+          "start_line": 98
+        },
+        {
+          "end_line": 927,
+          "path": "jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/HTTP2Session.java",
+          "start_line": 876
+        },
+        {
+          "end_line": 219,
+          "path": "jetty-core/jetty-http2/jetty-http2-client-transport/src/main/java/org/eclipse/jetty/http2/client/transport/internal/HttpReceiverOverHTTP2.java",
+          "start_line": 188
+        }
+      ],
+      "prerequisites": "The client must use Jetty's HTTP/2 transport (HttpClientTransportOverHTTP2). The stream-ID collision behavior needs no application cooperation (push is enabled by default: HTTP2Client.maxConcurrentPushedStreams=32, HTTP2Session.pushEnabled defaults to true). The pushed-authority consequence needs the application (or a downstream Jetty component) to have installed a push handler via Request.onPush and to act on the synthetic pushed Request.",
+      "root_cause": "On the client side, HTTP2ClientSession.onPushPromise (HTTP2ClientSession.java:98-127) accepts the `promisedStreamId` carried in a server PUSH_PROMISE frame with no RFC 9113 §6.6 validation: it does not require the promised ID to be even (server-initiated), strictly greater than all previously promised IDs, or not already consumed/closed, and it does not check that the associated stream is a valid open client stream. HTTP2Session.createRemoteStream (HTTP2Session.java:876-927) accepts the ID, unconditionally raises lastRemoteStreamId via updateLastRemoteStreamId, and inserts the stream into `streams` for any ID that is not currently in use (putIfAbsent), so an attacker-chosen odd/duplicate ID becomes a live 'remote' stream. In addition, HttpReceiverOverHTTP2.onPush (HttpReceiverOverHTTP2.java:188-219) synthesizes a client Request from the server-supplied pushed MetaData URI (`metaData.getHttpURI().toString()`) without verifying that its `:authority` matches the connection's Origin, and then binds that request/exchange to a channel of the current connection (lines 205-213).",
+      "title": "HTTP/2 client trusts server-supplied PUSH_PROMISE stream IDs and pushed authority without validation",
+      "trace": "1) Server sends PUSH_PROMISE with an odd/duplicate or next-client promisedStreamId. 2) HTTP2ClientSession.onPushPromise calls createRemoteStream(pushStreamId, metaData); putIfAbsent succeeds whenever that ID is not currently in `streams`, creating a 'remote' HTTP2Stream with an attacker-chosen ID and raising lastRemoteStreamId (HTTP2Session.createRemoteStream). 3) When the client later allocates that same ID for a real request, HTTP2Session.createLocalStream/putIfAbsent collides: the request is failed with 'Duplicate stream' (or, if the crafted stream was already removed after end-stream, the server can premptively ship HEADERS/DATA that the client then attributes to its own newly created stream). 4) Separately, the pushed MetaData URI becomes a client Request for an arbitrary authority (HttpReceiverOverHTTP2.onPush line 196); Request.send() on it resolves the destination from that URI (HttpRequest.send -> client.resolveDestination), i.e. a server-chosen destination.",
+      "unverified": "I could not confirm the exact upstream fix or reproduce the behavior at runtime. Whether the promised odd/duplicate stream ID leads to mis-attribution (and not just a failed client request) depends on the timing with which the client's next stream is allocated versus when the crafted remote stream is removed; and the 'different server' impact depends on application code acting on the pushed Request. HPACK/meta-data parsing for pushed requests was not exercised; only static reading of the client-server state machine was performed.",
+      "weakness_type": "Improper input validation / origin validation error in server-initiated stream handling (CWE-20, CWE-346)"
+    }
+  ],
+  "coverage_summary": "Reviewed the snapshot as a broad but not exhaustive main-source assessment. Deep reads: jetty-http2 common/client/server session state machines and parsers (HTTP2Session, HTTP2Stream, HTTP2ClientSession, HTTP2ServerSession, Parser/body parsers incl. PUSH_PROMISE/CONTINUATION, HPACK decoder/context), jetty-http2 client transport (HttpConnectionOverHTTP2, HttpChannelOverHTTP2, HttpReceiverOverHTTP2, HttpSenderOverHTTP2, HTTPSessionListenerPromise), jetty-client core/transport (HttpClient, HttpRequest, HttpConnection, HttpDestination, HttpRedirector, AuthenticationProtocolHandler, ProxyAuthenticationProtocolHandler, AuthenticationStore, Origin, HttpProxy), jetty-http (HttpParser, HttpURI, MetaData, HttpClientTransport), jetty-util (URIUtil canonicalization), jetty-proxy ProxyHandler, jetty-security/OpenID authentication-revocation paths. Skimmed/lighter coverage: jetty-http3/jetty-quic, WebSocket modules, ee8/ee9/ee10 servlet internals, session data stores, deployment/JMX/start modules. Test sources and any binary artifacts are outside the snapshot filters (model_visible_files=3671; no src/test sources were visible), so no test-based confirmation was possible.",
+  "limitations": [
+    "No runtime execution, HTTP/2 fuzzing, or exploit reproduction was performed; all conclusions are static-reading leads.",
+    "No git metadata/diff was available in the snapshot, so I could not confirm which file(s) the upstream security fix touched; the candidate is an inference from code and protocol requirements.",
+    "No test sources were present, so behavior asserted by existing unit tests could not be cross-checked.",
+    "The pushed-authority impact depends on application-level push handlers, which are not part of this repository snapshot; therefore the SSRF/'different server' consequence is conditional and unproven end-to-end.",
+    "Modules not reviewed in depth (HTTP/3-QUIC native bindings, WebSocket internals, ee9/ee8 nested servlet stack, deployment/start/JMX) could contain additional issues and are not covered by this candidate."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "HpackDecoder literal-header name index out of range: `_context.get(nameIndex)` can return null and the result is dereferenced without a null check (jetty-core/jetty-http2/jetty-http2-hpack/src/main/java/org/eclipse/jetty/http2/hpack/HpackDecoder.java:193-198).",
+      "reason": "Reachable by a remote peer (HPACK name index > static table with empty dynamic table) and would throw NPE rather than a proper COMPRESSION_ERROR, but the NPE is caught upstream by AdaptiveExecutionStrategy.produce() (jetty-core/jetty-util/.../AdaptiveExecutionStrategy.java:516, logs 'Task produce failed' and returns null), resulting at most in a stalled connection until idle timeout. Looks like long-standing behavior rather than a targeted security fix; no evidence of memory corruption or privilege impact."
+    },
+    {
+      "lead": "ServletApiRequest.isRequestedSessionIdValid dereferences session.getId() after getSession(false) may return null (jetty-ee10/jetty-ee10-servlet/src/main/java/org/eclipse/jetty/ee10/servlet/ServletApiRequest.java:549-559).",
+      "reason": "Latent NPE in a servlet API accessor, not attacker-controlled enough to demonstrate security impact; no evidence this is the snapshot's designated issue."
+    },
+    {
+      "lead": "HTTP2ClientSession.onHeaders silently ignores a response for the *next* local stream ID because isLocalStreamClosed() uses `streamId <= localStreamIds.get()` (jetty-core/jetty-http2/.../HTTP2Session.java:335-338), i.e. an unsolicited response can be ignored instead of raising PROTOCOL_ERROR.",
+      "reason": "No concrete harm found: the unsolicited HEADERS creates no stream, and the corresponding DATA frames are answered with RST_STREAM(STREAM_CLOSED), so no cross-exchange data delivery could be demonstrated."
+    },
+    {
+      "lead": "HTTP/1 hop-by-hop / Transfer-Encoding / Content-Length handling in HttpParser and ProxyHandler as a request-smuggling vector.",
+      "reason": "The snapshot already enforces the relevant hardening: multiple/conflicting Content-Length rejection, TRANSFER_ENCODING_WITH_CONTENT_LENGTH compliance checks (jetty-http HttpParser.java:1098-1129), and ProxyHandler strips Connection-named and hop-by-hop headers before forwarding (jetty-proxy ProxyHandler.java:282-327). No bypass identified."
+    },
+    {
+      "lead": "ThreadLimitHandler / DoSFilter / URI ambiguity regressions corresponding to older Jetty CVEs.",
+      "reason": "Those fixes (e.g. VERSION.txt entries for the ThreadLimitHandler and DoSFilter advisories) predate this 12.0.17-SNAPSHOT snapshot; the corresponding hardening was found present in the source."
+    }
+  ],
+  "summary": "Repository: Eclipse Jetty (12.0.17-SNAPSHOT; VERSION.txt ends at 12.0.16, 09 Dec 2024). Scope contained 3,671 main-source/documentation files (no test sources present in the snapshot). I traced the HTTP/1 and HTTP/2 parsing/generation paths, HPACK/QPACK decoders, URI/path canonicalization, the HTTP client (redirects, authentication, proxies, connection pools), the HTTP/2 client/server session state machines, the proxy handler, and session/security handling. One candidate with concrete source evidence is submitted; several other plausible-but-unconfirmed leads are listed as rejected. No runtime confirmation was possible (read-only review)."
+}

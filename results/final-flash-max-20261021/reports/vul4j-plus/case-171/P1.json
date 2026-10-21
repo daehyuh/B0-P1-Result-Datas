@@ -1,0 +1,86 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The effective user name is taken verbatim from untrusted sources: (a) the RPC ConnectionHeader, where the client writes an arbitrary UTF string as the user/real-user name (ConnectionHeader.readFields lines 65-76 -> UserGroupInformation.createRemoteUser), and the server adopts it as the call identity when SASL is not used (Server.processHeader lines 1285-1288; simple authentication is the default and is not rejected unless security is enabled); (b) the \"user.name\" HTTP query parameter, which JspHelper.getUGI turns into a remote UGI when security is disabled, and UserProvider uses for WebHDFS. UserGroupInformation.createRemoteUser only rejects null/empty names; HadoopKerberosName parsing leaves the raw string intact for names without '@'.",
+      "confidence": "medium",
+      "counterevidence_checked": "Checked that this is not blocked upstream: (a) UserGroupInformation.createRemoteUser and the User constructor perform no character validation, and HadoopKerberosName keeps the raw name when it has no '@'; (b) no userName sanitizer exists in Server/ConnectionHeader/SaslRpcServer, and I found no caller-side quoting helper in Shell.java (the only 'quote' reference is a comment); (c) looked for a pre-existing fix in CHANGES.txt for a groups/user-name injection and found none, while other security fixes (e.g., MAPREDUCE-5475 ACL verification, YARN-1932 JS injection) are present and their guards exist in code, making an unnoticed regression unlikely; (d) verified the defaults that make the path common (hadoop.security.authentication=simple; group.mapping=ShellBasedUnixGroupsMapping in core-default.xml; dfs.permissions.enabled=true in hdfs-default.xml/DFSConfigKeys); (e) confirmed the group lookup is not short-circuited for HDFS permission checks (FSPermissionChecker always calls getGroupNames; the default hadoop-policy wildcard ACLs only bypass the separate RPC service-ACL group lookup); (f) in Kerberos mode the primary identity comes from SASL and JspHelper enforces checkUsername, so the simplest paths require simple auth - this limits, but does not eliminate, the issue (proxy path above).",
+      "id": "hadoop-groups-username-cmd-injection",
+      "impact": "Remote arbitrary OS command execution as the Unix account running the Hadoop daemon (NameNode, ResourceManager, NodeManager, JobHistoryServer, etc.). This is a full compromise of the daemon host from the cluster network: read/modify/delete all HDFS data and cluster state, steal or forge credentials/keys accessible to that account, persist, and pivot to other cluster services. On non-Kerberos (default) deployments the trigger is effectively unauthenticated; the user name is also reachable through the NameNode/DataNode web UI and WebHDFS/HttpFS when those are enabled.",
+      "locations": [
+        {
+          "end_line": 59,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/Shell.java",
+          "start_line": 55
+        },
+        {
+          "end_line": 98,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/ShellBasedUnixGroupsMapping.java",
+          "start_line": 53
+        },
+        {
+          "end_line": 97,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java",
+          "start_line": 75
+        },
+        {
+          "end_line": 1174,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java",
+          "start_line": 1165
+        },
+        {
+          "end_line": 80,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/ConnectionHeader.java",
+          "start_line": 59
+        },
+        {
+          "end_line": 1311,
+          "path": "hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java",
+          "start_line": 1270
+        },
+        {
+          "end_line": 57,
+          "path": "hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java",
+          "start_line": 50
+        },
+        {
+          "end_line": 588,
+          "path": "hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/JspHelper.java",
+          "start_line": 540
+        }
+      ],
+      "prerequisites": "Cluster running default simple authentication (hadoop.security.authentication=simple, the default) so the claimed user name is accepted; default group mapping provider ShellBasedUnixGroupsMapping (core-default.xml) and default dfs.permissions.enabled=true in HDFS so FSPermissionChecker is constructed on operations; network reachability to the daemon RPC port (default 8020) or the HTTP UI (/contentSummary/*, /data/*, /listPaths/*, /fsck are registered without an auth filter when security is off). A secondary, narrower path exists on Kerberos clusters: in ProxyUsers.authorize (ProxyUsers.java line 132) the groups of the client-claimed effective user are resolved when the authenticated proxy superuser has a non-wildcard group list configured, again before any authorization decision.",
+      "root_cause": "Shell.getGroupsForUserCommand() builds the command string \"id -Gn \" + user and executes it via bash -c, without quoting or validating the user name. The name is attacker-supplied at the protocol/HTTP boundary and is carried through UserGroupInformation/Groups to the default group-mapping provider (ShellBasedUnixGroupsMapping) with no neutralization, so shell metacharacters embedded in the name are interpreted by bash in the daemon process.",
+      "title": "OS command injection through unquoted user name in shell-based group mapping (bash -c \"id -Gn \" + user)",
+      "trace": "1) Untrusted name enters via ConnectionHeader.readFields (ipc/ConnectionHeader.java 65-76) or request.getParameter(\"user.name\") (JspHelper.java 643-651) and is passed to UserGroupInformation.createRemoteUser (UGI.java 918-926), which performs only a null/empty check. 2) For RPC in simple mode, Server.processHeader assigns user = protocolUser (Server.java 1285-1288) and Server.Handler executes the call under that UGI (Server.java 1462-1470), so UserGroupInformation.getCurrentUser() inside the RPC handler is the attacker-claimed identity. 3) Any HDFS operation that checks permissions builds FSPermissionChecker with that UGI; its constructor calls ugi.getGroupNames() (FSPermissionChecker.java 50-57), as do web servlets that wrap NN calls in getUGI(...).doAs(...) (e.g., ContentSummaryServlet.java 44-61) and ACL checks (AccessControlList.isUserAllowed 217-228 / ProxyUsers.authorize 132). 4) UGI.getGroupNames() calls Groups.getGroups(getShortUserName()) (UGI.java 1165-1174; short name preserves the raw string for names without '@'), and Groups.getGroups delegates to the configured provider, default ShellBasedUnixGroupsMapping (Groups.java 53-59, 75-97). 5) ShellBasedUnixGroupsMapping.getUnixGroups passes the name to Shell.execCommand(Shell.getGroupsForUserCommand(user)) (ShellBasedUnixGroupsMapping.java 83-90). 6) getGroupsForUserCommand returns {\"bash\", \"-c\", \"id -Gn \" + user} (Shell.java 55-59) and Shell.execCommand/Shell.runCommand executes that array through ProcessBuilder (Shell.java 405-423, 135-149), so the user name is parsed by bash as shell syntax. 7) The daemon process therefore executes attacker-influenced commands as its own OS user; the failure/empty-group handling in Groups.getGroups and UGI.getGroupNames happens only after the command has run.",
+      "unverified": "No code execution, tests, or runtime probing were performed, so exploitability in a concrete deployment and the exact daemon configuration are inferred from source and documented defaults. The exact upstream fix/CVE identity for this snapshot is not asserted (no web/CVE data used). Whether HttpServer/WebApp filters or container settings would add any additional validation to user.name on a given installation was not runtime-verified. The snapshot contains only main sources (no tests/JSPs), so test-level evidence of a reverted fix could not be checked.",
+      "weakness_type": "CWE-78 OS Command Injection (unvalidated user-controlled string concatenated into shell command)"
+    }
+  ],
+  "coverage_summary": "Coverage: source_scope reports 3006 model-visible files (same filters for all conditions; binaries with NUL bytes in the first 8 KiB are skipped; no symlinks or >5 MiB files excluded). The P1 relation index reports 3006/3006 files indexed, 50846 symbols and 100028 edges, with no SAST/oracle findings loaded and no build/test execution; index coverage is syntactic navigation only, so absence of an index edge is not evidence of absence and no unreported area is claimed as reviewed. I inspected the RPC/IPC connection handling (Server, ConnectionHeader, SaslRpcServer), UGI/group resolution (UserGroupInformation, Groups, ShellBasedUnixGroupsMapping, Shell), authorization helpers (AccessControlList, ServiceAuthorizationManager, ProxyUsers), HDFS permission checking and web entry points (FSPermissionChecker, NameNodeHttpServer servlet registrations, ContentSummaryServlet, FileDataServlet, ListPathsServlet, JspHelper, WebHDFS UserProvider), YARN localization (FSDownload, FileUtil.unZip/unTar), YARN NodeManager web pages (ContainerLogsPage, AggregatedLogsBlock), and the YARN/MR webapp routing and Hamlet escaping. Not exhaustively audited: the full DFS/YARN protocol implementations, native sources, and configuration/XML parsers beyond spot checks.",
+  "limitations": [
+    "No execution, tests, scanners, or network probes were performed; every conclusion is from static source reading, so no finding is runtime-confirmed.",
+    "The snapshot excludes test sources and JSP files, so fix-reversion evidence from tests and JSP-level sinks could not be examined.",
+    "The relation index is syntactic/navigational only (no data-flow, reachability, or exploitability proof) and was used only to navigate; not every indexed edge was inspected.",
+    "The repository has no available history or patch metadata, so the exact upstream fix commit/CVE corresponding to this snapshot could not be identified and is not claimed.",
+    "Deployment-specific behavior (Jetty encoding of paths, exchange/route filters, whether simple authentication is in use, actual daemon OS account) is inferred from defaults and source, not observed."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Zip Slip / archive traversal in FileUtil.unZip (new File(unzipDir, entry.getName()) with no containment check) reached from YARN FSDownload.unpack for user-supplied .zip/.tar.gz local resources (FSDownload.java 194-234, FileUtil.java 576-612)",
+      "reason": "The missing check is real and could allow writes outside the localization dir as the NodeManager user, but this class of fix landed much later than this 2014 snapshot's era and extraction happens on attacker-supplied archives whose destination/permission side effects I could not fully bound from source alone; treated as a secondary lead, not the strongest evidence."
+    },
+    {
+      "lead": "Potential arbitrary file read via ContainerLogsPage where $(CONTAINER_LOG_TYPE) is concatenated into a local log path (ContainerLogsPage.java 199-236) with LocalDirAllocator.getLocalPathToRead doing no containment check (LocalDirAllocator.java 426-447)",
+      "reason": "Exploitability is conditional: the YARN route parameter cannot contain a decoded '/' under normal route matching, so traversal would depend on servlet-container handling of encoded slashes; not verified in source, so rejected as unconfirmed."
+    },
+    {
+      "lead": "XXE in Configuration.loadResource / HttpFS ConfigurationUtils / QueueConfigurationParser (DocumentBuilderFactory without disallow-doctype/secure processing)",
+      "reason": "Reachable chiefly by controlling local configuration files rather than by a remote attacker, so impact and prerequisites are weak for this snapshot."
+    },
+    {
+      "lead": "Various web-UI XSS/redirect surfaces in YARN/MR/HDFS pages",
+      "reason": "Hamlet escapes quoted output by default and several XSS fixes (e.g., YARN-1932) are present; remaining candidates are lower impact and not clearly unescaped, so no distinct well-evidenced XSS was selected."
+    }
+  ],
+  "summary": "Reviewed the Hadoop 0.23.11-SNAPSHOT tree (3006 main-source files; tests and JSPs are not present in the snapshot) with emphasis on Apache Hadoop's trust boundaries: IPC connection handling, UGI/group resolution, HDFS permission checks, YARN localization, and the servlet/web layers. One candidate is submitted: an unquoted attacker-controlled user name is interpolated into a `bash -c` command by the default shell-based group-mapping provider, giving any client that can claim a user name (default simple authentication) or a configured proxy user a way to run arbitrary OS commands as the Hadoop daemon user (NameNode/ResourceManager/etc.). Every link of the chain was verified in source text (entry point → UGI creation → group lookup → shell string build → ProcessBuilder array). No runtime execution or scanner was used; the candidate is a source-evidence lead, not a confirmed exploit. Other plausible but weaker/uncertain issues are listed as rejected leads."
+}

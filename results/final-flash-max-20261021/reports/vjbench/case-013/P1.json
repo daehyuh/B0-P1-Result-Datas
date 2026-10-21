@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The JSON-like string passed to JsonSanitizer.sanitize(String) / sanitize(String,int) / EvalMinifier.minify(...). Attacker only needs to supply a value containing a run of '[' (or '{') one level deeper than the configured maximum (64 by default). No other privileges or state required.",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched all uses of maximumNestingDepth (only constructor clamp line 196 and isMap allocation line 253) and all uses of bracketDepth (lines 170, 256/257, 283/288, 489-490) - no depth guard exists anywhere. Confirmed the only catch in the scan loop is UnbracketedComma (line 449), and sanitize()/sanitize(String,int) (lines 108-124, 207-493) declare no checked exceptions and are not wrapped. The documented class contract (lines 48-50, 85-91) promises bracket repair, not throwing. Considered whether the AIOOBE is intended rejection: there is no documented exception type, no IllegalArgumentException/Javadoc, and the parameter is described only as 'maximum nesting depth', so an out-of-range array index is an implementation defect rather than a specified limit. Also considered whether callers always catch RuntimeException: that is application-dependent, which is why this is a lead with stated prerequisites rather than a confirmed exploit.",
+      "id": "json-sanitizer-depth-aioobe",
+      "impact": "Attacker-controlled denial of service: any request path that pipes untrusted JSON-like data through JsonSanitizer with nesting deeper than the configured limit (64 by default) aborts with an uncaught ArrayIndexOutOfBoundsException instead of being sanitized, breaking the library's documented guarantee that it 'fixes ... mismatched or missing close brackets' and can be attached to a data pipeline. If the exception is not handled by the caller it terminates the request/thread and can be repeated cheaply (small payloads, ~65 characters) in an availability attack; where the sanitizer is used as a filter/input-validation stage, failure to sanitize is also the wrong fail-open direction.",
+      "locations": [
+        {
+          "end_line": 259,
+          "path": "src/main/java/com/google/json/JsonSanitizer.java",
+          "start_line": 250
+        },
+        {
+          "end_line": 99,
+          "path": "src/main/java/com/google/json/JsonSanitizer.java",
+          "start_line": 95
+        },
+        {
+          "end_line": 201,
+          "path": "src/main/java/com/google/json/JsonSanitizer.java",
+          "start_line": 195
+        },
+        {
+          "end_line": 452,
+          "path": "src/main/java/com/google/json/JsonSanitizer.java",
+          "start_line": 449
+        }
+      ],
+      "prerequisites": "Application calls the public sanitize/minify API on untrusted JSON-like content (the documented use case) and does not wrap it in a catch-all for RuntimeException. Input nesting depth must be > maximumNestingDepth (default 64; the public overload lets the caller pick, but anything above 4096 is clamped, so the exception is reachable for every configuration).",
+      "root_cause": "In JsonSanitizer.sanitize(), opening brackets allocate `isMap = new boolean[maximumNestingDepth]` once, then write `isMap[bracketDepth] = map; ++bracketDepth;` for every '{'/'[' with no comparison of `bracketDepth` against `maximumNestingDepth`. `bracketDepth` grows with the number of unclosed brackets, so once input nesting reaches `maximumNestingDepth + 1` the write is out of bounds. The parameter is clamped to [1, 4096] in the constructor (line 196), so no configuration avoids the crash on arbitrarily deep input, and the token loop only catches UnbracketedComma (line 449), so the AIOOBE propagates out of public `sanitize(String)` / `sanitize(String,int)`.",
+      "title": "Uncaught ArrayIndexOutOfBoundsException when input nesting exceeds the configured maximumNestingDepth",
+      "trace": "sanitize() token loop -> case '{': case '[' (line 250) -> requireValueState -> allocate isMap of size maximumNestingDepth on first bracket (lines 252-254) -> `isMap[bracketDepth] = map` (line 256) -> `++bracketDepth` (line 257). bracketDepth is only decremented on '}'/']' (line 283) and is never checked against the array length. On the (maximumNestingDepth+1)-th unclosed opening bracket, line 256 indexes past the end of `isMap`; the surrounding `try` only catches UnbracketedComma (line 449), so ArrayIndexOutOfBoundsException escapes sanitize() to the caller.",
+      "unverified": "Not runtime-executed: the AIOOBE is inferred from source (unbounded `bracketDepth` index into a fixed-size array). The exact sanitize() call sites and exception handling in real consumers are outside this snapshot, so real-world reachability/impact depends on the host application. Whether maintainers intended a thrown error when depth is exceeded (with callers expected to catch) could not be confirmed from the source or docs in this snapshot; no tests are present to show intended behavior.",
+      "weakness_type": "Improper validation of array index / uncaught runtime exception on attacker-controlled input (CWE-129, CWE-248) leading to denial of service"
+    }
+  ],
+  "coverage_summary": "All 11 files visible in the assigned snapshot were read or listed: src/main/java/com/google/json/JsonSanitizer.java (1176 lines, fully read), EvalMinifier.java (341 lines, fully read), package-info.java (not security-relevant), README.md, docs/contact.md, docs/getting_started.md, pom.xml, .travis.yml, .gitattributes, .gitignore, src/site/site.xml. Coverage was guided by the P1 relation scope (10 indexed files / 3 parsed Java files, 70 symbols, 246 call rows, 152 unresolved calls, partial index status; control flow, data flow and semantic resolution are not implemented, and 1 file was omitted from the index). The candidate was verified against source text (not index labels), including all uses of maximumNestingDepth and bracketDepth and the only exception handler in the scan loop.",
+  "limitations": [
+    "No tests, test resources, or golden files are present in the snapshot, so intended behavior for nesting-depth overflow and octal escapes could not be cross-checked against expected outputs.",
+    "No execution, static analysis, or fuzzing was performed (read-only review), so the ArrayIndexOutOfBoundsException is a source-inferred, not runtime-confirmed, behavior.",
+    "The P1 index is partial and syntactic only (no control/data-flow, reachability, or semantic resolution; 152 unresolved calls; 1 omitted file), so callers of JsonSanitizer outside this snapshot and their exception handling are unknown.",
+    "Upstream/patched versions, CVE/advisory data, and internet references were intentionally not consulted, so I could not confirm which of the observed code anomalies correspond to a historical fix.",
+    "Other potential correctness issues (octal escapes, trailing-comma assertions, number canonicalization) were inspected only as far as needed to judge security impact; they were not exhaustively enumerated."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Octal string-escape handling in sanitizeString (lines 594-610): the three-digit test compares `ch <= '3'` where `ch` is the backslash character (0x5C, always > '3'), and the value loop starts at `j = i` (the backslash) instead of `j = i + 1`, so escaped characters are computed from the wrong digits.",
+      "reason": "This mangles values (e.g. `\\101` cannot decode to 'A') and leaves single-digit octal escapes such as `\\1` unchanged, so the output can contain an escape JSON does not define, but the rewritten text stays between the string quotes (\\u00XX plus remaining octal digits), so I found no code-injection, quote-breakout, or XSS path from it in this snapshot; impact is data corruption/invalid-JSON risk with unclear security severity, and no source evidence in this snapshot proves the intended correct implementation. Also could not determine whether this is an upstream artifact or an introduced defect without external references."
+    },
+    {
+      "lead": "`</script` escaping in sanitizeString (lines 544-555) fails under some boundary condition.",
+      "reason": "Traced the check (`i > start && i + 2 < end && charAt(i-1)=='<' && lowercase(charAt(i+1))=='s' && lowercase(charAt(i+2))=='c') for closed, unterminated, single-quoted, inferred/unquoted, capitalised and split-across-region cases; the index guard covers the three characters needed after the slash, and regions ending inside the sequence do not produce the contiguous `</script` in the output. No concrete bypass found; kept as an unconfirmed rejected lead, not a candidate."
+    },
+    {
+      "lead": "`]]>` escaping condition (lines 556-561, `i + 2 < end`).",
+      "reason": "The bound check accepts the last three positions of the region, so `]]>` inside strings/unterminated strings is replaced with `\\u005d]>`; no cross-region construction of `]]>` in the output was found. Rejected as unconfirmed."
+    },
+    {
+      "lead": "EvalMinifier (whole file) may emit attacker-controlled code.",
+      "reason": "It sanitizes first with JsonSanitizer, then only re-emits scanned string/number/identifier tokens or generated single-letter parameter names bound inside the generated function expression; no free-variable or string-breakout path was found in source. Rejected as unconfirmed; also inherits the crash lead above via JsonSanitizer."
+    },
+    {
+      "lead": "pom.xml build/reporting/publishing configuration (plugins, staging profile, compiler target 1.6).",
+      "reason": "Configuration-only; no attacker-controlled input path or privilege/trust boundary demonstrable in this snapshot."
+    }
+  ],
+  "summary": "Reviewed the 11-file OWASP/json-sanitizer snapshot (version 1.2.1-SNAPSHOT): JsonSanitizer.java, EvalMinifier.java, package-info.java, pom.xml, README/docs/site metadata. The single strongest evidence-supported candidate is that the input nesting-depth limit is never enforced when opening brackets/braces: the per-depth `isMap` array is sized to `maximumNestingDepth` but indexed with an unbounded `bracketDepth`, so untrusted input nested deeper than the configured limit (default 64, hard-capped 4096) triggers an uncaught `ArrayIndexOutOfBoundsException` from the public `sanitize(...)` API. The two guarantee-critical escaping paths (`</script`, `]]>`) and the octal-escape code were scrutinized; the escaping paths held up under the cases I could trace, while the octal-escape logic shows separate correctness anomalies whose security impact is weak/unclear, so it is recorded only as a rejected lead. No candidate was runtime-confirmed (no execution permitted)."
+}

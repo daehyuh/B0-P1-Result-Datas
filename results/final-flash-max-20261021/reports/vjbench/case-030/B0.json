@@ -1,0 +1,70 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The attacker fully controls the UIDL RPC JSON sent to the Vaadin servlet (POST with request type UIDL): `{\"type\":\"mapSync\",\"node\":<attached node id>,\"feature\":<feature id>,\"property\":\"<any name>\",\"value\":<any JSON>}`. The property name and value are attacker-chosen and are not restricted to properties the server ever marked as synchronized; flow-client's MapProperty.syncToServer / StateTree.sendNodePropertySyncToServer show this same message shape is generated for any property on an active node, with no client-side authorization gate, so the server-side check is the only guard.",
+      "confidence": "medium",
+      "counterevidence_checked": "Template model maps are still protected: PolymerTemplate.initModel always installs an updateFromClientFilter (lines 226-242), so for those nodes the nested branch matches and the update is rejected (only the warning text differs); the flaw therefore requires a node with a null filter, which is the default for non-template elements. CSRF protection remains required (VaadinService.isCsrfTokenValid, line 1881-1893), which limits cross-site exploitation unless xsrf protection is disabled. The stock client only sends updates for properties the server marked as synchronized, so the issue requires a crafted client (devtools, script, extension). No server-side check on synchronized status exists anywhere else in the mapSync path (verified MapSyncRpcHandler, AbstractRpcInvocationHandler, NodeMap.put), and the absence of a check is contradicted by the method's own security comment and by NodeMap's documented contract.",
+      "id": "case-030-01",
+      "impact": "Server-side state tampering / authorization bypass. A malicious client can create or overwrite any property on any attached element of its UI, including the three properties the framework explicitly forbids from client updates, and can trigger the associated PropertyChangeEvent with attacker-chosen values; MapSyncRpcHandler.tryConvert additionally lets a crafted value containing `nodeId` inject a StateNode reference into the property map. Applications that treat element properties as authoritative state (read-only/approval/selected values, validation gates, template-model-like data) can have business logic and validation subverted. Access is confined to the attacker's own UI/session, so this is not cross-user data disclosure.",
+      "locations": [
+        {
+          "end_line": 100,
+          "path": "flow-server/src/main/java/com/vaadin/flow/internal/nodefeature/ElementPropertyMap.java",
+          "start_line": 78
+        },
+        {
+          "end_line": 254,
+          "path": "flow-server/src/main/java/com/vaadin/flow/internal/nodefeature/ElementPropertyMap.java",
+          "start_line": 237
+        },
+        {
+          "end_line": 108,
+          "path": "flow-server/src/main/java/com/vaadin/flow/server/communication/rpc/MapSyncRpcHandler.java",
+          "start_line": 53
+        },
+        {
+          "end_line": 486,
+          "path": "flow-server/src/main/java/com/vaadin/flow/internal/nodefeature/NodeMap.java",
+          "start_line": 466
+        }
+      ],
+      "prerequisites": "A reachable Vaadin UI/session and the ability to issue an HTTP request carrying the session's JSESSIONID and the matching CSRF token (VaadinService.isCsrfTokenValid, server default xsrf protection is enabled). This is reachable by the user's own manipulated browser/extension, by script injected into the application, or trivially when `disable-xsrf-protection` is configured (common in test setups). The targeted node must be attached and active (checked by AbstractRpcInvocationHandler.handle), and the server must be in normal (non-assert) execution. No filter must be configured for the node, which is the default for plain elements/components.",
+      "root_cause": "In ElementPropertyMap.deferredUpdateFromClient(String key, Serializable value) the guard `if (!mayUpdateFromClient(key, value))` only returns the no-op Runnable inside the nested branch `if (updateFromClientFilter != null && !updateFromClientFilter.test(key))`. When `updateFromClientFilter` is null (its default, line 56, and the normal situation for every element node that is not a PolymerTemplate model map — the filter is only installed in PolymerTemplate.initModel lines 226-242), the outer guard is entered but execution falls through to line 99 `return putWithDeferredChangeEvent(key, value, false)`. mayUpdateFromClient (lines 237-254) is deny-by-default: it returns false for forbiddenProperties (textContent, classList, className) and for any property that is neither in SynchronizedPropertiesList nor accepted by a filter, so the code applies exactly the updates the check was intended to reject. The comment at lines 80-85 ('Ignore updates for properties that are rejected...') and NodeMap.updateFromClient's contract (lines 466-486: 'The value is only updated if mayUpdateFromClient has been overridden to accept the value') show the intended behavior is unconditional rejection.",
+      "title": "Client-crafted UIDL RPC can write arbitrary server-side element properties because ElementPropertyMap.deferredUpdateFromClient falls through when no client-update filter is set",
+      "trace": "VaadinServlet.service -> VaadinService.handleRequest -> UidlRequestHandler.synchronizedHandleRequest (line 89) -> ServerRpcHandler.handleRpc (line 235; CSRF check at 250) -> handleInvocationData (line 371) -> MapSyncRpcHandler.handle (base-class check: node attached and active) -> MapSyncRpcHandler.handleNode (line 54; feature id only validated by asserts at 64-65) -> enqueuePropertyUpdate (line 98) -> ElementPropertyMap.deferredUpdateFromClient (line 106-107 of MapSyncRpcHandler / line 78 of ElementPropertyMap) -> mayUpdateFromClient returns false (lines 238-253) -> because updateFromClientFilter == null the inner if at 86-95 is skipped -> line 99 putWithDeferredChangeEvent applies the value, sets the change flag and later fires the PropertyChangeEvent.",
+      "unverified": "No runtime confirmation was performed and the snapshot contains no unit tests for this class (src/test trees are absent), so the intended upstream behavior is inferred from the code's comments, method contract and the deny-by-default implementation of mayUpdateFromClient. It could not be determined whether this is the historical upstream defect or a snapshot-introduced mutation. Concrete severity depends on how the target application reads/stores element properties; the StateNode-reference injection path via `nodeId` was traced in source but not exercised.",
+      "weakness_type": "CWE-863 Incorrect Authorization (client-controlled update of server-side element properties)"
+    }
+  ],
+  "coverage_summary": "Read-only review of the assigned snapshot (1,352 files). Concentrated on flow-server/src/main/java (462 files), especially server request handling (VaadinServlet, VaadinService, StaticFileServer, WebJarServer), bootstrap/PWA/inline resource generation, communication handlers (ServerRpcHandler, UidlRequestHandler, StreamReceiver/StreamRequestHandler, PushHandler, MapSyncRpcHandler, PublishedServerEventHandlerRpcHandler), and the state-tree feature classes (ElementPropertyMap, NodeMap, SynchronizedPropertiesList). flow-client main sources and flow-tests integration views were sampled for corroboration; build modules were only skimmed. No src/test unit-test sources exist in the snapshot, so behavior was inferred from main-code contracts and comments. No code was executed and no external references were consulted.",
+  "limitations": [
+    "No runtime/build validation was possible (read-only tools), so exploitability and the exact set of affected components are inferred from source only.",
+    "The snapshot contains no unit tests for ElementPropertyMap; the intended (rejecting) behavior is inferred from the in-code security comment, mayUpdateFromClient's deny-by-default implementation and NodeMap's documented contract.",
+    "No git history, upstream diff or CVE reference is available in the snapshot, so it cannot be determined whether this is a historical upstream bug present at this revision or an introduced mutation; the finding is submitted as a lead, not a confirmed vulnerability.",
+    "Impact is deployment-dependent: it requires application logic that treats element properties as authoritative state, and session-scoped exploitation (a valid CSRF token), which was not validated against a running application.",
+    "Dependency-level and servlet-container-specific behaviors (e.g., ServletContext.getResource normalization) were evaluated only from source assumptions, not tested."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path handling in WebJarServer/StaticFileServer (flow-server/src/main/java/com/vaadin/flow/server/webjar/WebJarServer.java getWebJarPath / StaticFileServer.getRequestFilename) passes container-decoded request paths containing '.'/'..' segments to ServletContext.getResource/getResourceAsStream.",
+      "reason": "The final resolution is delegated to the servlet container, whose getResource normally normalizes or rejects '..' traversal (Tomcat's ApplicationContext normalizes the path); no source-level evidence of a working traversal primitive exists in the snapshot, and the file must still start with the frontend/bower prefix. Speculative open-redirect in VaadinServlet.handleContextOrServletRootWithoutSlash (request URI reused in Location) is similarly unverified and not clearly cross-origin exploitable."
+    },
+    {
+      "lead": "SSRF via UidlWriter.getInlineResourceStream (flow-server/src/main/java/com/vaadin/flow/server/communication/UidlWriter.java line 276: new URL(url).openConnection().getInputStream()).",
+      "reason": "The URL comes from server-side dependency declarations (annotations such as @JavaScript/@HtmlImport and the Page/Element API), not from an untrusted request; the client cannot choose the dependency URL, so attacker-controllability is missing."
+    },
+    {
+      "lead": "Potential JS/HTML injection helpers: BootstrapUtils.makeJsString escapes only single quotes/escaped quotes but not backslashes, and BootstrapHandler.getBootstrapJS escapes '<' only in the initial UIDL, not in the appConfig JSON.",
+      "reason": "Both feed developer/deployment-controlled data (theme header contents, system messages, frontend/deployment configuration), not attacker-controlled input. No untrusted flow into these sinks was found."
+    },
+    {
+      "lead": "Reflection-based invocation in PublishedServerEventHandlerRpcHandler (findMethod/invokeMethod, setAccessible) and node-id driven handlers (AttachExistingElementRpcHandler, AttachTemplateChildRpcHandler).",
+      "reason": "Invocation is gated on @EventHandler/@ClientCallable annotations, the base handler requires the target node to be attached and active in the same UI, and requests pass the CSRF check. The unchecked outer requestedId/assignedId values can cause NullPointerException/IllegalStateException only (error-handler/DoS at most), which does not meet the evidence threshold for a distinct security finding."
+    },
+    {
+      "lead": "makeJsString in BootstrapUtils and PWA/service-worker path concatenation in PwaRegistry/BootstrapHandler.setupPwa emitting config strings into inline JavaScript.",
+      "reason": "Values originate from @PWA/theme/deployment configuration set by the application developer; no attacker-controlled source was identified."
+    }
+  ],
+  "summary": "Reviewed the assigned Vaadin Flow 1.3-SNAPSHOT source tree (1,352 files; flow-server main, flow-client, flow-tests, build modules) as a defensive source review. The strongest source-evidenced issue is in the client-to-server property-update path: MapSyncRpcHandler hands attacker-crafted property updates to ElementPropertyMap.deferredUpdateFromClient, whose rejection branch only returns the no-op runnable when an updateFromClientFilter exists and rejects the name. When no filter is configured (the default for every node that is not a PolymerTemplate model map), updates that mayUpdateFromClient explicitly refused — including the hard-forbidden textContent/classList/className and any non-synchronized property — fall through and are written into server-side state. This defeats the framework's own documented \"for security reasons\" restriction and is the single candidate submitted. No other reviewed lead reached the same evidence level; they are listed as rejected."
+}

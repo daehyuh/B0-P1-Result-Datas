@@ -1,0 +1,66 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The `url` argument is by design untrusted data (request parameters/persisted user content) passed by applications to the public XSSAPI/XSSFilter services; the snapshot itself contains no caller, so the attacker controls the string reaching these methods, not the call site.",
+      "confidence": "medium",
+      "counterevidence_checked": "Plain ':' is excluded by the regex and direct `javascript:` payloads are rejected, so the regex is genuinely the barrier being bypassed. The colon-in-query hardening at XSSAPIImpl.java:206-209 is present but does not cover entity-encoded colons, which are decoded only by the browser. I checked that the six percent-encoding replacements do not touch `&`/`#`/`;`, and that the effective policy href regex (config.xml:70-72) is used instead of the DEFAULT_HREF_ATTRIBUTE fallback because the default config defines an `a` tag with an `href` attribute (config.xml:244-249, 805-808), so both the policy path and the fallback path allow entity syntax. Whether callers HTML-encode the returned value cannot be verified from this snapshot; if they do, the payload is neutralized (double-decoding does not occur), which is the main limitation. AntiSamy's Attribute.containsAllowedValue semantics were reasoned from source knowledge because the antisamy jar is not part of the snapshot.",
+      "id": "cand-1-getvalidhref-entity-bypass",
+      "impact": "Bypass of the XSS sanitizer itself: a URL that the library reports as valid yields script execution in a victim's browser (session/token theft, arbitrary actions in the application origin) whenever an unencoded entity-bearing URL is accepted from an attacker and rendered as a link/image source. Because the vulnerable code is the shared security service, the flaw affects every consumer that relies on getValidHref without an extra encoding step.",
+      "locations": [
+        {
+          "end_line": 219,
+          "path": "src/main/java/org/apache/sling/xss/impl/XSSAPIImpl.java",
+          "start_line": 195
+        },
+        {
+          "end_line": 251,
+          "path": "src/main/java/org/apache/sling/xss/impl/XSSFilterImpl.java",
+          "start_line": 243
+        },
+        {
+          "end_line": 72,
+          "path": "src/main/resources/SLING-INF/content/config.xml",
+          "start_line": 70
+        }
+      ],
+      "prerequisites": "An application uses XSSAPI.getValidHref() (or XSSFilter.isValidHref()) on attacker-controlled input and writes the returned value into an HTML attribute without additional HTML encoding, which is the documented purpose of the API and consistent with the method pre-encoding `\"`/`'`/`<`/`>` so the value can be embedded in a quoted attribute. The attack also requires a browser to decode character references in the attribute value (standard behavior).",
+      "root_cause": "XSSAPIImpl.getValidHref() only percent-encodes `\"`, `'`, `>`, `<`, backtick and space (and `:` after a `?`) and then delegates trust to XSSFilterImpl.isValidHref(), which matches the raw string against the policy's onsiteURL/offsiteURL regexes. Those regexes allow every character needed to build an HTML character reference (`&`, `#`, `;`, digits, letters, `(`, `)`), and no HTML-entity decoding or scheme canonicalization is performed before validation. The returned URL is documented and intended for direct use as an HTML href/src attribute value, so the browser will decode entities such as `&#58;`/`&#x3a;`/`&colon;` back to `:` and execute the resulting `javascript:` URL. The comment in isValidHref claiming parity with `org.owasp.validator.html.scan.MagicSAXFilter.startElement()` is misleading: MagicSAXFilter validates attribute values after the HTML parser has decoded character references, whereas this method receives undecoded input.",
+      "title": "getValidHref()/isValidHref() accept HTML-entity-encoded javascript: URLs (XSS bypass)",
+      "trace": "1) Input `java&#115;cript&#58;alert(1)` (or `javascript&colon;alert(1)`) enters XSSAPIImpl.getValidHref (XSSAPIImpl.java:195). 2) The six replaceAll calls (lines 200-205) leave `&`, `#`, `;`, digits, letters and parentheses untouched; the '?' colon-encoding branch is skipped because there is no '?'. 3) mangleNamespaces (line 211) leaves the string unchanged (the `/([^:/]+):` pattern requires a literal ':' after '/', which is not present). 4) isValidHref (XSSFilterImpl.java:244-250) lowercases and matches the whole string against the onsiteURL regex `([\\p{L}\\p{N}\\\\.\\#@\\$%\\+&;\\-_~,\\?=/!\\*\\(\\)]*|\\#(\\w)+)` (config.xml:70), which accepts every character of the payload, so containsAllowedValue returns true and the offsiteURL regex is not even consulted. 5) getValidHref returns the entity-encoded string unchanged (line 213); the caller emits `<a href=\"java&#115;cript&#58;alert(1)\">`, the browser decodes it to `javascript:alert(1)`, and script executes when the link is activated. Plain `javascript:...` is correctly rejected because ':' is outside onsiteURL and offsiteURL demands an http(s)/ftp/mailto prefix, confirming the entity encoding is what defeats the only validation barrier.",
+      "unverified": "The AntiSamy 1.5.2 dependency is embedded (pom.xml:111-115) but its jar/source is not in the snapshot, so the exact containsAllowedValue/matchesAllowedExpression behavior is inferred, not read locally. No caller of getValidHref exists in this snapshot, and no tests exist, so end-to-end exploitability depends on consumer rendering behavior. Not runtime-confirmed and not matched to any CVE record.",
+      "weakness_type": "CWE-79 Cross-site Scripting (incomplete URL scheme validation; missing HTML entity decoding before validation, CWE-838/CWE-184 style bypass)"
+    }
+  ],
+  "coverage_summary": "All 19 model-visible files were enumerated; every Java source file was read end-to-end (XSSAPI, XSSFilter, ProtectionContext, JSONUtil, and the impl package: XSSAPIImpl, XSSFilterImpl, PolicyHandler, XSSFilterRule, HtmlToHtmlContentContext, PlainTextToHtmlContentContext, LongValidationRule, XSSAPIAdapterFactory, package-info), and pom.xml/README were read. In the 2,819-line config.xml I read the directives, common regexp definitions, common attributes (including href, style, event-handler literals), global-tag-attributes, and the tag definitions for the security-relevant elements (script/iframe/frame, form/input/button, a, link, style, img), then searched the remainder for event attributes, data:/javascript: URIs, script/embed/object/param/svg/math and remove actions. ESAPI.properties and validation.properties were inspected for validator configuration. Coverage gaps: the CSS-rule sections of config.xml (roughly lines 130-250 and 1000-2819) were only search-sampled, not read line-by-line; test sources, the AntiSamy/ESAPI/batik/encoder jars, and any Sling caller code are absent from the snapshot.",
+  "limitations": [
+    "No execution, build, dependency resolution or exploit attempt was performed; all conclusions are static source reads.",
+    "The AntiSamy 1.5.2, ESAPI 2.1.0, encoder 1.1.1 and batik 1.6 artifacts are referenced only by pom.xml/Embed-Dependency; their code is not in the snapshot, so containsAllowedValue/matchesAllowedExpression and CSS-scanner semantics are inferred from the API contract and known library behavior, not verified locally.",
+    "No callers of XSSAPI/XSSFilter and no tests are present in the 19-file snapshot, so end-to-end reachability depends on downstream Sling applications that were not inspected; this is the main uncertainty for the selected candidate.",
+    "The exact response encoding used by consumers (whether getValidHref's return value is embedded raw, as the method's own quote/angle/space percent-encoding implies, or HTML-encoded again) cannot be verified from this repository.",
+    "The mangleNamespaces '$'/StringIndexOutOfBounds behaviors and the getValidXML external-entity behavior were reasoned from Java/JDK semantics without runtime confirmation.",
+    "config.xml's CSS-validation sections were only keyword-sampled, so a policy-based CSS bypass (especially via the old batik-css 1.6 dependency) remains an unexamined residual area."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "XXE in XSSAPIImpl.getValidXML() (XSSAPIImpl.java:353-372): SAXParserFactory is created with setValidating(false)/setNamespaceAware(true) but no disallow-doctype-decl, external-general-entities=false or secure-processing settings.",
+      "reason": "Plausible but weaker than the selected candidate: impact is conditional on JDK/Xerces default external-entity resolution (not observable in-snapshot), parsed content is not returned to the caller (limiting file disclosure), and the realistic impact is SSRF/entity-expansion DoS rather than XSS. Kept as an unconfirmed hardening-gap lead."
+    },
+    {
+      "lead": "mangleNamespaces() passes group(1) into Matcher.appendReplacement() without Matcher.quoteReplacement() (XSSAPIImpl.java:174-180).",
+      "reason": "A URL segment containing '$' (e.g. `/a$b:`) makes appendReplacement interpret `$b` as an illegal group reference and throw IllegalArgumentException before isValidHref runs. Real robustness bug, but attacker impact is at most a failed request/exception (DoS of one rendering), and reachability again depends on an external caller; too weak to overtake the entity-encoding bypass."
+    },
+    {
+      "lead": "getValidJSToken() single-character quote input (XSSAPIImpl.java:225-239): token `'` or `\"` passes the length>0 check and endsWith(q), then substrings from index 1 to length-1 and throws StringIndexOutOfBoundsException instead of returning the default.",
+      "reason": "Denial-of-service via exception at most; requires a caller passing a bare quote to the API. Lower security impact than the href bypass."
+    },
+    {
+      "lead": "Stale/inconsistent default policy handling: XSSFilterImpl.updateDefaultHandler() only assigns the new handler when defaultHandler == null (XSSFilterImpl.java:123-124, 138-139), so an admin policy change at /libs/sling/xss/config.xml is ignored, and defaultHandler/hrefAttribute are non-volatile fields updated non-atomically (lines 216-217).",
+      "reason": "Configuration/consistency issue without attacker-controlled input or a demonstrated exploitation path in this snapshot; rejected as out of scope for the single strongest candidate."
+    },
+    {
+      "lead": "Embedded vulnerable dependencies: antisamy 1.5.2 and batik-css 1.6 are pinned (pom.xml:130-132, 169-174) while style attributes and <style> elements are allowed and CSS-validated (config.xml:218-219, 531, 838-845).",
+      "reason": "Version-pinning concern; no dependency source is present in the snapshot and no specific bypass is demonstrable from repository source alone."
+    }
+  ],
+  "summary": "The snapshot is Apache Sling's XSS Protection bundle (org.apache.sling.xss 1.0.8): a small Java service layer over AntiSamy/ESAPI/OWASP-Encoder that is supposed to sanitize attacker-controlled strings and URLs. Reviewing all 19 files, the strongest evidence-backed issue is in the URL validation path: XSSAPI.getValidHref()/XSSFilter.isValidHref() validate the raw (only superficially percent-encoded) URL against character-class regexes that still allow `&`, `#`, `;`, digits and letters, so HTML-entity-encoded schemes such as `javascript&#58;alert(1)` or `javascript&colon;alert(1)` are accepted and returned for direct placement in an `href`/`src` attribute, where the browser decodes the entity and executes the javascript: URL. Secondary, weaker issues (XXE in getValidXML, `$`-triggered IllegalArgumentException in mangleNamespaces, single-quote StringIndexOutOfBoundsException in getValidJSToken, stale default policy on reload) are listed as rejected/unconfirmed leads. No code was executed; the finding is a source-evidence lead, not a runtime confirmation."
+}

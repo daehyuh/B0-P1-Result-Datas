@@ -1,0 +1,93 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "Remote HTTP client controls the Host header (e.g. `Host: localhost` or `Host: 127.0.0.1:8080`) and can omit the Origin header entirely. It can then upgrade to the Dev UI JSON-RPC WebSocket at /q/dev-ui/... and send JSON-RPC requests with arbitrary method names and parameters (e.g. devui-workspace.getWorkspaceItemContent / saveWorkspaceItemContent with an attacker-chosen absolute path and content).",
+      "confidence": "medium",
+      "counterevidence_checked": "The CORS filter does enforce origin matching via CORSFilter (corsConfig.origins().contains / isSameOrigin) and rejects mismatched origins with 403, so the similarly weak `origin.startsWith(\"http://localhost\")` check in DevUICORSFilter is not independently exploitable from a browser; however CORSFilter returns `event.next()` when no Origin header is present, so non-browser clients are not covered. On a default Linux/macOS dev run the server binds to loopback, which would prevent remote connection (the finding matters for WSL defaults, explicit quarkus.http.host=0.0.0.0, containers/port mappings, or any proxy forwarding the Host header). Dev UI routes are registered only for local dev/test mode (build step gate), so this is not a production-mode issue. I found no additional token/session/authorization check on the JSON-RPC path (JsonRpcRouter, DevUIWebSocket) and none on the workspace actions. No runtime testing was performed; conclusions are from source reading only.",
+      "id": "devui-host-header-acl-bypass",
+      "impact": "Remote access to the privileged Dev UI tooling on the development machine: arbitrary file read and arbitrary file write as the developer/dev-process user (e.g. application sources, dotfiles such as SSH authorized_keys), plus other exposed Dev UI actions (extension management is enabled by default, test execution, DB inspector SQL, log/config views). Arbitrary file write yields a realistic code-execution path on the dev machine/container; at minimum it is a complete loss of the intended localhost-only trust boundary.",
+      "locations": [
+        {
+          "end_line": 70,
+          "path": "extensions/vertx-http/runtime-dev/src/main/java/io/quarkus/devui/runtime/LocalHostOnlyFilter.java",
+          "start_line": 46
+        },
+        {
+          "end_line": 168,
+          "path": "extensions/vertx-http/deployment/src/main/java/io/quarkus/devui/deployment/DevUIProcessor.java",
+          "start_line": 158
+        },
+        {
+          "end_line": 92,
+          "path": "extensions/vertx-http/runtime-dev/src/main/java/io/quarkus/devui/runtime/DevUICORSFilter.java",
+          "start_line": 72
+        },
+        {
+          "end_line": 45,
+          "path": "extensions/vertx-http/runtime-dev/src/main/java/io/quarkus/devui/runtime/DevUIWebSocket.java",
+          "start_line": 20
+        },
+        {
+          "end_line": 285,
+          "path": "extensions/vertx-http/runtime-dev/src/main/java/io/quarkus/devui/runtime/comms/JsonRpcRouter.java",
+          "start_line": 270
+        },
+        {
+          "end_line": 226,
+          "path": "extensions/vertx-http/deployment/src/main/java/io/quarkus/devui/deployment/menu/WorkspaceProcessor.java",
+          "start_line": 210
+        }
+      ],
+      "prerequisites": "Dev/test mode (Dev UI routes are registered only under IsLocalDevelopment / not non-local dev mode) and the dev-mode HTTP server reachable from the attacker's network position. Default binding is loopback on Linux/macOS, but Quarkus documents that it binds 0.0.0.0 in dev/test on WSL by default, and users commonly set quarkus.http.host=0.0.0.0 or expose dev containers/port-forwards. No application-level authorization is required; quarkus.dev-ui.hosts only adds allowed hosts, it does not change the bypass.",
+      "root_cause": "LocalHostOnlyFilter.hostIsValid derives the request host from event.request().absoluteURI() (the Host header for origin-form requests) and only compares it to \"localhost\"/\"127.0.0.1\" or configured hosts. The Host header is fully attacker-controlled, so the intended localhost-only restriction is not enforced; the only other guard (DevUICORSFilter) is bypassable by simply not sending an Origin header, and the Dev UI JSON-RPC web socket performs no further authorization before dispatching build-time actions. Because those actions include unrestricted workspace read/write, the bypass reaches sensitive operations.",
+      "title": "Dev UI localhost-only access control relies on client-controlled Host header, allowing remote access to privileged Dev UI JSON-RPC (file read/write)",
+      "trace": "1) DevUIProcessor.registerDevUiHandlers installs LocalHostOnlyFilter on the `/q/dev-ui/*` route (ordered route, lines 158-161). 2) LocalHostOnlyFilter.hostIsValid builds `new URI(event.request().absoluteURI()).toURL().getHost()` (lines 48-50) and compares it to localhost/127.0.0.1/allowed hosts (line 52) - for HTTP/1.1 origin-form requests this host comes from the Host header. 3) A remote client sending `Host: localhost` passes the filter; if it sends no Origin header, DevUICORSFilter immediately delegates without checking (lines 76-79 of DevUICORSFilter, which only guards browser CORS scenarios). 4) DevUIWebSocket accepts the WebSocket upgrade with no additional checks (lines 20-36). 5) JsonRpcRouter.routeToDeployment dispatches any requested method name through DevConsoleManager.invoke with attacker-supplied params and no authorization (lines 270-285). 6) WorkspaceProcessor registers getWorkspaceItemContent/saveWorkspaceItemContent (lines 210-226), which read arbitrary files and write arbitrary paths (writeContent at lines 269-280 creates missing directories/files with attacker content).",
+      "unverified": "Exploitability was not runtime-confirmed: not verified whether Vert.x/Quarkus ever overrides absoluteURI() from the connection instead of the Host header in the exact versions used, whether any deployment-time policy (e.g. an application-defined quarkus.http.auth.permission for /q/*) is commonly present, and whether the WSL/0.0.0.0 default applies in the target environment. The arbitrary-file-write impact also depends on the Dev UI workspace actions being callable by name over the WebSocket exactly as source indicates.",
+      "weakness_type": "Improper access control / trust of client-controlled Host header (CWE-290/CWE-346); dev-mode remote access to privileged tooling (potential RCE)"
+    }
+  ],
+  "coverage_summary": "Read-only source review of the assigned snapshot (12,982 files at root; 12,976 model-visible; 6 excluded by sensitive-name/path filter; 0 excluded for size; binary-like files skipped). The visible tree notably contains no `src/test` sources, so tests could not be used as evidence. P1 relation index: 12,920/12,982 files indexed (62 missing), 9,455 Java files parsed, 38 parse errors, 276,269 call records/183,573 candidate edges; the index provides syntax-level symbols/calls/containment only (no control flow, data flow, semantic resolution, Spring runtime/DI/security semantics, no SAST findings, no build/test execution). I inspected security/auth-relevant code extensively: vertx-http security handlers and policies (HttpAuthenticator, AbstractHttpAuthorizer, AbstractPathMatchingHttpSecurityPolicy/ImmutablePathMatcher, RolesAllowed/Authenticated/Deny policies, PersistentLoginManager, form/basic/mTLS mechanisms, management-interface security), REST security integration (EagerSecurityHandler/Context, SecurityContextOverrideHandler, JaxRsPathMatchingHttpSecurityPolicy, CSRF filter), OIDC/OidcProvider/token-state/session-cookie handling, Keycloak policy enforcer, WebAuthn, elytron realms (properties/JDBC/LDAP/OAuth2), Jakarta Security basics, spring-security checks and spring-web paths, Dev UI access control paths (LocalHostOnlyFilter, DevUICORSFilter, DevUIWebSocket, JsonRpcRouter, WorkspaceProcessor, MvnpmHandler, FileSystemStaticHandler, RemoteSyncHandler), WebSockets-next security upgrade checks, and targeted greps for dangerous sinks (command execution, deserialization, path handling, SQL concatenation, trust managers, weak randomness). Deeper coverage was not exhaustive for the whole repository; large areas such as integration-tests, ArC internals, build tooling, devtools, and many extensions were only sampled or searched by pattern.",
+  "limitations": [
+    "No code execution, tests, builds, or scanners were run; all conclusions are static source reading (no runtime confirmation).",
+    "Unit/integration test sources are absent from the visible snapshot, so I could not correlate code with failing regression tests or use test fixtures as evidence.",
+    "The P1 index is syntax/navigation-only (no control/data flow, no semantic resolution, 38 parse errors, 62 source files missing, ~211k unresolved calls), so some call/data-flow paths (e.g. whether application-defined HTTP permissions for /q/* are present in typical deployments) could not be established.",
+    "The Host-header bypass assessment depends on Vert.x behavior for HttpServerRequest.absoluteURI()/host() (origin-form requests use the Host header), which I inferred from source/usage rather than executing the server.",
+    "Dev-mode exploitability depends on environment-specific binding (WSL default 0.0.0.0, explicit quarkus.http.host, containers/port-forwarding), which is deployment-specific and not verifiable from this snapshot.",
+    "Repository snapshot excludes test sources and there was no access to git history, patches, CVE/CWE ground truth, or external advisories; the intended target vulnerability (if any) may lie in areas only sampled by this review."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "DevUICORSFilter uses origin.startsWith(\"http://localhost\")/prefix matching instead of exact origin comparison (extensions/vertx-http/runtime-dev/.../DevUICORSFilter.java lines 80-91).",
+      "reason": "Allowed-origin decision is delegated to CORSFilter, which rejects origins that are not exactly configured or same-origin (via URI host/port checks in CORSFilter.isSameOrigin), so a prefix-only origin such as http://localhost.attacker.com still gets a 403 and no ACAO/credentials headers. Dev-mode only; no concrete data exposure demonstrated."
+    },
+    {
+      "lead": "SQL injection in the integration-test application helper integration-tests/elytron-security-jdbc/src/main/java/io/quarkus/elytron/security/jdbc/it/JdbcPermissionChecker.java line 31 (`... where u.username='\" + username + \"'`), and in integration-tests/jpa/src/main/java/io/quarkus/it/jpa/defaultcatalogandschema/DefaultCatalogAndSchemaResource.java lines 45-49 (schema parameter concatenated into a native query).",
+      "reason": "Clear string-concatenation injection with request/authentication-controlled input, but located in integration-test modules rather than shipped extension/runtime code; security impact is confined to test applications, so it does not meet the impact threshold for the single production-grade candidate."
+    },
+    {
+      "lead": "TLS registry Let's Encrypt management endpoints are unauthenticated by default (extensions/tls-registry/runtime/.../LetsEncryptRecorder.java lines 141-159, 216-256, 267-287; registered on the management interface in CertificatesProcessor lines 98-106).",
+      "reason": "Gated behind build-time quarkus.tls.lets-encrypt.enabled=true (default false) and management-interface exposure; the effect is setting/serving ACME challenge content under /.well-known/acme-challenge/<token> and forcing certificate reloads, a much narrower impact than the submitted candidate."
+    },
+    {
+      "lead": "Dev services OIDC provider reflects redirect_uri/post_logout_redirect_uri into Location headers without validation (extensions/devservices/oidc/src/main/java/io/quarkus/devservices/oidc/OidcDevServicesProcessor.java lines 339-346, 487-534, 814-820).",
+      "reason": "Open-redirect behavior exists, but only in the Dev Services (dev-mode) OIDC mock provider and it is explicitly a test scaffold; not a production trust boundary."
+    },
+    {
+      "lead": "RemoteSyncHandler compares the remote-dev password hash with String.equals (non-constant time) and deserializes Java objects from request bodies (extensions/vertx-http/runtime/.../devmode/RemoteSyncHandler.java lines 174-216, 256-289).",
+      "reason": "Java deserialization is reachable only in remote dev mode and is password-gated; the timing-wise comparison is a hardening issue rather than a demonstrated exploitable flaw. Requires the developer to enable remote dev and expose the port."
+    },
+    {
+      "lead": "Dev UI DatabaseInspector builds SQL from client-supplied table/append strings and executes it (extensions/agroal/runtime-dev/.../DatabaseInspector.java lines 235-237, 334-336; Dev UI JS qwc-agroal-datasource.js line 815).",
+      "reason": "The Dev UI database inspector is explicitly a tool that executes user-provided SQL in dev mode, so the concatenation does not cross an additional trust boundary beyond the Dev UI access question captured in the submitted candidate."
+    },
+    {
+      "lead": "OIDC authorization-code-flow state cookie payload (restore path) is only base64-encoded, not integrity-protected, when PKCE and nonce are disabled (extensions/oidc/runtime/.../CodeAuthenticationMechanism.java lines 977-998, 1221-1245).",
+      "reason": "Exploitation would require the attacker to set the q_auth cookie in the victim's browser (XSS/subdomain) and the payload only influences a same-authority redirect path; upstream behavior appears deliberate, and I could not establish a complete attack path from source alone."
+    },
+    {
+      "lead": "Management interface has no authentication by default (ManagementRuntimeAuthConfig has no enabling/default permission; routes such as Hibernate Search /q/reindex and TLS reload are exposed on port 9000, bound 0.0.0.0 in prod).",
+      "reason": "This is documented management-interface behavior/configurable via quarkus.management.auth.* permissions rather than a code-level validation flaw; no single attacker-controlled sink with missing check was identified beyond the config default."
+    }
+  ],
+  "summary": "Quarkus (main/999-SNAPSHOT, ~3.23-dev) repository review. After a broad sweep of security/auth code (vertx-http security handlers, form/basic/mTLS auth, path-matching policies, REST security integration, OIDC token/cookie handling, WebAuthn, Keycloak PEP, Dev UI) I found no confirmed production-path authentication bypass. The strongest traceable issue is in dev-mode Dev UI access control: the \"localhost-only\" gate validates the client-supplied Host header instead of the socket peer, so any network client that can reach the dev-mode HTTP port can pass by sending `Host: localhost` and then use the unauthenticated Dev UI JSON-RPC (WebSocket) layer, which exposes arbitrary workspace file read/write build-time actions. Impact is high for a developer machine/dev container (file write → code execution), but it is dev/test-mode and requires non-loopback exposure; I therefore report it as a lead with medium confidence. Several other suspicious-but-weaker items were rejected and are listed as leads only."
+}

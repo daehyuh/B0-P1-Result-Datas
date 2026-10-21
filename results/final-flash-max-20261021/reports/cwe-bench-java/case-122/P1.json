@@ -1,0 +1,102 @@
+{
+  "candidates": [
+    {
+      "attacker_control": "The value of the tenant request header (default name 'X-Okapi-Tenant', configurable via tenant.header-name) is fully caller-controlled. It reaches TenantController.create/delete (POST/DELETE /_/tenant) through the @TenantHeader resolver, and reaches every JPA operation through HibernateTenantIdentifierResolver. Header values may contain SQL metacharacters such as quotes, semicolons and comments.",
+      "confidence": "medium",
+      "counterevidence_checked": "Searched the whole tree for tenant validation, sanitization, regex matching, interceptors and filters: no validation of the tenant header exists (only unrelated Pattern usages in domain services and checkstyle config). TenantController's @Validated applies to the TenantAttributes body, not the header. SchemaService's replace(\"-\", \"_\") is cosmetic and does not neutralize quotes/semicolons. No Spring Security dependency is declared (web/pom.xml). The schema SQL statements use plain Statement/String.format rather than bind parameters, and the Thymeleaf [(${schema})] syntax is unescaped text inlining. Counter-consideration lowering confidence: in a standard FOLIO deployment the header is supplied by Okapi, so whether an untrusted client can reach the module directly or set the header is a deployment property not provable from this source; JDBC multi-statement behavior for Statement.executeUpdate also varies by driver and was not executed.",
+      "id": "tenant-header-sqli",
+      "impact": "Arbitrary SQL execution with the module's database credentials: an attacker able to supply the tenant header can alter the injected predicate/statement (string-literal context in schemaExists), append statements in identifier context (CREATE/DROP SCHEMA, USE), and depending on JDBC/driver multi-statement handling execute additional DDL/DML. Realistic consequences are disclosure and modification of data in the module's database, dropping or replacing schemas (including other tenants' module schemas, since DROP SCHEMA ... CASCADE is executed from this header), corruption of tenant provisioning state, and denial of service. No runtime exploitation was performed; this is a source-evidence lead.",
+      "locations": [
+        {
+          "end_line": 33,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/resolver/TenantHeaderResolver.java",
+          "start_line": 26
+        },
+        {
+          "end_line": 54,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateTenantIdentifierResolver.java",
+          "start_line": 36
+        },
+        {
+          "end_line": 15,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/service/SchemaService.java",
+          "start_line": 13
+        },
+        {
+          "end_line": 47,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/controller/TenantController.java",
+          "start_line": 28
+        },
+        {
+          "end_line": 141,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateSchemaService.java",
+          "start_line": 137
+        },
+        {
+          "end_line": 188,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateSchemaService.java",
+          "start_line": 173
+        },
+        {
+          "end_line": 171,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateSchemaService.java",
+          "start_line": 149
+        },
+        {
+          "end_line": 65,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/hibernate/HibernateMultiTenantConnectionProvider.java",
+          "start_line": 45
+        },
+        {
+          "end_line": 35,
+          "path": "tenant/src/main/java/org/folio/spring/tenant/service/SqlTemplateService.java",
+          "start_line": 25
+        },
+        {
+          "end_line": 1,
+          "path": "tenant/src/main/resources/templates/schema/select.postgres.sql",
+          "start_line": 1
+        },
+        {
+          "end_line": 1,
+          "path": "tenant/src/main/resources/templates/schema/select.h2.sql",
+          "start_line": 1
+        }
+      ],
+      "prerequisites": "The module's HTTP endpoints are reachable by the attacker (or the attacker can control the tenant header forwarded by an intermediary), and the module database user has normal rights on the module's schemas (typical FOLIO deployment). No authentication/authorization or tenant-name validation exists in this source tree for these endpoints.",
+      "root_cause": "The tenant identifier is taken verbatim from an HTTP header (TenantHeaderResolver.resolveArgument returns webRequest.getHeader(tenantHeaderName); HibernateTenantIdentifierResolver.resolveCurrentTenantIdentifier reads the same header). The only transformation is SchemaService.getSchema(), which concatenates the module artifact name and replaces '-' with '_' — no validation, allow-listing, quoting or escaping. That value is then built into SQL statement text with String.format / string concatenation: schemaExists uses \"... schema_name = '%s'\", createSchema uses \"CREATE SCHEMA IF NOT EXISTS %s;\", dropSchema uses \"DROP SCHEMA IF EXISTS %s CASCADE;\", createAdditionalSchema executes the Thymeleaf templates templates/schema/select.h2.sql and select.postgres.sql that interpolate the schema unescaped via [(${schema})], and HibernateMultiTenantConnectionProvider.getConnection executes \"USE \" + schema for the H2 platform. Prepared statements or identifier quoting are never used for these statements.",
+      "title": "SQL injection via unvalidated tenant header in tenant schema management",
+      "trace": "HTTP request header -> TenantHeaderResolver.resolveArgument (line 32) -> TenantController.create/delete (lines 35, 45) -> HibernateSchemaService.createTenant (line 99) / deleteTenant (line 109) -> getSettings (lines 190-203) -> SchemaService.getSchema (lines 13-15) -> sinks: schemaExists String.format(\"SELECT EXISTS(... schema_name = '%s')\") executed via Statement.executeQuery (lines 181-182); createSchema String.format(\"CREATE SCHEMA IF NOT EXISTS %s;\") via executeUpdate (line 139); dropSchema String.format(\"DROP SCHEMA IF EXISTS %s CASCADE;\") via executeUpdate (line 175); createAdditionalSchema executes SqlTemplateService.templateSelectSchemaSql(schema) built from templates/schema/select.*.sql containing SET SCHEMA '[(${schema})]' (lines 157-158, templates line 1). Separately, for every DB request HibernateTenantIdentifierResolver.resolveCurrentTenantIdentifier (lines 39-41) returns schemaService.getSchema(headerTenant), and HibernateMultiTenantConnectionProvider.getConnection (lines 45-56) executes \"USE \" + schema on the H2 path. Note createTenant passes the raw header value to schemaExists while initializeSchema creates '<tenant>_<artifact>'; both forms are attacker-influenced and inserted into SQL text. SQL error messages are returned to the caller via TenantControllerAdvice (lines 23-28), which would aid error-based probing.",
+      "unverified": "Runtime exploitability not confirmed. Not verified: whether deployments expose module HTTP ports to untrusted clients or validate the tenant header upstream; whether PostgreSQL JDBC executes appended statements in the same executeUpdate/executeQuery call for these statements; exact H2 behavior for the concatenated 'USE ' statement; and the behavior of the empty import templates (templates/import/initial.h2.sql and initial.postgres.sql are 0 bytes in this snapshot, so initializeData currently contributes no SQL).",
+      "weakness_type": "CWE-89 SQL Injection (root cause: CWE-20 improper validation of tenant identifier)"
+    }
+  ],
+  "coverage_summary": "All 57 model-visible files were accounted for via get_source_scope and list_files; the P1 index reports 40 parsed Java files, 296 symbols, 381 calls, 0 omitted files, and syntax-only relations (no data/control flow). I read the full tenant module (controllers, resolvers, Hibernate schema/multi-tenant classes, services, properties, templates) and the full web module (resolvers, converter, HttpService, error models/utilities), plus the domain controllers/services/advice/entities, all three poms, README/CONTRIBUTING and build/checkstyle files. No test sources or application configuration files are present in the snapshot, so no runnable end-to-end configuration could be inspected.",
+  "limitations": [
+    "Static source review only: no build, tests, scanners or payloads were executed, and no runtime behavior or reachability was confirmed.",
+    "The P1 relation index is syntactic/navigation-only (no data flow, control flow, semantic resolution or Spring DI enforcement); index edges were used only to locate code and every cited edge was verified in source text.",
+    "Whether the tenant header is attacker-reachable in a real deployment depends on external Okapi/network configuration not present in this snapshot.",
+    "Driver-level multi-statement behavior (PostgreSQL JDBC, H2) was not verified by execution, so the exact maximum impact of the injection is an inference from SQL construction patterns.",
+    "templates/import/initial.h2.sql and initial.postgres.sql are empty in this snapshot, so the initializeData sink is currently a no-op.",
+    "Sibling repositories, patches, CVE data and prior experiment outputs were not consulted, per the task constraints."
+  ],
+  "rejected_leads": [
+    {
+      "lead": "Path traversal in JsonSchemasService.getSchemaByPath / RamlsService.getRamlByPath: user-controlled 'path' request parameter is concatenated into a 'classpath:ramls/' resource lookup (JsonSchemasService.java lines 41-47, RamlsService.java lines 37-43).",
+      "reason": "Plausible but unconfirmed: classpath resource resolution depends on packaging (jar entries cannot contain '..' traversal) and on classloader normalization behavior; no source-level proof that arbitrary files outside ramls/ can be read, and no test or configuration confirms an exploded classpath. Rejected as weaker than the SQL injection candidate."
+    },
+    {
+      "lead": "Reflected content injection of the 'x-okapi-url' header into JSON/RAML responses via replaceReferences (JsonSchemasService.java lines 49-64, RamlsService.java lines 45-61).",
+      "reason": "The header value is written into the response body ($ref/!include strings), not into response headers or executable content; impact is limited to clients that consume the returned schema/RAML, with no demonstrated security boundary crossing."
+    },
+    {
+      "lead": "ObjectPlainTextConverter accepts any caller-supplied charset and writes String responses with caller-influenced encoding (web/src/main/java/org/folio/spring/converter/ObjectPlainTextConverter.java lines 95-127).",
+      "reason": "Standard Spring-style converter behavior; no demonstrated confidentiality/integrity impact from source alone."
+    },
+    {
+      "lead": "SQLException/IOException messages are returned verbatim to API callers by TenantControllerAdvice (lines 23-35) and ErrorUtility.buildError.",
+      "reason": "Information disclosure is real but secondary and operates only through the SQL error path of the primary candidate; it is treated as supporting evidence, not a separate finding."
+    }
+  ],
+  "summary": "Reviewed the 57-file snapshot of spring-module-core (domain, tenant, web modules; 40 Java files parsed, no tests, no application config/security config present). The strongest source-supported issue is SQL injection through the tenant request header: the header is read verbatim by the argument resolver and by the Hibernate tenant-identifier resolver, passed through SchemaService.getSchema() (only string concatenation and '-'→'_' replacement), and then interpolated into SQL text in HibernateSchemaService (existence check string literal, CREATE SCHEMA, DROP SCHEMA), into Thymeleaf SQL templates executed for schema setup, and into HibernateMultiTenantConnectionProvider's \"USE \" + schema for the H2 path. No input validation, allow-list, prepared statement, or identifier quoting exists anywhere in the reviewed tree. Submitted as a single candidate; other leads (classpath path traversal, okapi-url reflection) are recorded as unconfirmed."
+}
