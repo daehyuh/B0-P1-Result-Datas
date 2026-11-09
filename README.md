@@ -1,15 +1,39 @@
-# B0–P1 Java vulnerability detection results
+# VulRIS Vul4J+ evaluation data
 
-| Dataset | Cases | CodeQL | B0 | P1 | P1−B0 (cases; pp) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| VJBench | 42 | 4 (9.52%) | 16 (38.10%) | 16 (38.10%) | +0; +0.00 pp |
-| Vul4J+ | 140 | 17 (12.14%) | 39 (27.86%) | 46 (32.86%) | +7; +5.00 pp |
-| CWE-Bench-Java | 213 | 41 (19.25%) | 52 (24.41%) | 51 (23.94%) | -1; -0.47 pp |
+This repository publishes the evidence used by the final VulRIS paper. The
+final experiment evaluates one fixed 140-case Vul4J+ cohort under a source-only
+baseline (B0) and a VulRIS-assisted condition (P1).
 
-All paired LLM submissions use Flash Max (`deepseek-flash`, reasoning effort `max`) and permit at most one candidate. B0 reads prepared source; P1 also queries read-only VulRIS relations. The metric is reference-cause and affected-path matching. CodeQL is the recorded baseline; exact source-version parity with every corrected LLM input has not been established.
+## Final paper results
 
-Legacy Vul4J multi-candidate responses and their derived comparisons have been removed from the current tree. The separate Vul4J P1 Top1 experiment (79 completed reviews, October 9–10) remains preserved. It has no matching Top1 B0 in the recorded experiment and is not substituted with old multi-candidate B0 results.
+| Method/model | B0 | P1 | P1−B0 |
+| --- | ---: | ---: | ---: |
+| DeepSeek 4.1 Flash (Max) | 39/140 (27.86%) | 48/140 (34.29%) | +9 (+6.43 pp) |
+| Gemini 3.8 Flash (High) | 52/140 (37.14%) | 49/140 (35.00%) | -3 (-2.14 pp) |
+| GPT-6 Luna (High) | 15/140 (10.71%) | 18/140 (12.86%) | +3 (+2.14 pp) |
+| GPT-6 Luna (Max) | 20/140 (14.29%) | 23/140 (16.43%) | +3 (+2.14 pp) |
 
-[Case rows, reports, labels and hashes](results/final-flash-max-20261021/).
+The CodeQL CLI 2.23.2 reference baseline reports 19/140 (13.57%). GPT-5.6
+Luna is excluded from the final paper and comparative experiment.
 
-[Relation builder](analyzer/) · [Prompts](prompts/) · [CodeQL baseline](results/codeql/)
+## Authoritative release
+
+- [Final binary adjudication, paper tables, and data dictionary](results/vul4jplus-final-20261110/)
+- [Raw SQLite ledgers and criteria artifacts](https://github.com/daehyuh/B0-P1-Result-Datas/releases/tag/vul4jplus-paper-evidence-20261110)
+- [VulRIS relation builder](analyzer/)
+- [Evaluation prompts](prompts/)
+
+The release asset preserves the seven DeepSeek ledger/repair overlays, six
+Gemini and GPT-6 B0/P1 ledgers, and four mapping/criteria artifacts used for
+log-level analysis. It is distributed as a release asset rather than a Git
+object because it is larger than 100 MB.
+
+## Scope of older material
+
+Folders outside `results/vul4jplus-final-20261110` are historical experiment
+artifacts from earlier manuscript iterations. They are retained for provenance
+but are not part of the final Vul4J+-only result table above.
+
+Benchmark source trees are not redistributed. Obtain Vul4J+ from its upstream
+Zenodo record and follow the upstream projects' licenses. See
+[DATA_SOURCES.md](DATA_SOURCES.md).
